@@ -1,6 +1,6 @@
 //! Batch UDP datagram IO on Linux (`recvmmsg` / `sendmmsg`).
 //!
-//! KCP pays one syscall per datagram in userspace — the cost TCP amortizes
+//! mhd pays one syscall per datagram in userspace — the cost TCP amortizes
 //! in the kernel via GSO/TSO. Batching a whole readiness wake into one
 //! `recvmmsg`/`sendmmsg` call is the same amortization QUIC stacks get from
 //! UDP GSO, and it changes nothing on the wire: the datagrams are
@@ -11,7 +11,7 @@
 //! the results back into `(SocketAddr, &[u8])`. There is no `unsafe` here.
 //! The price is a small per-batch setup cost: `MultiHeaders` is `!Send`, so
 //! it is rebuilt for each call instead of being carried across an await.
-//! Measured on the KCP `l4` path (`just bench --profile screen`, four runs),
+//! Measured on the mhd `l4` path (`just bench --profile screen`, four runs),
 //! that cost 1.4-1.9 % CPU per Gbit against the previous raw-pointer batch —
 //! inside the metric's 15 % materiality floor, and accepted for removing the
 //! eight FFI expectations. The record is in `HANDOFF.md`.
@@ -29,7 +29,7 @@ use nix::sys::socket::{
     ControlMessage, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg, sendmmsg,
 };
 
-use crate::kcp::KCP_OVERHEAD;
+use crate::mhd::MHD_OVERHEAD;
 use bytes::Bytes;
 
 use super::dgram::{BATCH, Span};
@@ -171,7 +171,7 @@ impl SendBatch {
                 }),
                 Span::Split { hdr_off, payload } => iovs.push(OneIov {
                     slices: [
-                        IoSlice::new(&buf[*hdr_off..*hdr_off + KCP_OVERHEAD]),
+                        IoSlice::new(&buf[*hdr_off..*hdr_off + MHD_OVERHEAD]),
                         IoSlice::new(payload),
                     ],
                     len: 2,
@@ -218,15 +218,15 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         let peer = receiver.local_addr().unwrap();
 
-        let header = [0xABu8; KCP_OVERHEAD];
-        let mut staging = vec![0u8; KCP_OVERHEAD + 4];
-        staging[..KCP_OVERHEAD].copy_from_slice(&header);
-        staging[KCP_OVERHEAD..].copy_from_slice(b"tail");
+        let header = [0xABu8; MHD_OVERHEAD];
+        let mut staging = vec![0u8; MHD_OVERHEAD + 4];
+        staging[..MHD_OVERHEAD].copy_from_slice(&header);
+        staging[MHD_OVERHEAD..].copy_from_slice(b"tail");
         let buf = Bytes::from(staging);
         let payload = Bytes::from_static(b"payload");
         let spans = [
             Span::Staged {
-                off: KCP_OVERHEAD,
+                off: MHD_OVERHEAD,
                 len: 4,
             },
             Span::Split {

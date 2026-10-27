@@ -73,6 +73,11 @@ impl std::fmt::Debug for ProtocolVersion {
 ///   `Vnet` and keeps the virtio-net header/GSO path; any pair with a plain-IP
 ///   device negotiates `Ip`, and the Linux side converts.
 ///
+/// v6.0 is the carrier redesign: the data plane's own carrier (`mhd`) replaces
+/// the KCP session, which is why the registration's carrier name changes with
+/// it. Both ends upgrade together; a v5.x peer is refused on the connection it
+/// happens on, with the version it actually sent.
+///
 /// v5.0's number, kept for the refusal tests: a v5.0 peer must be turned away
 /// with the version it actually sent.
 #[cfg(test)]
@@ -81,7 +86,7 @@ pub const PROTO_V5_0_VERSION: ProtocolVersion = ProtocolVersion::new(5, 0);
 /// The dialect this build *speaks*: the version it puts in the hellos it
 /// originates. It is deliberately separate from [`SUPPORTED_PROTO_VERSIONS`],
 /// because a server has to keep serving the dialects it no longer speaks.
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = ProtocolVersion::new(5, 2);
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = ProtocolVersion::new(6, 0);
 
 /// The dialect a *server* accepts, and the only one it speaks.
 ///
@@ -97,7 +102,7 @@ pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [CURRENT_PROTO_VERSIO
 const HELLO_PREFIX_LEN: usize = 3;
 
 /// First byte of every byte stream between client and server (TCP
-/// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
+/// connections and mhd sessions alike): `PLAIN_SELECTOR` is followed by
 /// the postcard hello, `NOISE_SELECTOR` by the Noise handshake. The
 /// opt-in session-resume selector (`0x02`, `noise_resume.rs`) is a
 /// third value on the same byte, and an old peer rejects it the same way
@@ -113,8 +118,8 @@ pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 pub enum Carrier {
     #[serde(rename = "tcp")]
     Tcp,
-    #[serde(rename = "kcp")]
-    Kcp,
+    #[serde(rename = "mhd")]
+    Mhd,
 }
 
 impl Carrier {
@@ -125,7 +130,7 @@ impl Carrier {
     pub fn from_data_carrier(c: crate::transport::carrier::Carrier) -> Carrier {
         match c {
             crate::transport::carrier::Carrier::Tcp => Carrier::Tcp,
-            crate::transport::carrier::Carrier::Kcp => Carrier::Kcp,
+            crate::transport::carrier::Carrier::Mhd => Carrier::Mhd,
         }
     }
 }
@@ -175,7 +180,7 @@ pub struct ServiceRegistration {
     /// Public address the service is exposed at, chosen by the client.
     pub bind_addr: SocketAddr,
     /// The data-plane carrier this service's tunnels will use
-    /// (`tcp`/`kcp`, client-declared). The server validates it against its
+    /// (`tcp`/`mhd`, client-declared). The server validates it against its
     /// own capabilities and lazily opens its listeners on first use.
     pub carrier: Carrier,
     /// Receive buffer size for UDP datagrams of this service. Ignored for
@@ -1988,7 +1993,7 @@ mod tests {
         for version in [
             ProtocolVersion::new(0, 0),
             PROTO_V5_0_VERSION,
-            ProtocolVersion::new(6, 0),
+            ProtocolVersion::new(5, 2),
             ProtocolVersion::new(99, 0),
         ] {
             let (mut tx, mut rx) = duplex(64);
@@ -2143,7 +2148,7 @@ mod tests {
         tx.write_all(&hello).await.unwrap();
         let err = read_hello(&mut rx).await.unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("Supported versions: [v5.2]"), "{msg}");
+        assert!(msg.contains("Supported versions: [v6.0]"), "{msg}");
         assert!(msg.contains("got v5."), "{msg}");
     }
 

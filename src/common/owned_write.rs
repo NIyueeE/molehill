@@ -2,7 +2,7 @@
 //!
 //! The forwarding path's write side used to copy each byte one more time
 //! per layer that had to stage a borrowed slice into a buffer of its own:
-//! the Noise layer encrypted into its pooled buffer, and KCP then copied
+//! the Noise layer encrypted into its pooled buffer, and mhd then copied
 //! the record into a `Bytes` for the writer channel. Both hops exist only
 //! because the next layer's `AsyncWrite::poll_write` takes a borrowed
 //! slice.
@@ -26,11 +26,11 @@ use tokio::io::AsyncWrite;
 
 /// A write target that can take an owned buffer without copying it.
 #[cfg_attr(
-    not(any(feature = "noise", feature = "kcp")),
+    not(any(feature = "noise", feature = "mhd")),
     expect(
         dead_code,
         reason = "the boundary's consumer (the Noise owned-record path over \
-                  KCP) is feature-gated; a build without either feature has \
+                  mhd) is feature-gated; a build without either feature has \
                   no owned write to dispatch"
     )
 )]

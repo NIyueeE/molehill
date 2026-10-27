@@ -1,8 +1,8 @@
-# Arm 2 fixture: the data tunnels are KCP-over-UDP sessions wrapped in Noise
+# Arm 2 fixture: the data tunnels are mhd-over-UDP sessions wrapped in Noise
 # (same keys as the TCP+Noise control channel); the control channel itself
 # stays TCP+Noise. The count is not written here, so the pool establishes the
 # default (`DEFAULT_MUX_TUNNELS`, 4) at service start and keeps it. Requires a
-# binary built with the `kcp` feature.
+# binary built with the `mhd` feature.
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures

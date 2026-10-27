@@ -150,7 +150,7 @@ PIDS+=("$!")
 SRV_PID=$!
 PIDS+=("$SRV_PID")
 # TCP forced: this profile prices the multiplexer's per-byte cost, and the data
-# plane tries KCP first by default.
+# plane tries mhd first by default.
 MOLEHILL_DATA_CARRIER=tcp "$BINARY" --client "$LOG/client.toml" >"$LOG/client.log" 2>&1 &
 CLI_PID=$!
 PIDS+=("$CLI_PID")

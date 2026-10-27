@@ -847,56 +847,56 @@ async fn mixed_transports() -> Result<()> {
     Ok(())
 }
 
-/// The KCP data plane: data tunnels are KCP-over-UDP sessions (Noise-wrapped
+/// The mhd data plane: data tunnels are mhd-over-UDP sessions (Noise-wrapped
 /// with the control transport's keys, `[client.data].tunnels` established at
 /// service start — the default 4 when unwritten); the control channel stays
 /// TCP+Noise. Full lifecycle.
-#[cfg(all(feature = "multiplex", feature = "kcp"))]
+#[cfg(all(feature = "multiplex", feature = "mhd"))]
 #[tokio::test]
-async fn kcp_tunnel() -> Result<()> {
+async fn mhd_tunnel() -> Result<()> {
     init();
 
     spawn_tcp_backends();
 
-    test("tests/for_tcp/kcp_tunnel.toml", Type::Tcp, None).await?;
+    test("tests/for_tcp/mhd_tunnel.toml", Type::Tcp, None).await?;
 
     Ok(())
 }
 
-/// The KCP carrier is orthogonal to a service's *shape*: this fixture pins a
-/// KCP pool, and the KCP listener must accept the tunnel hello and carry the
+/// The mhd carrier is orthogonal to a service's *shape*: this fixture pins a
+/// mhd pool, and the mhd listener must accept the tunnel hello and carry the
 /// service's data channels as streams of those sessions. Full lifecycle, over
 /// Noise.
 ///
-/// The *direct*-channel-over-KCP leg this used to cover is gone with the `mode`
+/// The *direct*-channel-over-mhd leg this used to cover is gone with the `mode`
 /// key: after it, a direct data channel is only ever a transparent claim's lane,
 /// and a claim's lanes need a TUN device on both ends — the root-only acceptance
 /// script (`just l3-accept`), not this suite.
-#[cfg(all(feature = "multiplex", feature = "kcp"))]
+#[cfg(all(feature = "multiplex", feature = "mhd"))]
 #[tokio::test]
-async fn kcp_tunnel_carries_streams() -> Result<()> {
+async fn mhd_tunnel_carries_streams() -> Result<()> {
     init();
 
     spawn_tcp_backends();
 
-    test("tests/for_tcp/kcp_tunnel.toml", Type::Tcp, None).await?;
+    test("tests/for_tcp/mhd_tunnel.toml", Type::Tcp, None).await?;
 
     Ok(())
 }
 
-/// KCP tunnels on the default data-plane endpoint: with neither
-/// `[client.data].default_addr` nor `[server.data].bind_addr` set, the KCP sessions
-/// dial the control address over UDP — TCP control and UDP KCP data share
+/// mhd tunnels on the default data-plane endpoint: with neither
+/// `[client.data].default_addr` nor `[server.data].bind_addr` set, the mhd sessions
+/// dial the control address over UDP — TCP control and UDP mhd data share
 /// one port number (different protocols). Two sessions share the single UDP
 /// listener, demuxed by peer address + conversation id.
-#[cfg(all(feature = "multiplex", feature = "kcp"))]
+#[cfg(all(feature = "multiplex", feature = "mhd"))]
 #[tokio::test]
-async fn kcp_same_port() -> Result<()> {
+async fn mhd_same_port() -> Result<()> {
     init();
 
     spawn_tcp_backends();
 
-    test("tests/for_tcp/kcp_same_port.toml", Type::Tcp, None).await?;
+    test("tests/for_tcp/mhd_same_port.toml", Type::Tcp, None).await?;
 
     Ok(())
 }

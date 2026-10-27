@@ -1,7 +1,7 @@
 use std::error::Error as StdError;
 use std::io::{self, ErrorKind};
 
-/// KCP protocol errors
+/// mhd protocol errors
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("conv inconsistent, expected {0}, found {1}")]

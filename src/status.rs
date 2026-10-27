@@ -14,7 +14,7 @@
 //!
 //! Why the client and not the server: the client is where this branch's own
 //! instruments already look — the tunnel pool (with its per-tunnel bytes and
-//! KCP ARQ health) is the client's, the L3 lane allocator is the client's,
+//! mhd ARQ health) is the client's, the L3 lane allocator is the client's,
 //! and the server's per-tunnel health arrives *at the client* as the tunnel
 //! report. The one process that can answer "what are my services and tunnels
 //! doing" without a new wire command is the one behind the NAT.
@@ -175,12 +175,12 @@ struct TunnelStatus {
     /// Cumulative bytes: what the tunnel delivered, what was written in.
     delivered_bytes: u64,
     written_bytes: u64,
-    /// KCP ARQ health, `null` for a TCP tunnel: datagrams sent and segments
+    /// mhd ARQ health, `null` for a TCP tunnel: datagrams sent and segments
     /// re-sent, cumulative for the tunnel's life. A re-send rate above
     /// nothing is the carrier losing traffic — the signal the carrier rule
     /// acts on.
-    kcp_datagrams_out: Option<u64>,
-    kcp_retransmits: Option<u64>,
+    mhd_datagrams_out: Option<u64>,
+    mhd_retransmits: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -651,13 +651,13 @@ fn pool_reports(answered_pools: &HashSet<String>) -> Vec<PoolReport> {
                             carrier: carrier.as_str().to_owned(),
                             delivered_bytes: snapshot.bytes.get(index).map_or(0, |b| b.0),
                             written_bytes: snapshot.bytes.get(index).map_or(0, |b| b.1),
-                            kcp_datagrams_out: snapshot
-                                .kcp_health
+                            mhd_datagrams_out: snapshot
+                                .mhd_health
                                 .get(index)
                                 .and_then(Option::as_ref)
                                 .map(|h| h.0),
-                            kcp_retransmits: snapshot
-                                .kcp_health
+                            mhd_retransmits: snapshot
+                                .mhd_health
                                 .get(index)
                                 .and_then(Option::as_ref)
                                 .map(|h| h.1),

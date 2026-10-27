@@ -1,16 +1,16 @@
 //! One carrier session's ARQ health, as the layers above the engine read it.
 //!
-//! This lives outside [`crate::kcp`] on purpose: the type is two counters and
-//! has no dependency on the KCP engine, but the multiplexer and the server's
+//! This lives outside [`crate::mhd`] on purpose: the type is two counters and
+//! has no dependency on the mhd engine, but the multiplexer and the server's
 //! tunnel report thread it through *their* signatures — and those compile in
-//! builds without the `kcp` feature. A type that exists only behind a feature
+//! builds without the `mhd` feature. A type that exists only behind a feature
 //! its users do not require makes every one of them carry a `cfg`.
 
 #![cfg_attr(
-    not(feature = "kcp"),
+    not(feature = "mhd"),
     allow(
         dead_code,
-        reason = "without `kcp` no session carries ARQ counters, so nothing                   constructs this; the type still has to exist because the                   layers that thread it through their signatures compile in                   that build"
+        reason = "without `mhd` no session carries ARQ counters, so nothing                   constructs this; the type still has to exist because the                   layers that thread it through their signatures compile in                   that build"
     )
 )]
 
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// One session's own ARQ counters: what a *per-tunnel* view of the carrier's
 /// health reads.
 ///
-/// The KCP engine's process-global counters answer "how is this process
+/// The mhd engine's process-global counters answer "how is this process
 /// doing"; a carrier policy has to answer "how is **this tunnel's** connection
 /// doing" — a pool's tunnels are independent sessions, and only the
 /// retransmit share of the degraded one rises (measured: 1 vs ~5,000

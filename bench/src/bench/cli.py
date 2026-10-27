@@ -573,8 +573,8 @@ def _check_arms(c: Checker) -> None:
     )
     c.check(
         "arm spec refuses a carrier key",
-        _refused(model.parse_arm_spec, "id=l3,force_carrier=kcp"),
-        "force_carrier=kcp was accepted (the carrier is chosen at runtime)",
+        _refused(model.parse_arm_spec, "id=l3,force_carrier=mhd"),
+        "force_carrier=mhd was accepted (the carrier is chosen at runtime)",
     )
     c.check(
         "unknown arm key is refused",

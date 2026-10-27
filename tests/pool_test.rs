@@ -1122,7 +1122,7 @@ async fn run_binary_pair(
     let log = dir.join("client.log");
     // These scenarios measure the **TCP** tunnel path: the operator's valve
     // refuses a tunnel hello with a typed ack, and the pool's own lines describe
-    // those tunnels. The data plane tries KCP first by default, so the carrier
+    // those tunnels. The data plane tries mhd first by default, so the carrier
     // is forced here — which is what the diagnostic switch exists for — rather
     // than leaving the run to whatever the loopback path happens to carry.
     let mut server = Command::new(bin)
@@ -1396,7 +1396,7 @@ async fn wait_for_cross_carrier(
 
 /// A carrier handover on a live pool keeps the flows it carries.
 ///
-/// The pool starts on the carrier the loopback path gives it (KCP first), a
+/// The pool starts on the carrier the loopback path gives it (mhd first), a
 /// visitor holds a stream open, and the diagnostic hatch
 /// (`MOLEHILL_TUNNEL_SWITCH_AT`) excludes one tunnel from new placements at
 /// three seconds. What the scenario asserts is the no-disruption contract and

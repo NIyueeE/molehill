@@ -870,9 +870,9 @@ class Arm:
     an L3 arm may say so (a forwarding service has no lanes to move).
 
     The data plane's *carrier* is not an arm parameter: the product chooses it
-    at runtime (KCP, falling back to TCP, re-probing), so a run that needs the
+    at runtime (mhd, falling back to TCP, re-probing), so a run that needs the
     paths apart says so with a **condition** — `udp_blocked` is the fallback, a
-    clean path carries KCP — or, to isolate one carrier, with the inherited
+    clean path carries mhd — or, to isolate one carrier, with the inherited
     `MOLEHILL_DATA_CARRIER` switch, which the results record as instrumentation.
     The data plane's *shape* is not an arm parameter either: a forwarding
     service always multiplexes and a claim never does, which is what the product
@@ -920,7 +920,7 @@ class Arm:
     def data_carrier(self) -> str:
         """The carrier an arm can claim, which is none: the product chooses.
 
-        `auto` for a tool arm — the data plane tries KCP and falls back to TCP on
+        `auto` for a tool arm — the data plane tries mhd and falls back to TCP on
         its own, so an arm cannot name a carrier without describing a setting the
         product no longer has. A run that needs the paths apart uses the
         `udp_blocked` condition (the fallback) or the inherited
@@ -931,8 +931,8 @@ class Arm:
         return "" if self.kind in ("peer", "control") else "auto"
 
     @property
-    def states_kcp(self) -> bool:
-        return self.data_carrier == "kcp"
+    def states_mhd(self) -> bool:
+        return self.data_carrier == "mhd"
 
     @property
     def uses_device_io(self) -> bool:
@@ -1033,8 +1033,8 @@ ARM_CATALOG: dict = {
     ),
     "l3-deep": Arm("l3-deep", "l3", txqueuelen=DEEP_TXQUEUELEN),
     # There is no carrier axis: the product chooses its carrier at runtime
-    # (KCP, falling back to TCP), so the contrast lives in the *path* — a run
-    # against `--condition udp_blocked` is the fallback, a clean run is KCP —
+    # (mhd, falling back to TCP), so the contrast lives in the *path* — a run
+    # against `--condition udp_blocked` is the fallback, a clean run is mhd —
     # while forcing one carrier for isolation is an experiment-wide environment
     # switch rather than an arm.
     # The reference tools. Their adapters live in `targets/peers/`; the arm is the
@@ -1174,7 +1174,7 @@ def refuse_misplaced_condition(condition: Condition, leg: str) -> None:
     `udp_blocked` is how a run asks for the data plane's *fallback*: it drops
     UDP on the leg the carrier crosses. Imposed on the visitor's leg it would
     block the payload instead and the carrier would come up as usual — a run
-    whose method says "the fallback" while every packet rode KCP. The refusal
+    whose method says "the fallback" while every packet rode mhd. The refusal
     names the leg to use rather than letting the number lie.
     """
     if (condition.block_udp or condition.udp_limit is not None) and leg != "tunnel":
@@ -1188,10 +1188,10 @@ def refuse_misplaced_condition(condition: Condition, leg: str) -> None:
 def refuse_carrier_arm(arm: Arm) -> None:
     """Refuse an arm that names a carrier.
 
-    The data plane's carrier is chosen at runtime (KCP, falling back to TCP), so
+    The data plane's carrier is chosen at runtime (mhd, falling back to TCP), so
     there is no key to write and no arm field to set: a run that means "the
-    fallback" asks for the `udp_blocked` condition, and one that means "KCP
-    alone" sets `MOLEHILL_DATA_CARRIER=kcp` in the environment it launches the
+    fallback" asks for the `udp_blocked` condition, and one that means "mhd
+    alone" sets `MOLEHILL_DATA_CARRIER=mhd` in the environment it launches the
     bench from (the results record it as instrumentation). An arm that named a
     carrier anyway would measure the product's own choice while its name said
     otherwise — the failure the arm parser exists to prevent.
@@ -1605,7 +1605,7 @@ PROFILES |= {
     # off. It exists to answer one question — whether the L3 wedge is the
     # carrier's own behaviour at that condition or contention with a bulk claim
     # sharing it — and the answer is read from the interactive series beside the
-    # product's own KCP and L3 stats lines. `streams: 0` removes the contention;
+    # product's own mhd and L3 stats lines. `streams: 0` removes the contention;
     # the `wedge` timeline keeps the delay and gives it time.
     "carrier": {
         "what": (

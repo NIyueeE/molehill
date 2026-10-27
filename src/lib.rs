@@ -12,9 +12,9 @@ mod cli;
 mod common;
 mod config;
 mod core;
-#[cfg(feature = "kcp")]
-mod kcp;
 pub mod logging;
+#[cfg(feature = "mhd")]
+mod mhd;
 #[cfg(feature = "multiplex")]
 mod mux;
 mod protocol;

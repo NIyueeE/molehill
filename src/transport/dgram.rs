@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 
-use crate::kcp::KCP_OVERHEAD;
+use crate::mhd::MHD_OVERHEAD;
 
 /// Datagrams per syscall. 32 × ~1.5 KiB ≈ 48 KiB per wake; far below
 /// `UIO_MAXIOV`, and a whole burst fits in one call.
@@ -35,7 +35,7 @@ pub const BATCH: usize = 32;
 pub enum Span {
     /// A whole datagram at `off..off + len` inside the batch buffer.
     Staged { off: usize, len: usize },
-    /// A two-iovec datagram: a `KCP_OVERHEAD` header at `hdr_off` inside
+    /// A two-iovec datagram: a `MHD_OVERHEAD` header at `hdr_off` inside
     /// the batch buffer, then `payload` by reference. The `Bytes` handle
     /// is an O(1) share of the engine segment's buffer.
     Split { hdr_off: usize, payload: Bytes },
@@ -46,7 +46,7 @@ impl Span {
     pub fn len(&self) -> usize {
         match self {
             Span::Staged { len, .. } => *len,
-            Span::Split { payload, .. } => KCP_OVERHEAD + payload.len(),
+            Span::Split { payload, .. } => MHD_OVERHEAD + payload.len(),
         }
     }
 }

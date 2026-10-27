@@ -82,7 +82,7 @@ pub trait Transport: Debug + Send + Sync {
 mod tcp;
 pub use tcp::TcpTransport;
 
-/// The data plane's carrier and the fallback that chooses it (KCP, else TCP).
+/// The data plane's carrier and the fallback that chooses it (mhd, else TCP).
 ///
 /// `carrier` is independent of yamux: a transparent claim uses the carrier
 /// choice without ever multiplexing its traffic, so the type and policy are a
@@ -103,23 +103,23 @@ pub(crate) mod noise_stream;
 #[cfg(feature = "noise")]
 pub use noise_stream::NoiseStream;
 // Key material: the Noise transport, the server's dual-transport accept,
-// and the KCP tunnel path (Noise-over-KCP) all build sessions from it.
+// and the mhd tunnel path (Noise-over-mhd) all build sessions from it.
 #[cfg(feature = "noise")]
 pub(crate) use noise::NoiseKeys;
 
-#[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
-pub(crate) mod kcp;
+#[cfg(all(feature = "mhd", any(feature = "client", feature = "server")))]
+pub(crate) mod mhd;
 
 /// The portable half of an outbound datagram batch: the batch's shape, which
 /// every platform shares, as opposed to the syscall that sends it. Gated with
-/// `kcp` and not with the platform, because the non-Linux send path uses it.
-#[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
+/// `mhd` and not with the platform, because the non-Linux send path uses it.
+#[cfg(all(feature = "mhd", any(feature = "client", feature = "server")))]
 pub(crate) mod dgram;
 
-// Batch UDP datagram IO (recvmmsg/sendmmsg) for the KCP carrier on Linux.
+// Batch UDP datagram IO (recvmmsg/sendmmsg) for the mhd carrier on Linux.
 #[cfg(all(
     target_os = "linux",
-    feature = "kcp",
+    feature = "mhd",
     any(feature = "client", feature = "server")
 ))]
 pub(crate) mod udp_batch;

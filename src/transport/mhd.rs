@@ -1,31 +1,31 @@
-//! Thin tokio adapter around the in-house KCP state machine (`kcp` feature,
+//! Thin tokio adapter around the in-house mhd state machine (`mhd` feature,
 //! arm 2 of the transport comparison).
 //!
-//! The `kcp` module (`src/kcp/`) is a pure state machine implementing the
-//! KCP (ARQ) protocol, aligned with the reference C implementation: it owns
+//! The `mhd` module (`src/mhd/`) is a pure state machine implementing the
+//! mhd (ARQ) protocol, aligned with the reference C implementation: it owns
 //! no socket, no clock and no stream semantics.
 //! This module supplies exactly that thin missing layer:
 //!
 //! ```text
-//! UDP socket ⇄ pump task ⇄ Kcp (stream mode) ⇄ bounded channels ⇄ KcpStream
+//! UDP socket ⇄ pump task ⇄ Mhd (stream mode) ⇄ bounded channels ⇄ MhdStream
 //!                          ▲ check()-driven update timer
 //! ```
 //!
-//! - One **pump task** per session owns the `Kcp` instance. It multiplexes
+//! - One **pump task** per session owns the `Mhd` instance. It multiplexes
 //!   three event sources: app data from the writer channel, inbound datagrams
 //!   (client: a per-session ingress task reading the socket; server: the
-//!   listener's dispatcher), and a `Kcp::check`-driven update timer. Every
-//!   datagram KCP emits is sent out over the session's UDP socket.
+//!   listener's dispatcher), and a `Mhd::check`-driven update timer. Every
+//!   datagram mhd emits is sent out over the session's UDP socket.
 //! - **Backpressure**: the writer side is gated by a semaphore and
-//!   `Kcp::wait_snd()` (the ARQ send queue). The reader side never blocks the
-//!   pump: undeliverable chunks spill to a local queue and stay in KCP's
+//!   `Mhd::wait_snd()` (the ARQ send queue). The reader side never blocks the
+//!   pump: undeliverable chunks spill to a local queue and stay in mhd's
 //!   receive queue otherwise, shrinking the advertised window until the
 //!   reader catches up — parking the pump instead would delay acks and
 //!   escalate the peer's RTO into seconds-long stalls. The server dispatcher
 //!   hands datagrams to sessions with a blocking send: a lagging session
 //!   backpressures through the (burst-sized) kernel socket buffer to the
 //!   peer's window rather than losing datagrams in userspace.
-//! - **KCP stream mode has no FIN**: a session ends when both stream halves
+//! - **mhd stream mode has no FIN**: a session ends when both stream halves
 //!   are dropped (graceful: already-queued data is flushed best-effort
 //!   first), when the reader half is dropped, when the peer stops acking
 //!   (dead-link after the module's 20-retransmit limit), or on fatal errors.
@@ -77,9 +77,9 @@
 //! channel boundary is a move rather than a copy; a transport that cannot
 //! take owned records (plain TCP) keeps the pooled-buffer path.
 //!
-//! Security note: KCP provides reliability, not confidentiality. In the
-//! arm-2 stack Noise rides **on top** of `KcpStream`
-//! (`NoiseStream<KcpStream>`), replacing only the plaintext TCP leg of a
+//! Security note: mhd provides reliability, not confidentiality. In the
+//! arm-2 stack Noise rides **on top** of `MhdStream`
+//! (`NoiseStream<MhdStream>`), replacing only the plaintext TCP leg of a
 //! tunnel; the tunnel hello/ack and yamux layers are unchanged.
 
 use std::collections::HashMap;
@@ -91,7 +91,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::kcp::{DatagramSink, KCP_OVERHEAD, Kcp, get_conv};
+use crate::mhd::{DatagramSink, MHD_OVERHEAD, Mhd, get_conv};
 use anyhow::{Context as _, Result, bail};
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
@@ -103,14 +103,14 @@ use tracing::{debug, info, trace, warn};
 
 use crate::transport::dgram::{BATCH, Span};
 
-/// KCP flush interval in ms (`nodelay` mode; also the pump's timer floor
+/// mhd flush interval in ms (`nodelay` mode; also the pump's timer floor
 /// and the retransmit RTO base). 10 ms is the measured sweet spot:
 /// 5 ms halves recovery latency but regressed loopback 8-stream
 /// throughput ~3x (busier update timer stealing pump iterations under
 /// saturation) for no measurable weak-cell gain.
-const KCP_INTERVAL_MS: i32 = 10;
+const MHD_INTERVAL_MS: i32 = 10;
 /// Fast-resend trigger: retransmit a segment after this many skipped acks.
-const KCP_FAST_RESEND: i32 = 2;
+const MHD_FAST_RESEND: i32 = 2;
 /// Send/receive window in segments. The send window is the carrier's
 /// throughput ceiling whenever a path's bandwidth-delay product exceeds it:
 /// 2048 segments ≈ 2.8 MiB carried 533 Mbit/s at the ~44 ms round trip a
@@ -128,14 +128,14 @@ const KCP_FAST_RESEND: i32 = 2;
 /// advertised window is then the effective cap (4096 × 1472 B / 44 ms ≈
 /// 1.1 Gbit/s) and doubling it is its own change to measure, not an
 /// assumption.
-const KCP_SND_WND: u16 = 8192;
-const KCP_RCV_WND: u16 = 4096;
+const MHD_SND_WND: u16 = 8192;
+const MHD_RCV_WND: u16 = 4096;
 /// The most a session may keep *parked* for the pacer, in bytes. Parking is
 /// bounded by the send window in practice (the engine cannot emit more than
 /// that ahead); this is the backstop that keeps a pathological rate from
 /// growing the queue without limit.
 const PARKED_MAX_BYTES: usize = 16 * 1024 * 1024;
-/// Cap on app data queued in the `Kcp` send queue, in segments. Beyond this
+/// Cap on app data queued in the `Mhd` send queue, in segments. Beyond this
 /// the pump stops pulling from the writer channel, backpressuring
 /// `AsyncWrite`.
 ///
@@ -149,8 +149,8 @@ const PARKED_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// datagrams, because a window barely one bandwidth-delay product wide leaves
 /// fast retransmit nothing to ride on. A lossy path wants the window *wider*
 /// than the path's BDP, not closer to it.
-const SND_QUEUE_LIMIT: usize = 2 * KCP_SND_WND as usize;
-/// One `Kcp::send` call must stay under 128 segments (`UserBufTooBig`), so
+const SND_QUEUE_LIMIT: usize = 2 * MHD_SND_WND as usize;
+/// One `Mhd::send` call must stay under 128 segments (`UserBufTooBig`), so
 /// app writes are chunked well below that.
 const SEND_CHUNK: usize = 64 * 1024;
 /// Graceful-close budget: after BOTH stream halves are gone, keep pumping
@@ -159,13 +159,13 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Consecutive quiet pump rounds (nothing sent, nothing delivered, queue
 /// empty) that end a graceful close early.
 const CLOSE_QUIET_ROUNDS: u32 = 3;
-/// Socket buffer size for KCP UDP sockets. A full multi-session burst
+/// Socket buffer size for mhd UDP sockets. A full multi-session burst
 /// (4 × 2.8 MiB at 2048 segments) lands at once; the kernel default
 /// (~208 KiB) drops most of it even on loopback, and every drop escalates
 /// that segment's RTO (nodelay x1.5 per retransmit) into seconds-long
 /// stalls. 32 MiB absorbs the largest burst with headroom; requests are
 /// clamped by the system's `rmem_max`/`wmem_max`.
-const KCP_SOCKET_BUF_BYTES: usize = 32 * 1024 * 1024;
+const MHD_SOCKET_BUF_BYTES: usize = 32 * 1024 * 1024;
 /// Inbound app-data channel depth (messages of one `ReadBatch`, at most
 /// `COALESCE_LIMIT_BYTES` across its parts, or one segment under reader
 /// backpressure); half the ARQ receive window in segments, so reader
@@ -190,7 +190,7 @@ const DATAGRAM_CHANNEL_DEPTH: usize = 8192;
 /// not grow the session map without bound).
 #[cfg(any(feature = "server", test))]
 const MAX_LISTENER_SESSIONS: usize = 4096;
-/// Max datagrams fed to `Kcp::input` per pump iteration. Bounding the batch
+/// Max datagrams fed to `Mhd::input` per pump iteration. Bounding the batch
 /// keeps delivery + ack flushing interleaved with intake, so the advertised
 /// window reflects the post-delivery state instead of a burst-inflated
 /// receive queue. Sized generously: a small batch would force extra select
@@ -204,18 +204,18 @@ const INPUT_BATCH_LIMIT: usize = 512;
 /// truncates the datagram instead of failing — the first jumbo experiment
 /// arrived as a retransmit storm because this was 2048 bytes against 8000-byte
 /// segments.
-const DGRAM_BUF: usize = KCP_MTU_CEILING + KCP_OVERHEAD;
+const DGRAM_BUF: usize = MHD_MTU_CEILING + MHD_OVERHEAD;
 /// The largest datagram a session may use. The engine's default (1400) is where
 /// every session *starts*, because that is what any path carries; the path-MTU
 /// probe is what permits more, and this is the cap on what it may permit — a
 /// jumbo datagram, not an arbitrary one, so a bogus probe result cannot make
 /// the carrier emit something that must be fragmented.
-const KCP_MTU_CEILING: usize = 8000;
+const MHD_MTU_CEILING: usize = 8000;
 /// Staging capacity of one outbound batch: a full `BATCH` of
 /// maximum-size datagrams (MTU + header) plus one datagram of slack, so
 /// appending never reallocates inside a batch (≈256 KiB at the ceiling).
 const BATCH_STAGE_BYTES: usize =
-    BATCH * (KCP_MTU_CEILING + KCP_OVERHEAD) + KCP_MTU_CEILING + KCP_OVERHEAD;
+    BATCH * (MHD_MTU_CEILING + MHD_OVERHEAD) + MHD_MTU_CEILING + MHD_OVERHEAD;
 /// Reader-side coalescing target: consecutive segments are batched into
 /// one channel message up to this many bytes (the mux/yamux/Noise reader
 /// above asks for ~24 such segments per frame, so this cuts the
@@ -232,9 +232,9 @@ const MAX_READ_PARTS: usize = 32;
 /// granularity.
 const COALESCE_PRESSURE_PERMITS: usize = 64;
 // --- adapter control frames ------------------------------------------
-// Datagrams whose 5th byte is CTRL_MAGIC are NOT KCP segments (KCP commands
+// Datagrams whose 5th byte is CTRL_MAGIC are NOT mhd segments (mhd commands
 // live at that offset with values 0x81..=0x84). Shapes (16 B, same order as
-// a KCP header so the path is trivial):
+// an mhd header so the path is trivial):
 //   PING: conv(4) magic(1) 0x01 ts(8) pad(2)
 //   PONG: conv(4) magic(1) 0x02 ts(8) pad(2)   (ts echoed from the PING)
 //   SACK: conv(4) magic(1) 0x03 sn(4) pad(6)   (resend this segment)
@@ -330,10 +330,10 @@ impl Pacer {
     }
 }
 
-// --- pump statistics (opt-in, MOLEHILL_KCP_STATS) -----------------------
+// --- pump statistics (opt-in, MOLEHILL_MHD_STATS) -----------------------
 //
-// The adapter-side half of the KCP attribution tool (the engine counters
-// live in `kcp.rs`): what the pump does that the protocol engine cannot
+// The adapter-side half of the mhd attribution tool (the engine counters
+// live in `mhd.rs`): what the pump does that the protocol engine cannot
 // see — control frames, round counts, and coarse per-phase timings that
 // split a segment's userspace cost into intake, delivery, the writer
 // drain, the wire drain and the ARQ update. Read by a single periodic
@@ -342,44 +342,44 @@ impl Pacer {
 
 /// SACK gap notifications the adapter sent (its own loss-recovery
 /// extension, outside the engine).
-pub(crate) static KCP_SACKS_SENT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_SACKS_SENT: AtomicU64 = AtomicU64::new(0);
 /// Completed pump rounds (select iterations): the scheduling granularity
 /// of all per-segment work.
-pub(crate) static KCP_PUMP_ROUNDS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_PUMP_ROUNDS: AtomicU64 = AtomicU64::new(0);
 /// Reader-channel messages handed over (several consecutive segments
 /// batched into one message — the receive-path amortization; the ratio
 /// `datagrams_in / blobs_out` is the hop reduction it achieves).
-pub(crate) static KCP_BLOBS_OUT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_BLOBS_OUT: AtomicU64 = AtomicU64::new(0);
 /// Receive-queue segments handed to the reader channel (before batching):
 /// the denominator for a per-segment delivery cost.
-pub(crate) static KCP_SEGMENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_SEGMENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
 /// `recv` calls that found the receive queue empty — the fixed per-round
 /// probe every delivery round pays, separated from the data path so the
 /// two can be attributed apart.
-pub(crate) static KCP_RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Coarse phase durations, in nanoseconds, accumulated across all
-/// sessions of this process. `KCP_NS_DELIVER` is the whole delivery
+/// sessions of this process. `MHD_NS_DELIVER` is the whole delivery
 /// phase and stays for continuity; the two splits below carve the spill
 /// flush and the receive-queue drain out of it.
 /// Bytes handed to a session's reader channel and not yet consumed by it, and
 /// the bytes parked in spill queues beside it. These are the buffers between
 /// the wire and the reader, and their depth is what the path above experiences
 /// as round-trip time when a reader cannot keep up.
-pub(crate) static KCP_READER_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_READER_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Peak `wait_snd` (unacknowledged segments) since the last stats line: the
 /// session's own queue, as the engine sees it.
-pub(crate) static KCP_WAIT_SND_PEAK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_WAIT_SND_PEAK: AtomicU64 = AtomicU64::new(0);
 /// The receive queue's depth and the window this side advertises, sampled once
 /// per pump round: the state a stalled reader turns into backpressure.
-pub(crate) static KCP_WAIT_RCV: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_ADVERTISED_WND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_WAIT_RCV: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_ADVERTISED_WND: AtomicU64 = AtomicU64::new(0);
 /// The peer's advertised window, as last received.
-pub(crate) static KCP_PEER_WND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_PEER_WND: AtomicU64 = AtomicU64::new(0);
 /// The adaptive send pacer's current allowance, in bits per second. It is cut
 /// on a keepalive timeout and only raised 5 % per four clean ones, so it is the
 /// one piece of state in this path that can hold a session down for minutes.
-pub(crate) static KCP_PACER_BPS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_PACER_BPS: AtomicU64 = AtomicU64::new(0);
 /// The datagram size the **last** session adapted to, in bytes.
 ///
 /// Per-session by nature (each session follows the path it was given), and the
@@ -387,45 +387,45 @@ pub(crate) static KCP_PACER_BPS: AtomicU64 = AtomicU64::new(0);
 /// a mean: enough to answer "is this build emitting full datagrams or half-empty
 /// ones?", which is the question the size field exists for. A mixed pool is read
 /// as its last writer, and `RUST_LOG=debug` still names each session's own value.
-pub(crate) static KCP_DATAGRAM_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_DATAGRAM_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// The engine's current retransmission timeout and smoothed round-trip
 /// estimate, in milliseconds.
-pub(crate) static KCP_RTO_MS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_SRTT_MS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_INPUT: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_DELIVER: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_DELIVER_RECV: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_WRITER: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_OUTPUT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_RTO_MS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_SRTT_MS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_INPUT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_DELIVER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_DELIVER_RECV: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_WRITER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_OUTPUT: AtomicU64 = AtomicU64::new(0);
 /// The output phase, split in two: the pacer's per-span decision (a clock read
 /// and a token test per datagram) and the wire send that carries a batch of
 /// them. The split exists because the phase as a whole is the carrier's largest
 /// on a clean path — 3.8 µs per outbound datagram, measured — and one number
 /// cannot say which half owns it.
-pub(crate) static KCP_NS_OUT_PACE: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_OUT_SEND: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_NS_UPDATE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_OUT_PACE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_OUT_SEND: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_NS_UPDATE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the pump's diagnostic instrumentation is collected at all.
 ///
 /// Every counter it feeds is only ever *read* by the periodic stats line, and
-/// that line is spawned only when `MOLEHILL_KCP_STATS` is set (`spawn_kcp_stats`).
+/// that line is spawned only when `MOLEHILL_MHD_STATS` is set (`spawn_mhd_stats`).
 /// On a default run the pump was therefore paying, per phase per round, a clock
 /// read and an atomic add for a number nobody would read — and per round a
 /// handful of gauge stores beside them. The switch is read once per process,
 /// like the environment variable it follows.
 #[must_use]
-fn kcp_stats_enabled() -> bool {
+fn mhd_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("MOLEHILL_KCP_STATS").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("MOLEHILL_MHD_STATS").is_some())
 }
 
 /// Times one pump phase into its counter on drop, so a `break`/early
 /// return mid-phase still books the elapsed time.
 ///
-/// A no-op timer when the stats line is off (see [`kcp_stats_enabled`]): the
+/// A no-op timer when the stats line is off (see [`mhd_stats_enabled`]): the
 /// clock is not read at all, which is the point — the timings describe a run
 /// that asked for them.
 struct PhaseTimer<'a> {
@@ -437,7 +437,7 @@ impl<'a> PhaseTimer<'a> {
     fn new(stat: &'a AtomicU64) -> Self {
         PhaseTimer {
             stat,
-            start: kcp_stats_enabled().then(Instant::now),
+            start: mhd_stats_enabled().then(Instant::now),
         }
     }
 }
@@ -452,8 +452,8 @@ impl Drop for PhaseTimer<'_> {
     }
 }
 
-/// Snapshot of every KCP path counter, engine and adapter alike.
-pub(crate) struct KcpStats {
+/// Snapshot of every mhd path counter, engine and adapter alike.
+pub(crate) struct MhdStats {
     pub datagrams_in: u64,
     pub datagrams_out: u64,
     pub retransmits: u64,
@@ -494,9 +494,9 @@ pub(crate) struct KcpStats {
     pub proc_cpu_ms: u64,
 }
 
-/// Snapshot of the KCP path counters, for the periodic stats line.
-pub(crate) fn kcp_stats() -> KcpStats {
-    use crate::kcp::kcp_engine_stats;
+/// Snapshot of the mhd path counters, for the periodic stats line.
+pub(crate) fn mhd_stats() -> MhdStats {
+    use crate::mhd::mhd_engine_stats;
     /// Nanosecond accumulators as milliseconds. `Duration` does the
     /// conversion exactly (the accumulators stay far below 2^53 ns, the
     /// point where an `f64` stops counting nanoseconds) and without the
@@ -504,38 +504,38 @@ pub(crate) fn kcp_stats() -> KcpStats {
     fn ms(stat: &AtomicU64) -> f64 {
         Duration::from_nanos(stat.load(Ordering::Relaxed)).as_secs_f64() * 1.0e3
     }
-    let (dg_in, dg_out, retransmits, acks_out, resends_rto, resends_fast) = kcp_engine_stats();
-    KcpStats {
+    let (dg_in, dg_out, retransmits, acks_out, resends_rto, resends_fast) = mhd_engine_stats();
+    MhdStats {
         datagrams_in: dg_in,
         datagrams_out: dg_out,
         retransmits,
         acks_out,
         resends_rto,
         resends_fast,
-        sacks_sent: KCP_SACKS_SENT.load(Ordering::Relaxed),
-        blobs_out: KCP_BLOBS_OUT.load(Ordering::Relaxed),
-        segments_delivered: KCP_SEGMENTS_DELIVERED.load(Ordering::Relaxed),
-        recv_empty: KCP_RECV_EMPTY.load(Ordering::Relaxed),
-        pump_rounds: KCP_PUMP_ROUNDS.load(Ordering::Relaxed),
-        ms_input: ms(&KCP_NS_INPUT),
-        ms_deliver: ms(&KCP_NS_DELIVER),
-        ms_deliver_spill: ms(&KCP_NS_DELIVER_SPILL),
-        ms_deliver_recv: ms(&KCP_NS_DELIVER_RECV),
-        ms_writer: ms(&KCP_NS_WRITER),
-        ms_output: ms(&KCP_NS_OUTPUT),
-        ms_out_pace: ms(&KCP_NS_OUT_PACE),
-        ms_out_send: ms(&KCP_NS_OUT_SEND),
-        ms_update: ms(&KCP_NS_UPDATE),
-        reader_queued_bytes: KCP_READER_QUEUED_BYTES.load(Ordering::Relaxed),
-        spill_bytes: KCP_SPILL_BYTES.load(Ordering::Relaxed),
-        wait_snd_peak: KCP_WAIT_SND_PEAK.swap(0, Ordering::Relaxed),
-        wait_rcv: KCP_WAIT_RCV.load(Ordering::Relaxed),
-        advertised_wnd: KCP_ADVERTISED_WND.load(Ordering::Relaxed),
-        peer_wnd: KCP_PEER_WND.load(Ordering::Relaxed),
-        pacer_bps: KCP_PACER_BPS.load(Ordering::Relaxed),
-        rto_ms: KCP_RTO_MS.load(Ordering::Relaxed),
-        srtt_ms: KCP_SRTT_MS.load(Ordering::Relaxed),
-        datagram_bytes: KCP_DATAGRAM_BYTES.load(Ordering::Relaxed),
+        sacks_sent: MHD_SACKS_SENT.load(Ordering::Relaxed),
+        blobs_out: MHD_BLOBS_OUT.load(Ordering::Relaxed),
+        segments_delivered: MHD_SEGMENTS_DELIVERED.load(Ordering::Relaxed),
+        recv_empty: MHD_RECV_EMPTY.load(Ordering::Relaxed),
+        pump_rounds: MHD_PUMP_ROUNDS.load(Ordering::Relaxed),
+        ms_input: ms(&MHD_NS_INPUT),
+        ms_deliver: ms(&MHD_NS_DELIVER),
+        ms_deliver_spill: ms(&MHD_NS_DELIVER_SPILL),
+        ms_deliver_recv: ms(&MHD_NS_DELIVER_RECV),
+        ms_writer: ms(&MHD_NS_WRITER),
+        ms_output: ms(&MHD_NS_OUTPUT),
+        ms_out_pace: ms(&MHD_NS_OUT_PACE),
+        ms_out_send: ms(&MHD_NS_OUT_SEND),
+        ms_update: ms(&MHD_NS_UPDATE),
+        reader_queued_bytes: MHD_READER_QUEUED_BYTES.load(Ordering::Relaxed),
+        spill_bytes: MHD_SPILL_BYTES.load(Ordering::Relaxed),
+        wait_snd_peak: MHD_WAIT_SND_PEAK.swap(0, Ordering::Relaxed),
+        wait_rcv: MHD_WAIT_RCV.load(Ordering::Relaxed),
+        advertised_wnd: MHD_ADVERTISED_WND.load(Ordering::Relaxed),
+        peer_wnd: MHD_PEER_WND.load(Ordering::Relaxed),
+        pacer_bps: MHD_PACER_BPS.load(Ordering::Relaxed),
+        rto_ms: MHD_RTO_MS.load(Ordering::Relaxed),
+        srtt_ms: MHD_SRTT_MS.load(Ordering::Relaxed),
+        datagram_bytes: MHD_DATAGRAM_BYTES.load(Ordering::Relaxed),
         proc_cpu_ms: proc_cpu_ms(),
     }
 }
@@ -587,18 +587,18 @@ fn proc_cpu_ms() -> u64 {
     0
 }
 
-/// Guards the one-time spawn of the stats task (see `spawn_kcp_stats`).
-static KCP_STATS_SPAWNED: std::sync::Once = std::sync::Once::new();
+/// Guards the one-time spawn of the stats task (see `spawn_mhd_stats`).
+static MHD_STATS_SPAWNED: std::sync::Once = std::sync::Once::new();
 
 /// Spawn the periodic stats line, once per process, when
-/// `MOLEHILL_KCP_STATS` is set. The counters are cumulative, so a reader
+/// `MOLEHILL_MHD_STATS` is set. The counters are cumulative, so a reader
 /// that knows the window (or takes the first and last line of a run)
 /// gets per-second rates and cost-per-datagram.
-fn spawn_kcp_stats() {
-    if std::env::var_os("MOLEHILL_KCP_STATS").is_none() {
+fn spawn_mhd_stats() {
+    if std::env::var_os("MOLEHILL_MHD_STATS").is_none() {
         return;
     }
-    KCP_STATS_SPAWNED.call_once(|| {
+    MHD_STATS_SPAWNED.call_once(|| {
         tokio::spawn(async {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             // A missed tick is not worth catching up on: the counters are
@@ -606,7 +606,7 @@ fn spawn_kcp_stats() {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let s = kcp_stats();
+                let s = mhd_stats();
                 info!(
                     datagrams_in = s.datagrams_in,
                     datagrams_out = s.datagrams_out,
@@ -639,7 +639,7 @@ fn spawn_kcp_stats() {
                     srtt_ms = s.srtt_ms,
                     datagram_b = s.datagram_bytes,
                     proc_cpu_ms = s.proc_cpu_ms,
-                    "kcp-stats: cumulative counters"
+                    "mhd-stats: cumulative counters"
                 );
             }
         });
@@ -661,7 +661,7 @@ type AcquirePermitFuture = dyn std::future::Future<
 /// segment's own payload buffer by reference ([`Span::Split`]) — so the
 /// payload is not copied into the staging buffer either. The pacer may
 /// deny individual spans, in which case only that span is dropped and
-/// KCP's ARQ re-emits the segment on the next flush.
+/// mhd's ARQ re-emits the segment on the next flush.
 struct DgramBatch {
     buf: Bytes,
     spans: Vec<Span>,
@@ -684,14 +684,14 @@ pub(crate) struct ReadBatch {
     pub bytes: usize,
 }
 
-/// Collects `Kcp` output as whole datagrams: each `Write::write` call from
+/// Collects `Mhd` output as whole datagrams: each `Write::write` call from
 /// `flush`/`update` is exactly one datagram (at most MTU bytes), staged
 /// contiguously, while each [`DatagramSink::write_datagram`] call is one
 /// two-iovec datagram (staged header + payload by reference). Datagrams
 /// stage in a reusable buffer and travel to the pump as one
 /// [`DgramBatch`] per batch — the batch closes at `BATCH` datagrams, at
 /// the staging cap, or at the engine's flush boundary (`Write::flush`,
-/// which `Kcp::flush` now calls once per flush).
+/// which `Mhd::flush` now calls once per flush).
 struct DatagramOut {
     tx: mpsc::UnboundedSender<DgramBatch>,
     /// Batch in progress: staged datagrams, back to back.
@@ -739,7 +739,7 @@ impl DatagramOut {
             return;
         }
         // The pump owns the receiver and drops it only together with the
-        // `Kcp` instance, so a send error here is unreachable in practice;
+        // `Mhd` instance, so a send error here is unreachable in practice;
         // a dropped batch would still be recovered by ARQ.
         let _ = self.tx.send(DgramBatch {
             buf: std::mem::replace(
@@ -765,7 +765,7 @@ impl io::Write for DatagramOut {
             off: self.staging.len() - buf.len(),
             len: buf.len(),
         });
-        crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
+        crate::mhd::MHD_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
         if let Some(health) = &self.health {
             health.datagrams_out.fetch_add(1, Ordering::Relaxed);
         }
@@ -776,7 +776,7 @@ impl io::Write for DatagramOut {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // The engine calls this once at the end of every `Kcp::flush`:
+        // The engine calls this once at the end of every `Mhd::flush`:
         // the natural batch boundary. Between boundaries the size/count
         // caps in `write` keep the message bounded.
         self.emit();
@@ -810,7 +810,7 @@ impl DatagramSink for DatagramOut {
                 payload: payload.clone(),
             });
         }
-        crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
+        crate::mhd::MHD_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
         if let Some(health) = &self.health {
             health.datagrams_out.fetch_add(1, Ordering::Relaxed);
         }
@@ -822,9 +822,9 @@ impl DatagramSink for DatagramOut {
 }
 
 /// Apply the fixed arm-2 protocol parameters (see the module docs).
-fn configure(kcp: &mut Kcp<DatagramOut>) {
-    kcp.set_nodelay(true, KCP_INTERVAL_MS, KCP_FAST_RESEND, true);
-    kcp.set_wndsize(KCP_SND_WND, KCP_RCV_WND);
+fn configure(mhd: &mut Mhd<DatagramOut>) {
+    mhd.set_nodelay(true, MHD_INTERVAL_MS, MHD_FAST_RESEND, true);
+    mhd.set_wndsize(MHD_SND_WND, MHD_RCV_WND);
 }
 
 /// Add to a residency gauge (saturating: a gauge is a diagnostic, never a
@@ -845,7 +845,7 @@ fn sub_bytes(gauge: &AtomicU64, bytes: usize) {
 /// since the last line, so a transient backlog is visible rather than averaged
 /// away).
 fn note_wait_snd(depth: usize) {
-    KCP_WAIT_SND_PEAK.fetch_max(u64::try_from(depth).unwrap_or(u64::MAX), Ordering::Relaxed);
+    MHD_WAIT_SND_PEAK.fetch_max(u64::try_from(depth).unwrap_or(u64::MAX), Ordering::Relaxed);
 }
 
 /// Record the receive-side window state for the periodic stats line: the
@@ -860,7 +860,7 @@ fn note_pacer(rate_bps: f64) {
         reason = "a diagnostic gauge; the value is a positive bit rate far below u64::MAX"
     )]
     let bps = rate_bps as u64;
-    KCP_PACER_BPS.store(bps, Ordering::Relaxed);
+    MHD_PACER_BPS.store(bps, Ordering::Relaxed);
 }
 
 /// Sample every per-session gauge the periodic stats line reports, once per
@@ -868,51 +868,51 @@ fn note_pacer(rate_bps: f64) {
 /// timeout the engine is working to, and the pacer's allowance. They are the
 /// state a stuck session is stuck *in*, which is what made this path's measured
 /// regressions findable at all.
-fn note_gauges(kcp: &Kcp<DatagramOut>, pacer_bps: f64) {
-    if !kcp_stats_enabled() {
+fn note_gauges(mhd: &Mhd<DatagramOut>, pacer_bps: f64) {
+    if !mhd_stats_enabled() {
         return;
     }
-    note_wait_snd(kcp.wait_snd());
-    note_windows(kcp);
-    note_rto(kcp);
+    note_wait_snd(mhd.wait_snd());
+    note_windows(mhd);
+    note_rto(mhd);
     note_pacer(pacer_bps);
 }
 
 /// Record the retransmission timeout and round-trip estimate in force.
-fn note_rto(kcp: &Kcp<DatagramOut>) {
-    KCP_RTO_MS.store(u64::from(kcp.rx_rto_ms()), Ordering::Relaxed);
-    KCP_SRTT_MS.store(u64::from(kcp.rx_srtt_ms()), Ordering::Relaxed);
+fn note_rto(mhd: &Mhd<DatagramOut>) {
+    MHD_RTO_MS.store(u64::from(mhd.rx_rto_ms()), Ordering::Relaxed);
+    MHD_SRTT_MS.store(u64::from(mhd.rx_srtt_ms()), Ordering::Relaxed);
 }
 
 /// Record the receive queue's depth, the window this side advertises out of
 /// it, and the peer's window as last received.
-fn note_windows(kcp: &Kcp<DatagramOut>) {
-    KCP_WAIT_RCV.store(
-        u64::try_from(kcp.wait_rcv()).unwrap_or(u64::MAX),
+fn note_windows(mhd: &Mhd<DatagramOut>) {
+    MHD_WAIT_RCV.store(
+        u64::try_from(mhd.wait_rcv()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
     );
-    KCP_ADVERTISED_WND.store(u64::from(kcp.advertised_wnd()), Ordering::Relaxed);
-    KCP_PEER_WND.store(u64::from(kcp.peer_wnd()), Ordering::Relaxed);
+    MHD_ADVERTISED_WND.store(u64::from(mhd.advertised_wnd()), Ordering::Relaxed);
+    MHD_PEER_WND.store(u64::from(mhd.peer_wnd()), Ordering::Relaxed);
 }
 
-/// Request large kernel buffers on a KCP socket (see
-/// `KCP_SOCKET_BUF_BYTES`). Tokio does not expose the option on UDP sockets,
+/// Request large kernel buffers on an mhd socket (see
+/// `MHD_SOCKET_BUF_BYTES`). Tokio does not expose the option on UDP sockets,
 /// so this goes through socket2 (the same pattern as `try_set_tcp_keepalive`).
-/// Failures are non-fatal: the system cap may be lower, and KCP's ARQ still
+/// Failures are non-fatal: the system cap may be lower, and mhd's ARQ still
 /// recovers the occasional drop.
 fn tune_socket_buffers(socket: &UdpSocket) {
     let s = socket2::SockRef::from(socket);
-    if let Err(e) = s.set_recv_buffer_size(KCP_SOCKET_BUF_BYTES) {
-        warn!("Failed to raise the KCP socket receive buffer: {e}");
+    if let Err(e) = s.set_recv_buffer_size(MHD_SOCKET_BUF_BYTES) {
+        warn!("Failed to raise the mhd socket receive buffer: {e}");
     }
-    if let Err(e) = s.set_send_buffer_size(KCP_SOCKET_BUF_BYTES) {
-        warn!("Failed to raise the KCP socket send buffer: {e}");
+    if let Err(e) = s.set_send_buffer_size(MHD_SOCKET_BUF_BYTES) {
+        warn!("Failed to raise the mhd socket send buffer: {e}");
     }
 }
 
-/// Milliseconds since `start`, on KCP's wrapping u32 clock.
+/// Milliseconds since `start`, on mhd's wrapping u32 clock.
 ///
-/// KCP's protocol clock runs in milliseconds modulo 2^32 (~49.7 days) and
+/// mhd's protocol clock runs in milliseconds modulo 2^32 (~49.7 days) and
 /// its `timediff` arithmetic handles the wraparound by design, so the low
 /// 32 bits are the value — masked here rather than truncated by a cast, so
 /// the wrap is a statement about the protocol clock and not an accident of
@@ -929,8 +929,8 @@ fn ms_now(start: Instant) -> u32 {
 /// The zero-copy write path (link L3): the buffer the writer handed over
 /// becomes the segments' payloads by reference — `send_owned` splits it
 /// with O(1) `Bytes` handles, so no per-segment copy is paid. Chunking
-/// stays `Kcp::send`-safe (each call under the engine's segment bound).
-fn kcp_send_owned_all(kcp: &mut Kcp<DatagramOut>, mut data: Bytes) -> Result<()> {
+/// stays `Mhd::send`-safe (each call under the engine's segment bound).
+fn mhd_send_owned_all(mhd: &mut Mhd<DatagramOut>, mut data: Bytes) -> Result<()> {
     while !data.is_empty() {
         let head = if data.len() > SEND_CHUNK {
             data.split_to(SEND_CHUNK)
@@ -938,12 +938,12 @@ fn kcp_send_owned_all(kcp: &mut Kcp<DatagramOut>, mut data: Bytes) -> Result<()>
             std::mem::take(&mut data)
         };
         let want = head.len();
-        match kcp.send_owned(head) {
+        match mhd.send_owned(head) {
             // Stream mode queues the whole chunk or fails; a partial accept
             // would duplicate bytes on resend, so treat it as fatal.
             Ok(n) if n == want => {}
-            Ok(_) => bail!("KCP send made partial progress"),
-            Err(e) => bail!("KCP send failed: {e}"),
+            Ok(_) => bail!("mhd send made partial progress"),
+            Err(e) => bail!("mhd send failed: {e}"),
         }
     }
     Ok(())
@@ -977,11 +977,11 @@ impl SessionNet {
 /// Feed one datagram to the state machine; returns whether it was accepted.
 /// Stray/corrupt datagrams must not kill the session — ARQ recovers anything
 /// lost.
-fn feed_input(kcp: &mut Kcp<DatagramOut>, pkt: &[u8]) -> bool {
-    match kcp.input(pkt) {
+fn feed_input(mhd: &mut Mhd<DatagramOut>, pkt: &[u8]) -> bool {
+    match mhd.input(pkt) {
         Ok(_) => true,
         Err(e) => {
-            trace!("KCP input rejected a datagram: {e}");
+            trace!("mhd input rejected a datagram: {e}");
             false
         }
     }
@@ -1010,7 +1010,7 @@ enum BatchFeed {
 /// [`CTRL_MAGIC`] at offset 4, and the backlog a burst leaves behind is
 /// exactly where a keepalive or a close lands — behind the payload it was
 /// sent with. Feeding those to the ARQ is not a neutral mistake: they are
-/// shorter than a KCP header, so `Kcp::input` rejects them as
+/// shorter than an mhd header, so `Mhd::input` rejects them as
 /// `InvalidSegmentSize`, and a CLOSE that arrives there is *silently lost* —
 /// which is the retired-lane black hole again (see `CTRL_CLOSE`), reachable
 /// whenever the peer's close datagram shares a readiness wake with data.
@@ -1020,7 +1020,7 @@ enum BatchFeed {
 /// keeping the ordering of one pump round (intake, then control, then the
 /// tail) unchanged.
 fn feed_batch(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     pkt_rx: &mut mpsc::Receiver<Bytes>,
     first: Bytes,
 ) -> BatchFeed {
@@ -1046,7 +1046,7 @@ fn feed_batch(
             ctrl.push((pkt[5], ctrl_payload(&pkt).to_vec()));
             continue;
         }
-        if feed_input(kcp, &pkt) {
+        if feed_input(mhd, &pkt) {
             accepted = true;
         }
     }
@@ -1099,12 +1099,12 @@ fn flush_parts(
     let batch = ReadBatch { parts, bytes };
     match in_tx.try_send(batch) {
         Ok(()) => {
-            KCP_BLOBS_OUT.fetch_add(1, Ordering::Relaxed);
-            add_bytes(&KCP_READER_QUEUED_BYTES, bytes);
+            MHD_BLOBS_OUT.fetch_add(1, Ordering::Relaxed);
+            add_bytes(&MHD_READER_QUEUED_BYTES, bytes);
             BlobFlush::Sent
         }
         Err(TrySendError::Full(batch)) => {
-            add_bytes(&KCP_SPILL_BYTES, batch.bytes);
+            add_bytes(&MHD_SPILL_BYTES, batch.bytes);
             spill.push_back(batch);
             BlobFlush::Spilled
         }
@@ -1112,9 +1112,9 @@ fn flush_parts(
     }
 }
 
-/// Move received app data from the KCP receive queue to the reader channel
+/// Move received app data from the mhd receive queue to the reader channel
 /// without ever blocking: batches the bounded channel cannot take spill to
-/// a local queue (and stay in KCP's queue otherwise), which shrinks the
+/// a local queue (and stay in mhd's queue otherwise), which shrinks the
 /// advertised window until the reader catches up — backpressure through the
 /// protocol instead of a parked pump.
 ///
@@ -1131,7 +1131,7 @@ fn flush_parts(
 /// segment flushes on its own again, keeping the stall residency of the
 /// bounded channel at the pre-coalescing granularity.
 fn deliver_recv(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     in_tx: &mpsc::Sender<ReadBatch>,
     spill: &mut std::collections::VecDeque<ReadBatch>,
     parts: &mut Vec<Bytes>,
@@ -1143,13 +1143,13 @@ fn deliver_recv(
     // allocation-free (a `front.clone()` of the parts vector would
     // allocate once per spill entry per round).
     {
-        let _t = PhaseTimer::new(&KCP_NS_DELIVER_SPILL);
+        let _t = PhaseTimer::new(&MHD_NS_DELIVER_SPILL);
         while let Some(batch) = spill.pop_front() {
             let spilled = batch.bytes;
             match in_tx.try_send(batch) {
                 Ok(()) => {
-                    sub_bytes(&KCP_SPILL_BYTES, spilled);
-                    add_bytes(&KCP_READER_QUEUED_BYTES, spilled);
+                    sub_bytes(&MHD_SPILL_BYTES, spilled);
+                    add_bytes(&MHD_READER_QUEUED_BYTES, spilled);
                     delivered = true;
                 }
                 Err(TrySendError::Full(batch)) => {
@@ -1157,28 +1157,28 @@ fn deliver_recv(
                     break;
                 }
                 Err(TrySendError::Closed(_)) => {
-                    sub_bytes(&KCP_SPILL_BYTES, spilled);
+                    sub_bytes(&MHD_SPILL_BYTES, spilled);
                     return Delivery::ReaderGone;
                 }
             }
         }
     }
 
-    // Then drain the KCP receive queue into the channel (or the spill).
+    // Then drain the mhd receive queue into the channel (or the spill).
     if spill.is_empty() {
-        let _t = PhaseTimer::new(&KCP_NS_DELIVER_RECV);
+        let _t = PhaseTimer::new(&MHD_NS_DELIVER_RECV);
         let mut parts_bytes = 0usize;
         loop {
-            match kcp.recv_owned() {
-                Err(crate::kcp::Error::RecvQueueEmpty | crate::kcp::Error::ExpectingFragment) => {
+            match mhd.recv_owned() {
+                Err(crate::mhd::Error::RecvQueueEmpty | crate::mhd::Error::ExpectingFragment) => {
                     // The fixed empty probe every delivery round pays:
                     // counted apart from data segments so the two costs
                     // can be attributed separately.
-                    KCP_RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
+                    MHD_RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
                 Ok(data) => {
-                    KCP_SEGMENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                    MHD_SEGMENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
                     // A zero-length segment carries no bytes for the
                     // reader (and `poll_read` would skip it): stop here,
                     // the same way the buffer API's `Ok(0)` did.
@@ -1197,7 +1197,7 @@ fn deliver_recv(
                                 parts_bytes = 0;
                             }
                             // Channel full: stop delivering this round; the
-                            // rest stays in KCP's queue and shrinks the
+                            // rest stays in mhd's queue and shrinks the
                             // advertised window.
                             BlobFlush::Spilled => break,
                             BlobFlush::Closed => return Delivery::ReaderGone,
@@ -1205,7 +1205,7 @@ fn deliver_recv(
                     }
                 }
                 Err(e) => {
-                    warn!("KCP recv failed: {e}");
+                    warn!("mhd recv failed: {e}");
                     break;
                 }
             }
@@ -1228,7 +1228,7 @@ enum Drain {
     /// All queued writes were encoded into the ARQ queue (the caller then
     /// flushes once).
     Flushed,
-    /// `kcp_send_owned_all` failed midway — the pump must exit.
+    /// `mhd_send_owned_all` failed midway — the pump must exit.
     Fatal,
 }
 
@@ -1238,25 +1238,25 @@ enum Drain {
 /// rate when the inbound channel is permanently ready under load.
 ///
 /// Every message is an owned buffer (a Noise record's ciphertext on the
-/// kcp4+noise path, a copied slice on the others), so it is handed to the
+/// mhd4+noise path, a copied slice on the others), so it is handed to the
 /// engine by ownership — `send_owned` shares it per segment and the write
 /// path pays no per-segment copy.
 fn drain_writer(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     out_rx: &mut mpsc::UnboundedReceiver<Bytes>,
     out_sem: &Semaphore,
     first: Bytes,
 ) -> Drain {
     let mut data = first;
     loop {
-        if let Err(e) = kcp_send_owned_all(kcp, data) {
-            warn!("KCP session send failed: {e:#}");
+        if let Err(e) = mhd_send_owned_all(mhd, data) {
+            warn!("mhd session send failed: {e:#}");
             return Drain::Fatal;
         }
         // One queued write consumed: hand the capacity permit back to the
         // writer half.
         out_sem.add_permits(1);
-        if kcp.wait_snd() >= SND_QUEUE_LIMIT {
+        if mhd.wait_snd() >= SND_QUEUE_LIMIT {
             break;
         }
         match out_rx.try_recv() {
@@ -1276,14 +1276,14 @@ fn drain_writer(
 /// absolute timestamp); a due timer (0-1 ms under load) must be consumed
 /// here, otherwise it stays ready and tokio's uniform select fairness lets
 /// it steal ~1/3 of the pump iterations from the data paths.
-fn update_due(kcp: &mut Kcp<DatagramOut>, start: Instant) -> Option<u32> {
-    let mut delay = kcp.check(ms_now(start)).min(1000);
+fn update_due(mhd: &mut Mhd<DatagramOut>, start: Instant) -> Option<u32> {
+    let mut delay = mhd.check(ms_now(start)).min(1000);
     if delay == 0 {
-        if let Err(e) = kcp.update(ms_now(start)) {
-            warn!("KCP session update failed: {e}");
+        if let Err(e) = mhd.update(ms_now(start)) {
+            warn!("mhd session update failed: {e}");
             return None;
         }
-        delay = kcp.check(ms_now(start)).min(1000);
+        delay = mhd.check(ms_now(start)).min(1000);
         if delay == 0 {
             delay = 1;
         }
@@ -1385,8 +1385,8 @@ impl PaceState {
     /// room to be the thing that acts, and the result is measurable: without
     /// this bound the parked path cost 18 % more wire bytes on `rtt100` and
     /// put 3 879 RTO re-sends on the *receiving* side's acknowledgements alone.
-    fn park_deadline(kcp: &Kcp<DatagramOut>) -> Duration {
-        let half_rto = kcp.rx_rto_ms() / 2;
+    fn park_deadline(mhd: &Mhd<DatagramOut>) -> Duration {
+        let half_rto = mhd.rx_rto_ms() / 2;
         Duration::from_millis(u64::from(half_rto.clamp(5, 100)))
     }
 
@@ -1406,24 +1406,24 @@ impl PaceState {
     fn on_ping_timeout(&mut self, snd_una: u32) {
         if snd_una != self.una_at_ping {
             debug!(
-                "KCP pacer: late PONG with progress, rate held at {:.0} bps",
+                "mhd pacer: late PONG with progress, rate held at {:.0} bps",
                 self.rate_bps
             );
             return;
         }
         self.rate_bps = (self.rate_bps * PACER_DOWN_FACTOR).max(PACER_MIN_BPS);
         self.clean_pongs = 0;
-        debug!("KCP pacer: PONG timeout, rate -> {:.0} bps", self.rate_bps);
+        debug!("mhd pacer: PONG timeout, rate -> {:.0} bps", self.rate_bps);
     }
 }
 
-/// Handle an adapter control frame (NOT a KCP segment). `start` anchors
+/// Handle an adapter control frame (NOT an mhd segment). `start` anchors
 /// the pump's microsecond clock for RTT computation.
 /// Returns `false` when the peer said the session is over.
 async fn handle_ctrl(
     kind: u8,
     payload: &[u8],
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
     start: Instant,
@@ -1431,9 +1431,9 @@ async fn handle_ctrl(
     match kind {
         CTRL_PING => {
             // Echo the timestamp back: the peer measures RTT via PONG.
-            let f = ctrl_frame(kcp.conv(), CTRL_PONG, payload);
+            let f = ctrl_frame(mhd.conv(), CTRL_PONG, payload);
             if let Err(e) = net.send_datagram(&f).await {
-                debug!("KCP PONG send failed (peer {}): {e}", net.peer);
+                debug!("mhd PONG send failed (peer {}): {e}", net.peer);
             }
         }
         CTRL_PONG => {
@@ -1450,8 +1450,8 @@ async fn handle_ctrl(
             let mut sn = [0u8; 4];
             sn.copy_from_slice(&payload[..4]);
             let sn = u32::from_le_bytes(sn);
-            if !kcp.retransmit_sn(sn) {
-                trace!("KCP SACK for segment {sn} not in the send buffer");
+            if !mhd.retransmit_sn(sn) {
+                trace!("mhd SACK for segment {sn} not in the send buffer");
             }
         }
         CTRL_CLOSE => {
@@ -1461,10 +1461,10 @@ async fn handle_ctrl(
             // were pinned to it. Without this frame the peer only learns from
             // its own dead-link rule, which needs a still send window and
             // therefore never fires for a lane with traffic.
-            debug!("KCP session closed by peer {}", net.peer);
+            debug!("mhd session closed by peer {}", net.peer);
             return false;
         }
-        _ => trace!("KCP unknown control frame kind {kind}"),
+        _ => trace!("mhd unknown control frame kind {kind}"),
     }
     true
 }
@@ -1473,7 +1473,7 @@ async fn handle_ctrl(
 /// previous PING went unanswered, cut the pacing rate first (the pacer is
 /// the congestion-control stand-in with nc=1).
 async fn maybe_ping(
-    kcp: &Kcp<DatagramOut>,
+    mhd: &Mhd<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
     start: Instant,
@@ -1482,23 +1482,23 @@ async fn maybe_ping(
     // signal: cut the rate immediately instead of waiting for the next
     // keepalive tick, and allow an immediate retry.
     if pace.ping_outstanding && pace.last_ping.elapsed() >= PONG_TIMEOUT {
-        pace.on_ping_timeout(kcp.snd_una());
+        pace.on_ping_timeout(mhd.snd_una());
         pace.ping_outstanding = false;
     }
     if pace.last_ping.elapsed() < Duration::from_millis(u64::from(KEEPALIVE_MS)) {
         return;
     }
     if pace.ping_outstanding {
-        pace.on_ping_timeout(kcp.snd_una());
+        pace.on_ping_timeout(mhd.snd_una());
     }
-    pace.una_at_ping = kcp.snd_una();
+    pace.una_at_ping = mhd.snd_una();
     pace.last_ping = Instant::now();
     let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     pace.last_ping_us = us;
     pace.ping_outstanding = true;
-    let f = ctrl_frame(kcp.conv(), CTRL_PING, &us.to_le_bytes());
+    let f = ctrl_frame(mhd.conv(), CTRL_PING, &us.to_le_bytes());
     if let Err(e) = net.send_datagram(&f).await {
-        debug!("KCP PING send failed (peer {}): {e}", net.peer);
+        debug!("mhd PING send failed (peer {}): {e}", net.peer);
     }
 }
 
@@ -1512,7 +1512,7 @@ fn park(pace: &mut PaceState, buf: &Bytes, spans: Vec<Span>) {
     let bytes: usize = spans.iter().map(Span::len).sum();
     if pace.parked_bytes + bytes > PARKED_MAX_BYTES {
         debug!(
-            "KCP pacer: parked queue full ({} bytes), dropping {} datagrams",
+            "mhd pacer: parked queue full ({} bytes), dropping {} datagrams",
             pace.parked_bytes,
             spans.len()
         );
@@ -1551,13 +1551,13 @@ async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::R
 /// buffer here — the copy this platform pays, byte-identical on the wire.
 #[cfg(not(target_os = "linux"))]
 async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::Result<usize> {
-    let mut dgram_buf = [0u8; KCP_MTU_CEILING + KCP_OVERHEAD];
+    let mut dgram_buf = [0u8; MHD_MTU_CEILING + MHD_OVERHEAD];
     let mut sent = 0;
     for span in spans {
         let (header, payload): (&[u8], &[u8]) = match span {
             Span::Staged { off, len } => (&buf[*off..*off + *len], &[]),
             Span::Split { hdr_off, payload } => {
-                (&buf[*hdr_off..*hdr_off + KCP_OVERHEAD], payload.as_ref())
+                (&buf[*hdr_off..*hdr_off + MHD_OVERHEAD], payload.as_ref())
             }
         };
         let total = header.len() + payload.len();
@@ -1576,7 +1576,7 @@ async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::R
     Ok(sent)
 }
 
-/// Drain KCP's outbound datagrams onto the wire, through the pacer.
+/// Drain mhd's outbound datagrams onto the wire, through the pacer.
 ///
 /// Nothing here is dropped on refusal: a datagram the pacer or the kernel will
 /// not take is parked, in order, and retried on the next round. Dropping it
@@ -1587,7 +1587,7 @@ async fn drain_dgrams(
     dgram_rx: &mut mpsc::UnboundedReceiver<DgramBatch>,
     net: &SessionNet,
     pace: &mut PaceState,
-    kcp: &Kcp<DatagramOut>,
+    mhd: &Mhd<DatagramOut>,
     sent_any: &mut bool,
 ) {
     if pace.parked.is_empty() {
@@ -1596,7 +1596,7 @@ async fn drain_dgrams(
         // Parked data goes first: it is older than anything still in the
         // channel, and letting newer datagrams overtake it would reorder a
         // stream the ARQ has already put on the wire.
-        drain_parked(net, pace, kcp, sent_any).await;
+        drain_parked(net, pace, mhd, sent_any).await;
     }
 }
 
@@ -1605,10 +1605,10 @@ async fn drain_dgrams(
 async fn drain_parked(
     net: &SessionNet,
     pace: &mut PaceState,
-    kcp: &Kcp<DatagramOut>,
+    mhd: &Mhd<DatagramOut>,
     sent_any: &mut bool,
 ) {
-    let deadline = PaceState::park_deadline(kcp);
+    let deadline = PaceState::park_deadline(mhd);
     while let Some(front) = pace.parked.front_mut() {
         let rate = pace.rate_bps;
         // Past the deadline the pacer yields: a datagram held longer than the
@@ -1618,7 +1618,7 @@ async fn drain_parked(
         let mut take: Vec<Span> = Vec::with_capacity(front.spans.len());
         let mut rest: Vec<Span> = Vec::new();
         {
-            let _t = PhaseTimer::new(&KCP_NS_OUT_PACE);
+            let _t = PhaseTimer::new(&MHD_NS_OUT_PACE);
             for (i, span) in front.spans.iter().enumerate() {
                 if overdue || pace.pacer.allow(Instant::now(), span.len(), rate).is_ok() {
                     take.push(span.clone());
@@ -1641,7 +1641,7 @@ async fn drain_parked(
             front.spans = rest;
         }
         let sent = {
-            let _t = PhaseTimer::new(&KCP_NS_OUT_SEND);
+            let _t = PhaseTimer::new(&MHD_NS_OUT_SEND);
             send_spans(net, &buf, &take).await
         };
         match sent {
@@ -1658,7 +1658,7 @@ async fn drain_parked(
                 }
             }
             Err(e) => {
-                debug!("KCP datagram send failed (peer {}): {e}", net.peer);
+                debug!("mhd datagram send failed (peer {}): {e}", net.peer);
                 park_front(pace, &buf, take);
                 return;
             }
@@ -1685,7 +1685,7 @@ async fn drain_batches(
         let mut allowed: Vec<Span> = Vec::with_capacity(batch.spans.len());
         let mut denied: Vec<Span> = Vec::new();
         {
-            let _t = PhaseTimer::new(&KCP_NS_OUT_PACE);
+            let _t = PhaseTimer::new(&MHD_NS_OUT_PACE);
             for span in &batch.spans {
                 let ok = denied.is_empty()
                     && pace
@@ -1704,7 +1704,7 @@ async fn drain_batches(
             return;
         }
         let sent = {
-            let _t = PhaseTimer::new(&KCP_NS_OUT_SEND);
+            let _t = PhaseTimer::new(&MHD_NS_OUT_SEND);
             send_spans(net, &batch.buf, &allowed).await
         };
         match sent {
@@ -1723,7 +1723,7 @@ async fn drain_batches(
                 }
             }
             Err(e) => {
-                debug!("KCP datagram send failed (peer {}): {e}", net.peer);
+                debug!("mhd datagram send failed (peer {}): {e}", net.peer);
                 let mut unsent = allowed;
                 unsent.extend(denied);
                 park(pace, &batch.buf, unsent);
@@ -1745,7 +1745,7 @@ fn park_front(pace: &mut PaceState, buf: &Bytes, spans: Vec<Span>) {
 fn closing_quiescent(
     sent_any: bool,
     delivered: bool,
-    kcp: &Kcp<DatagramOut>,
+    mhd: &Mhd<DatagramOut>,
     spill: &std::collections::VecDeque<ReadBatch>,
     parked: &std::collections::VecDeque<ParkedBatch>,
     quiet_rounds: &mut u32,
@@ -1755,7 +1755,7 @@ fn closing_quiescent(
     // pacer is still holding: a parked datagram is data the peer has not seen,
     // so a session with one is not done — the engine would sit `wait_snd`
     // until the close deadline and then drop the tail.
-    if !sent_any && !delivered && kcp.wait_snd() == 0 && spill.is_empty() && parked.is_empty() {
+    if !sent_any && !delivered && mhd.wait_snd() == 0 && spill.is_empty() && parked.is_empty() {
         *quiet_rounds += 1;
     } else {
         *quiet_rounds = 0;
@@ -1766,15 +1766,15 @@ fn closing_quiescent(
 /// One pump round's head: run due updates and the keepalive PING; returns
 /// the timer delay for the select arm (None = the pump must exit).
 async fn pump_head(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
     start: Instant,
     datagram_bytes: &AtomicUsize,
 ) -> Option<u32> {
-    let delay = update_due(kcp, start)?;
-    maybe_ping(kcp, net, pace, start).await;
-    maybe_path_mtu(kcp, net, pace, datagram_bytes);
+    let delay = update_due(mhd, start)?;
+    maybe_ping(mhd, net, pace, start).await;
+    maybe_path_mtu(mhd, net, pace, datagram_bytes);
     Some(delay)
 }
 
@@ -1794,7 +1794,7 @@ async fn pump_head(
 /// path's own datagram size, and a carrier pinned below it pays its
 /// per-datagram cost 5.7× more often than it has to on a jumbo path (measured:
 /// +35 % throughput, −30 % CPU per byte — [benchmarks.md](../../docs/benchmarks.md),
-/// "The carrier axis"). Growth is bounded by [`KCP_MTU_CEILING`], and both
+/// "The carrier axis"). Growth is bounded by [`MHD_MTU_CEILING`], and both
 /// directions are hysteresis-free on purpose: the value is a property of the
 /// path, not a probe of it, so a path that changes is followed rather than
 /// averaged.
@@ -1804,7 +1804,7 @@ const PATH_MTU_RECHECK: Duration = Duration::from_secs(1);
 /// Shrink-only, so a probe that reports a larger path (a stale cache, a route
 /// that came back) is ignored rather than oscillating.
 fn maybe_path_mtu(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
     datagram_bytes: &AtomicUsize,
@@ -1820,15 +1820,15 @@ fn maybe_path_mtu(
         return;
     };
     let Some(fits) = datagram_for_path(path_mtu, net.peer.is_ipv6()) else {
-        // Smaller than a KCP header can be: not our call to make, and the
+        // Smaller than an mhd header can be: not our call to make, and the
         // engine's floor keeps a payload in any case.
         return;
     };
-    let before = kcp.mtu();
-    if kcp.set_mtu(fits) != before {
-        datagram_bytes.store(kcp.mtu(), Ordering::Relaxed);
-        KCP_DATAGRAM_BYTES.store(kcp.mtu() as u64, Ordering::Relaxed);
-        let after = kcp.mtu();
+    let before = mhd.mtu();
+    if mhd.set_mtu(fits) != before {
+        datagram_bytes.store(mhd.mtu(), Ordering::Relaxed);
+        MHD_DATAGRAM_BYTES.store(mhd.mtu() as u64, Ordering::Relaxed);
+        let after = mhd.mtu();
         MTU_ADAPTED.report(
             || {
                 info!(
@@ -1836,7 +1836,7 @@ fn maybe_path_mtu(
                     path_mtu,
                     datagram_before = before,
                     datagram_after = after,
-                    "KCP datagram size adapted to the path MTU"
+                    "mhd datagram size adapted to the path MTU"
                 );
             },
             || {
@@ -1845,7 +1845,7 @@ fn maybe_path_mtu(
                     path_mtu,
                     datagram_before = before,
                     datagram_after = after,
-                    "KCP datagram size adapted to the path MTU"
+                    "mhd datagram size adapted to the path MTU"
                 );
             },
         );
@@ -1862,9 +1862,9 @@ static MTU_ADAPTED: crate::logging::RepeatNotice = crate::logging::RepeatNotice:
 /// Flush acks for a consumed input batch, then fill the newly-opened
 /// window slots straight from `snd_queue` — waiting for the next writer
 /// message or timer tick would idle a full RTT at large RTTs.
-fn flush_after_batch(kcp: &mut Kcp<DatagramOut>) -> crate::kcp::KcpResult<()> {
-    kcp.flush_ack()?;
-    kcp.flush()
+fn flush_after_batch(mhd: &mut Mhd<DatagramOut>) -> crate::mhd::MhdResult<()> {
+    mhd.flush_ack()?;
+    mhd.flush()
 }
 
 /// Send a SACK gap notification when a prefix gap is parked in the receive
@@ -1872,7 +1872,7 @@ fn flush_after_batch(kcp: &mut Kcp<DatagramOut>) -> crate::kcp::KcpResult<()> {
 /// — the peer resends the missing segment out of turn instead of waiting
 /// out the RTO backoff.
 async fn maybe_sack(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     net: &SessionNet,
     delivered: bool,
     spill: &std::collections::VecDeque<ReadBatch>,
@@ -1880,15 +1880,15 @@ async fn maybe_sack(
 ) {
     if !delivered
         && spill.is_empty()
-        && kcp.recv_queue_len() > SACK_PILEUP_SEGMENTS
+        && mhd.recv_queue_len() > SACK_PILEUP_SEGMENTS
         && last_sack_sent.elapsed() >= SACK_COOLDOWN
     {
         *last_sack_sent = Instant::now();
-        let f = ctrl_frame(kcp.conv(), CTRL_SACK, &kcp.rcv_nxt_sn().to_le_bytes());
+        let f = ctrl_frame(mhd.conv(), CTRL_SACK, &mhd.rcv_nxt_sn().to_le_bytes());
         if let Err(e) = net.send_datagram(&f).await {
-            debug!("KCP SACK send failed (peer {}): {e}", net.peer);
+            debug!("mhd SACK send failed (peer {}): {e}", net.peer);
         } else {
-            KCP_SACKS_SENT.fetch_add(1, Ordering::Relaxed);
+            MHD_SACKS_SENT.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1904,7 +1904,7 @@ enum Tail {
 
 /// The per-round pump state [`pump_tail`] drives, bundled from the locals
 /// of `run_session`: everything the tail reads or writes besides the
-/// session's own `Kcp`, `SessionNet` and `PaceState`.
+/// session's own `Mhd`, `SessionNet` and `PaceState`.
 struct PumpTailCtx<'a> {
     /// Channel into the reader half of the stream.
     in_tx: &'a mpsc::Sender<ReadBatch>,
@@ -1925,10 +1925,10 @@ struct PumpTailCtx<'a> {
 }
 
 /// One pump round after its select: deliver received data, notify gaps,
-/// flush the batch's acks, push KCP's datagrams onto the wire, and check
+/// flush the batch's acks, push mhd's datagrams onto the wire, and check
 /// liveness. Split out of `run_session` so the select stays readable.
 async fn pump_tail(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
     tail: &mut PumpTailCtx<'_>,
@@ -1946,11 +1946,11 @@ async fn pump_tail(
     // this timer would book everything below (SACK, ack flush, the wire
     // drain) into the delivery phase.
     let delivered = {
-        let _t = PhaseTimer::new(&KCP_NS_DELIVER);
-        match deliver_recv(kcp, tail.in_tx, tail.spill, tail.parts) {
+        let _t = PhaseTimer::new(&MHD_NS_DELIVER);
+        match deliver_recv(mhd, tail.in_tx, tail.spill, tail.parts) {
             Delivery::Done { delivered } => delivered,
             Delivery::ReaderGone => {
-                debug!("KCP session reader gone, closing (peer {})", net.peer);
+                debug!("mhd session reader gone, closing (peer {})", net.peer);
                 return Tail::Exit;
             }
         }
@@ -1958,27 +1958,27 @@ async fn pump_tail(
 
     // SACK gap detection (see `maybe_sack`): tell the peer to resend
     // the missing segment instead of waiting out the RTO backoff.
-    maybe_sack(kcp, net, delivered, tail.spill, tail.last_sack_sent).await;
+    maybe_sack(mhd, net, delivered, tail.spill, tail.last_sack_sent).await;
 
     // 3) Flush acks for the batch just consumed — now that delivery has
     //    drained the receive queue, the advertised window is honest.
     if *tail.ack_flush_due {
         *tail.ack_flush_due = false;
-        if let Err(e) = flush_after_batch(kcp) {
-            warn!("KCP session ack flush failed: {e}");
+        if let Err(e) = flush_after_batch(mhd) {
+            warn!("mhd session ack flush failed: {e}");
             return Tail::Exit;
         }
     }
 
-    // 4) Push datagrams KCP emitted this round onto the wire — through the
+    // 4) Push datagrams mhd emitted this round onto the wire — through the
     //    pacer (see `drain_dgrams`).
     {
-        let _t = PhaseTimer::new(&KCP_NS_OUTPUT);
-        drain_dgrams(tail.dgram_rx, net, pace, kcp, tail.sent_any).await;
+        let _t = PhaseTimer::new(&MHD_NS_OUTPUT);
+        drain_dgrams(tail.dgram_rx, net, pace, mhd, tail.sent_any).await;
     }
 
-    if kcp.is_dead_link() {
-        debug!("KCP session dead link (peer {})", net.peer);
+    if mhd.is_dead_link() {
+        debug!("mhd session dead link (peer {})", net.peer);
         return Tail::Exit;
     }
 
@@ -1992,7 +1992,7 @@ async fn pump_tail(
             && closing_quiescent(
                 *tail.sent_any,
                 delivered,
-                kcp,
+                mhd,
                 tail.spill,
                 &pace.parked,
                 tail.quiet_rounds,
@@ -2000,13 +2000,13 @@ async fn pump_tail(
             )
         {
             // Both halves are gone and the ARQ tail is flushed: tell the peer.
-            // It has no other way to learn — KCP has no close handshake — and
+            // It has no other way to learn — mhd has no close handshake — and
             // without the frame the peer keeps a session alive that nothing
             // reads (see `CTRL_CLOSE_FRAMES`).
             for _ in 0..CTRL_CLOSE_FRAMES {
-                let f = ctrl_frame(kcp.conv(), CTRL_CLOSE, &[]);
+                let f = ctrl_frame(mhd.conv(), CTRL_CLOSE, &[]);
                 if let Err(e) = net.send_datagram(&f).await {
-                    debug!("KCP CLOSE send failed (peer {}): {e}", net.peer);
+                    debug!("mhd CLOSE send failed (peer {}): {e}", net.peer);
                     break;
                 }
                 tokio::time::sleep(CTRL_CLOSE_GAP).await;
@@ -2026,7 +2026,7 @@ async fn pump_tail(
 /// frames are answered in arrival order, and a CLOSE among them ends the
 /// session whether or not data came with it (see [`feed_batch`]).
 async fn intake(
-    kcp: &mut Kcp<DatagramOut>,
+    mhd: &mut Mhd<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
     pkt_rx: &mut mpsc::Receiver<Bytes>,
@@ -2034,21 +2034,21 @@ async fn intake(
     ack_flush_due: &mut bool,
     start: Instant,
 ) -> bool {
-    let _t = PhaseTimer::new(&KCP_NS_INPUT);
+    let _t = PhaseTimer::new(&MHD_NS_INPUT);
     if is_ctrl_frame(&pkt) {
         // A control frame that arrived alone: the same handling a batched one
         // gets, without the batch (there is nothing to drain behind it).
         let kind = pkt[5];
-        return handle_ctrl(kind, ctrl_payload(&pkt), kcp, net, pace, start).await;
+        return handle_ctrl(kind, ctrl_payload(&pkt), mhd, net, pace, start).await;
     }
-    match feed_batch(kcp, pkt_rx, pkt) {
+    match feed_batch(mhd, pkt_rx, pkt) {
         BatchFeed::Consumed { flush_ack } => {
             *ack_flush_due |= flush_ack;
         }
         BatchFeed::Control { flush_ack, ctrl } => {
             *ack_flush_due |= flush_ack;
             for (kind, payload) in ctrl {
-                if !handle_ctrl(kind, &payload, kcp, net, pace, start).await {
+                if !handle_ctrl(kind, &payload, mhd, net, pace, start).await {
                     return false;
                 }
             }
@@ -2057,7 +2057,7 @@ async fn intake(
     true
 }
 
-/// The per-session pump: owns the `Kcp` state machine and drives it between
+/// The per-session pump: owns the `Mhd` state machine and drives it between
 /// the writer channel, the inbound-datagram channel and the update timer.
 #[expect(
     clippy::too_many_arguments,
@@ -2065,7 +2065,7 @@ async fn intake(
               bundling them into a struct would only move the list"
 )]
 async fn run_session(
-    mut kcp: Kcp<DatagramOut>,
+    mut mhd: Mhd<DatagramOut>,
     net: SessionNet,
     mut pkt_rx: mpsc::Receiver<Bytes>,
     mut dgram_rx: mpsc::UnboundedReceiver<DgramBatch>,
@@ -2076,8 +2076,8 @@ async fn run_session(
 ) {
     let start = Instant::now();
     // Prime the clock: `flush`/`check` require one `update` call first.
-    if let Err(e) = kcp.update(ms_now(start)) {
-        warn!("KCP session initial update failed: {e}");
+    if let Err(e) = mhd.update(ms_now(start)) {
+        warn!("mhd session initial update failed: {e}");
         out_sem.close();
         net.announce_gone().await;
         return;
@@ -2097,10 +2097,10 @@ async fn run_session(
     // Last SACK gap notification (throttled by SACK_COOLDOWN).
     let mut last_sack_sent = Instant::now();
     while let Some(delay) = {
-        let _t = PhaseTimer::new(&KCP_NS_UPDATE); // pump_head = update + keepalive
-        pump_head(&mut kcp, &net, &mut pace, start, &datagram_bytes).await
+        let _t = PhaseTimer::new(&MHD_NS_UPDATE); // pump_head = update + keepalive
+        pump_head(&mut mhd, &net, &mut pace, start, &datagram_bytes).await
     } {
-        KCP_PUMP_ROUNDS.fetch_add(1, Ordering::Relaxed);
+        MHD_PUMP_ROUNDS.fetch_add(1, Ordering::Relaxed);
         let mut sent_any = false;
         tokio::select! {
             // App data from the writer half (gated on the ARQ queue cap).
@@ -2109,28 +2109,28 @@ async fn run_session(
             // fairness would otherwise starve the writer side to a fraction
             // of the link rate (measured ~half the window limit at 20 ms).
             data = out_rx.recv(), if {
-                note_gauges(&kcp, pace.rate_bps);
-                !closing && kcp.wait_snd() < SND_QUEUE_LIMIT
+                note_gauges(&mhd, pace.rate_bps);
+                !closing && mhd.wait_snd() < SND_QUEUE_LIMIT
             } => {
                 if let Some(data) = data {
                     let mut fatal = false;
-                    let _t = PhaseTimer::new(&KCP_NS_WRITER);
+                    let _t = PhaseTimer::new(&MHD_NS_WRITER);
                     if let Drain::Fatal =
-                        drain_writer(&mut kcp, &mut out_rx, &out_sem, data)
+                        drain_writer(&mut mhd, &mut out_rx, &out_sem, data)
                     {
                         fatal = true;
                     }
                     // Push immediately instead of waiting for the next
                     // timer tick (interactive latency).
-                    if let Err(e) = kcp.flush() {
-                        warn!("KCP session flush failed: {e}");
+                    if let Err(e) = mhd.flush() {
+                        warn!("mhd session flush failed: {e}");
                         break;
                     }
                     if fatal {
                         break;
                     }
                 } else {
-                    // Writer half dropped: flush what KCP accepted, then end.
+                    // Writer half dropped: flush what mhd accepted, then end.
                     closing = true;
                     close_deadline = Instant::now() + CLOSE_FLUSH_TIMEOUT;
                 }
@@ -2142,7 +2142,7 @@ async fn run_session(
                     // Ingress task/dispatcher gone: the session is over.
                     None => break,
                     Some(pkt) => {
-                        if !intake(&mut kcp, &net, &mut pace, &mut pkt_rx, pkt,
+                        if !intake(&mut mhd, &net, &mut pace, &mut pkt_rx, pkt,
                                    &mut ack_flush_due, start).await
                         {
                             break;
@@ -2152,16 +2152,16 @@ async fn run_session(
             }
             // Update timer: retransmits, delayed acks, window probes.
             () = tokio::time::sleep(Duration::from_millis(u64::from(delay))) => {
-                let _t = PhaseTimer::new(&KCP_NS_UPDATE);
-                if let Err(e) = kcp.update(ms_now(start)) {
-                    warn!("KCP session update failed: {e}");
+                let _t = PhaseTimer::new(&MHD_NS_UPDATE);
+                if let Err(e) = mhd.update(ms_now(start)) {
+                    warn!("mhd session update failed: {e}");
                     break;
                 }
             }
         }
 
         match pump_tail(
-            &mut kcp,
+            &mut mhd,
             &net,
             &mut pace,
             &mut PumpTailCtx {
@@ -2192,10 +2192,10 @@ async fn run_session(
     out_sem.close();
     let peer = net.peer;
     net.announce_gone().await;
-    debug!("KCP session pump exited (peer {peer})");
+    debug!("mhd session pump exited (peer {peer})");
 }
 
-/// IPv4 and IPv6 header + UDP header, the bytes a KCP datagram's IP packet
+/// IPv4 and IPv6 header + UDP header, the bytes an mhd datagram's IP packet
 /// adds on top of it.
 const IPV4_UDP_HEADERS: usize = 20 + 8;
 const IPV6_UDP_HEADERS: usize = 40 + 8;
@@ -2237,17 +2237,17 @@ fn ipv6_mtu_of(probe: &std::net::UdpSocket) -> Option<usize> {
 /// The datagram size that fits a path of `path_mtu`, or `None` when the
 /// current size already fits (nothing to do).
 ///
-/// Pure, so the arithmetic is testable without a shaped interface: a KCP
+/// Pure, so the arithmetic is testable without a shaped interface: a mhd
 /// datagram of size `m` becomes an IP packet of `m + headers`, and the
 /// kernel fragments it when that exceeds the path MTU. Fragmentation is the
 /// failure this exists to avoid — one lost fragment costs the whole
 /// datagram, so a 1% fragment loss becomes ~2% datagram loss on a path that
-/// needs two fragments (measured on the `loss1_mtu1280` cell: the KCP arm
+/// needs two fragments (measured on the `loss1_mtu1280` cell: the mhd arm
 /// drops from 0.3 Gbit/s to zero, while the TCP arm is unaffected because
 /// the kernel does this arithmetic for TCP).
 /// The datagram size a path of `path_mtu` deserves: what is left after the IP
-/// and UDP headers this session's family adds, capped at [`KCP_MTU_CEILING`],
-/// or `None` when even a KCP header does not fit.
+/// and UDP headers this session's family adds, capped at [`MHD_MTU_CEILING`],
+/// or `None` when even an mhd header does not fit.
 fn datagram_for_path(path_mtu: usize, ipv6: bool) -> Option<usize> {
     let overhead = if ipv6 {
         IPV6_UDP_HEADERS
@@ -2255,7 +2255,7 @@ fn datagram_for_path(path_mtu: usize, ipv6: bool) -> Option<usize> {
         IPV4_UDP_HEADERS
     };
     let fits = path_mtu.saturating_sub(overhead);
-    (fits > KCP_OVERHEAD).then(|| fits.min(KCP_MTU_CEILING))
+    (fits > MHD_OVERHEAD).then(|| fits.min(MHD_MTU_CEILING))
 }
 
 /// The kernel's current path MTU towards `peer`, as it knows it today.
@@ -2306,26 +2306,26 @@ fn probe_path_mtu(local: Option<SocketAddr>, peer: SocketAddr) -> Option<usize> 
     }
 }
 
-/// Build the channel quartet + configured `Kcp` for one session and spawn
+/// Build the channel quartet + configured `Mhd` for one session and spawn
 /// its pump. Returns the user-facing stream and the datagram-in sender the
 /// ingress side must hold (dropping it ends the session).
-fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>) {
+fn spawn_session(conv: u32, net: SessionNet) -> (MhdStream, mpsc::Sender<Bytes>) {
     let (dgram_tx, dgram_rx) = mpsc::unbounded_channel();
     // The session's own ARQ counters: the engine and its datagram staging
     // both add to this pair, and the stream hands it to whoever owns the
     // session's life (a carrier policy reads it per tunnel; the global
     // counters cannot answer "this tunnel").
     let health = crate::transport::health::SessionHealth::new();
-    let mut kcp = Kcp::new_stream(
+    let mut mhd = Mhd::new_stream(
         conv,
         DatagramOut::with_health(dgram_tx, Arc::clone(&health)),
     );
-    kcp.set_health(Arc::clone(&health));
-    configure(&mut kcp);
+    mhd.set_health(Arc::clone(&health));
+    configure(&mut mhd);
     // The engine's datagram size, published here so it has exactly one
     // writer: the pump (below) lowers it when the path asks for it. The
     // constructed value is what the session starts with (1400).
-    let datagram_bytes = Arc::new(AtomicUsize::new(kcp.mtu()));
+    let datagram_bytes = Arc::new(AtomicUsize::new(mhd.mtu()));
     // The datagram size is adapted to the path by the pump's first round
     // (`maybe_path_mtu`), which runs before it drains any application data —
     // one mechanism, so a session cannot be adapted in two places that drift.
@@ -2338,9 +2338,9 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
     let out_sem = Arc::new(Semaphore::new(OUTBOUND_CHANNEL_DEPTH));
     let (in_tx, in_rx) = mpsc::channel::<ReadBatch>(INBOUND_CHANNEL_DEPTH);
 
-    spawn_kcp_stats();
+    spawn_mhd_stats();
     tokio::spawn(run_session(
-        kcp,
+        mhd,
         net,
         pkt_rx,
         dgram_rx,
@@ -2350,20 +2350,20 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
         Arc::clone(&datagram_bytes),
     ));
     (
-        KcpStream::new(out_tx, out_sem, in_rx, datagram_bytes, health),
+        MhdStream::new(out_tx, out_sem, in_rx, datagram_bytes, health),
         pkt_tx,
     )
 }
 
-/// A KCP session presented as a reliable byte stream (tokio IO traits), so
+/// A mhd session presented as a reliable byte stream (tokio IO traits), so
 /// Noise/yamux ride on top unchanged.
 ///
-/// Dropping the stream ends the session: the pump flushes what KCP already
+/// Dropping the stream ends the session: the pump flushes what mhd already
 /// accepted (best effort, bounded), then exits.
-pub struct KcpStream {
+pub struct MhdStream {
     out_tx: Option<mpsc::UnboundedSender<Bytes>>,
     /// Capacity gate for `out_tx`: one permit per in-flight write, returned
-    /// by the pump as it feeds each write to KCP.
+    /// by the pump as it feeds each write to mhd.
     out_sem: Arc<Semaphore>,
     /// The pump's current datagram size in bytes (see `datagram_bytes`).
     datagram_bytes: Arc<AtomicUsize>,
@@ -2383,24 +2383,24 @@ pub struct KcpStream {
     read_queue: std::collections::VecDeque<Bytes>,
 }
 
-impl std::fmt::Debug for KcpStream {
+impl std::fmt::Debug for MhdStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KcpStream")
+        f.debug_struct("MhdStream")
             .field("write_open", &self.out_tx.is_some())
             .field("read_open", &self.in_rx.is_some())
             .finish_non_exhaustive()
     }
 }
 
-impl KcpStream {
+impl MhdStream {
     fn new(
         out_tx: mpsc::UnboundedSender<Bytes>,
         out_sem: Arc<Semaphore>,
         in_rx: mpsc::Receiver<ReadBatch>,
         datagram_bytes: Arc<AtomicUsize>,
         health: Arc<crate::transport::health::SessionHealth>,
-    ) -> KcpStream {
-        KcpStream {
+    ) -> MhdStream {
+        MhdStream {
             out_tx: Some(out_tx),
             out_sem,
             datagram_bytes,
@@ -2455,7 +2455,7 @@ impl KcpStream {
             Ok(permit) => Poll::Ready(Ok(permit)),
             Err(tokio::sync::TryAcquireError::Closed) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "KCP session closed",
+                "mhd session closed",
             ))),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 let fut = self.out_acquire.get_or_insert_with(|| {
@@ -2470,7 +2470,7 @@ impl KcpStream {
                     // a dead session anyway.
                     Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "KCP session closed",
+                        "mhd session closed",
                     ))),
                     Poll::Pending => Poll::Pending,
                 }
@@ -2483,7 +2483,7 @@ impl KcpStream {
 /// ownership — no copy at the channel, and the engine shares it per
 /// segment. This is link L3's half on the stream side; the record producer
 /// is the Noise layer's owned-record path.
-impl crate::common::owned_write::AsyncWriteOwned for KcpStream {
+impl crate::common::owned_write::AsyncWriteOwned for MhdStream {
     const TAKES_OWNED: bool = true;
 
     fn poll_write_owned(
@@ -2498,7 +2498,7 @@ impl crate::common::owned_write::AsyncWriteOwned for KcpStream {
         if me.out_tx.is_none() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "KCP session write half already shut down",
+                "mhd session write half already shut down",
             )));
         }
         // Capacity gate: acquire one permit (registering the waker when the
@@ -2514,19 +2514,19 @@ impl crate::common::owned_write::AsyncWriteOwned for KcpStream {
                 // Pump gone: the session is dead.
                 Err(_) => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "KCP session closed",
+                    "mhd session closed",
                 ))),
             },
             // Checked above; the half cannot close while this poll runs.
             None => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "KCP session write half already shut down",
+                "mhd session write half already shut down",
             ))),
         }
     }
 }
 
-impl AsyncRead for KcpStream {
+impl AsyncRead for MhdStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -2549,7 +2549,7 @@ impl AsyncRead for KcpStream {
             };
             match rx.poll_recv(cx) {
                 Poll::Ready(Some(batch)) => {
-                    sub_bytes(&KCP_READER_QUEUED_BYTES, batch.bytes);
+                    sub_bytes(&MHD_READER_QUEUED_BYTES, batch.bytes);
                     for part in batch.parts {
                         if !part.is_empty() {
                             me.read_queue.push_back(part);
@@ -2565,7 +2565,7 @@ impl AsyncRead for KcpStream {
     }
 }
 
-impl AsyncWrite for KcpStream {
+impl AsyncWrite for MhdStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -2578,7 +2578,7 @@ impl AsyncWrite for KcpStream {
         if me.out_tx.is_none() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "KCP session write half already shut down",
+                "mhd session write half already shut down",
             )));
         }
         // Capacity gate: acquire one permit (registering the waker when the
@@ -2593,19 +2593,19 @@ impl AsyncWrite for KcpStream {
                 // Pump gone: the session is dead.
                 Err(_) => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "KCP session closed",
+                    "mhd session closed",
                 ))),
             },
             // Checked above; the half cannot close while this poll runs.
             None => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "KCP session write half already shut down",
+                "mhd session write half already shut down",
             ))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // KCP has no user-visible flush: the pump pushes every accepted byte
+        // mhd has no user-visible flush: the pump pushes every accepted byte
         // onto the wire immediately (nodelay) and retransmits until acked.
         Poll::Ready(Ok(()))
     }
@@ -2618,95 +2618,95 @@ impl AsyncWrite for KcpStream {
     }
 }
 
-/// The tunnel byte stream over a KCP session: plain, or Noise-wrapped when
+/// The tunnel byte stream over an mhd session: plain, or Noise-wrapped when
 /// the control transport is `noise` — arm 2 keeps the crypto stack and only
 /// replaces the TCP leg. The tunnel hello/ack and the yamux session ride on
 /// this.
-pub enum KcpTunnelStream {
-    /// Plain KCP (control transport is `tcp`).
-    Plain(KcpStream),
-    /// Noise over KCP (control transport is `noise`). Boxed: the noise
+pub enum MhdTunnelStream {
+    /// Plain mhd (control transport is `tcp`).
+    Plain(MhdStream),
+    /// Noise over mhd (control transport is `noise`). Boxed: the noise
     /// state machine dwarfs the plain variant, and this enum lives on the
     /// stack of every tunnel task.
     #[cfg(feature = "noise")]
-    Noise(Box<crate::transport::NoiseStream<KcpStream>>),
+    Noise(Box<crate::transport::NoiseStream<MhdStream>>),
 }
 
-impl std::fmt::Debug for KcpTunnelStream {
+impl std::fmt::Debug for MhdTunnelStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KcpTunnelStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
+            MhdTunnelStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
             #[cfg(feature = "noise")]
-            KcpTunnelStream::Noise(_) => f.debug_tuple("Noise").finish(),
+            MhdTunnelStream::Noise(_) => f.debug_tuple("Noise").finish(),
         }
     }
 }
 
-impl KcpTunnelStream {
+impl MhdTunnelStream {
     /// This session's own ARQ counters, cumulative (see
     /// [`crate::transport::health::SessionHealth`]): the per-tunnel degradation signal a
     /// carrier policy reads. The same pair under both shapes — the Noise
     /// wrapper exposes the session it wraps.
     pub(crate) fn health(&self) -> Arc<crate::transport::health::SessionHealth> {
         match self {
-            KcpTunnelStream::Plain(s) => s.health(),
+            MhdTunnelStream::Plain(s) => s.health(),
             #[cfg(feature = "noise")]
-            KcpTunnelStream::Noise(s) => s.get_inner().health(),
+            MhdTunnelStream::Noise(s) => s.get_inner().health(),
         }
     }
 }
 
-impl AsyncRead for KcpTunnelStream {
+impl AsyncRead for MhdTunnelStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            KcpTunnelStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            MhdTunnelStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "noise")]
-            KcpTunnelStream::Noise(s) => Pin::new(s).poll_read(cx, buf),
+            MhdTunnelStream::Noise(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
 
-impl AsyncWrite for KcpTunnelStream {
+impl AsyncWrite for MhdTunnelStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            KcpTunnelStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            MhdTunnelStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "noise")]
-            KcpTunnelStream::Noise(s) => Pin::new(s).poll_write(cx, buf),
+            MhdTunnelStream::Noise(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            KcpTunnelStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            MhdTunnelStream::Plain(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "noise")]
-            KcpTunnelStream::Noise(s) => Pin::new(s).poll_flush(cx),
+            MhdTunnelStream::Noise(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            KcpTunnelStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            MhdTunnelStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "noise")]
-            KcpTunnelStream::Noise(s) => Pin::new(s).poll_shutdown(cx),
+            MhdTunnelStream::Noise(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
 
-/// Client side: open one KCP session to `remote`, carrying the protocol.
+/// Client side: open one mhd session to `remote`, carrying the protocol.
 ///
 /// A TCP connection opens with one transport selector byte (or a full Noise
-/// handshake, where the wrapper owns the selector); a KCP session must open the
+/// handshake, where the wrapper owns the selector); an mhd session must open the
 /// same way, because everything above it — the hello, the prologue, the
 /// forwarder — is protocol-agnostic. This is that opening, in one place, so a
-/// KCP **tunnel** (yamux on top) and a KCP **direct data channel** (the session
+/// mhd **tunnel** (yamux on top) and an mhd **direct data channel** (the session
 /// is the channel) can never drift apart.
 ///
 /// The conversation id is random: together with the ephemeral source port it
@@ -2726,35 +2726,35 @@ pub async fn connect_stream(
         )
     )]
     noise: Option<&crate::config::parsing::NoiseConfig>,
-) -> Result<KcpTunnelStream> {
+) -> Result<MhdTunnelStream> {
     use rand::TryRng;
 
     let mut rng = rand::rngs::SysRng;
     let mut conv_bytes = [0u8; 4];
     rng.try_fill_bytes(&mut conv_bytes)
-        .with_context(|| "Failed to generate a KCP conversation id")?;
+        .with_context(|| "Failed to generate an mhd conversation id")?;
     let conv = u32::from_le_bytes(conv_bytes);
 
     let stream = connect(remote, conv).await?;
     #[cfg(feature = "noise")]
     if let Some(cfg) = noise {
         let keys = crate::transport::NoiseKeys::from_config(cfg)?;
-        return Ok(KcpTunnelStream::Noise(Box::new(
+        return Ok(MhdTunnelStream::Noise(Box::new(
             keys.wrap_initiator(stream).await?,
         )));
     }
     let mut stream = stream;
     stream.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
-    Ok(KcpTunnelStream::Plain(stream))
+    Ok(MhdTunnelStream::Plain(stream))
 }
 
-/// Client side: open one KCP session to `remote` under `conv`.
+/// Client side: open one mhd session to `remote` under `conv`.
 ///
 /// The session owns a fresh ephemeral UDP socket (arm 2 runs N sessions, so
 /// each gets an independent kernel queue and source port). Packets from any
 /// address other than `remote` are dropped.
 #[cfg(any(feature = "client", test))]
-pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
+pub async fn connect(remote: SocketAddr, conv: u32) -> Result<MhdStream> {
     let bind = if remote.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -2762,7 +2762,7 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
     };
     let socket = UdpSocket::bind(bind)
         .await
-        .with_context(|| format!("Failed to bind the KCP client socket ({bind})"))?;
+        .with_context(|| format!("Failed to bind the mhd client socket ({bind})"))?;
     tune_socket_buffers(&socket);
     let socket = Arc::new(socket);
 
@@ -2795,7 +2795,7 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
                         let mut pump_gone = false;
                         for (from, data) in batch.iter() {
                             if from != remote {
-                                trace!("Dropping a KCP datagram from an unexpected peer {from}");
+                                trace!("Dropping an mhd datagram from an unexpected peer {from}");
                                 continue;
                             }
                             if pkt_tx.send(Bytes::copy_from_slice(data)).await.is_err() {
@@ -2811,7 +2811,7 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
                         // Drained (stale readiness flag); park again.
                     }
                     Err(e) => {
-                        debug!("KCP client socket recv failed: {e}");
+                        debug!("mhd client socket recv failed: {e}");
                         break;
                     }
                 }
@@ -2821,7 +2821,7 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
                 match socket.recv_from(&mut buf).await {
                     Ok((n, from)) => {
                         if from != remote {
-                            trace!("Dropping a KCP datagram from an unexpected peer {from}");
+                            trace!("Dropping an mhd datagram from an unexpected peer {from}");
                             continue;
                         }
                         if pkt_tx
@@ -2833,7 +2833,7 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
                         }
                     }
                     Err(e) => {
-                        debug!("KCP client socket recv failed: {e}");
+                        debug!("mhd client socket recv failed: {e}");
                         break;
                     }
                 }
@@ -2841,46 +2841,46 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
         }
     });
 
-    debug!(%remote, conv, "KCP session dialed (client)");
+    debug!(%remote, conv, "mhd session dialed (client)");
     Ok(stream)
 }
 
-/// One accepted server-side KCP session, before any hello validation.
+/// One accepted server-side mhd session, before any hello validation.
 #[cfg(any(feature = "server", test))]
 pub struct AcceptedSession {
     /// The reliable byte stream (Noise/yamux ride on top).
-    pub stream: KcpStream,
+    pub stream: MhdStream,
     /// The peer's UDP address.
     pub peer: SocketAddr,
 }
 
-/// Server-side KCP listener: one UDP socket demultiplexed into sessions by
+/// Server-side mhd listener: one UDP socket demultiplexed into sessions by
 /// `(peer address, conv)`. A datagram carrying an unknown conv adopts that
-/// conv into a fresh session (standard KCP listener behavior — the protocol
+/// conv into a fresh session (standard mhd listener behavior — the protocol
 /// has no handshake of its own; authentication is the tunnel hello's job).
 #[cfg(any(feature = "server", test))]
-pub struct KcpAcceptor {
+pub struct MhdAcceptor {
     socket: Arc<UdpSocket>,
     accepted_rx: Mutex<mpsc::Receiver<AcceptedSession>>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 #[cfg(any(feature = "server", test))]
-impl std::fmt::Debug for KcpAcceptor {
+impl std::fmt::Debug for MhdAcceptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KcpAcceptor")
+        f.debug_struct("MhdAcceptor")
             .field("addr", &self.socket.local_addr())
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(any(feature = "server", test))]
-impl KcpAcceptor {
+impl MhdAcceptor {
     /// Bind the listener socket and start the dispatcher task.
-    pub async fn bind<A: tokio::net::ToSocketAddrs + Send>(addr: A) -> Result<KcpAcceptor> {
+    pub async fn bind<A: tokio::net::ToSocketAddrs + Send>(addr: A) -> Result<MhdAcceptor> {
         let socket = UdpSocket::bind(&addr)
             .await
-            .with_context(|| "Failed to bind the KCP listener socket")?;
+            .with_context(|| "Failed to bind the mhd listener socket")?;
         let bound = socket.local_addr()?;
         tune_socket_buffers(&socket);
         let socket = Arc::new(socket);
@@ -2891,11 +2891,11 @@ impl KcpAcceptor {
 
         debug!(
             %bound,
-            "KCP listener up (stream mode, nodelay=1 interval={KCP_INTERVAL_MS}ms \
-             fast-resend={KCP_FAST_RESEND} nc=1 \
-             sndwnd={KCP_SND_WND} rcvwnd={KCP_RCV_WND} mtu=1400)"
+            "mhd listener up (stream mode, nodelay=1 interval={MHD_INTERVAL_MS}ms \
+             fast-resend={MHD_FAST_RESEND} nc=1 \
+             sndwnd={MHD_SND_WND} rcvwnd={MHD_RCV_WND} mtu=1400)"
         );
-        Ok(KcpAcceptor {
+        Ok(MhdAcceptor {
             socket,
             accepted_rx: Mutex::new(accepted_rx),
             shutdown_tx,
@@ -2917,7 +2917,7 @@ impl KcpAcceptor {
 }
 
 #[cfg(any(feature = "server", test))]
-impl Drop for KcpAcceptor {
+impl Drop for MhdAcceptor {
     fn drop(&mut self) {
         let _ = self.shutdown_tx.send(true);
     }
@@ -2937,17 +2937,17 @@ async fn route_datagram(
     data: &[u8],
 ) -> bool {
     // Adapter control frames (PING/PONG/SACK) are shorter than
-    // a KCP header: recognize them by the magic byte instead
+    // an mhd header: recognize them by the magic byte instead
     // of dropping them as runts — the pacing/keepalive state
     // machine depends on these crossing the listener.
     let (conv, is_ctrl) = if is_ctrl_frame(data) {
         let mut c = [0u8; 4];
         c.copy_from_slice(&data[..4]);
         (u32::from_le_bytes(c), true)
-    } else if data.len() >= KCP_OVERHEAD {
+    } else if data.len() >= MHD_OVERHEAD {
         (get_conv(data), false)
     } else {
-        trace!("Dropping a runt KCP datagram ({}) from {from}", data.len());
+        trace!("Dropping a runt mhd datagram ({}) from {from}", data.len());
         return true;
     };
     let key = (from, conv);
@@ -2983,7 +2983,7 @@ async fn route_datagram(
 
     if sessions.len() >= MAX_LISTENER_SESSIONS {
         warn!(
-            "KCP listener at the session cap ({}), dropping new conv {} from {from}",
+            "mhd listener at the session cap ({}), dropping new conv {} from {from}",
             MAX_LISTENER_SESSIONS, conv
         );
         return true;
@@ -2998,11 +2998,11 @@ async fn route_datagram(
     };
     let (stream, pkt_tx) = spawn_session(conv, net);
     if pkt_tx.try_send(pkt).is_err() {
-        warn!("Fresh KCP session {key:?} rejected its first datagram");
+        warn!("Fresh mhd session {key:?} rejected its first datagram");
         return true;
     }
     sessions.insert(key, pkt_tx);
-    debug!(peer = %from, conv, "KCP session adopted");
+    debug!(peer = %from, conv, "mhd session adopted");
     accepted_tx
         .send(AcceptedSession { stream, peer: from })
         .await
@@ -3043,7 +3043,7 @@ async fn dispatch_recv(
                 // `try_io`, so the next `readable()` parks again.
             }
             Err(e) => {
-                warn!("KCP listener recv failed: {e}");
+                warn!("mhd listener recv failed: {e}");
             }
         }
     }
@@ -3058,7 +3058,7 @@ async fn dispatch_recv(
                 // `try_io`, so the next `readable()` parks again.
             }
             Err(e) => {
-                warn!("KCP listener recv failed: {e}");
+                warn!("mhd listener recv failed: {e}");
             }
         }
     }
@@ -3066,7 +3066,7 @@ async fn dispatch_recv(
 
 /// The listener dispatcher: owns the session map, routes datagrams by
 /// `(peer, conv)` and adopts new conversations. Routing never blocks on a
-/// session's queue — overflow datagrams are dropped and recovered by KCP's
+/// session's queue — overflow datagrams are dropped and recovered by mhd's
 /// ARQ.
 #[cfg(any(feature = "server", test))]
 async fn dispatch(
@@ -3104,7 +3104,7 @@ async fn dispatch(
 
     // Shutdown: dropping the senders ends every session pump.
     sessions.clear();
-    debug!("KCP listener dispatcher exited");
+    debug!("mhd listener dispatcher exited");
 }
 
 #[cfg(test)]
@@ -3114,23 +3114,23 @@ mod path_mtu_tests {
         reason = "a test's failure path is a panic; the module-level allow keeps \
                   the assertions readable"
     )]
-    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, KCP_MTU_CEILING, datagram_for_path};
-    use crate::kcp::KCP_OVERHEAD;
+    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, MHD_MTU_CEILING, datagram_for_path};
+    use crate::mhd::MHD_OVERHEAD;
     #[cfg(target_os = "linux")]
-    use crate::transport::kcp::ipv6_mtu_of;
+    use crate::transport::mhd::ipv6_mtu_of;
     #[cfg(target_os = "linux")]
     use std::net::SocketAddr;
 
     /// The engine's default datagram size, mirrored here because the constant
     /// itself is private to the engine module (this test pins the arithmetic
     /// against the value the adapter actually ships with).
-    const KCP_MTU_DEF: usize = 1400;
+    const MHD_MTU_DEF: usize = 1400;
 
     /// The arithmetic that decides which datagram size a path deserves, per
     /// family. Every case here is a boundary a wrong constant would move: a
     /// clean path, the 1280 path (the cell this exists for), a path exactly the
     /// size of the engine's default, a jumbo path (where the *ceiling* binds),
-    /// and a path too small to carry a KCP header at all.
+    /// and a path too small to carry an mhd header at all.
     ///
     /// The IPv6 column is what the `IPV6_MTU` probe feeds: its overhead is
     /// the 40-byte IPv6 header plus UDP, not the IPv4 pair.
@@ -3152,7 +3152,7 @@ mod path_mtu_tests {
         }
 
         // A clean path: the ceiling binds, not the path (65536 - 28 > 8000).
-        row(65536, Some(KCP_MTU_CEILING), Some(KCP_MTU_CEILING));
+        row(65536, Some(MHD_MTU_CEILING), Some(MHD_MTU_CEILING));
 
         // 1280: the IPv6 minimum every real path must carry. The datagram has
         // to shed the header the path adds, per family.
@@ -3164,17 +3164,17 @@ mod path_mtu_tests {
 
         // A path exactly the size of the engine's default: one byte less than
         // it, once the header the path adds is paid.
-        row(KCP_MTU_DEF, Some(1400 - 28), Some(1400 - 48));
+        row(MHD_MTU_DEF, Some(1400 - 28), Some(1400 - 48));
 
         // A jumbo path is followed up to the ceiling — this is the growth the
         // measurement asked for. The ceiling binds for both families: a 9000-byte
         // link would carry 8972 bytes of IPv4 payload, and the carrier stops at
         // 8000 by design rather than at whatever a probe reports.
-        row(9000, Some(KCP_MTU_CEILING), Some(KCP_MTU_CEILING));
+        row(9000, Some(MHD_MTU_CEILING), Some(MHD_MTU_CEILING));
 
-        // Smaller than a KCP header can be: not our call to make, leave the
+        // Smaller than an mhd header can be: not our call to make, leave the
         // engine alone rather than produce an unsendable size.
-        assert_eq!(datagram_for_path(KCP_OVERHEAD + 10, false), None);
+        assert_eq!(datagram_for_path(MHD_OVERHEAD + 10, false), None);
 
         // Both families' 1280 arithmetic against the shipped engine default:
         // the datagram below the IPv6 minimum a v6 session must not exceed.
@@ -3221,41 +3221,41 @@ mod tests {
     use std::net::Ipv6Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Read exactly `n` bytes with a generous timeout (KCP is userspace ARQ
+    /// Read exactly `n` bytes with a generous timeout (mhd is userspace ARQ
     /// ticking at a 10 ms interval even on loopback).
-    async fn read_exact_timeout(stream: &mut KcpStream, n: usize) -> Vec<u8> {
+    async fn read_exact_timeout(stream: &mut MhdStream, n: usize) -> Vec<u8> {
         let mut buf = vec![0u8; n];
         tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut buf))
             .await
-            .expect("KCP read timed out")
+            .expect("mhd read timed out")
             .unwrap();
         buf
     }
 
     /// A control frame that arrives **behind** data in one batch is a control
-    /// frame, not a short KCP segment.
+    /// frame, not a short mhd segment.
     ///
     /// `feed_batch` exists to amortise intake, and the backlog it drains is
     /// exactly where a keepalive or a close lands — sent with the payload it
     /// shares a readiness wake with. Feeding those to the ARQ is not neutral:
-    /// they are shorter than a KCP header, so `Kcp::input` rejects them, and a
+    /// they are shorter than an mhd header, so `Mhd::input` rejects them, and a
     /// CLOSE that arrives there is lost — the retired-lane black hole
     /// (`CTRL_CLOSE`) is reachable from an ordinary burst. This pins the
     /// classification at the batch level, which is where the bug was.
     #[test]
     fn a_control_frame_behind_data_in_one_batch_is_not_fed_to_the_arq() {
         let (dgram_tx, _dgram_rx) = mpsc::unbounded_channel();
-        let mut kcp = Kcp::new_stream(0x5EED_5EED, DatagramOut::new(dgram_tx));
-        kcp.update(0).unwrap();
+        let mut mhd = Mhd::new_stream(0x5EED_5EED, DatagramOut::new(dgram_tx));
+        mhd.update(0).unwrap();
         // The pump's own clock, so the session is past its prime.
-        kcp.update(1_000).unwrap();
+        mhd.update(1_000).unwrap();
 
         let (pkt_tx, mut pkt_rx) = mpsc::channel::<Bytes>(8);
         // A CLOSE behind one data-shaped datagram: the shape a peer's close
         // has whenever it shares a wake with the last of its payload.
-        let close = ctrl_frame(kcp.conv(), CTRL_CLOSE, &[]);
+        let close = ctrl_frame(mhd.conv(), CTRL_CLOSE, &[]);
         pkt_tx
-            .try_send(Bytes::copy_from_slice(&[0u8; KCP_OVERHEAD]))
+            .try_send(Bytes::copy_from_slice(&[0u8; MHD_OVERHEAD]))
             .unwrap();
         pkt_tx.try_send(Bytes::copy_from_slice(&close)).unwrap();
 
@@ -3263,7 +3263,7 @@ mod tests {
         // The first datagram is not a control frame, so the batch path is the
         // one under test (a control frame first is handled by the caller).
         assert!(!is_ctrl_frame(&first));
-        match feed_batch(&mut kcp, &mut pkt_rx, first) {
+        match feed_batch(&mut mhd, &mut pkt_rx, first) {
             BatchFeed::Control { flush_ack, ctrl } => {
                 // The ARQ rejected the zeroed datagram, so no ack is owed by
                 // it; the point is that the CLOSE came back rather than being
@@ -3336,7 +3336,7 @@ mod tests {
         let mut out = DatagramOut::new(tx);
         let payload = Bytes::from_static(b"the payload is shared, not copied");
 
-        crate::kcp::DatagramSink::write_datagram(&mut out, b"0123456789abcdef01234567", &payload)
+        crate::mhd::DatagramSink::write_datagram(&mut out, b"0123456789abcdef01234567", &payload)
             .unwrap();
         std::io::Write::flush(&mut out).unwrap();
         let batch = rx.try_recv().expect("the datagram must cross the channel");
@@ -3350,7 +3350,7 @@ mod tests {
         };
         // The staged header is the first 24 bytes of the batch buffer.
         assert_eq!(
-            &batch.buf[*hdr_off..*hdr_off + KCP_OVERHEAD],
+            &batch.buf[*hdr_off..*hdr_off + MHD_OVERHEAD],
             b"0123456789abcdef01234567"
         );
         // Same allocation as the engine segment's buffer: no copy.
@@ -3378,9 +3378,9 @@ mod tests {
         // loopback it is the ceiling (8000), so a 32 KiB write would be four
         // segments and the merge factor would say nothing.
         const PAYLOAD: usize = 256 * 1024;
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
-        let before = super::kcp_stats();
+        let before = super::mhd_stats();
 
         let mut client = connect(addr, 0x0BAD_F00D).await.unwrap();
         let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
@@ -3394,7 +3394,7 @@ mod tests {
         let got = read_exact_timeout(&mut session, PAYLOAD).await;
         assert_eq!(got, payload, "coalescing must not alter the byte stream");
 
-        let after = super::kcp_stats();
+        let after = super::mhd_stats();
         let segments = after.datagrams_in - before.datagrams_in;
         let blobs = after.blobs_out - before.blobs_out;
         // Two segments per message at least. The merge *factor* is bounded by
@@ -3421,7 +3421,7 @@ mod tests {
     /// the drop reads on, and this test times out.
     #[tokio::test]
     async fn a_dropped_stream_ends_the_session_for_the_peer() {
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
         // The acceptor adopts a conversation from the traffic it sees, so the
         // client keeps talking until it is accepted.
@@ -3447,10 +3447,10 @@ mod tests {
         // The consumer goes away.
         talker.abort();
         let _ = talker.await;
-        let after_drop = super::kcp_stats();
+        let after_drop = super::mhd_stats();
 
         // The peer keeps *sending* — that is what a claim's lane does, and it is
-        // also the only thing that can tell it the session is over: KCP has no
+        // also the only thing that can tell it the session is over: mhd has no
         // close handshake, so a peer with nothing outstanding cannot learn
         // anything at all. Every round writes and then reads with a short
         // timeout, so the writes keep coming and stay unacknowledged; the peer
@@ -3473,7 +3473,7 @@ mod tests {
         // The counters are the diagnosis when this fails: no retransmits while the
         // peer keeps writing means the other end is still acknowledging, i.e. its
         // session outlived its stream.
-        let after = super::kcp_stats();
+        let after = super::mhd_stats();
         let out_delta = after.datagrams_out - after_drop.datagrams_out;
         let rtx_delta = after.retransmits - after_drop.retransmits;
         assert!(
@@ -3496,13 +3496,13 @@ mod tests {
         // bench-cell scale, not a unit-test one; its zero-alloc
         // take/put-back loop shares this ordering guarantee.)
         const PAYLOAD: usize = 512 * 1024;
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
 
         let mut client = connect(addr, 0x0BAD_F00D).await.unwrap();
         let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
         // The write pushes the whole payload through the tunnel (the
-        // writer half is unbounded, so this returns once KCP accepted
+        // writer half is unbounded, so this returns once mhd accepted
         // the bytes) and is what makes the server adopt the session.
         client.write_all(&payload).await.unwrap();
 
@@ -3517,7 +3517,7 @@ mod tests {
         let head = 64 * 1024;
         let mut got = read_exact_timeout(&mut session, head).await;
         // Give the pump time to fill the channel and spill while the
-        // reader is parked (one KCP flush interval is 10 ms; the payload
+        // reader is parked (one mhd flush interval is 10 ms; the payload
         // is ~380 segments, so a few intervals suffice).
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -3547,9 +3547,9 @@ mod tests {
         // The counters are process-global (every session adds to them), so
         // the test reads deltas around one round trip rather than
         // absolute values.
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
-        let before = super::kcp_stats();
+        let before = super::mhd_stats();
 
         let mut client = connect(addr, 0x0BAD_F00D).await.unwrap();
         client.write_all(b"stats probe").await.unwrap();
@@ -3567,7 +3567,7 @@ mod tests {
         let got = read_exact_timeout(&mut client, b"ack-back".len()).await;
         assert_eq!(&got, b"ack-back");
 
-        let after = super::kcp_stats();
+        let after = super::mhd_stats();
         assert!(
             after.datagrams_in > before.datagrams_in,
             "no datagram was counted on input"
@@ -3589,7 +3589,7 @@ mod tests {
             "no empty receive probe was counted"
         );
         // The per-phase timings are instrumentation, and instrumentation is
-        // collected only when a run asks for it: with `MOLEHILL_KCP_STATS=1`
+        // collected only when a run asks for it: with `MOLEHILL_MHD_STATS=1`
         // every phase that ran books time, and without it nothing is read from
         // the clock at all — which is the property that keeps a default run
         // from paying for numbers nobody reads. The counters above are the
@@ -3602,7 +3602,7 @@ mod tests {
             + before.ms_writer
             + before.ms_output
             + before.ms_update;
-        if super::kcp_stats_enabled() {
+        if super::mhd_stats_enabled() {
             assert!(
                 ns > before_ns,
                 "no phase booked time, and timings were asked for"
@@ -3610,18 +3610,18 @@ mod tests {
         } else {
             assert_eq!(
                 ns, 0.0,
-                "phase timings were collected without MOLEHILL_KCP_STATS"
+                "phase timings were collected without MOLEHILL_MHD_STATS"
             );
         }
     }
 
     #[tokio::test]
     async fn client_server_roundtrip() {
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
 
         let mut client = connect(addr, 0x1234_5678).await.unwrap();
-        client.write_all(b"hello kcp").await.unwrap();
+        client.write_all(b"hello mhd").await.unwrap();
 
         let session = tokio::time::timeout(Duration::from_secs(10), acceptor.accept())
             .await
@@ -3629,8 +3629,8 @@ mod tests {
             .expect("acceptor closed");
         let mut server = session.stream;
 
-        let got = read_exact_timeout(&mut server, "hello kcp".len()).await;
-        assert_eq!(&got, b"hello kcp");
+        let got = read_exact_timeout(&mut server, "hello mhd".len()).await;
+        assert_eq!(&got, b"hello mhd");
 
         server.write_all(b"hello back").await.unwrap();
         let got = read_exact_timeout(&mut client, "hello back".len()).await;
@@ -3639,15 +3639,15 @@ mod tests {
 
     /// **End-to-end proof that the IPv6 path-MTU clamp fires on a shrunken
     /// path.** The unit test above proves the probe reads the kernel; this one
-    /// proves the *session* acts on it: a real client/server KCP pair over
+    /// proves the *session* acts on it: a real client/server mhd pair over
     /// `::1` must report a datagram size of `loopback_mtu − 48` — the IPv6
-    /// header plus the UDP header, the bytes the kernel adds on top of a KCP
+    /// header plus the UDP header, the bytes the kernel adds on top of a mhd
     /// datagram — instead of the engine's 1400-byte default. Before the IPv6
     /// probe existed the session kept 1400, and on a 1280-byte path every
     /// datagram became two IP fragments, one lost fragment costing the whole
     /// datagram.
     ///
-    /// The assertion is on the live sessions (`KcpStream::datagram_bytes`), not
+    /// The assertion is on the live sessions (`MhdStream::datagram_bytes`), not
     /// on the clamp function, so it fails if the pump never runs the probe —
     /// and it covers both ends, the client that dials and the server that
     /// accepts. It lives with the adapter rather than in `tests/` because the
@@ -3675,16 +3675,16 @@ mod tests {
             .expect("the v6 loopback must answer the path-MTU probe");
         let expected = loopback_mtu - IPV6_UDP_HEADERS;
         assert!(
-            expected < KCP_MTU_CEILING,
+            expected < MHD_MTU_CEILING,
             "this test needs a shrunken v6 loopback to mean anything: lo reports an MTU of \
-             {loopback_mtu}, so the carrier's {KCP_MTU_CEILING}-byte ceiling is what binds. Run \
+             {loopback_mtu}, so the carrier's {MHD_MTU_CEILING}-byte ceiling is what binds. Run \
              it inside a network namespace:\n  \
              sudo unshare -n bash -c 'ip link set lo up; ip link set lo mtu 1280; \
              ip -6 addr add ::1/128 dev lo 2>/dev/null; \
              cargo test --lib ipv6_path_mtu_clamps_on_a_shrunk_loopback -- --ignored --nocapture'"
         );
 
-        let acceptor = KcpAcceptor::bind("[::1]:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("[::1]:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
         assert!(addr.is_ipv6(), "the acceptor must be on the v6 loopback");
 
@@ -3718,7 +3718,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_sessions_stay_isolated() {
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
 
         let mut c1 = connect(addr, 11).await.unwrap();
@@ -3756,7 +3756,7 @@ mod tests {
         // 4 MiB through one session: exercises chunking, the ARQ window,
         // pump backpressure and the update timer under load.
         const SIZE: usize = 4 * 1024 * 1024;
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
 
         let mut client = connect(addr, 77).await.unwrap();
@@ -3796,9 +3796,9 @@ mod tests {
     #[tokio::test]
     async fn graceful_shutdown_flushes_queued_data() {
         // Write a chunk, immediately shut the write half: the pump must
-        // still deliver everything KCP accepted before exiting.
+        // still deliver everything mhd accepted before exiting.
         const SIZE: usize = 256 * 1024;
-        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let acceptor = MhdAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
 
         let mut client = connect(addr, 99).await.unwrap();

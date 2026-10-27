@@ -21,7 +21,7 @@ default = [
     "noise",
     "hot-reload",
     "multiplex",
-    "kcp",
+    "mhd",
     "transparent",
 ]
 
@@ -42,8 +42,8 @@ noise = ["dep:base64", "dep:snow", "dep:pin-project"]
 # Configuration hot-reload support
 hot-reload = ["dep:notify"]
 
-# Which carrier the data plane uses, and the fallback that chooses it: KCP
-# (with `kcp`) else TCP. Independent of yamux because a transparent claim
+# Which carrier the data plane uses, and the fallback that chooses it: mhd
+# (with `mhd`) else TCP. Independent of yamux because a transparent claim
 # chooses a carrier without multiplexing its own traffic.
 carrier = []
 
@@ -57,9 +57,9 @@ embedded = ["server", "client", "hot-reload", "noise"]
 # Feature to enable tokio-console. Disabled by default.
 # Don't enable it unless for debugging purposes.
 console = ["dep:console-subscriber", "tokio/tracing"]
-# A KCP tunnel is a mux tunnel over UDP: the feature implies `multiplex`.
+# A mhd tunnel is a mux tunnel over UDP: the feature implies `multiplex`.
 # In the default set so one release binary covers all comparison arms.
-kcp = ["multiplex", "dep:log", "dep:thiserror"]
+mhd = ["multiplex", "dep:log", "dep:thiserror"]
 # Transparent (L3) services: the client owns the public `ip:port` instead of
 # the server binding it, so the visitor's packets reach the client's TUN device
 # and its kernel answers them -- the backend sees the visitor's real address
@@ -67,7 +67,7 @@ kcp = ["multiplex", "dep:log", "dep:thiserror"]
 # Windows can serve a transparent client but cannot be one (it has no
 # source-address policy routing), and a config that asks for a client there is
 # refused with a precise reason. The device layer is `tun-rs`. `carrier` is
-# implied: a claim chooses KCP/TCP per lane and reads the lane budget, but its
+# implied: a claim chooses mhd/TCP per lane and reads the lane budget, but its
 # own traffic is one connection per lane and never yamux, so `multiplex` is
 # not required. `noise` is implied too: the control channel that carries a
 # claim's registration is always Noise.

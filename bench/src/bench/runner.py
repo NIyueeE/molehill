@@ -477,7 +477,7 @@ class ArmTurn:
         fh = path.open("ab")
         # The daemons inherit this process's environment, which is where the
         # diagnostic switches live: a run that forces a carrier
-        # (`MOLEHILL_DATA_CARRIER=kcp`) inherited it from the shell that started
+        # (`MOLEHILL_DATA_CARRIER=mhd`) inherited it from the shell that started
         # the bench, and the results record inherited `MOLEHILL_*` switches as
         # instrumentation, so the forcing is auditable rather than implied.
         env = dict(os.environ)
@@ -681,7 +681,7 @@ def build_results(camp: Campaign, pre: dict, provenance: dict, started: str) -> 
                         "MOLEHILL_CARRIER_SWITCH_AT",
                         "MOLEHILL_TUNNEL_SWITCH_AT",
                         "MOLEHILL_L3_STATS",
-                        "MOLEHILL_KCP_STATS",
+                        "MOLEHILL_MHD_STATS",
                         "MOLEHILL_TUNNEL_STATS",
                         "MOLEHILL_POOL_STATS",
                         "MOLEHILL_STRIPE_COUNT",

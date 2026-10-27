@@ -21,8 +21,8 @@ pub(crate) const NOISE_PATTERN: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
 
 /// Parsed KK key material: this host's private key and the peer's public key.
 ///
-/// Shared by the TCP transport (control and, when enabled, data) and the KCP
-/// tunnel path, where the same handshake rides on a KCP byte stream instead.
+/// Shared by the TCP transport (control and, when enabled, data) and the mhd
+/// tunnel path, where the same handshake rides on an mhd byte stream instead.
 #[derive(Clone)]
 pub(crate) struct NoiseKeys {
     params: NoiseParams,

@@ -1,6 +1,6 @@
-# Same-port fixture: neither side sets a data-plane address, so the KCP
-# tunnel endpoint defaults to the control endpoint — TCP control and UDP KCP
-# data share port 2341 (different protocols, no conflict). Two KCP sessions
+# Same-port fixture: neither side sets a data-plane address, so the mhd
+# tunnel endpoint defaults to the control endpoint — TCP control and UDP mhd
+# data share port 2341 (different protocols, no conflict). Two mhd sessions
 # also share the one UDP listener (demuxed by peer address + conv id).
 
 [client]

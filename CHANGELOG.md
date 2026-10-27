@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: the data-plane carrier is named `mhd`.** The carrier was
+  already this repository's own implementation — descended from the KCP
+  algorithm, maintained in-repo, with the SACK extensions and the datagram
+  send path it grew here — so it now carries this project's name instead of
+  another project's. The rename is end to end: the feature (`kcp` → `mhd`),
+  the engine module (`src/kcp.rs` → `src/mhd.rs`), the carrier name the
+  registration puts on the wire (`"kcp"` → `"mhd"`), the diagnostic switch
+  (`MOLEHILL_DATA_CARRIER=kcp` → `=mhd`), the statistics switch
+  (`MOLEHILL_KCP_STATS` → `MOLEHILL_MHD_STATS`), and the status API's
+  per-tunnel counters (`kcp_datagrams_out` / `kcp_retransmits` →
+  `mhd_datagrams_out` / `mhd_retransmits`). **No configuration key changes**:
+  the data plane's keys were already carrier-neutral.
+- **BREAKING: the wire dialect is 6.0.** The registration carries the carrier
+  name, so renaming the carrier is a wire change, and a wire change is a new
+  dialect. A 5.x peer is refused on the connection it happens on, with the
+  version it sent; upgrading means upgrading both ends.
+
 ## [0.11.2] - 2026-10-20
 
 ### Added

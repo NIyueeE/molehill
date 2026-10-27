@@ -127,7 +127,7 @@ jobs:
         run: >
           cargo check --all-targets --target ${{ matrix.target }}
           --no-default-features
-          --features server,client,noise,hot-reload,multiplex,kcp,transparent
+          --features server,client,noise,hot-reload,multiplex,mhd,transparent
 
   musl-embedded:
     name: musl check ${{ matrix.target }} (embedded)

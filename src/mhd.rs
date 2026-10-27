@@ -1,22 +1,22 @@
-//! Internal implementation of the KCP (ARQ) protocol engine.
+//! The `mhd` carrier's ARQ engine.
 //!
 //! molehill maintains this module in-repo as its own code: the algorithm
 //! follows the reference C implementation by skywind3000
 //! (<https://github.com/skywind3000/kcp>) and is deliberately **not** a
 //! vendored crate. Self-maintaining keeps three things under molehill's
-//! control: the SACK extensions the adapter needs (`Kcp::retransmit_sn`,
-//! `Kcp::recv_queue_len`, `Kcp::rcv_nxt_sn`), the dependency graph
+//! control: the SACK extensions the adapter needs (`Mhd::retransmit_sn`,
+//! `Mhd::recv_queue_len`, `Mhd::rcv_nxt_sn`), the dependency graph
 //! (nothing external to patch around), and the lint and waiver story (this
 //! module is bound by molehill's rules like any other module).
 //!
 //! Local rules and deliberate deltas vs the reference:
-//! - the SACK extensions the adapter uses (`Kcp::retransmit_sn`,
-//!   `Kcp::recv_queue_len`, `Kcp::rcv_nxt_sn`) add explicit gap recovery
+//! - the SACK extensions the adapter uses (`Mhd::retransmit_sn`,
+//!   `Mhd::recv_queue_len`, `Mhd::rcv_nxt_sn`) add explicit gap recovery
 //!   beyond the reference;
 //! - `flush()` closes with one `Write::flush` call on the output, which
 //!   the reference never makes: the adapter uses it as the batch boundary
 //!   for its outbound datagrams (see `DatagramOut` in
-//!   `src/transport/kcp.rs`), and `Write::flush`'s default no-op keeps any
+//!   `src/transport/mhd.rs`), and `Write::flush`'s default no-op keeps any
 //!   other output user unaffected;
 //! - stream-mode PUSH datagrams are emitted through
 //!   [`DatagramSink::write_datagram`] — a 24-byte header plus the segment's
@@ -32,21 +32,21 @@
 //! - the `tokio`-feature code and the unused accessor methods are trimmed
 //!   (datagram mode, `set_interval`, the conv-adoption hook); `mtu` is the
 //!   one accessor kept back, because the adapter shrinks the datagram size to
-//!   the path MTU the kernel reports (`set_mtu`, see `transport::kcp`);
+//!   the path MTU the kernel reports (`set_mtu`, see `transport::mhd`);
 //! - buffers are grown through the safe `BytesMut::zeroed` instead of
 //!   `unsafe` length manipulation;
 //! - errors are molehill's own `Error` type.
 //!
 //! The protocol core is a pure state machine: it owns no socket, no clock
-//! and no stream semantics. See `src/transport/kcp.rs` for the tokio
+//! and no stream semantics. See `src/transport/mhd.rs` for the tokio
 //! adapter.
 
 mod error;
 
 pub use error::Error;
 
-/// KCP result
-pub type KcpResult<T> = Result<T, Error>;
+/// mhd result
+pub type MhdResult<T> = Result<T, Error>;
 
 use std::cmp;
 use std::cmp::Ordering;
@@ -58,8 +58,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use log::{debug, trace};
 
-const KCP_RTO_NDL: u32 = 30; // no delay min rto
-const KCP_RTO_MIN: u32 = 100; // normal min rto
+const MHD_RTO_NDL: u32 = 30; // no delay min rto
+const MHD_RTO_MIN: u32 = 100; // normal min rto
 /// The RTO's headroom over the measured round trip, as a fraction of it
 /// (`srtt / this`), when the jitter-derived term is smaller.
 ///
@@ -74,28 +74,28 @@ const KCP_RTO_MIN: u32 = 100; // normal min rto
 /// no loss at all). A margin that grows with the round trip keeps the timeout
 /// ahead of the acknowledgements it is waiting for, and leaves short paths
 /// exactly where they were: nothing changes below an 80 ms round trip.
-const KCP_RTO_HEADROOM_DIVISOR: u32 = 8;
-const KCP_RTO_DEF: u32 = 200;
-const KCP_RTO_MAX: u32 = 60000;
+const MHD_RTO_HEADROOM_DIVISOR: u32 = 8;
+const MHD_RTO_DEF: u32 = 200;
+const MHD_RTO_MAX: u32 = 60000;
 
-const KCP_CMD_PUSH: u8 = 81; // cmd: push data
-const KCP_CMD_ACK: u8 = 82; // cmd: ack
-const KCP_CMD_WASK: u8 = 83; // cmd: window probe (ask)
-const KCP_CMD_WINS: u8 = 84; // cmd: window size (tell)
+const MHD_CMD_PUSH: u8 = 81; // cmd: push data
+const MHD_CMD_ACK: u8 = 82; // cmd: ack
+const MHD_CMD_WASK: u8 = 83; // cmd: window probe (ask)
+const MHD_CMD_WINS: u8 = 84; // cmd: window size (tell)
 
-const KCP_ASK_SEND: u32 = 1; // need to send IKCP_CMD_WASK
-const KCP_ASK_TELL: u32 = 2; // need to send IKCP_CMD_WINS
+const MHD_ASK_SEND: u32 = 1; // need to send IKCP_CMD_WASK
+const MHD_ASK_TELL: u32 = 2; // need to send IKCP_CMD_WINS
 
-const KCP_WND_SND: u16 = 32;
-const KCP_WND_RCV: u16 = 128; // must >= max fragment size
+const MHD_WND_SND: u16 = 32;
+const MHD_WND_RCV: u16 = 128; // must >= max fragment size
 
-const KCP_MTU_DEF: usize = 1400;
+const MHD_MTU_DEF: usize = 1400;
 
-const KCP_INTERVAL: u32 = 100;
-/// KCP Header size
-pub const KCP_OVERHEAD: usize = 24;
-const KCP_DEADLINK: u32 = 20;
-/// How long the send window may stand still before [`KCP_DEADLINK`] means what
+const MHD_INTERVAL: u32 = 100;
+/// mhd Header size
+pub const MHD_OVERHEAD: usize = 24;
+const MHD_DEADLINK: u32 = 20;
+/// How long the send window may stand still before [`MHD_DEADLINK`] means what
 /// it is for.
 ///
 /// The reference counts a segment's retransmissions and calls the session dead
@@ -104,28 +104,28 @@ const KCP_DEADLINK: u32 = 20;
 /// can be behind megabytes of queued traffic while the peer acknowledges
 /// everything else happily — and the retransmissions fired into that queue make
 /// the wait longer still, so twenty of them arrive in seconds and a live
-/// session is closed (measured: the multiplexed KCP arm died on every round of
+/// session is closed (measured: the multiplexed mhd arm died on every round of
 /// the bench's `loss1_rate100` cell, [benchmarks.md](../../docs/benchmarks.md)).
 /// A session that is moving its `snd_una` is not dead, whatever any single
 /// segment's retransmit count says; one that has moved nothing for this long is,
 /// whether or not twenty retransmissions have gone by.
-const KCP_DEAD_GRACE_MS: i32 = 5_000;
+const MHD_DEAD_GRACE_MS: i32 = 5_000;
 
-const KCP_THRESH_INIT: u16 = 2;
-const KCP_THRESH_MIN: u16 = 2;
+const MHD_THRESH_INIT: u16 = 2;
+const MHD_THRESH_MIN: u16 = 2;
 
-const KCP_PROBE_INIT: u32 = 5000; // 5 secs to probe window size
-const KCP_PROBE_LIMIT: u32 = 120_000; // up to 120 secs to probe window
-const KCP_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
+const MHD_PROBE_INIT: u32 = 5000; // 5 secs to probe window size
+const MHD_PROBE_LIMIT: u32 = 120_000; // up to 120 secs to probe window
+const MHD_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
 
 // --- path statistics (opt-in) -------------------------------------------
 //
-// Cumulative counters for the KCP data path, read periodically when
-// `MOLEHILL_KCP_STATS=1` — the attribution tool the mux framing counters
+// Cumulative counters for the mhd data path, read periodically when
+// `MOLEHILL_MHD_STATS=1` — the attribution tool the mux framing counters
 // provide for that engine: datagram rates beside the measured CPU turn a
 // throughput number into cost-per-datagram, which separates "the engine
 // does too much work per datagram" from "there are too many datagrams"
-// (the kcp4 arm runs ~1400-byte datagrams where TCP runs kernel-side
+// (the mhd4 arm runs ~1400-byte datagrams where TCP runs kernel-side
 // segmentation). A relaxed atomic add per datagram costs a few
 // nanoseconds against the datagram's own cost, and the counters are only
 // read by the adapter's stats task.
@@ -135,9 +135,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use crate::transport::health::SessionHealth;
 
 /// Datagrams accepted from the peer (one `input` call each).
-pub(crate) static KCP_DATAGRAMS_IN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_DATAGRAMS_IN: AtomicU64 = AtomicU64::new(0);
 /// Datagrams the engine emitted (`flush`/`update` output writes).
-pub(crate) static KCP_DATAGRAMS_OUT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_DATAGRAMS_OUT: AtomicU64 = AtomicU64::new(0);
 /// Segment retransmissions: RTO-expired and fast-resend alike (a
 /// SACK-marked resend flows through the RTO path). Each one is a loss
 /// event with exact timing — feeding it to the pacer as a congestion
@@ -145,32 +145,32 @@ pub(crate) static KCP_DATAGRAMS_OUT: AtomicU64 = AtomicU64::new(0);
 /// outruns the PONG-probe recovery; see HANDOFF.md, "Phase 2 A/B —
 /// DROPPED"), so today this is an attribution counter: a rising rate is
 /// how a collapsing cell is recognized in a stats line.
-pub(crate) static KCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 /// The same events, split by what fired them: an RTO (`resendts` reached,
 /// nothing heard about the segment) or a run of later acknowledgements
 /// (`fastack`, the peer is receiving *around* a hole). The two mean opposite
 /// things about a path — a timeout is silence, a skip is a gap — so a stats
 /// line that cannot tell them apart cannot say which one a cell is paying for.
-pub(crate) static KCP_RESENDS_RTO: AtomicU64 = AtomicU64::new(0);
-pub(crate) static KCP_RESENDS_FAST: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_RESENDS_RTO: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_RESENDS_FAST: AtomicU64 = AtomicU64::new(0);
 /// Ack entries sent to the peer (several may share one datagram).
-pub(crate) static KCP_ACKS_OUT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MHD_ACKS_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the engine-side counters, for the periodic stats line.
-pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64, u64, u64) {
+pub(crate) fn mhd_engine_stats() -> (u64, u64, u64, u64, u64, u64) {
     (
-        KCP_DATAGRAMS_IN.load(Relaxed),
-        KCP_DATAGRAMS_OUT.load(Relaxed),
-        KCP_RETRANSMITS.load(Relaxed),
-        KCP_ACKS_OUT.load(Relaxed),
-        KCP_RESENDS_RTO.load(Relaxed),
-        KCP_RESENDS_FAST.load(Relaxed),
+        MHD_DATAGRAMS_IN.load(Relaxed),
+        MHD_DATAGRAMS_OUT.load(Relaxed),
+        MHD_RETRANSMITS.load(Relaxed),
+        MHD_ACKS_OUT.load(Relaxed),
+        MHD_RESENDS_RTO.load(Relaxed),
+        MHD_RESENDS_FAST.load(Relaxed),
     )
 }
 
 /// Read `conv` from raw buffer
 pub fn get_conv(mut buf: &[u8]) -> u32 {
-    assert!(buf.len() >= KCP_OVERHEAD);
+    assert!(buf.len() >= MHD_OVERHEAD);
     buf.get_u32_le()
 }
 
@@ -187,7 +187,7 @@ fn timediff(later: u32, earlier: u32) -> i32 {
 }
 
 #[derive(Default, Clone, Debug)]
-struct KcpSegment {
+struct MhdSegment {
     conv: u32,
     cmd: u8,
     frg: u8,
@@ -208,9 +208,9 @@ struct KcpSegment {
     data: Bytes,
 }
 
-impl KcpSegment {
+impl MhdSegment {
     fn new_with_data(data: Bytes) -> Self {
-        KcpSegment {
+        MhdSegment {
             conv: 0,
             cmd: 0,
             frg: 0,
@@ -244,8 +244,8 @@ impl KcpSegment {
     /// The `len` field is the payload length, so the wire bytes are exactly
     /// the head of what `encode` would write. This is the two-iovec send
     /// path's half that travels through staging.
-    fn encode_header(&self) -> [u8; KCP_OVERHEAD] {
-        let mut out = [0u8; KCP_OVERHEAD];
+    fn encode_header(&self) -> [u8; MHD_OVERHEAD] {
+        let mut out = [0u8; MHD_OVERHEAD];
         out[0..4].copy_from_slice(&self.conv.to_le_bytes());
         out[4] = self.cmd;
         out[5] = self.frg;
@@ -262,7 +262,7 @@ impl KcpSegment {
     }
 
     fn encoded_len(&self) -> usize {
-        KCP_OVERHEAD + self.data.len()
+        MHD_OVERHEAD + self.data.len()
     }
 }
 
@@ -284,9 +284,9 @@ pub trait DatagramSink: Write {
 }
 
 #[derive(Default)]
-struct KcpOutput<O>(O);
+struct MhdOutput<O>(O);
 
-impl<O: Write> Write for KcpOutput<O> {
+impl<O: Write> Write for MhdOutput<O> {
     #[inline]
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         trace!("[RO] {} bytes", data.len());
@@ -299,7 +299,7 @@ impl<O: Write> Write for KcpOutput<O> {
     }
 }
 
-impl<O: DatagramSink> KcpOutput<O> {
+impl<O: DatagramSink> MhdOutput<O> {
     /// Emit one datagram as a header plus a payload reference, without
     /// staging the payload (see [`DatagramSink`]). Returns the datagram's
     /// total length, mirroring `Write::write`'s convention.
@@ -314,9 +314,9 @@ impl<O: DatagramSink> KcpOutput<O> {
 /// fields grouped so the hot state stays compact (and clippy's bool-field
 /// limit applies to the packed type, not the protocol struct).
 #[derive(Default, Clone, Copy)]
-struct KcpFlags(u8);
+struct MhdFlags(u8);
 
-impl KcpFlags {
+impl MhdFlags {
     const NODELAY: u8 = 1 << 0;
     const UPDATED: u8 = 1 << 1;
     const NOCWND: u8 = 1 << 2;
@@ -337,9 +337,9 @@ impl KcpFlags {
     }
 }
 
-/// KCP control
+/// mhd control
 #[derive(Default)]
-pub struct Kcp<Output> {
+pub struct Mhd<Output> {
     /// Conversation ID
     conv: u32,
     /// Maximum Transmission Unit
@@ -390,7 +390,7 @@ pub struct Kcp<Output> {
     xmit: u32,
 
     /// Packed session flags (nodelay / updated / nocwnd / stream)
-    flags: KcpFlags,
+    flags: MhdFlags,
 
     /// Next check window timestamp
     ts_probe: u32,
@@ -400,7 +400,7 @@ pub struct Kcp<Output> {
     /// Maximum resend time
     dead_link: u32,
     /// `current` (ms) when the send window last moved: the difference between a
-    /// peer that is slow and one that is gone (see [`KCP_DEAD_GRACE_MS`]).
+    /// peer that is slow and one that is gone (see [`MHD_DEAD_GRACE_MS`]).
     last_progress: u32,
     /// Maximum payload size
     incr: usize,
@@ -411,10 +411,10 @@ pub struct Kcp<Output> {
     /// never allocates the pair.
     health: Option<std::sync::Arc<SessionHealth>>,
 
-    snd_queue: VecDeque<KcpSegment>,
-    rcv_queue: VecDeque<KcpSegment>,
-    snd_buf: VecDeque<KcpSegment>,
-    rcv_buf: VecDeque<KcpSegment>,
+    snd_queue: VecDeque<MhdSegment>,
+    rcv_queue: VecDeque<MhdSegment>,
+    snd_buf: VecDeque<MhdSegment>,
+    rcv_buf: VecDeque<MhdSegment>,
 
     /// Pending ACK
     acklist: VecDeque<(u32, u32)>,
@@ -424,12 +424,12 @@ pub struct Kcp<Output> {
     fastresend: u32,
     fastlimit: u32,
 
-    output: KcpOutput<Output>,
+    output: MhdOutput<Output>,
 }
 
-impl<Output> Debug for Kcp<Output> {
+impl<Output> Debug for Mhd<Output> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Kcp")
+        f.debug_struct("Mhd")
             .field("conv", &self.conv)
             .field("mtu", &self.mtu)
             .field("mss", &self.mss)
@@ -451,8 +451,8 @@ impl<Output> Debug for Kcp<Output> {
             .field("interval", &self.interval)
             .field("ts_flush", &self.ts_flush)
             .field("xmit", &self.xmit)
-            .field("nodelay", &self.flags.has(KcpFlags::NODELAY))
-            .field("updated", &self.flags.has(KcpFlags::UPDATED))
+            .field("nodelay", &self.flags.has(MhdFlags::NODELAY))
+            .field("updated", &self.flags.has(MhdFlags::UPDATED))
             .field("ts_probe", &self.ts_probe)
             .field("probe_wait", &self.probe_wait)
             .field("dead_link", &self.dead_link)
@@ -468,21 +468,21 @@ impl<Output> Debug for Kcp<Output> {
             .field("buf.len", &self.buf.len())
             .field("fastresend", &self.fastresend)
             .field("fastlimit", &self.fastlimit)
-            .field("nocwnd", &self.flags.has(KcpFlags::NOCWND))
-            .field("stream", &self.flags.has(KcpFlags::STREAM))
+            .field("nocwnd", &self.flags.has(MhdFlags::NOCWND))
+            .field("stream", &self.flags.has(MhdFlags::STREAM))
             // the output sink is opaque; omit its contents
             .field("output", &"<omitted>")
             .finish()
     }
 }
 
-impl<Output> Kcp<Output> {
-    /// Creates a KCP control object in stream mode, `conv` must be equal in both endpoints in one connection.
+impl<Output> Mhd<Output> {
+    /// Creates an mhd control object in stream mode, `conv` must be equal in both endpoints in one connection.
     /// `output` is the callback object for writing.
     ///
     /// `conv` represents conversation.
     pub fn new_stream(conv: u32, output: Output) -> Self {
-        Kcp::construct(conv, output, true)
+        Mhd::construct(conv, output, true)
     }
 
     /// The current maximum datagram size (header included).
@@ -504,10 +504,10 @@ impl<Output> Kcp<Output> {
     /// the `mss > 0` assertion on the send path cannot be broken by a
     /// nonsensical probe result.
     pub fn set_mtu(&mut self, mtu: usize) -> usize {
-        let mtu = mtu.max(KCP_OVERHEAD + 1);
+        let mtu = mtu.max(MHD_OVERHEAD + 1);
         if mtu != self.mtu {
             self.mtu = mtu;
-            self.mss = mtu - KCP_OVERHEAD;
+            self.mss = mtu - MHD_OVERHEAD;
         }
         self.mtu
     }
@@ -521,28 +521,28 @@ impl<Output> Kcp<Output> {
     }
 
     fn construct(conv: u32, output: Output, stream: bool) -> Self {
-        Kcp {
+        Mhd {
             conv,
             snd_una: 0,
             snd_nxt: 0,
             rcv_nxt: 0,
             ts_probe: 0,
             probe_wait: 0,
-            snd_wnd: KCP_WND_SND,
-            rcv_wnd: KCP_WND_RCV,
-            rmt_wnd: KCP_WND_RCV,
+            snd_wnd: MHD_WND_SND,
+            rcv_wnd: MHD_WND_RCV,
+            rmt_wnd: MHD_WND_RCV,
             cwnd: 0,
             incr: 0,
             probe: 0,
-            mtu: KCP_MTU_DEF,
-            mss: KCP_MTU_DEF - KCP_OVERHEAD,
+            mtu: MHD_MTU_DEF,
+            mss: MHD_MTU_DEF - MHD_OVERHEAD,
             flags: {
-                let mut flags = KcpFlags::default();
-                flags.set(KcpFlags::STREAM, stream);
+                let mut flags = MhdFlags::default();
+                flags.set(MhdFlags::STREAM, stream);
                 flags
             },
 
-            buf: BytesMut::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) * 3),
+            buf: BytesMut::with_capacity((MHD_MTU_DEF + MHD_OVERHEAD) * 3),
 
             health: None,
 
@@ -557,20 +557,20 @@ impl<Output> Kcp<Output> {
 
             rx_srtt: 0,
             rx_rttval: 0,
-            rx_rto: KCP_RTO_DEF,
-            rx_minrto: KCP_RTO_MIN,
+            rx_rto: MHD_RTO_DEF,
+            rx_minrto: MHD_RTO_MIN,
 
             current: 0,
-            interval: KCP_INTERVAL,
-            ts_flush: KCP_INTERVAL,
-            ssthresh: KCP_THRESH_INIT,
+            interval: MHD_INTERVAL,
+            ts_flush: MHD_INTERVAL,
+            ssthresh: MHD_THRESH_INIT,
             fastresend: 0,
-            fastlimit: KCP_FASTACK_LIMIT,
+            fastlimit: MHD_FASTACK_LIMIT,
             xmit: 0,
-            dead_link: KCP_DEADLINK,
+            dead_link: MHD_DEADLINK,
             last_progress: 0,
 
-            output: KcpOutput(output),
+            output: MhdOutput(output),
         }
     }
 
@@ -602,7 +602,7 @@ impl<Output> Kcp<Output> {
     /// `recv_owned`, so it is test-gated rather than left dead (or worse,
     /// allowed-dead).
     #[cfg(test)]
-    pub fn recv(&mut self, buf: &mut [u8]) -> KcpResult<usize> {
+    pub fn recv(&mut self, buf: &mut [u8]) -> MhdResult<usize> {
         let peeksize = self.peeksize()?;
 
         if peeksize > buf.len() {
@@ -635,7 +635,7 @@ impl<Output> Kcp<Output> {
     /// message. A non-zero `frg` would mean message mode, which nothing
     /// here builds; it answers `ExpectingFragment` like `recv` does
     /// rather than guessing at a merge.
-    fn recv_pop(&mut self) -> KcpResult<Bytes> {
+    fn recv_pop(&mut self) -> MhdResult<Bytes> {
         if self.rcv_queue.front().is_some_and(|seg| seg.frg != 0) {
             return Err(Error::ExpectingFragment);
         }
@@ -653,21 +653,21 @@ impl<Output> Kcp<Output> {
         if self.rcv_queue.len() < self.rcv_wnd as usize && recover {
             // ready to send back IKCP_CMD_WINS in ikcp_flush
             // tell remote my window size
-            self.probe |= KCP_ASK_TELL;
+            self.probe |= MHD_ASK_TELL;
         }
 
         Ok(data)
     }
 
     /// Receive the next message as an owned buffer (see `recv_pop`).
-    pub fn recv_owned(&mut self) -> KcpResult<Bytes> {
+    pub fn recv_owned(&mut self) -> MhdResult<Bytes> {
         self.recv_pop()
     }
 
     /// Check buffer size without actually consuming it.
     /// Test-gated together with its only caller, `recv`.
     #[cfg(test)]
-    pub fn peeksize(&self) -> KcpResult<usize> {
+    pub fn peeksize(&self) -> MhdResult<usize> {
         match self.rcv_queue.front() {
             Some(segment) => {
                 if segment.frg == 0 {
@@ -702,13 +702,13 @@ impl<Output> Kcp<Output> {
     /// copy per segment and exists so the two can be compared byte for
     /// byte.
     #[cfg(test)]
-    pub fn send(&mut self, mut buf: &[u8]) -> KcpResult<usize> {
+    pub fn send(&mut self, mut buf: &[u8]) -> MhdResult<usize> {
         let mut sent_size = 0;
 
         assert!(self.mss > 0);
 
         // append to previous segment in streaming mode (if possible)
-        if self.flags.has(KcpFlags::STREAM) {
+        if self.flags.has(MhdFlags::STREAM) {
             if let Some(old) = self.snd_queue.back_mut() {
                 let l = old.data.len();
                 if l < self.mss {
@@ -742,12 +742,12 @@ impl<Output> Kcp<Output> {
 
         let count = buf.len().div_ceil(self.mss);
 
-        if count >= KCP_WND_RCV as usize {
+        if count >= MHD_WND_RCV as usize {
             debug!("send bufsize={} mss={} too large", buf.len(), self.mss);
             // stream mode already extended the queued segment: report the
             // partial progress like the reference instead of erroring (a
             // retry after the error would duplicate the appended bytes)
-            if self.flags.has(KcpFlags::STREAM) && sent_size > 0 {
+            if self.flags.has(MhdFlags::STREAM) && sent_size > 0 {
                 return Ok(sent_size);
             }
             return Err(Error::UserBufTooBig);
@@ -760,14 +760,14 @@ impl<Output> Kcp<Output> {
 
             let (lf, rt) = buf.split_at(size);
 
-            let mut new_segment = KcpSegment::new_with_data(Bytes::copy_from_slice(lf));
+            let mut new_segment = MhdSegment::new_with_data(Bytes::copy_from_slice(lf));
             buf = rt;
 
-            // `count` is checked against `KCP_WND_RCV` (128) above, so
+            // `count` is checked against `MHD_WND_RCV` (128) above, so
             // the fragment index fits u8; an impossible overshoot reports
             // the same too-big-buffer error that check produces.
             let frg = u8::try_from(count - i - 1).map_err(|_| Error::UserBufTooBig)?;
-            new_segment.frg = if self.flags.has(KcpFlags::STREAM) {
+            new_segment.frg = if self.flags.has(MhdFlags::STREAM) {
                 0
             } else {
                 frg
@@ -787,13 +787,13 @@ impl<Output> Kcp<Output> {
     /// MSS-sized segment is an O(1) `Bytes::slice` of it — no per-segment
     /// copy. The window, ordering and error semantics are exactly `send`'s;
     /// the only difference is where the bytes live.
-    pub fn send_owned(&mut self, mut data: Bytes) -> KcpResult<usize> {
+    pub fn send_owned(&mut self, mut data: Bytes) -> MhdResult<usize> {
         let mut sent_size = 0;
 
         assert!(self.mss > 0);
 
         // append to previous segment in streaming mode (if possible)
-        if self.flags.has(KcpFlags::STREAM) {
+        if self.flags.has(MhdFlags::STREAM) {
             if let Some(old) = self.snd_queue.back_mut() {
                 let l = old.data.len();
                 if l < self.mss {
@@ -825,12 +825,12 @@ impl<Output> Kcp<Output> {
 
         let count = data.len().div_ceil(self.mss);
 
-        if count >= KCP_WND_RCV as usize {
+        if count >= MHD_WND_RCV as usize {
             debug!("send bufsize={} mss={} too large", data.len(), self.mss);
             // stream mode already extended the queued segment: report the
             // partial progress like the reference instead of erroring (a
             // retry after the error would duplicate the appended bytes)
-            if self.flags.has(KcpFlags::STREAM) && sent_size > 0 {
+            if self.flags.has(MhdFlags::STREAM) && sent_size > 0 {
                 return Ok(sent_size);
             }
             return Err(Error::UserBufTooBig);
@@ -845,13 +845,13 @@ impl<Output> Kcp<Output> {
             // buffer and leaves the rest in `data`: an O(1) handle split,
             // no copy.
             let rest = data.split_to(size);
-            let mut new_segment = KcpSegment::new_with_data(rest);
+            let mut new_segment = MhdSegment::new_with_data(rest);
 
-            // `count` is checked against `KCP_WND_RCV` (128) above, so
+            // `count` is checked against `MHD_WND_RCV` (128) above, so
             // the fragment index fits u8; an impossible overshoot reports
             // the same too-big-buffer error that check produces.
             let frg = u8::try_from(count - i - 1).map_err(|_| Error::UserBufTooBig)?;
-            new_segment.frg = if self.flags.has(KcpFlags::STREAM) {
+            new_segment.frg = if self.flags.has(MhdFlags::STREAM) {
                 0
             } else {
                 frg
@@ -877,9 +877,9 @@ impl<Output> Kcp<Output> {
             }
         }
         let headroom = cmp::max(self.interval, 4 * self.rx_rttval)
-            .max(self.rx_srtt / KCP_RTO_HEADROOM_DIVISOR);
+            .max(self.rx_srtt / MHD_RTO_HEADROOM_DIVISOR);
         let rto = self.rx_srtt + headroom;
-        self.rx_rto = bound(self.rx_minrto, rto, KCP_RTO_MAX);
+        self.rx_rto = bound(self.rx_minrto, rto, MHD_RTO_MAX);
     }
 
     #[inline]
@@ -942,7 +942,7 @@ impl<Output> Kcp<Output> {
         self.acklist.push_back((sn, ts));
     }
 
-    fn parse_data(&mut self, new_segment: KcpSegment) {
+    fn parse_data(&mut self, new_segment: MhdSegment) {
         let sn = new_segment.sn;
 
         if timediff(sn, self.rcv_nxt + u32::from(self.rcv_wnd)) >= 0
@@ -986,12 +986,12 @@ impl<Output> Kcp<Output> {
     /// One pass over the datagram's segments: `SegHead::parse` reads and
     /// validates each header, the per-command arms branch on it, and the
     /// congestion window is recomputed once the whole batch is consumed.
-    pub fn input(&mut self, buf: &[u8]) -> KcpResult<usize> {
+    pub fn input(&mut self, buf: &[u8]) -> MhdResult<usize> {
         trace!("[RI] {} bytes", buf.len());
 
-        if buf.len() < KCP_OVERHEAD {
+        if buf.len() < MHD_OVERHEAD {
             debug!(
-                "input bufsize={} too small, at least {KCP_OVERHEAD}",
+                "input bufsize={} too small, at least {MHD_OVERHEAD}",
                 buf.len()
             );
             return Err(Error::InvalidSegmentSize(buf.len()));
@@ -1003,7 +1003,7 @@ impl<Output> Kcp<Output> {
         let mut latest_ts = 0;
 
         let mut buf = Cursor::new(buf);
-        while buf.remaining() >= KCP_OVERHEAD {
+        while buf.remaining() >= MHD_OVERHEAD {
             let head = SegHead::parse(&mut buf, self.conv)?;
 
             self.rmt_wnd = head.wnd;
@@ -1014,7 +1014,7 @@ impl<Output> Kcp<Output> {
             let mut has_read_data = false;
 
             match head.cmd {
-                KCP_CMD_ACK => {
+                MHD_CMD_ACK => {
                     // A negative timediff is a clock wrap, not an RTT
                     // sample: the u32 conversion succeeds exactly when
                     // the sample is non-negative, so it subsumes the
@@ -1043,17 +1043,17 @@ impl<Output> Kcp<Output> {
                         self.rx_rto
                     );
                 }
-                KCP_CMD_PUSH => {
+                MHD_CMD_PUSH => {
                     trace!("input psh: sn={} ts={}", head.sn, head.ts);
                     has_read_data = self.accept_push(&mut buf, &head)?;
                 }
-                KCP_CMD_WASK => {
+                MHD_CMD_WASK => {
                     // ready to send back IKCP_CMD_WINS in ikcp_flush
                     // tell remote my window size
                     trace!("input probe");
-                    self.probe |= KCP_ASK_TELL;
+                    self.probe |= MHD_ASK_TELL;
                 }
-                KCP_CMD_WINS => {
+                MHD_CMD_WINS => {
                     // Do nothing
                     trace!("input wins: {}", head.wnd);
                 }
@@ -1073,18 +1073,18 @@ impl<Output> Kcp<Output> {
 
         self.update_cwnd_after_acks(old_una);
 
-        KCP_DATAGRAMS_IN.fetch_add(1, Relaxed);
+        MHD_DATAGRAMS_IN.fetch_add(1, Relaxed);
         // The cursor cannot advance past the datagram it was created
         // over, so the position always fits in `usize`.
         Ok(usize::try_from(buf.position()).unwrap_or(usize::MAX))
     }
 
-    /// The PUSH arm of [`Kcp::input`]: acknowledge the segment and, when
+    /// The PUSH arm of [`Mhd::input`]: acknowledge the segment and, when
     /// it is inside the receive window and in order, read its payload
     /// into the receive pipeline as an owned shared buffer. Returns
     /// whether the payload was consumed from the cursor — the caller
     /// skips over it otherwise.
-    fn accept_push(&mut self, buf: &mut Cursor<&[u8]>, head: &SegHead) -> KcpResult<bool> {
+    fn accept_push(&mut self, buf: &mut Cursor<&[u8]>, head: &SegHead) -> MhdResult<bool> {
         if timediff(head.sn, self.rcv_nxt + u32::from(self.rcv_wnd)) >= 0 {
             return Ok(false);
         }
@@ -1099,7 +1099,7 @@ impl<Output> Kcp<Output> {
         let mut sbuf = BytesMut::zeroed(head.len);
         buf.read_exact(&mut sbuf)?;
 
-        let mut segment = KcpSegment::new_with_data(sbuf.freeze());
+        let mut segment = MhdSegment::new_with_data(sbuf.freeze());
 
         segment.conv = head.conv;
         segment.cmd = head.cmd;
@@ -1160,21 +1160,21 @@ impl<Output> Kcp<Output> {
         // probe window size (if remote window size equals zero)
         if self.rmt_wnd == 0 {
             if self.probe_wait == 0 {
-                self.probe_wait = KCP_PROBE_INIT;
+                self.probe_wait = MHD_PROBE_INIT;
                 self.ts_probe = self.current + self.probe_wait;
             } else if timediff(self.current, self.ts_probe) >= 0 {
-                if self.probe_wait < KCP_PROBE_INIT {
-                    self.probe_wait = KCP_PROBE_INIT;
+                if self.probe_wait < MHD_PROBE_INIT {
+                    self.probe_wait = MHD_PROBE_INIT;
                 }
 
                 self.probe_wait += self.probe_wait / 2;
 
-                if self.probe_wait > KCP_PROBE_LIMIT {
-                    self.probe_wait = KCP_PROBE_LIMIT;
+                if self.probe_wait > MHD_PROBE_LIMIT {
+                    self.probe_wait = MHD_PROBE_LIMIT;
                 }
 
                 self.ts_probe = self.current + self.probe_wait;
-                self.probe |= KCP_ASK_SEND;
+                self.probe |= MHD_ASK_SEND;
             }
         } else {
             self.ts_probe = 0;
@@ -1187,7 +1187,7 @@ impl<Output> Kcp<Output> {
     /// is due (assuming no `input`/`send` in between) — a duration, unlike
     /// the reference's absolute timestamp.
     pub fn check(&self, current: u32) -> u32 {
-        if !self.flags.has(KcpFlags::UPDATED) {
+        if !self.flags.has(MhdFlags::UPDATED) {
             return 0;
         }
 
@@ -1232,11 +1232,11 @@ impl<Output> Kcp<Output> {
     /// `resend`: 0:disable fast resend(default), 1:enable fast resend
     /// `nc`: `false`: normal congestion control(default), `true`: disable congestion control
     pub fn set_nodelay(&mut self, nodelay: bool, interval: i32, resend: i32, nc: bool) {
-        self.flags.set(KcpFlags::NODELAY, nodelay);
+        self.flags.set(MhdFlags::NODELAY, nodelay);
         if nodelay {
-            self.rx_minrto = KCP_RTO_NDL;
+            self.rx_minrto = MHD_RTO_NDL;
         } else {
-            self.rx_minrto = KCP_RTO_MIN;
+            self.rx_minrto = MHD_RTO_MIN;
         }
 
         // The match arms clamp the interval into [10, 5000], so the
@@ -1252,7 +1252,7 @@ impl<Output> Kcp<Output> {
             self.fastresend = fastresend;
         }
 
-        self.flags.set(KcpFlags::NOCWND, nc);
+        self.flags.set(MhdFlags::NOCWND, nc);
     }
 
     /// Set `wndsize`
@@ -1263,7 +1263,7 @@ impl<Output> Kcp<Output> {
         }
 
         if rcvwnd > 0 {
-            self.rcv_wnd = cmp::max(rcvwnd, KCP_WND_RCV);
+            self.rcv_wnd = cmp::max(rcvwnd, MHD_WND_RCV);
         }
     }
 
@@ -1344,7 +1344,7 @@ impl<Output> Kcp<Output> {
         self.rcv_nxt
     }
 
-    /// Check if KCP connection is dead (resend times excceeded *and* the send
+    /// Check if mhd connection is dead (resend times excceeded *and* the send
     /// window has stood still — see [`Self::peer_is_gone`])
     #[inline]
     pub fn is_dead_link(&self) -> bool {
@@ -1359,15 +1359,15 @@ impl<Output> Kcp<Output> {
 /// wrong: acknowledgements queued behind megabytes of shaped traffic arrive
 /// later than the retransmissions they would have stopped, so the count climbs
 /// on a peer that is answering everything. The silence is what separates a peer
-/// that is slow from one that is absent (see [`KCP_DEAD_GRACE_MS`]).
+/// that is slow from one that is absent (see [`MHD_DEAD_GRACE_MS`]).
 #[inline]
 const fn peer_is_gone(xmit: u32, dead_link: u32, window_still: bool) -> bool {
     xmit >= dead_link && window_still
 }
 
-/// One parsed KCP segment header, as read off the wire in [`Kcp::input`].
+/// One parsed mhd segment header, as read off the wire in [`Mhd::input`].
 ///
-/// The fields are handed to [`Kcp::accept_push`] as one value so the
+/// The fields are handed to [`Mhd::accept_push`] as one value so the
 /// receive path stays a function of the segment, not of eight loose
 /// locals.
 struct SegHead {
@@ -1386,7 +1386,7 @@ struct SegHead {
 impl SegHead {
     /// Read one segment header off the wire, validating the conversation
     /// id, the declared payload length and the command byte.
-    fn parse(buf: &mut Cursor<&[u8]>, expected_conv: u32) -> KcpResult<SegHead> {
+    fn parse(buf: &mut Cursor<&[u8]>, expected_conv: u32) -> MhdResult<SegHead> {
         let conv = buf.get_u32_le();
         if conv != expected_conv {
             // like the reference: a mismatched conversation is a hard
@@ -1413,7 +1413,7 @@ impl SegHead {
         }
 
         match cmd {
-            KCP_CMD_PUSH | KCP_CMD_ACK | KCP_CMD_WASK | KCP_CMD_WINS => {}
+            MHD_CMD_PUSH | MHD_CMD_ACK | MHD_CMD_WASK | MHD_CMD_WINS => {}
             _ => {
                 debug!("input cmd={cmd} unrecognized");
                 return Err(Error::UnsupportedCmd(cmd));
@@ -1433,15 +1433,15 @@ impl SegHead {
     }
 }
 
-impl<Output: DatagramSink> Kcp<Output> {
-    fn flush_ack_inner(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
+impl<Output: DatagramSink> Mhd<Output> {
+    fn flush_ack_inner(&mut self, segment: &mut MhdSegment) -> MhdResult<()> {
         // flush acknowledges
-        KCP_ACKS_OUT.fetch_add(
+        MHD_ACKS_OUT.fetch_add(
             u64::try_from(self.acklist.len()).unwrap_or(u64::MAX),
             Relaxed,
         );
         for &(sn, ts) in &self.acklist {
-            if self.buf.len() + KCP_OVERHEAD > self.mtu {
+            if self.buf.len() + MHD_OVERHEAD > self.mtu {
                 self.output.write_all(&self.buf)?;
                 self.buf.clear();
             }
@@ -1454,9 +1454,9 @@ impl<Output: DatagramSink> Kcp<Output> {
         Ok(())
     }
 
-    fn flush_probe_commands_inner(&mut self, cmd: u8, segment: &mut KcpSegment) -> KcpResult<()> {
+    fn flush_probe_commands_inner(&mut self, cmd: u8, segment: &mut MhdSegment) -> MhdResult<()> {
         segment.cmd = cmd;
-        if self.buf.len() + KCP_OVERHEAD > self.mtu {
+        if self.buf.len() + MHD_OVERHEAD > self.mtu {
             self.output.write_all(&self.buf)?;
             self.buf.clear();
         }
@@ -1464,30 +1464,30 @@ impl<Output: DatagramSink> Kcp<Output> {
         Ok(())
     }
 
-    fn flush_probe_commands(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
+    fn flush_probe_commands(&mut self, segment: &mut MhdSegment) -> MhdResult<()> {
         // flush window probing commands
-        if (self.probe & KCP_ASK_SEND) != 0 {
-            self.flush_probe_commands_inner(KCP_CMD_WASK, segment)?;
+        if (self.probe & MHD_ASK_SEND) != 0 {
+            self.flush_probe_commands_inner(MHD_CMD_WASK, segment)?;
         }
 
         // flush window probing commands
-        if (self.probe & KCP_ASK_TELL) != 0 {
-            self.flush_probe_commands_inner(KCP_CMD_WINS, segment)?;
+        if (self.probe & MHD_ASK_TELL) != 0 {
+            self.flush_probe_commands_inner(MHD_CMD_WINS, segment)?;
         }
         self.probe = 0;
         Ok(())
     }
 
     /// Flush pending ACKs
-    pub fn flush_ack(&mut self) -> KcpResult<()> {
-        if !self.flags.has(KcpFlags::UPDATED) {
+    pub fn flush_ack(&mut self) -> MhdResult<()> {
+        if !self.flags.has(MhdFlags::UPDATED) {
             debug!("flush updated() must be called at least once");
             return Err(Error::NeedUpdate);
         }
 
-        let mut segment = KcpSegment {
+        let mut segment = MhdSegment {
             conv: self.conv,
-            cmd: KCP_CMD_ACK,
+            cmd: MHD_CMD_ACK,
             wnd: self.wnd_unused(),
             una: self.rcv_nxt,
             ..Default::default()
@@ -1497,8 +1497,8 @@ impl<Output: DatagramSink> Kcp<Output> {
     }
 
     /// Flush pending data in buffer.
-    pub fn flush(&mut self) -> KcpResult<()> {
-        if !self.flags.has(KcpFlags::UPDATED) {
+    pub fn flush(&mut self) -> MhdResult<()> {
+        if !self.flags.has(MhdFlags::UPDATED) {
             debug!("flush updated() must be called at least once");
             return Err(Error::NeedUpdate);
         }
@@ -1507,9 +1507,9 @@ impl<Output: DatagramSink> Kcp<Output> {
         // it stood when this flush began, not the min() window below
         let prior_cwnd = self.cwnd;
 
-        let mut segment = KcpSegment {
+        let mut segment = MhdSegment {
             conv: self.conv,
-            cmd: KCP_CMD_ACK,
+            cmd: MHD_CMD_ACK,
             wnd: self.wnd_unused(),
             una: self.rcv_nxt,
             ..Default::default()
@@ -1521,7 +1521,7 @@ impl<Output: DatagramSink> Kcp<Output> {
 
         // calculate window size
         let mut cwnd = cmp::min(self.snd_wnd, self.rmt_wnd);
-        if !self.flags.has(KcpFlags::NOCWND) {
+        if !self.flags.has(MhdFlags::NOCWND) {
             cwnd = cmp::min(self.cwnd, cwnd);
         }
 
@@ -1535,7 +1535,7 @@ impl<Output: DatagramSink> Kcp<Output> {
             u32::MAX
         };
 
-        let rtomin = if self.flags.has(KcpFlags::NODELAY) {
+        let rtomin = if self.flags.has(MhdFlags::NODELAY) {
             0
         } else {
             self.rx_rto >> 3
@@ -1545,7 +1545,7 @@ impl<Output: DatagramSink> Kcp<Output> {
         let mut change = 0;
         // Read the dead-link inputs before the loop borrows `snd_buf` mutably.
         let dead_link = self.dead_link;
-        let window_still = timediff(self.current, self.last_progress) > KCP_DEAD_GRACE_MS;
+        let window_still = timediff(self.current, self.last_progress) > MHD_DEAD_GRACE_MS;
 
         for snd_segment in &mut self.snd_buf {
             let mut need_send = false;
@@ -1559,12 +1559,12 @@ impl<Output: DatagramSink> Kcp<Output> {
                 need_send = true;
                 snd_segment.xmit += 1;
                 self.xmit += 1;
-                KCP_RETRANSMITS.fetch_add(1, Relaxed);
-                KCP_RESENDS_RTO.fetch_add(1, Relaxed);
+                MHD_RETRANSMITS.fetch_add(1, Relaxed);
+                MHD_RESENDS_RTO.fetch_add(1, Relaxed);
                 if let Some(health) = &self.health {
                     health.retransmits.fetch_add(1, Relaxed);
                 }
-                if self.flags.has(KcpFlags::NODELAY) {
+                if self.flags.has(MhdFlags::NODELAY) {
                     // nodelay steps the RTO by half instead of doubling it
                     let step = snd_segment.rto;
                     snd_segment.rto += step / 2;
@@ -1581,8 +1581,8 @@ impl<Output: DatagramSink> Kcp<Output> {
                 snd_segment.fastack = 0;
                 snd_segment.resendts = self.current + snd_segment.rto;
                 change += 1;
-                KCP_RETRANSMITS.fetch_add(1, Relaxed);
-                KCP_RESENDS_FAST.fetch_add(1, Relaxed);
+                MHD_RETRANSMITS.fetch_add(1, Relaxed);
+                MHD_RESENDS_FAST.fetch_add(1, Relaxed);
                 if let Some(health) = &self.health {
                     health.retransmits.fetch_add(1, Relaxed);
                 }
@@ -1601,12 +1601,12 @@ impl<Output: DatagramSink> Kcp<Output> {
                 // the payload. Packed acks (or a datagram that does not
                 // fit the two-iovec shape) keep the reference path, and
                 // the bytes are identical either way.
-                if self.buf.is_empty() && snd_segment.cmd == KCP_CMD_PUSH {
+                if self.buf.is_empty() && snd_segment.cmd == MHD_CMD_PUSH {
                     let header = snd_segment.encode_header();
                     let payload = snd_segment.data.clone();
                     self.output.write_datagram(&header, &payload)?;
                 } else {
-                    let need = KCP_OVERHEAD + snd_segment.data.len();
+                    let need = MHD_OVERHEAD + snd_segment.data.len();
 
                     if self.buf.len() + need > self.mtu {
                         self.output.write_all(&self.buf)?;
@@ -1650,7 +1650,7 @@ impl<Output: DatagramSink> Kcp<Output> {
             match self.snd_queue.pop_front() {
                 Some(mut new_segment) => {
                     new_segment.conv = self.conv;
-                    new_segment.cmd = KCP_CMD_PUSH;
+                    new_segment.cmd = MHD_CMD_PUSH;
                     new_segment.wnd = wnd;
                     new_segment.ts = self.current;
                     new_segment.sn = self.snd_nxt;
@@ -1680,8 +1680,8 @@ impl<Output: DatagramSink> Kcp<Output> {
         if change > 0 {
             let inflight = self.snd_nxt - self.snd_una;
             self.ssthresh = u16::try_from(inflight).unwrap_or(u16::MAX) / 2;
-            if self.ssthresh < KCP_THRESH_MIN {
-                self.ssthresh = KCP_THRESH_MIN;
+            if self.ssthresh < MHD_THRESH_MIN {
+                self.ssthresh = MHD_THRESH_MIN;
             }
             self.cwnd = self.ssthresh + u16::try_from(resent).unwrap_or(u16::MAX);
             self.incr = usize::from(self.cwnd) * self.mss;
@@ -1689,8 +1689,8 @@ impl<Output: DatagramSink> Kcp<Output> {
 
         if lost {
             self.ssthresh = prior_cwnd / 2;
-            if self.ssthresh < KCP_THRESH_MIN {
-                self.ssthresh = KCP_THRESH_MIN;
+            if self.ssthresh < MHD_THRESH_MIN {
+                self.ssthresh = MHD_THRESH_MIN;
             }
             self.cwnd = 1;
             self.incr = self.mss;
@@ -1705,11 +1705,11 @@ impl<Output: DatagramSink> Kcp<Output> {
     /// Update state every 10ms ~ 100ms.
     ///
     /// Or you can ask `check` when to call this again.
-    pub fn update(&mut self, current: u32) -> KcpResult<()> {
+    pub fn update(&mut self, current: u32) -> MhdResult<()> {
         self.current = current;
 
-        if !self.flags.has(KcpFlags::UPDATED) {
-            self.flags.set(KcpFlags::UPDATED, true);
+        if !self.flags.has(MhdFlags::UPDATED) {
+            self.flags.set(MhdFlags::UPDATED, true);
             self.ts_flush = self.current;
         }
 
@@ -1743,7 +1743,7 @@ mod tests {
 
     /// One captured two-iovec emission: the staged header plus the payload
     /// handle the sink received.
-    type SplitEntry = ([u8; KCP_OVERHEAD], Bytes);
+    type SplitEntry = ([u8; MHD_OVERHEAD], Bytes);
 
     /// A `Write` the test can read back: the engine's output, shared by
     /// clone so the sender and the assertion see the same buffer.
@@ -1767,48 +1767,48 @@ mod tests {
     /// multiplexed session on every round of the bench's `loss1_rate100` cell.
     #[test]
     fn the_dead_link_needs_silence_not_just_retransmits() {
-        let mut kcp = Kcp::new_stream(0x1234, SharedBuf::default());
-        kcp.update(1).unwrap();
-        kcp.send(&[0u8; 64]).unwrap();
-        kcp.flush().unwrap();
+        let mut mhd = Mhd::new_stream(0x1234, SharedBuf::default());
+        mhd.update(1).unwrap();
+        mhd.send(&[0u8; 64]).unwrap();
+        mhd.flush().unwrap();
 
         // The same silence test `flush` performs, spelled out here so the two
         // thresholds stay visible.
         let still =
-            |kcp: &Kcp<SharedBuf>| timediff(kcp.current, kcp.last_progress) > KCP_DEAD_GRACE_MS;
-        let grace = u32::try_from(KCP_DEAD_GRACE_MS).unwrap();
-        kcp.current = 10_000;
+            |mhd: &Mhd<SharedBuf>| timediff(mhd.current, mhd.last_progress) > MHD_DEAD_GRACE_MS;
+        let grace = u32::try_from(MHD_DEAD_GRACE_MS).unwrap();
+        mhd.current = 10_000;
 
         // The count alone, with progress just inside the grace: alive.
-        kcp.last_progress = 10_000 - (grace - 1);
-        assert!(!peer_is_gone(KCP_DEADLINK, KCP_DEADLINK, still(&kcp)));
+        mhd.last_progress = 10_000 - (grace - 1);
+        assert!(!peer_is_gone(MHD_DEADLINK, MHD_DEADLINK, still(&mhd)));
 
         // The same count with the window still where it was a whole grace ago:
         // a peer that has stopped answering.
-        kcp.last_progress = 10_000 - (grace + 1);
-        assert!(peer_is_gone(KCP_DEADLINK, KCP_DEADLINK, still(&kcp)));
+        mhd.last_progress = 10_000 - (grace + 1);
+        assert!(peer_is_gone(MHD_DEADLINK, MHD_DEADLINK, still(&mhd)));
 
         // Below the count it is not a dead link either, however quiet: the
         // first retransmissions of a stalled segment are what the RTO loop is
         // for, and a peer that comes back inside them is served.
-        assert!(!peer_is_gone(KCP_DEADLINK - 1, KCP_DEADLINK, still(&kcp)));
+        assert!(!peer_is_gone(MHD_DEADLINK - 1, MHD_DEADLINK, still(&mhd)));
 
         // And the rule is what ends a session: a flush past both thresholds
         // flips the state the adapter reads. Nodelay, as the adapter configures
         // it, so the RTO steps by half of itself per retransmit rather than
         // doubling — the difference between reaching the trigger in twenty
         // rounds and in fifteen.
-        kcp.set_nodelay(true, 10, 2, true);
-        kcp.current = 10_000_000;
-        kcp.last_progress = 0;
-        for _ in 0..(KCP_DEADLINK + 2) {
+        mhd.set_nodelay(true, 10, 2, true);
+        mhd.current = 10_000_000;
+        mhd.last_progress = 0;
+        for _ in 0..(MHD_DEADLINK + 2) {
             // Far beyond any RTO the escalation can reach in nodelay mode, so
             // every round retransmits.
-            kcp.current += 10 * KCP_RTO_MAX;
-            kcp.flush().unwrap();
+            mhd.current += 10 * MHD_RTO_MAX;
+            mhd.flush().unwrap();
         }
         assert!(
-            kcp.is_dead_link(),
+            mhd.is_dead_link(),
             "a window that has stood still past the grace, with the count over the trigger, \
              must end the session"
         );
@@ -1816,28 +1816,28 @@ mod tests {
 
     /// The timeout must stay ahead of the round trip it is timing, by a margin
     /// that grows with it — the interval term alone leaves a long path with none
-    /// (see [`KCP_RTO_HEADROOM_DIVISOR`]).
+    /// (see [`MHD_RTO_HEADROOM_DIVISOR`]).
     #[test]
     fn a_long_path_gets_rto_headroom() {
         let out = SharedBuf::default();
-        let mut kcp = Kcp::new_stream(0x1234, out);
+        let mut mhd = Mhd::new_stream(0x1234, out);
         // The adapter's parameters: a 10 ms flush interval, nodelay.
-        kcp.set_nodelay(true, 10, 2, true);
+        mhd.set_nodelay(true, 10, 2, true);
 
         // A steady 200 ms round trip with no jitter (a shaped path).
         for _ in 0..8 {
-            kcp.update_ack(200);
+            mhd.update_ack(200);
         }
-        assert_eq!(kcp.rx_srtt, 200);
+        assert_eq!(mhd.rx_srtt, 200);
         assert!(
-            kcp.rx_rto >= 200 + 200 / KCP_RTO_HEADROOM_DIVISOR,
+            mhd.rx_rto >= 200 + 200 / MHD_RTO_HEADROOM_DIVISOR,
             "a 200 ms path got an RTO of {} ms: the timeout must clear the round \
              trip by a margin that grows with it",
-            kcp.rx_rto
+            mhd.rx_rto
         );
 
         // A short path is untouched: the interval term still dominates.
-        let mut lan = Kcp::new_stream(0x1234, SharedBuf::default());
+        let mut lan = Mhd::new_stream(0x1234, SharedBuf::default());
         lan.set_nodelay(true, 10, 2, true);
         for _ in 0..8 {
             lan.update_ack(1);
@@ -1853,20 +1853,20 @@ mod tests {
     /// *policy* (which size a path deserves) lives there, the invariant here.
     #[test]
     fn set_mtu_follows_the_caller_and_keeps_a_payload() {
-        let mut kcp = Kcp::new_stream(0x1234, SharedBuf::default());
-        assert_eq!(kcp.mtu(), KCP_MTU_DEF);
-        assert_eq!(kcp.mss, KCP_MTU_DEF - KCP_OVERHEAD);
+        let mut mhd = Mhd::new_stream(0x1234, SharedBuf::default());
+        assert_eq!(mhd.mtu(), MHD_MTU_DEF);
+        assert_eq!(mhd.mss, MHD_MTU_DEF - MHD_OVERHEAD);
 
-        assert_eq!(kcp.set_mtu(1252), 1252);
-        assert_eq!(kcp.mss, 1252 - KCP_OVERHEAD);
+        assert_eq!(mhd.set_mtu(1252), 1252);
+        assert_eq!(mhd.mss, 1252 - MHD_OVERHEAD);
 
         // A jumbo path grows the datagram — the whole point of the setter.
-        assert_eq!(kcp.set_mtu(8000), 8000);
-        assert_eq!(kcp.mss, 8000 - KCP_OVERHEAD);
+        assert_eq!(mhd.set_mtu(8000), 8000);
+        assert_eq!(mhd.mss, 8000 - MHD_OVERHEAD);
 
         // Nonsense cannot produce an empty payload: `send` asserts `mss > 0`.
-        assert_eq!(kcp.set_mtu(0), KCP_OVERHEAD + 1);
-        assert_eq!(kcp.mss, 1);
+        assert_eq!(mhd.set_mtu(0), MHD_OVERHEAD + 1);
+        assert_eq!(mhd.mss, 1);
     }
 
     impl DatagramSink for SharedBuf {
@@ -1875,10 +1875,10 @@ mod tests {
         fn write_datagram(&mut self, header: &[u8], payload: &Bytes) -> io::Result<usize> {
             let total = header.len() + payload.len();
             assert!(
-                total <= KCP_MTU_DEF,
+                total <= MHD_MTU_DEF,
                 "a stream-mode datagram is at most one MTU"
             );
-            let mut buf = [0u8; KCP_MTU_DEF];
+            let mut buf = [0u8; MHD_MTU_DEF];
             buf[..header.len()].copy_from_slice(header);
             buf[header.len()..total].copy_from_slice(payload);
             self.write_all(&buf[..total])?;
@@ -1907,7 +1907,7 @@ mod tests {
 
     impl DatagramSink for SplitCapture {
         fn write_datagram(&mut self, header: &[u8], payload: &Bytes) -> io::Result<usize> {
-            let mut hdr = [0u8; KCP_OVERHEAD];
+            let mut hdr = [0u8; MHD_OVERHEAD];
             hdr.copy_from_slice(header);
             self.split.borrow_mut().push((hdr, payload.clone()));
             Ok(header.len() + payload.len())
@@ -1919,11 +1919,11 @@ mod tests {
     /// each datagram is a 24-byte header plus `mss` bytes — the final one
     /// plus the remainder.
     fn split_push_datagrams(buf: &[u8]) -> Vec<&[u8]> {
-        let mss = KCP_MTU_DEF - KCP_OVERHEAD;
+        let mss = MHD_MTU_DEF - MHD_OVERHEAD;
         let mut out = Vec::new();
         let mut rest = buf;
         while !rest.is_empty() {
-            let len = (KCP_OVERHEAD + mss).min(rest.len());
+            let len = (MHD_OVERHEAD + mss).min(rest.len());
             out.push(&rest[..len]);
             rest = &rest[len..];
         }
@@ -1936,15 +1936,15 @@ mod tests {
     /// zero-copy path the adapter now uses.
     fn roundtrip(payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let out = SharedBuf::default();
-        let mut sender = Kcp::new_stream(7, out.clone());
+        let mut sender = Mhd::new_stream(7, out.clone());
         sender.update(1).unwrap();
         assert_eq!(sender.send(payload).unwrap(), payload.len());
         sender.flush().unwrap();
         let wire = out.0.borrow().clone();
         assert!(!wire.is_empty(), "the sender emitted nothing");
 
-        let mut copied_engine = Kcp::new_stream(7, SharedBuf::default());
-        let mut owned_engine = Kcp::new_stream(7, SharedBuf::default());
+        let mut copied_engine = Mhd::new_stream(7, SharedBuf::default());
+        let mut owned_engine = Mhd::new_stream(7, SharedBuf::default());
         copied_engine.update(1).unwrap();
         owned_engine.update(1).unwrap();
         for datagram in split_push_datagrams(&wire) {
@@ -1990,8 +1990,8 @@ mod tests {
         // deliver either way — so the check starts at one byte.)
         for payload in [
             &b"x"[..],
-            b"hello kcp",
-            &[0x5Au8; KCP_MTU_DEF - KCP_OVERHEAD], // exactly one MSS
+            b"hello mhd",
+            &[0x5Au8; MHD_MTU_DEF - MHD_OVERHEAD], // exactly one MSS
         ] {
             let (copied, owned) = roundtrip(payload);
             assert_eq!(copied, payload, "recv changed the byte stream");
@@ -2005,18 +2005,18 @@ mod tests {
         // bytes must be identical to the copying slice path. A payload
         // spanning several MSS plus a partial tail exercises both the
         // full-segment splits and the remainder.
-        let payload: Vec<u8> = (0..(3 * (KCP_MTU_DEF - KCP_OVERHEAD) + 17))
+        let payload: Vec<u8> = (0..(3 * (MHD_MTU_DEF - MHD_OVERHEAD) + 17))
             .map(|i| u8::try_from(i % 251).unwrap())
             .collect();
 
         let copied_out = SharedBuf::default();
-        let mut copied_engine = Kcp::new_stream(7, copied_out.clone());
+        let mut copied_engine = Mhd::new_stream(7, copied_out.clone());
         copied_engine.update(1).unwrap();
         assert_eq!(copied_engine.send(&payload).unwrap(), payload.len());
         copied_engine.flush().unwrap();
 
         let owned_out = SharedBuf::default();
-        let mut owned_engine = Kcp::new_stream(7, owned_out.clone());
+        let mut owned_engine = Mhd::new_stream(7, owned_out.clone());
         owned_engine.update(1).unwrap();
         let record = Bytes::from(payload.clone());
         assert_eq!(owned_engine.send_owned(record).unwrap(), payload.len());
@@ -2032,7 +2032,7 @@ mod tests {
 
     #[test]
     fn recv_owned_empty_queue_errors() {
-        let mut engine = Kcp::new_stream(1, SharedBuf::default());
+        let mut engine = Mhd::new_stream(1, SharedBuf::default());
         engine.update(1).unwrap();
         assert!(matches!(engine.recv_owned(), Err(Error::RecvQueueEmpty)));
         assert!(matches!(
@@ -2049,9 +2049,9 @@ mod tests {
         // bytes must still be exactly the packed form, and a retransmit
         // re-emits the same buffer (the same allocation, not a copy of it).
         let out = SplitCapture::default();
-        let mut engine = Kcp::new_stream(7, out.clone());
+        let mut engine = Mhd::new_stream(7, out.clone());
         engine.update(1).unwrap();
-        let payload = Bytes::from(vec![0x5Au8; KCP_MTU_DEF - KCP_OVERHEAD]); // exactly one MSS
+        let payload = Bytes::from(vec![0x5Au8; MHD_MTU_DEF - MHD_OVERHEAD]); // exactly one MSS
         assert_eq!(engine.send(&payload).unwrap(), payload.len());
         engine.flush().unwrap();
 
@@ -2059,7 +2059,7 @@ mod tests {
         assert_eq!(sent.len(), 1, "one datagram per flush in stream mode");
         let (hdr, got) = &sent[0];
         // The header decodes to a PUSH segment carrying the payload length.
-        assert_eq!(hdr[4], KCP_CMD_PUSH, "cmd");
+        assert_eq!(hdr[4], MHD_CMD_PUSH, "cmd");
         assert_eq!(hdr[5], 0, "frg (stream mode)");
         let len = u32::from_le_bytes(hdr[20..24].try_into().unwrap());
         assert_eq!(len as usize, payload.len(), "len field");
@@ -2068,11 +2068,11 @@ mod tests {
         // The wire bytes of the split form are the packed form: re-encode
         // the same datagram through the pack path and compare.
         let packed = SharedBuf::default();
-        let mut reference = Kcp::new_stream(7, packed.clone());
+        let mut reference = Mhd::new_stream(7, packed.clone());
         reference.update(1).unwrap();
         reference.send(&payload).unwrap();
         reference.flush().unwrap();
-        let mut wire = Vec::with_capacity(KCP_OVERHEAD + payload.len());
+        let mut wire = Vec::with_capacity(MHD_OVERHEAD + payload.len());
         wire.extend_from_slice(hdr);
         wire.extend_from_slice(got);
         assert_eq!(

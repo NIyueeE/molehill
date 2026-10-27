@@ -168,7 +168,7 @@ container:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "$(git rev-parse --show-toplevel)"
-    cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features server,client,noise,hot-reload,multiplex,kcp,transparent
+    cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features server,client,noise,hot-reload,multiplex,mhd,transparent
     mkdir -p img/bin/amd64
     cp target/x86_64-unknown-linux-musl/release/molehill img/bin/amd64/
     docker build -f Containerfile -t molehill img/

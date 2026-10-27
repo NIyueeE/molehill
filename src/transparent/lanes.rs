@@ -199,8 +199,8 @@ pub struct CarrierMove {
 #[must_use]
 pub fn carrier_move(evidence: &[LaneEvidence], chosen: Carrier) -> Option<CarrierMove> {
     let other = match chosen {
-        Carrier::Kcp => Carrier::Tcp,
-        Carrier::Tcp => Carrier::Kcp,
+        Carrier::Mhd => Carrier::Tcp,
+        Carrier::Tcp => Carrier::Mhd,
     };
     let usable: Vec<&LaneEvidence> = evidence
         .iter()
@@ -508,10 +508,10 @@ mod tests {
     #[test]
     fn a_carrier_losing_nothing_is_left_alone() {
         let evidence = [
-            proof(0, 1, Carrier::Kcp, 10_000, 0, 9_900),
-            proof(1, 2, Carrier::Kcp, 9_000, 5, 8_900),
+            proof(0, 1, Carrier::Mhd, 10_000, 0, 9_900),
+            proof(1, 2, Carrier::Mhd, 9_000, 5, 8_900),
         ];
-        assert_eq!(carrier_move(&evidence, Carrier::Kcp), None);
+        assert_eq!(carrier_move(&evidence, Carrier::Mhd), None);
         assert_eq!(carrier_move(&evidence, Carrier::Tcp), None);
     }
 
@@ -520,8 +520,8 @@ mod tests {
     /// datagram.
     #[test]
     fn a_lane_below_the_evidence_floor_is_not_judged() {
-        let evidence = [proof(0, 1, Carrier::Kcp, CARRIER_MIN_PACKETS - 1, 5, 10)];
-        assert_eq!(carrier_move(&evidence, Carrier::Kcp), None);
+        let evidence = [proof(0, 1, Carrier::Mhd, CARRIER_MIN_PACKETS - 1, 5, 10)];
+        assert_eq!(carrier_move(&evidence, Carrier::Mhd), None);
     }
 
     /// A claim losing traffic on its chosen carrier probes the other one: with
@@ -530,11 +530,11 @@ mod tests {
     #[test]
     fn a_lossy_carrier_is_probed_by_draining_its_worst_lane() {
         let evidence = [
-            proof(0, 7, Carrier::Kcp, 10_000, 4_000, 6_000),
-            proof(1, 8, Carrier::Kcp, 10_000, 1_000, 9_000),
+            proof(0, 7, Carrier::Mhd, 10_000, 4_000, 6_000),
+            proof(1, 8, Carrier::Mhd, 10_000, 1_000, 9_000),
         ];
         assert_eq!(
-            carrier_move(&evidence, Carrier::Kcp),
+            carrier_move(&evidence, Carrier::Mhd),
             Some(CarrierMove {
                 retire: 0,
                 lane: LaneId::new(7),
@@ -550,12 +550,12 @@ mod tests {
     fn the_comparison_needs_a_real_gap() {
         // The probe refuses 0.2 % against the rest's 40 %: move.
         let better = [
-            proof(0, 1, Carrier::Kcp, 10_000, 4_000, 6_000),
-            proof(1, 2, Carrier::Kcp, 10_000, 3_000, 7_000),
+            proof(0, 1, Carrier::Mhd, 10_000, 4_000, 6_000),
+            proof(1, 2, Carrier::Mhd, 10_000, 3_000, 7_000),
             proof(2, 3, Carrier::Tcp, 10_000, 20, 9_980),
         ];
         assert_eq!(
-            carrier_move(&better, Carrier::Kcp),
+            carrier_move(&better, Carrier::Mhd),
             Some(CarrierMove {
                 retire: 0,
                 lane: LaneId::new(1),
@@ -565,20 +565,20 @@ mod tests {
 
         // Level (inside the margin): no move, however lossy the path is.
         let level = [
-            proof(0, 1, Carrier::Kcp, 10_000, 4_000, 6_000),
-            proof(1, 2, Carrier::Kcp, 10_000, 3_000, 7_000),
+            proof(0, 1, Carrier::Mhd, 10_000, 4_000, 6_000),
+            proof(1, 2, Carrier::Mhd, 10_000, 3_000, 7_000),
             proof(2, 3, Carrier::Tcp, 10_000, 3_500, 6_500),
         ];
-        assert_eq!(carrier_move(&level, Carrier::Kcp), None);
+        assert_eq!(carrier_move(&level, Carrier::Mhd), None);
 
         // Higher refusal share but far more delivered: the rate arm of the rule
         // is what decides, and it needs CARRIER_EDGE.
         let rate = [
-            proof(0, 1, Carrier::Kcp, 10_000, 2_000, 1_000),
+            proof(0, 1, Carrier::Mhd, 10_000, 2_000, 1_000),
             proof(1, 2, Carrier::Tcp, 10_000, 2_500, 2_000),
         ];
         assert_eq!(
-            carrier_move(&rate, Carrier::Kcp),
+            carrier_move(&rate, Carrier::Mhd),
             Some(CarrierMove {
                 retire: 0,
                 lane: LaneId::new(1),
@@ -605,13 +605,13 @@ mod tests {
         };
 
         // Only an unknown lane: nothing to judge, nothing to retire.
-        assert_eq!(carrier_move(&[unknown], Carrier::Kcp), None);
+        assert_eq!(carrier_move(&[unknown], Carrier::Mhd), None);
 
         // One known, lossy lane beside it: the probe is decided on the known
         // lane — the unknown one is not evidence for it, and is not a target.
-        let evidence = [unknown, proof(1, 2, Carrier::Kcp, 10_000, 8_000, 1_000)];
+        let evidence = [unknown, proof(1, 2, Carrier::Mhd, 10_000, 8_000, 1_000)];
         assert_eq!(
-            carrier_move(&evidence, Carrier::Kcp),
+            carrier_move(&evidence, Carrier::Mhd),
             Some(CarrierMove {
                 retire: 1,
                 lane: LaneId::new(2),

@@ -125,7 +125,7 @@ pub struct TransparentDataConfig {
     ///
     /// The same key a forwarding client writes, because a lane is the same
     /// physical thing a pool's tunnel is — one carrier connection — and the
-    /// carrier itself is chosen at runtime (KCP, falling back to TCP).
+    /// carrier itself is chosen at runtime (mhd, falling back to TCP).
     pub tunnels: Option<u16>,
     /// Whether a claim's idle lanes may be lent to a sibling claim carrying more
     /// flows than lanes (`lend = false` keeps the equal split static).
@@ -646,9 +646,9 @@ remote_bind_addr = "10.99.0.1:8443"
     /// A claim never multiplexes: it has no pool to size, so its lanes are
     /// connections of its own and `tunnels` is a budget rather than a width.
     /// The carrier is not a key anywhere, which is what this pins: a claim over
-    /// KCP is what the runtime chooses when the path carries it.
+    /// mhd is what the runtime chooses when the path carries it.
     #[test]
-    fn a_kcp_carrier_is_not_a_key_a_claim_can_write() {
+    fn a_mhd_carrier_is_not_a_key_a_claim_can_write() {
         let config = r#"
 [transparent]
 default_token = "t"
@@ -683,7 +683,7 @@ remote_bind_addr = "10.99.0.1:8443"
         // reader who wrote it is told what to do rather than that it is wrong.
         let with_carrier = config.replace(
             "[transparent.data]\ntunnels = 2",
-            "[transparent.data]\ndefault_carrier = \"kcp\"",
+            "[transparent.data]\ndefault_carrier = \"mhd\"",
         );
         let message = format!("{:#}", Config::from_str(&with_carrier).unwrap_err());
         assert!(

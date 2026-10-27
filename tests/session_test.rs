@@ -149,7 +149,7 @@ enum ServiceType {
 #[derive(Serialize, Debug, Clone, Copy)]
 enum Carrier {
     Tcp,
-    Kcp,
+    Mhd,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -556,7 +556,7 @@ fn the_wire_mirror_is_total() {
     ] {
         assert_eq!(postcard::to_stdvec(&hello).unwrap().len(), 35);
     }
-    for carrier in [Carrier::Tcp, Carrier::Kcp] {
+    for carrier in [Carrier::Tcp, Carrier::Mhd] {
         assert_eq!(postcard::to_stdvec(&carrier).unwrap().len(), 1);
     }
     for service_type in [ServiceType::Tcp, ServiceType::Udp] {

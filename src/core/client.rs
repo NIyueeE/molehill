@@ -33,7 +33,7 @@ use crate::transparent::lanes::{self, ClaimLoad, LaneLoad};
 #[cfg(any(feature = "multiplex", mh_l3_client))]
 use crate::transport::carrier::{Carrier, CarrierChoice};
 #[cfg(feature = "multiplex")]
-use crate::transport::carrier::{KCP_ATTEMPT_BUDGET, first_carrier};
+use crate::transport::carrier::{MHD_ATTEMPT_BUDGET, first_carrier};
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
@@ -101,9 +101,9 @@ struct DataOpts {
     /// service of the session draws on this one pool.
     #[cfg(feature = "multiplex")]
     tunnels: usize,
-    /// Noise key config, `Some` iff the control transport is `noise`; KCP
+    /// Noise key config, `Some` iff the control transport is `noise`; mhd
     /// tunnels wrap it on top (the crypto stack is kept).
-    #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+    #[cfg(all(feature = "multiplex", feature = "mhd", feature = "noise"))]
     noise: Option<NoiseConfig>,
 }
 
@@ -132,15 +132,15 @@ type Pins = ();
 /// byte: plain TCP, or TCP wrapped in the Noise record stream. The
 /// transport is a per-service decision (see `ClientTransport`).
 ///
-/// A `Kcp` variant is the carrier's own byte stream. A KCP *tunnel* is a yamux
+/// A `Mhd` variant is the carrier's own byte stream. A mhd *tunnel* is a yamux
 /// session whose channels are `TunnelStream`s, so this variant exists for the
 /// **direct** data channels, where the carrier's session is the channel.
 enum ClientStream {
     Plain(TcpStream),
     #[cfg(feature = "noise")]
     Noise(Box<crate::transport::NoiseStream<TcpStream>>),
-    #[cfg(feature = "kcp")]
-    Kcp(crate::transport::kcp::KcpTunnelStream),
+    #[cfg(feature = "mhd")]
+    Mhd(crate::transport::mhd::MhdTunnelStream),
 }
 
 impl std::fmt::Debug for ClientStream {
@@ -149,8 +149,8 @@ impl std::fmt::Debug for ClientStream {
             ClientStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
             #[cfg(feature = "noise")]
             ClientStream::Noise(_) => f.debug_tuple("Noise").finish(),
-            #[cfg(feature = "kcp")]
-            ClientStream::Kcp(s) => f.debug_tuple("Kcp").field(s).finish(),
+            #[cfg(feature = "mhd")]
+            ClientStream::Mhd(s) => f.debug_tuple("Mhd").field(s).finish(),
         }
     }
 }
@@ -158,16 +158,16 @@ impl std::fmt::Debug for ClientStream {
 impl ClientStream {
     /// Apply socket options to the underlying TCP socket.
     ///
-    /// A KCP stream has no socket of its own: its session's UDP socket is tuned
-    /// where it is created (`transport::kcp::tune_socket_buffers`), and the
+    /// A mhd stream has no socket of its own: its session's UDP socket is tuned
+    /// where it is created (`transport::mhd::tune_socket_buffers`), and the
     /// per-connection TCP options have nothing to land on.
     fn hint(&self, opts: SocketOpts) {
         match self {
             ClientStream::Plain(s) => opts.apply(s),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => opts.apply(s.get_inner()),
-            #[cfg(feature = "kcp")]
-            ClientStream::Kcp(_) => {}
+            #[cfg(feature = "mhd")]
+            ClientStream::Mhd(_) => {}
         }
     }
 }
@@ -182,8 +182,8 @@ impl tokio::io::AsyncRead for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            #[cfg(feature = "kcp")]
-            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "mhd")]
+            ClientStream::Mhd(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -198,8 +198,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "kcp")]
-            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "mhd")]
+            ClientStream::Mhd(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(
@@ -210,8 +210,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "kcp")]
-            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "mhd")]
+            ClientStream::Mhd(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -222,8 +222,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "kcp")]
-            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "mhd")]
+            ClientStream::Mhd(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -320,7 +320,7 @@ impl DataOpts {
             addr: s.endpoint_with(c.data_addr()).to_owned(),
             #[cfg(feature = "multiplex")]
             tunnels: c.tunnels(),
-            #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+            #[cfg(all(feature = "multiplex", feature = "mhd", feature = "noise"))]
             noise: s
                 .data_enabled_with(c.noise.data_enable.unwrap_or(true))
                 .then(|| ClientTransport::noise_keys(c, s)),
@@ -379,7 +379,7 @@ impl ServiceSlot {
                 name: self.service.name.clone(),
                 service_type: self.service.service_type,
                 bind_addr,
-                // The carrier the client will **try first** (KCP where the
+                // The carrier the client will **try first** (mhd where the
                 // feature is built in, TCP otherwise). The server opens the
                 // listener that needs opening and validates nothing further: a
                 // channel that arrives on the other carrier is served exactly
@@ -930,10 +930,10 @@ struct RunDataChannelArgs {
     channels: std::sync::atomic::AtomicU64,
     /// Shared UDP hub for the service; `Some` iff this is a UDP service.
     udp: Option<Arc<UdpHub>>,
-    /// The service's Noise keys, when its control transport is `noise`: a KCP
+    /// The service's Noise keys, when its control transport is `noise`: a mhd
     /// data channel carries the same record stream a TCP one does, so it is
     /// wrapped under exactly the same rule.
-    #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+    #[cfg(all(feature = "multiplex", feature = "mhd", feature = "noise"))]
     noise: Option<NoiseConfig>,
     /// Stripe-group registry of the service session: stripes of one
     /// visitor connection arrive as independent data channels and park
@@ -1134,16 +1134,16 @@ impl RunDataChannelArgs {
 /// TCP goes through the service's transport (`ClientTransport`, so Noise is
 /// applied where the control channel's wire stack says it should be) with the
 /// usual retry: a visitor may arrive while the server is briefly unreachable.
-/// KCP opens a session on the data endpoint directly — the carrier owns its own
+/// mhd opens a session on the data endpoint directly — the carrier owns its own
 /// socket stack — and its reliability makes the retry loop meaningless: a lost
-/// datagram is KCP's business, and there is no connect error to retry on.
+/// datagram is mhd's business, and there is no connect error to retry on.
 async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStream> {
-    // KCP first, where the endpoint's choice still allows it: an attempt is
+    // mhd first, where the endpoint's choice still allows it: an attempt is
     // bounded, and a path that cannot bring a session up in that budget is one
     // where UDP is going nowhere — the fallback turns that into a delay on this
     // channel rather than a data plane that never comes up.
-    #[cfg(all(feature = "multiplex", feature = "kcp"))]
-    if args.carrier.try_kcp() {
+    #[cfg(all(feature = "multiplex", feature = "mhd"))]
+    if args.carrier.try_mhd() {
         let remote_addr = {
             let mut probe = args.remote_addr.clone();
             probe
@@ -1159,26 +1159,26 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
         #[cfg(not(feature = "noise"))]
         let noise = None;
         match tokio::time::timeout(
-            KCP_ATTEMPT_BUDGET,
-            crate::transport::kcp::connect_stream(remote_addr, noise),
+            MHD_ATTEMPT_BUDGET,
+            crate::transport::mhd::connect_stream(remote_addr, noise),
         )
         .await
         {
             Ok(Ok(stream)) => {
-                args.carrier.reached_kcp();
-                return Ok(ClientStream::Kcp(stream));
+                args.carrier.reached_mhd();
+                return Ok(ClientStream::Mhd(stream));
             }
             Ok(Err(e)) => {
-                if !args.carrier.on_kcp_failure(&format!("{e:#}")) {
-                    return Err(e).context("the KCP session failed and the carrier is forced");
+                if !args.carrier.on_mhd_failure(&format!("{e:#}")) {
+                    return Err(e).context("the mhd session failed and the carrier is forced");
                 }
             }
             Err(_) => {
                 if !args
                     .carrier
-                    .on_kcp_failure("the KCP session did not come up in time")
+                    .on_mhd_failure("the mhd session did not come up in time")
                 {
-                    bail!("the KCP session did not come up in time, and the carrier is forced");
+                    bail!("the mhd session did not come up in time, and the carrier is forced");
                 }
             }
         }
@@ -1252,7 +1252,7 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
 }
 
 /// The established tunnel(s) of one control session, per `[client].tunnel`:
-/// a yamux tunnel pool over TCP (arms 0/1) or KCP (arm 2).
+/// a yamux tunnel pool over TCP (arms 0/1) or mhd (arm 2).
 #[cfg(feature = "multiplex")]
 #[derive(Clone)]
 enum Tunnels {
@@ -1470,7 +1470,7 @@ impl ClientDataChannel {
     /// The carrier this channel rides, when the channel *is* the carrier.
     ///
     /// A direct channel is one carrier connection — a plain TCP socket, a Noise
-    /// stream over one, or a KCP session — so its own type is the answer, and
+    /// stream over one, or an mhd session — so its own type is the answer, and
     /// that is what a transparent lane needs: the hub records it per slot so the
     /// allocator's carrier policy compares lanes by what they actually ride
     /// rather than by the choice in force when they were dialed. A multiplexed
@@ -1486,11 +1486,11 @@ impl ClientDataChannel {
     )]
     fn carrier(&self) -> Option<Carrier> {
         match self {
-            // The KCP arm is the feature's: without `kcp` the variant does not
+            // The mhd arm is the feature's: without `mhd` the variant does not
             // exist and every raw channel is a TCP connection, which is the
             // only carrier this build has.
-            #[cfg(feature = "kcp")]
-            Self::Raw(ClientStream::Kcp(_)) => Some(Carrier::Kcp),
+            #[cfg(feature = "mhd")]
+            Self::Raw(ClientStream::Mhd(_)) => Some(Carrier::Mhd),
             Self::Raw(_) => Some(Carrier::Tcp),
             #[cfg(feature = "multiplex")]
             Self::Mux(_) => None,
@@ -1770,7 +1770,7 @@ async fn establish_tunnel(
     let config = crate::transport::multiplex::mux_config();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tunnel = ClientTunnel::start(conn, config, shutdown_rx);
-    // The per-tunnel byte counters start with the first tunnel, like the KCP
+    // The per-tunnel byte counters start with the first tunnel, like the mhd
     // adapter's own stats task: no entry point has to know about it, and a
     // run that never multiplexes pays nothing.
     spawn_tunnel_stats();
@@ -1786,8 +1786,8 @@ async fn establish_tunnel(
 /// operator's `[client.data].tunnels`, or the default raised to the
 /// UDP-derived floor (`floor`) of the services sharing the pool.
 ///
-/// The carrier is chosen at runtime, not written: KCP first (feature `kcp`),
-/// TCP when a KCP session cannot be established within the attempt's budget,
+/// The carrier is chosen at runtime, not written: mhd first (feature `mhd`),
+/// TCP when an mhd session cannot be established within the attempt's budget,
 /// with the decision remembered per data endpoint and re-probed after a
 /// cooldown (see [`crate::transport::carrier`]). The pool's identity is `key`:
 /// `session` for a shared pool, `service:<name>` otherwise.
@@ -1813,29 +1813,29 @@ async fn establish_tunnels(
     // endpoints's other channels: a pool that established on TCP keeps dialing
     // TCP (its repair included), because a pool whose tunnels rode two carriers
     // would be two pools wearing one name.
-    let (carrier, dialer, initial) = if choice.try_kcp() {
+    let (carrier, dialer, initial) = if choice.try_mhd() {
         match dial.dialer().await {
             Ok(dialer) => {
                 let attempt = tokio::time::timeout(
-                    KCP_ATTEMPT_BUDGET,
-                    establish_initial(&dialer, target, key, Carrier::Kcp),
+                    MHD_ATTEMPT_BUDGET,
+                    establish_initial(&dialer, target, key, Carrier::Mhd),
                 )
                 .await;
                 match attempt {
                     Ok(established) if !established.is_empty() => {
-                        choice.reached_kcp();
-                        (Carrier::Kcp, dialer, established)
+                        choice.reached_mhd();
+                        (Carrier::Mhd, dialer, established)
                     }
                     Ok(_) => {
-                        if !choice.on_kcp_failure("no KCP session came up") {
-                            bail!("no KCP session came up, and the carrier is forced");
+                        if !choice.on_mhd_failure("no mhd session came up") {
+                            bail!("no mhd session came up, and the carrier is forced");
                         }
                         let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
                         (Carrier::Tcp, dialer, initial)
                     }
                     Err(_) => {
-                        if !choice.on_kcp_failure("KCP establishment timed out") {
-                            bail!("KCP establishment timed out, and the carrier is forced");
+                        if !choice.on_mhd_failure("mhd establishment timed out") {
+                            bail!("mhd establishment timed out, and the carrier is forced");
                         }
                         let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
                         (Carrier::Tcp, dialer, initial)
@@ -1843,8 +1843,8 @@ async fn establish_tunnels(
                 }
             }
             Err(e) => {
-                if !choice.on_kcp_failure(&format!("{e:#}")) {
-                    return Err(e).context("the KCP dial failed and the carrier is forced");
+                if !choice.on_mhd_failure(&format!("{e:#}")) {
+                    return Err(e).context("the mhd dial failed and the carrier is forced");
                 }
                 let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
                 (Carrier::Tcp, dialer, initial)
@@ -1927,7 +1927,7 @@ async fn establish_initial(
 
 /// The closure a pool calls to add a tunnel.
 ///
-/// KCP tunnels are established by dialing the resolved endpoint directly (the
+/// mhd tunnels are established by dialing the resolved endpoint directly (the
 /// carrier owns its own socket stack), TCP tunnels by the service's transport
 /// — so a Noise-wrapped pool keeps its crypto, exactly as the initial
 /// establishment did.
@@ -1939,13 +1939,13 @@ async fn tunnel_dialer(
     opts: &DataOpts,
     choice: &Arc<CarrierChoice>,
 ) -> Result<Dialer> {
-    // The KCP arm is the only reader of these; a TCP-only build still keeps
+    // The mhd arm is the only reader of these; a TCP-only build still keeps
     // the same dialer signature.
-    #[cfg(not(feature = "kcp"))]
+    #[cfg(not(feature = "mhd"))]
     let _ = (opts, choice);
     // Both carriers are built, and the pool says which one to use **per call**:
     // a repair asks for the carrier the endpoint prefers *now*, which is what
-    // lets a pool that came up on KCP bring its replacement up on TCP after UDP
+    // lets a pool that came up on mhd bring its replacement up on TCP after UDP
     // stops working.
     /// One carrier's dial, before the choice of which to call: the composite
     /// below is what the pool holds.
@@ -1973,18 +1973,18 @@ async fn tunnel_dialer(
             })
         }
     };
-    #[cfg(feature = "kcp")]
-    let kcp: OneDialer = {
-        // Resolved once, at pool creation: a KCP growth must not block on
+    #[cfg(feature = "mhd")]
+    let mhd: OneDialer = {
+        // Resolved once, at pool creation: an mhd growth must not block on
         // DNS inside the placement path.
         let remote_addr = {
             let mut probe = AddrMaybeCached::new(&opts.addr);
             probe.resolve().await.with_context(|| {
-                format!("Failed to resolve the KCP data endpoint {}", opts.addr)
+                format!("Failed to resolve the mhd data endpoint {}", opts.addr)
             })?;
             probe
                 .socket_addr
-                .ok_or_else(|| anyhow!("The KCP data endpoint {} resolved to nothing", opts.addr))?
+                .ok_or_else(|| anyhow!("The mhd data endpoint {} resolved to nothing", opts.addr))?
         };
         let opts = opts.clone();
         let choice = Arc::clone(choice);
@@ -1993,15 +1993,15 @@ async fn tunnel_dialer(
             let choice = Arc::clone(&choice);
             Box::pin(async move {
                 let attempt = tokio::time::timeout(
-                    KCP_ESTABLISH_TIMEOUT,
-                    establish_one_kcp_tunnel(remote_addr, session_nonce, &opts, "pool"),
+                    MHD_ESTABLISH_TIMEOUT,
+                    establish_one_mhd_tunnel(remote_addr, session_nonce, &opts, "pool"),
                 )
                 .await;
                 let result = attempt
-                    .map_err(|_| "KCP tunnel establishment timed out".to_owned())?
+                    .map_err(|_| "mhd tunnel establishment timed out".to_owned())?
                     .map_err(|e| format!("{e:#}"));
                 if let Err(e) = &result {
-                    // A repair that cannot bring KCP up is the same news the
+                    // A repair that cannot bring mhd up is the same news the
                     // *initial* establishment reports, and it is the only
                     // news the endpoint's choice would otherwise never get:
                     // the pool's dialer is fixed to the carrier the pool was
@@ -2009,7 +2009,7 @@ async fn tunnel_dialer(
                     // path that has since stopped carrying UDP is fine —
                     // and every other pool, lane and future session that
                     // dials that endpoint keeps paying for the attempt.
-                    choice.on_kcp_failure(e);
+                    choice.on_mhd_failure(e);
                 }
                 result
             })
@@ -2017,13 +2017,13 @@ async fn tunnel_dialer(
     };
     Ok(Arc::new(move |wanted: Carrier| match wanted {
         Carrier::Tcp => tcp(),
-        // A build without the feature has no way to be asked for KCP
-        // (`CarrierChoice::try_kcp` answers false), and TCP is then the only
+        // A build without the feature has no way to be asked for mhd
+        // (`CarrierChoice::try_mhd` answers false), and TCP is then the only
         // carrier there is.
-        #[cfg(feature = "kcp")]
-        Carrier::Kcp => kcp(),
-        #[cfg(not(feature = "kcp"))]
-        Carrier::Kcp => tcp(),
+        #[cfg(feature = "mhd")]
+        Carrier::Mhd => mhd(),
+        #[cfg(not(feature = "mhd"))]
+        Carrier::Mhd => tcp(),
     }))
 }
 
@@ -2037,14 +2037,14 @@ struct PoolDial<'a> {
     session_nonce: Nonce,
     opts: &'a DataOpts,
     /// The endpoint's carrier decision, so a dialer's own failures are reported
-    /// to the one place that knows what the path is doing (see the KCP arm of
+    /// to the one place that knows what the path is doing (see the mhd arm of
     /// [`tunnel_dialer`]).
     choice: &'a Arc<CarrierChoice>,
 }
 
 /// A pool's start on TCP: its dialer (which repair keeps using) and the tunnels
 /// that came up. The fallback's own half, and the only half a build without the
-/// `kcp` feature ever runs.
+/// `mhd` feature ever runs.
 #[cfg(feature = "multiplex")]
 async fn tcp_pool_start(
     dial: PoolDial<'_>,
@@ -2074,32 +2074,32 @@ impl PoolDial<'_> {
     }
 }
 
-/// Timeout for one KCP tunnel establishment (session dial + optional Noise
+/// Timeout for one mhd tunnel establishment (session dial + optional Noise
 /// handshake + hello/ack). UDP gives no connect error, so a blackholed
 /// endpoint must not hang the control channel forever; on timeout the usual
 /// control-channel retry loop rebuilds the pool.
-#[cfg(all(feature = "multiplex", feature = "kcp"))]
-const KCP_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(all(feature = "multiplex", feature = "mhd"))]
+const MHD_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Open one KCP session, optionally wrap it in Noise, exchange the tunnel
+/// Open one mhd session, optionally wrap it in Noise, exchange the tunnel
 /// hello/ack and start the yamux driver.
-#[cfg(all(feature = "multiplex", feature = "kcp"))]
-async fn establish_one_kcp_tunnel(
+#[cfg(all(feature = "multiplex", feature = "mhd"))]
+async fn establish_one_mhd_tunnel(
     remote_addr: SocketAddr,
     session_nonce: Nonce,
     opts: &DataOpts,
     service_name: &str,
 ) -> Result<(ClientTunnel, watch::Sender<bool>)> {
     // Full Noise handshake + v3 selector byte (the wrapper owns the selector):
-    // KCP tunnels establish once per control session, so a resume attempt has
+    // mhd tunnels establish once per control session, so a resume attempt has
     // nothing cached yet and would only add a round trip.
     #[cfg(feature = "noise")]
     let noise = opts.noise.as_ref();
     #[cfg(not(feature = "noise"))]
     let noise = None;
-    let mut io = crate::transport::kcp::connect_stream(remote_addr, noise).await?;
+    let mut io = crate::transport::mhd::connect_stream(remote_addr, noise).await?;
     // The session's ARQ counters travel with the tunnel: the pool reads this
-    // tunnel's retransmit share for the carrier rule (the KCP-side signal; a
+    // tunnel's retransmit share for the carrier rule (the mhd-side signal; a
     // TCP tunnel has none, which is why the rule is one-sided by construction).
     let health = io.health();
 
@@ -2108,7 +2108,7 @@ async fn establish_one_kcp_tunnel(
     io.flush().await?;
     match read_ack(&mut io).await? {
         Ack::Ok => {}
-        v => bail!("Service {service_name}: the server refused the KCP data tunnel: {v}"),
+        v => bail!("Service {service_name}: the server refused the mhd data tunnel: {v}"),
     }
 
     let config = crate::transport::multiplex::mux_config();
@@ -3268,8 +3268,8 @@ impl LanePool {
         for (endpoint, args, lane) in targets {
             let choice = &args.carrier;
             let other = match choice.carrier() {
-                Carrier::Kcp => Carrier::Tcp,
-                Carrier::Tcp => Carrier::Kcp,
+                Carrier::Mhd => Carrier::Tcp,
+                Carrier::Tcp => Carrier::Mhd,
             };
             // `prefer` is per *endpoint* and the choice is shared by every claim
             // dialing it, so the first claim moves it and the rest find it
@@ -3376,7 +3376,7 @@ impl LanePool {
         // with: `MOLEHILL_DATA_CARRIER` exists so a measurement can pin one
         // carrier, `prefer` refuses to move it, and asking the peer to drain
         // lanes anyway would take them out of service for a switch that cannot
-        // happen. (Measured: the "forced KCP" control of the first A/B asked for
+        // happen. (Measured: the "forced mhd" control of the first A/B asked for
         // four drains, one per round, and moved lanes while claiming to be the
         // arm where nothing moves.)
         if crate::transport::carrier::forced_carrier().is_some() {
@@ -4401,7 +4401,7 @@ impl ClientSession {
     ///
     /// Per endpoint rather than per service: the decision is about a network
     /// path, and services that dial the same address share it — including the
-    /// one bounded KCP attempt it costs when the path cannot carry KCP.
+    /// one bounded mhd attempt it costs when the path cannot carry mhd.
     #[cfg(any(feature = "multiplex", mh_l3_client))]
     fn carrier_for(&mut self, data_addr: &AddrMaybeCached) -> Arc<CarrierChoice> {
         let key = data_addr.addr.clone();
@@ -4510,7 +4510,7 @@ impl ClientSession {
                 socket_opts: SocketOpts::for_service(),
                 service: slot.service.clone(),
                 udp: build_udp_hub(&slot.service, pins),
-                #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+                #[cfg(all(feature = "multiplex", feature = "mhd", feature = "noise"))]
                 noise: slot.data.noise.clone(),
                 #[cfg(feature = "multiplex")]
                 channels: std::sync::atomic::AtomicU64::new(0),

@@ -45,7 +45,7 @@ pub(crate) const GROW_WAIT_BUDGET: std::time::Duration = std::time::Duration::fr
 /// group that never completes (four channel opens, three `NoTunnel` failures).
 /// The repair's own completion signal is the normal path; this bounds the wait
 /// for a dialer that never returns, so it has to cover the slowest carrier's
-/// dial timeout (`KCP_ESTABLISH_TIMEOUT`, 10 s).
+/// dial timeout (`MHD_ESTABLISH_TIMEOUT`, 10 s).
 pub(crate) const COLD_GROW_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The in-flight open budget of one tunnel.

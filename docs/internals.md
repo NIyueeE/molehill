@@ -14,7 +14,7 @@
 
 ## Startup and registration
 
-In client mode, molehill groups its configured services by endpoint: a service's own `remote_addr` (`[client.services.<name>]`) when it declares one, else the client-wide `[client.control].default_remote_addr`. Every group dials **one control session**, authenticates once with `[client].default_token`, and registers its services on it. The server owns no service configuration: each `Register` carries the service's name, type and public endpoint (`remote_bind_addr`), and the server validates it against its policy before exposing anything — `allow_ports` whitelist, the declared data-plane carrier (which only decides whether the KCP listener is opened), and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
+In client mode, molehill groups its configured services by endpoint: a service's own `remote_addr` (`[client.services.<name>]`) when it declares one, else the client-wide `[client.control].default_remote_addr`. Every group dials **one control session**, authenticates once with `[client].default_token`, and registers its services on it. The server owns no service configuration: each `Register` carries the service's name, type and public endpoint (`remote_bind_addr`), and the server validates it against its policy before exposing anything — `allow_ports` whitelist, the declared data-plane carrier (which only decides whether the mhd listener is opened), and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
 
 On success the server binds the endpoint and starts serving visitors. On failure it answers `RegisterRejected` for **that registration alone**: the client reports the exact reason once and stops that service, while the session and the services beside it keep running. A registration carries no pool size — the channel pool is the client's own concern (see "Forwarding").
 
@@ -113,9 +113,9 @@ The count is the operator's: `[client.data].tunnels`, default 4. A UDP service's
 
 **A per-tunnel carrier handover retires one tunnel at a time, without touching its streams** — the pool-level analogue of the lane drain above. The pool's replacement already rides whatever carrier the endpoint prefers (that is what repair dials), but a pool whose tunnels all still ride the *old* carrier keeps them for their whole lives: repair replaces only what dies. The handover makes the move possible while everything lives. Excluding a tunnel from new placements marks it draining — its established streams keep running to the end, a stream cannot move without reordering it — and only when it holds no stream and no pinned UDP peer is it removed, its slot refilled by the repair dial on the new carrier. At most one tunnel is in a handover at a time, and both of its waits are bounded, for the same reason the lane drain has a budget: a drain that waits for a long-lived flow past its budget is called off and the tunnel returns to service; a replacement that cannot be established (UDP blocked, server down) releases the handover so ordinary repair dials the live preference instead. A pool is never left one tunnel short for ever. Placement refusal during the window is short-lived pressure, not saturation, so it does not report the "raise `tunnels`" line. The mechanism has no trigger of its own: it exists for the diagnostic hatch (`MOLEHILL_TUNNEL_SWITCH_AT`, [configuration.md](configuration.md#diagnostics-switches-opt-in)) and for a quality rule to call, exactly as the lane machinery did before its policy landed.
 
-**And the quality rule has landed, on the same evidence-first shape the lane policy has.** Each KCP tunnel carries its own ARQ counters — what its session emitted and what it re-sent (an RTO or a fast re-send), counted per session, not per process. The rule differences two samples taken 50 ms apart per maintenance tick, and a tunnel whose retransmit share clears the measured floor for three consecutive windows is a carrier losing its traffic: the pool hands **that** tunnel over to TCP through the handover above — a tunnel pinned to a UDP peer cannot drain, so the move falls back to the least-loaded member rather than stalling — and moves the endpoint's carrier decision with it, under the same switch cooldown every other switch respects. The rule is one-sided by construction — a TCP tunnel's retransmit state stays in the kernel, so only KCP's degradation is visible in userspace, and only KCP → TCP moves come from this rule (a move back is the lane policy's business, on the L3 evidence chain).
+**And the quality rule has landed, on the same evidence-first shape the lane policy has.** Each mhd tunnel carries its own ARQ counters — what its session emitted and what it re-sent (an RTO or a fast re-send), counted per session, not per process. The rule differences two samples taken 50 ms apart per maintenance tick, and a tunnel whose retransmit share clears the measured floor for three consecutive windows is a carrier losing its traffic: the pool hands **that** tunnel over to TCP through the handover above — a tunnel pinned to a UDP peer cannot drain, so the move falls back to the least-loaded member rather than stalling — and moves the endpoint's carrier decision with it, under the same switch cooldown every other switch respects. The rule is one-sided by construction — a TCP tunnel's retransmit state stays in the kernel, so only mhd's degradation is visible in userspace, and only mhd → TCP moves come from this rule (a move back is the lane policy's business, on the L3 evidence chain).
 
-**And one-sided is not the only way it is narrow: it is also blind by direction, measured.** The rule reads the *dialing* end's sessions, so it sees the health of what that end sends. A workload carried *downstream* through the pool (visitor → server → tunnel → client) has its loss on the **server's** sending side, which no client-side counter can see: on the UDP-policed condition (`udp_throttled`) the client's sessions sent thousands of datagrams and re-sent six or seven while the delivered inner payload fell to 78–101 Mbit/s with 44–93 % loss, and the rule never fired. Nothing died either — the run logs zero repairs — because a KCP session's dead-link rule needs unacknowledged data of its own, and the client had almost none in flight. What the deciding end needs is the peer's own numbers: a per-tunnel report on the control channel, the lane `CarrierReport`'s L4 analogue, which is the recorded next instrument (HANDOFF.md). The floors come from the measurement that preceded the rule: a healthy session re-sends ~nothing of what it emits, a carrier losing its traffic re-sends thousands per cell — a separation orders of magnitude wide (HANDOFF.md round 37's S1). `MOLEHILL_TUNNEL_CARRIER_RULE=0` switches the rule off ([configuration.md](configuration.md#diagnostics-switches-opt-in)); the hatch is independent of it.
+**And one-sided is not the only way it is narrow: it is also blind by direction, measured.** The rule reads the *dialing* end's sessions, so it sees the health of what that end sends. A workload carried *downstream* through the pool (visitor → server → tunnel → client) has its loss on the **server's** sending side, which no client-side counter can see: on the UDP-policed condition (`udp_throttled`) the client's sessions sent thousands of datagrams and re-sent six or seven while the delivered inner payload fell to 78–101 Mbit/s with 44–93 % loss, and the rule never fired. Nothing died either — the run logs zero repairs — because an mhd session's dead-link rule needs unacknowledged data of its own, and the client had almost none in flight. What the deciding end needs is the peer's own numbers: a per-tunnel report on the control channel, the lane `CarrierReport`'s L4 analogue, which is the recorded next instrument (HANDOFF.md). The floors come from the measurement that preceded the rule: a healthy session re-sends ~nothing of what it emits, a carrier losing its traffic re-sends thousands per cell — a separation orders of magnitude wide (HANDOFF.md round 37's S1). `MOLEHILL_TUNNEL_CARRIER_RULE=0` switches the rule off ([configuration.md](configuration.md#diagnostics-switches-opt-in)); the hatch is independent of it.
 
 **Oversubscription is answered by sharing, not by width.** Placement refuses a tunnel at `TUNNEL_STREAM_CEILING` (56 of the engine's 64, counting reserved-but-unfinished opens as well as established ones), so the pool's ceiling is `count × 56` streams. An open that finds every tunnel at the ceiling waits briefly (`CAPACITY_WAIT`, 250 ms) for a stream to retire and is then refused with a typed error — a failure the operator can act on by raising `tunnels`, rather than a silently degraded pool. The sizing guidance and the measurements behind it are in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
@@ -206,7 +206,7 @@ How a claim's lane set is opened, held and repaired:
   divided equally among them and never below one
   (`TransparentClientConfig::claim_lanes`), so a client that writes no budget
   gets `DEFAULT_CLAIM_LANES` (two) per claim. No multiplexer sits above a lane:
-  a `tcp` lane is a TCP connection, a `kcp` lane a KCP session. A transparent
+  a `tcp` lane is a TCP connection, a `mhd` lane an mhd session. A transparent
   lane opens with the eight-byte service + lane prologue; every other data
   channel keeps the four-byte service prologue, so the server knows which
   service — and therefore which endpoint — a lane carries before the first
@@ -364,7 +364,7 @@ property of the pool, not of the worker set — measured, the then-current
 visitors alike, and the datagrams beyond that are dropped rather than queued
 without bound (`MOLEHILL_UDP_STATS` counts them; the measurement is recorded in
 HANDOFF.md, "D27's evidence, measured"). `transport::udp_batch`'s `recvmmsg`
-batching — used by KCP's socket loop — is the lever if that ceiling ever needs to
+batching — used by mhd's socket loop — is the lever if that ceiling ever needs to
 move; this reader takes one datagram per syscall.
 
 UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the server side, each peer is pinned to one data channel by the session-affinity table above. On the client side, a per-service hub maps every peer address to exactly one local forwarder socket for the peer's whole session — the `(ip, port)` tuple the local service sees stays stable across channel re-sharding and channel loss — and pins the peer's outbound traffic to the channel its inbound traffic arrives on, falling back to any live channel when that one died. An idle forwarder is cleaned up after the mapping's lifetime, which follows the peer's own largest observed gap (four times it, clamped to 30-300 s); re-binding after that changes the local source port, which stateful protocols notice as a new session. Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable. All queues enqueue with `try_send` and drop on overflow: UDP semantics, and a single slow peer can never stall others sharing the channel.
@@ -387,20 +387,20 @@ as `worker:peers` pairs, plus the cumulative `queue_full` and `no_worker` drop
 counters separately; being cumulative, per-second rates come from consecutive
 lines. The pinned counts live on this line rather than a line of their own:
 they *are* the affinity table, cut by the channel each peer is pinned to. The switch is independent of
-`MOLEHILL_KCP_STATS` because a run can exercise
-the UDP path with no KCP session in existence. The runner records whichever
+`MOLEHILL_MHD_STATS` because a run can exercise
+the UDP path with no mhd session in existence. The runner records whichever
 `MOLEHILL_*` switches a run inherited in its results meta (`instrumentation`),
 so an instrumented run is never mistaken for a clean one.
 
-### KCP datagram size follows the path MTU
+### mhd datagram size follows the path MTU
 
-A KCP datagram is one UDP packet, and UDP does not negotiate a path MTU the way
+A mhd datagram is one UDP packet, and UDP does not negotiate a path MTU the way
 TCP does: Linux's default `IP_MTU_DISCOVER` for UDP fragments an oversized
-datagram instead of reporting an error, so a 1400-byte KCP datagram on a
+datagram instead of reporting an error, so a 1400-byte mhd datagram on a
 1280-byte path becomes two fragments and **one lost fragment costs the whole
 datagram** — a 1 % fragment loss becomes ~2 % datagram loss, which at the
 carrier's ARQ cost is the difference between working and not (measured on
-`loss1_mtu1280`: the KCP arm goes from 0.37 Gbit/s to zero while the TCP arm is
+`loss1_mtu1280`: the mhd arm goes from 0.37 Gbit/s to zero while the TCP arm is
 unaffected, because the kernel does this arithmetic for TCP).
 
 Each session therefore reads the kernel's path MTU (`getsockopt(IP_MTU)` on a

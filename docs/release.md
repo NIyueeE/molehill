@@ -208,7 +208,7 @@ inside the instrument's own scatter.
 2. **build matrix** (10 targets): linux gnu + musl, aarch64 gnu + musl (native
    arm64 runners), arm/armv7 musl (`embedded` feature, via cross), macOS
    x86_64 + aarch64 on native x64/arm64 runners, Windows msvc. The full default
-   feature set (`server,client,noise,hot-reload,multiplex,kcp,transparent`) is
+   feature set (`server,client,noise,hot-reload,multiplex,mhd,transparent`) is
    built by the x86_64/aarch64 legs, including the two GHCR image architectures;
    linux artifacts are UPX-compressed. The matrix builds every artifact and
    smoke-tests each native one with `--help`; the test suite is CI's job (it

@@ -195,7 +195,7 @@ pub(crate) struct TunnelCounters {
     delivered: std::sync::atomic::AtomicU64,
     /// Bytes the forwarding code handed to this tunnel's streams.
     written: std::sync::atomic::AtomicU64,
-    /// The KCP session's own ARQ counters, when this tunnel rides KCP (see
+    /// The mhd session's own ARQ counters, when this tunnel rides mhd (see
     /// [`crate::transport::health::SessionHealth`]): the retransmit share of the pair is
     /// the per-tunnel signal a carrier policy judges. `None` on a TCP tunnel
     /// — the kernel's TCP has no userspace retransmit counter to offer, which
@@ -227,7 +227,7 @@ struct PeerHealth {
 }
 
 impl TunnelCounters {
-    /// The tunnel's counters, with the KCP session's health when it rides KCP.
+    /// The tunnel's counters, with the mhd session's health when it rides mhd.
     fn with_health(
         health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
     ) -> std::sync::Arc<Self> {
@@ -465,12 +465,12 @@ pub struct PoolSnapshot {
     /// [`PoolSnapshot::tunnels`]: the `MOLEHILL_TUNNEL_STATS` line's source and
     /// the windowed per-tunnel evidence a carrier policy differences.
     pub bytes: Vec<(u64, u64)>,
-    /// Per-tunnel KCP ARQ health, cumulative `(datagrams_out, retransmits)`,
-    /// in the same order — `None` where the tunnel does not ride KCP (a TCP
+    /// Per-tunnel mhd ARQ health, cumulative `(datagrams_out, retransmits)`,
+    /// in the same order — `None` where the tunnel does not ride mhd (a TCP
     /// tunnel's retransmit state stays in the kernel). The carrier rule's
     /// degradation signal: a healthy session re-sends ~nothing, a carrier
     /// losing its traffic re-sends segments by the thousands (S1, round 37).
-    pub kcp_health: Vec<Option<(u64, u64)>>,
+    pub mhd_health: Vec<Option<(u64, u64)>>,
     /// Whether each entry in `tunnels` accepts new streams.
     pub draining: Vec<bool>,
     /// Active handover as `(old tunnel id, target carrier, phase)`.
@@ -1015,7 +1015,7 @@ impl TunnelPool {
             return;
         }
         // `from` is the carrier the pool's tunnels actually ride — after a
-        // fallback a pool born on KCP may hold only TCP entries, and the hatch
+        // fallback a pool born on mhd may hold only TCP entries, and the hatch
         // has to move one of *those* — and the target is the other one.
         let state = self.inner.state.lock();
         let Some(&from) = state
@@ -1029,8 +1029,8 @@ impl TunnelPool {
         };
         drop(state);
         let target = match from {
-            Carrier::Kcp => Carrier::Tcp,
-            Carrier::Tcp => Carrier::Kcp,
+            Carrier::Mhd => Carrier::Tcp,
+            Carrier::Tcp => Carrier::Mhd,
         };
         if self.begin_handover(from, target) {
             self.inner
@@ -1100,7 +1100,7 @@ impl TunnelPool {
         );
     }
 
-    /// The quality rule the handover mechanism was built for: hand one KCP
+    /// The quality rule the handover mechanism was built for: hand one mhd
     /// tunnel over to TCP when its session is measurably losing traffic.
     ///
     /// The signal is the tunnel's own ARQ counters (see
@@ -1111,7 +1111,7 @@ impl TunnelPool {
     /// re-sends by the thousands — a separation orders of magnitude wide, so
     /// the floors below sit far inside it and far above scatter. TCP has no
     /// userspace equivalent, so the rule is **one-sided by construction**: it
-    /// moves KCP → TCP on KCP's own evidence, and never judges a TCP tunnel
+    /// moves mhd → TCP on mhd's own evidence, and never judges a TCP tunnel
     /// (the kernel keeps its retransmit state where userspace cannot read
     /// it); a move back is the L3 policy's business, driven by that rule's
     /// evidence chain.
@@ -1121,7 +1121,7 @@ impl TunnelPool {
     /// uses. [`CARRIER_RULE_MIN_DATAGRAMS`] keeps a quiet session from being
     /// judged on one stray retransmit; [`CARRIER_RULE_RETRANSMIT_SHARE_PCT`]
     /// is the share at which the cell the S1 ran on says the carrier is
-    /// losing (1 % loss path, KCP re-sending 5.7 % at its ceiling); a
+    /// losing (1 % loss path, mhd re-sending 5.7 % at its ceiling); a
     /// retransmitting tunnel is preferred for the move over a clean one of
     /// the same carrier (the worst lane leaves first, as the lane policy
     /// retires its worst).
@@ -1261,7 +1261,7 @@ impl TunnelPool {
     /// least-loaded-first; asking for the convicted id is what makes the log's
     /// "handing it over" describe the tunnel that actually left.
     fn move_convicted_tunnel(&self, convicted: usize, share_pct: f64) {
-        if let Some(moved) = self.begin_handover_on(Carrier::Kcp, Carrier::Tcp, Some(convicted)) {
+        if let Some(moved) = self.begin_handover_on(Carrier::Mhd, Carrier::Tcp, Some(convicted)) {
             if moved == convicted {
                 info!(
                     pool = %self.inner.shared.key,
@@ -1289,7 +1289,7 @@ impl TunnelPool {
         }
     }
 
-    /// One sample of every tunnel's KCP health, keyed by tunnel id, in pool
+    /// One sample of every tunnel's mhd health, keyed by tunnel id, in pool
     /// order — the rule's window input.
     #[cfg(feature = "client")]
     fn health_sample(&self) -> HealthSample {
@@ -1390,12 +1390,12 @@ impl TunnelPool {
         {
             return false;
         }
-        // The probe rides the carrier the pool is NOT on: a Kcp pool probes
-        // tcp, and a Tcp pool probes kcp (the shape the lane policy's
+        // The probe rides the carrier the pool is NOT on: a Mhd pool probes
+        // tcp, and a Tcp pool probes mhd (the shape the lane policy's
         // suspicion-driven probe takes on its own scale).
         let probed = match self.inner.shared.carrier {
-            Carrier::Kcp => Carrier::Tcp,
-            Carrier::Tcp => Carrier::Kcp,
+            Carrier::Mhd => Carrier::Tcp,
+            Carrier::Tcp => Carrier::Mhd,
         };
         if self.begin_handover(self.inner.shared.carrier, probed) {
             probe.active = Some((probed, std::time::Instant::now()));
@@ -1771,7 +1771,7 @@ impl TunnelPool {
             shrinks: 0,
             tunnels: Vec::new(),
             bytes: Vec::new(),
-            kcp_health: Vec::new(),
+            mhd_health: Vec::new(),
             draining: Vec::new(),
             handover: None,
         })
@@ -1810,7 +1810,7 @@ impl TunnelPool {
             // The rule's own reading — both ends summed — rather than this
             // end's half: an operator watching the line sees what the policy
             // acts on, and the peer's half is where a policed path shows up.
-            kcp_health: state
+            mhd_health: state
                 .entries
                 .iter()
                 .map(|e| e.tunnel.counters.health_counts())
@@ -2370,7 +2370,7 @@ impl TunnelPool {
         // A repair is a lifecycle event: one INFO line per size change. The
         // carrier named is the one the new tunnel actually rides (`wanted`) —
         // the pool's birth carrier would hide a handover's replacement (and
-        // did: a switched run read `carrier="kcp"` for every repair while the
+        // did: a switched run read `carrier="mhd"` for every repair while the
         // truth lived only in the pool-stats timeline).
         info!(
             pool = %self.inner.shared.key,
@@ -2786,7 +2786,7 @@ const CARRIER_RULE_MIN_HANDED_BYTES: u64 = 64 * 1024;
 ///
 /// **It fires on neither class, and that is measured rather than assumed.** On
 /// the policed path this end receives *everything* the peer hands over — 100.0 %
-/// with the tunnel's `handed` sitting at the policer's own ceiling — because KCP
+/// with the tunnel's `handed` sitting at the policer's own ceiling — because mhd
 /// is reliable: a dropped datagram is re-sent until it arrives, so a policed
 /// carrier surfaces as **throughput**, not as a delivery gap. A threshold on any
 /// local quantity therefore cannot separate the classes (the re-send share fires
@@ -2798,7 +2798,7 @@ const CARRIER_RULE_MIN_HANDED_BYTES: u64 = 64 * 1024;
 /// verdict: measured on the two
 /// classes (HANDOFF.md, round 6-7): a UDP-policed path — where the handover to
 /// TCP is worth 10-13x — delivers ~10-20 % of what the server hands it, while the
-/// healthy lossy class, where KCP is the carrier to keep, delivers ~95-100 %.
+/// healthy lossy class, where mhd is the carrier to keep, delivers ~95-100 %.
 /// The two do not overlap, which is why a floor here can be both sensitive and
 /// safe; 60 % sits between them with a 3x margin below and a 1.6x margin above.
 /// The residues that keep a healthy tunnel below 100 % (the multiplexer's own
@@ -3141,12 +3141,12 @@ impl TunnelPool {
             || "-".to_owned(),
             |(tunnel, target, phase)| format!("{tunnel}/{}:{phase}", target.as_str()),
         );
-        // The KCP half of the carrier rule's evidence, on the same line:
+        // The mhd half of the carrier rule's evidence, on the same line:
         // per-tunnel cumulative `(datagrams_out, retransmits)` — `-` where the
-        // tunnel does not ride KCP. A reader that differences two lines per
+        // tunnel does not ride mhd. A reader that differences two lines per
         // tunnel sees exactly the window the rule judges.
         let health: Vec<String> = snapshot
-            .kcp_health
+            .mhd_health
             .iter()
             .map(|h| h.map_or_else(|| "-".to_owned(), |(out, ret)| format!("{out}/{ret}")))
             .collect();
@@ -3174,7 +3174,7 @@ impl TunnelPool {
             grows = snapshot.grows,
             shrinks = snapshot.shrinks,
             handover = %handover,
-            kcp_health = %health.join(","),
+            mhd_health = %health.join(","),
             "pool-stats: tunnel pool timeline"
         );
     }
@@ -3225,8 +3225,8 @@ impl ClientTunnel {
         Self::start_with_health(io, None, config, shutdown)
     }
 
-    /// The same, carrying the KCP session's ARQ health when the tunnel's
-    /// connection is a KCP session (see [`crate::transport::health::SessionHealth`]): the
+    /// The same, carrying the mhd session's ARQ health when the tunnel's
+    /// connection is an mhd session (see [`crate::transport::health::SessionHealth`]): the
     /// counters live on the tunnel's own bookkeeping, so the pool reads this
     /// tunnel's retransmit share apart from every other tunnel's. A TCP
     /// tunnel passes `None` — the kernel keeps its retransmit state where
@@ -3452,9 +3452,9 @@ mod tests {
         unsafe {
             std::env::set_var("MOLEHILL_TUNNEL_CARRIER_RULE", "1");
         }
-        // A Kcp-carrier pool with a live choice: the probe hands a tunnel to
+        // A Mhd-carrier pool with a live choice: the probe hands a tunnel to
         // tcp, and a Move verdict goes through the choice's `prefer`.
-        let (pool, _rxs, choice) = duplex_pool_with_choice(Carrier::Kcp, 2, 2);
+        let (pool, _rxs, choice) = duplex_pool_with_choice(Carrier::Mhd, 2, 2);
         let counters: Vec<std::sync::Arc<TunnelCounters>> = {
             let state = pool.inner.state.lock();
             state
@@ -3509,7 +3509,7 @@ mod tests {
             .as_ref()
             .map(|(carrier, _)| *carrier)
             .expect("the confirmed suspicion starts a probe");
-        assert_eq!(probed, Carrier::Tcp, "a Kcp pool probes tcp");
+        assert_eq!(probed, Carrier::Tcp, "a Mhd pool probes tcp");
         assert!(
             pool.snapshot().handover.is_some(),
             "the probe is a real handover: {snap:?}",
@@ -3571,8 +3571,8 @@ mod tests {
     /// clearly less gives the tunnel back and parks the pool in its backoff,
     /// so a merely lossy path pays one split tunnel and then nothing.
     /// Needs both carriers: a probe hands a tunnel to the carrier the pool is
-    /// not riding, and a build without `kcp` has only one to ride.
-    #[cfg(feature = "kcp")]
+    /// not riding, and a build without `mhd` has only one to ride.
+    #[cfg(feature = "mhd")]
     #[tokio::test]
     #[expect(
         unsafe_code,
@@ -3584,7 +3584,7 @@ mod tests {
         unsafe {
             std::env::set_var("MOLEHILL_TUNNEL_CARRIER_RULE", "1");
         }
-        let (pool, _rxs, choice) = duplex_pool_with_choice(Carrier::Kcp, 2, 2);
+        let (pool, _rxs, choice) = duplex_pool_with_choice(Carrier::Mhd, 2, 2);
         let counters: Vec<std::sync::Arc<TunnelCounters>> = {
             let state = pool.inner.state.lock();
             state
@@ -3679,7 +3679,7 @@ mod tests {
         }
         assert_eq!(
             choice.carrier(),
-            Carrier::Kcp,
+            Carrier::Mhd,
             "a Revert verdict leaves the endpoint's choice alone"
         );
         // Same reason as the Move test: the registry entry must expire before
@@ -3704,9 +3704,9 @@ mod tests {
         unsafe {
             std::env::set_var("MOLEHILL_TUNNEL_CARRIER_RULE", "1");
         }
-        // A Kcp-carrier pool: the rule's move is Kcp → Tcp, and a handover
-        // looks for Kcp entries in the pool it runs on.
-        let (pool, _rxs) = duplex_pool_on(Carrier::Kcp, 2, 2);
+        // A Mhd-carrier pool: the rule's move is Mhd → Tcp, and a handover
+        // looks for Mhd entries in the pool it runs on.
+        let (pool, _rxs) = duplex_pool_on(Carrier::Mhd, 2, 2);
         let counters: Vec<std::sync::Arc<TunnelCounters>> = {
             let state = pool.inner.state.lock();
             state
@@ -4192,8 +4192,8 @@ mod tests {
     }
 
     /// The same, on the named carrier: the carrier rule's tests need a pool
-    /// whose entries ride Kcp, because its move is `Kcp → Tcp` and a
-    /// `begin_handover` refuses to look for Kcp entries in a Tcp pool.
+    /// whose entries ride Mhd, because its move is `Mhd → Tcp` and a
+    /// `begin_handover` refuses to look for Mhd entries in a Tcp pool.
     fn duplex_pool_on(
         carrier: Carrier,
         n: usize,
@@ -4923,7 +4923,7 @@ mod tests {
         tx.send(true).unwrap();
     }
 
-    /// A two-tunnel KCP pool whose repairs record their dials and must ask for
+    /// A two-tunnel mhd pool whose repairs record their dials and must ask for
     /// TCP: the fixture both handover tests start from.
     fn handover_pool(key: &str) -> (TunnelPool, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4943,7 +4943,7 @@ mod tests {
             (duplex_tunnel(), tokio::sync::watch::channel(false).0),
         ];
         let pool = TunnelPool::with_preference(
-            Carrier::Kcp,
+            Carrier::Mhd,
             key.to_owned(),
             initial,
             2,
@@ -4975,15 +4975,15 @@ mod tests {
             anchor.tunnel_id(),
             "back-to-back leases land on distinct tunnels"
         );
-        assert!(pool.begin_handover(Carrier::Kcp, Carrier::Tcp));
+        assert!(pool.begin_handover(Carrier::Mhd, Carrier::Tcp));
         let snapshot = pool.snapshot();
         assert!(
             snapshot
                 .draining
                 .iter()
                 .enumerate()
-                .any(|(index, draining)| *draining && snapshot.tunnels[index].3 == Carrier::Kcp),
-            "a KCP tunnel is unavailable to placement: {snapshot:?}"
+                .any(|(index, draining)| *draining && snapshot.tunnels[index].3 == Carrier::Mhd),
+            "an mhd tunnel is unavailable to placement: {snapshot:?}"
         );
         assert!(
             snapshot.handover.is_some_and(|(_, carrier, phase)| {
@@ -5097,7 +5097,7 @@ mod tests {
             loads[1].0
         };
         assert_eq!(
-            pool.begin_handover_on(Carrier::Kcp, Carrier::Tcp, Some(convicted)),
+            pool.begin_handover_on(Carrier::Mhd, Carrier::Tcp, Some(convicted)),
             Some(convicted),
             "the named tunnel is the one that drains"
         );
@@ -5146,10 +5146,10 @@ mod tests {
     ///
     /// The pool's carrier is part of its identity, and its dialer used to be
     /// built for that one carrier at pool creation — so a pool that came up on
-    /// KCP kept repairing into KCP after UDP stopped working, which is the
+    /// mhd kept repairing into mhd after UDP stopped working, which is the
     /// defect this seam exists for. The fixture makes the two answers differ on
-    /// purpose: born on TCP, preferring KCP, and the *first* repair must ask for
-    /// KCP.
+    /// purpose: born on TCP, preferring mhd, and the *first* repair must ask for
+    /// mhd.
     #[tokio::test]
     async fn a_repair_establishes_the_preferred_carrier() {
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5161,7 +5161,7 @@ mod tests {
                 Err("no server in this test".to_owned())
             })
         });
-        let preferred: PreferredCarrier = std::sync::Arc::new(|| Carrier::Kcp);
+        let preferred: PreferredCarrier = std::sync::Arc::new(|| Carrier::Mhd);
         // Empty pool, count 1: the maintenance tick's first act is a repair.
         let _pool = TunnelPool::with_preference(
             Carrier::Tcp,
@@ -5182,7 +5182,7 @@ mod tests {
         let seen = asked.lock().unwrap().clone();
         assert_eq!(
             seen.first().copied(),
-            Some(Carrier::Kcp),
+            Some(Carrier::Mhd),
             "the repair must ask for the preferred carrier, not the pool's birth one: {seen:?}"
         );
     }
