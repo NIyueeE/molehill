@@ -47,6 +47,18 @@
 
 ## Where this stands
 
+**The swap hit a real abstraction seam, and it is not cosmetic.** The first
+attempt was to make MhdTunnelStream hold a boxed carrier stream so the server's
+per-tunnel handler could take either carrier. It does not compile: the Noise
+wrapper's initiator/responder take a stream that implements this crate's
+AsyncWriteOwned trait (the owned-buffer path that avoids a copy per write), and a
+boxed dyn stream cannot satisfy it — dyn erases the associated const and the
+owned write. So the tunnel handler must be generic over its stream type, or the
+box must implement AsyncWriteOwned by delegating; the first is the honest one,
+and it decides how the two carriers meet: a generic serve path, not a common
+trait object. Recorded here because the next attempt should start from that
+decision rather than rediscovering it by compiling.
+
 **The swap that remains (P3a-6), and why it is one commit.** The new engine is
 complete and tested on its own: wire, stream buffers, recovery, connection,
 async seam, pump, lane and listener, each with unit tests, and the lane test runs
