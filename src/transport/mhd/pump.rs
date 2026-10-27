@@ -281,39 +281,53 @@ impl MhdListener {
         let registry: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Arc<Shared>>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let next_id = Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let mut buf = vec![0u8; 2048];
+        #[cfg(target_os = "linux")]
+        let mut batch = crate::transport::udp_batch::RecvBatch::new(16, 2048);
+        #[cfg(not(target_os = "linux"))]
+        let mut batch = ();
         tokio::spawn(async move {
             loop {
-                let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+                // One batched read, then route what it carried: a coalesced
+                // GRO run arrives here as the datagrams it was made of.
+                let mut arriving: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+                let read = receive(&socket, &mut batch, |from, data| {
+                    arriving.push((from, data.to_vec()));
+                })
+                .await;
+                if read.is_err() {
                     return;
-                };
-                let Ok(packet) = crate::transport::mhd::wire::decode(&buf[..len]) else {
-                    continue;
-                };
-                let now = Instant::now();
-                if let Some(shared) = registry.lock().get(&packet.id).cloned() {
-                    shared.with(|conn| {
-                        let _ = conn.on_datagram(now, &buf[..len]);
-                    });
-                    shared.wake_readers();
-                    shared.wake_writers();
-                    continue;
                 }
-                let shared = Shared::new(crate::transport::mhd::conn::Conn::new(packet.id, false));
-                shared.with(|conn| {
-                    let _ = conn.on_datagram(now, &buf[..len]);
-                });
-                registry.lock().insert(packet.id, Arc::clone(&shared));
-                let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let task = spawn_sender(Arc::clone(&socket), from, Arc::clone(&shared));
-                let lane = Arc::new(MhdLane {
-                    id,
-                    shared,
-                    counters: crate::transport::multiplex::TunnelCounters::for_lane(),
-                    _task: task,
-                });
-                if tx.send(lane).is_err() {
-                    return;
+                for (from, datagram) in arriving {
+                    let buf = &datagram[..];
+                    let Ok(packet) = crate::transport::mhd::wire::decode(buf) else {
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if let Some(shared) = registry.lock().get(&packet.id).cloned() {
+                        shared.with(|conn| {
+                            let _ = conn.on_datagram(now, buf);
+                        });
+                        shared.wake_readers();
+                        shared.wake_writers();
+                        continue;
+                    }
+                    let shared =
+                        Shared::new(crate::transport::mhd::conn::Conn::new(packet.id, false));
+                    shared.with(|conn| {
+                        let _ = conn.on_datagram(now, buf);
+                    });
+                    registry.lock().insert(packet.id, Arc::clone(&shared));
+                    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let task = spawn_sender(Arc::clone(&socket), from, Arc::clone(&shared));
+                    let lane = Arc::new(MhdLane {
+                        id,
+                        shared,
+                        counters: crate::transport::multiplex::TunnelCounters::for_lane(),
+                        _task: task,
+                    });
+                    if tx.send(lane).is_err() {
+                        return;
+                    }
                 }
             }
         });
