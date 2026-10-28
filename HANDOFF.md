@@ -82,14 +82,51 @@ where one was possible:
   segmented as one super-packet must fall back whole, and a partial send must
   resume, never silently drop the rest).
 
-**Verification so far.** `githooks/pre-push` (the whole chain: audit, deny,
-outdated, the serial test suite) is green on `3e8f095`. `cargo test --lib`:
-300 pass (21 in the new engine, including a 100-round-trip Noise stream and an
-8 MiB stream behind a slow reader). `integration_test`: 22/22 pass with
-`MOLEHILL_DATA_CARRIER=mhd` and 22/22 with `=tcp` (serial, separate runs), and
-the striped bulk transfer test ran 12 times in a row. `pool_test` (default
-carrier), `status_api_test`, `log_budget_test`, `session_test`,
-`startup_failure_test`, `noise_keys_test` and `hot_reload_test` are green.
+**The cost investigation (2026-10-28) fixed the engine's data path.** The P2
+measurement above is the result; what it cost to get there is the record below,
+because each of these was a real defect, not a tuning knob:
+
+- the receive buffer was sized from the caller's nominal batch (32 KiB) while
+  the kernel coalesces up to 64 KiB of segments per `GRO` run: every run was
+  truncated by `recvmsg` and the tail was dropped *silently* — an 8 MiB transfer
+  stalled 4 KiB in while the sender re-sent 220 MB. `MSG_TRUNC` now detects it
+  and the region is `GRO_BUF`;
+- the reader staged the whole contiguous prefix and memmoved the remainder per
+  caller-sized slice (a memmove per byte); it now fills the caller's buffer
+  directly, and a received range that continues the piece before it is appended
+  to it instead of becoming a tree entry per 1365 bytes;
+- a packet that fell below the acknowledgement bitmap's 64-number window could
+  never be retired by any later ack, so it was re-sent for the connection's
+  life. The block now carries a cumulative frontier (`Ack::below`) and retires a
+  flight of any width;
+- control packets consumed packet numbers but were never retransmitted, so a
+  lost one left a permanent hole in that frontier (the lane then stalled with its
+  window open). They repeat the last data packet's number and carry
+  `FLAG_UNNUMBERED`, so the receiver does not count them;
+- a finish sent as an unacknowledged reset could be lost and the peer's reader
+  then waited for ever. A finish is now a tracked, empty stream frame at the
+  stream's end offset, retransmitted like data;
+- data for a stream this end had already retired was rejected as
+  `UnknownStream` and therefore never acknowledged; the sender counted ten
+  unanswered retransmissions and declared the *lane* dead. Every short-lived
+  visitor connection eventually killed the lane the others shared — the bench's
+  `iperf3: control socket has closed unexpectedly`. Such data is now dropped and
+  its packet acknowledged;
+- the record layer's resumed `poll_write` answered with the *old* buffer's
+  length: a 32778-byte count for an 8202-byte buffer, which the stripe sender
+  recorded and then sliced past the end of (a panic and a dead group);
+- the stripe sender rotated a frame to another stream after a `Pending`, on the
+  assumption that `Pending` means nothing was taken. A record layer that has
+  already encrypted the bytes into a record breaks that assumption, so one frame
+  could land on two streams and tear the receiver's framing. A frame now stays
+  on the stripe it was offered to.
+
+**Verification so far.** The full serial suite (`cargo test -- --test-threads=1`,
+twelve binaries) is green on `47a0016`: 304 lib tests, `integration_test` 22/22
+with `MOLEHILL_DATA_CARRIER=mhd` and 22/22 with `=tcp` (serial, separate runs),
+and `pool_test`, `status_api_test`, `log_budget_test`, `session_test`,
+`startup_failure_test`, `noise_keys_test`, `hot_reload_test`, `config_test` and
+`interop_test` green.
 `pool_test` under a *forced* `tcp` still fails the three tests that use the
 diagnostic cross-carrier handover hatch (the server never binds UDP when the
 client declares TCP); that is a harness/diagnostic interaction, not a data-path
@@ -98,49 +135,45 @@ suite's.
 
 **Still open, in order:**
 
-1. **The cost gate was measured and it fails — this is the stop condition.**
-   Two `screen` runs with `--aa` on this host, 2026-10-27, the same method
-   fingerprint (`2bdcdece60a72f0c`), binaries built from `3e8f095`; results
-   (outside the tree, raw evidence beside them):
-   `/home/dsh/tmp/bench-20261027-150525.json` (TCP) and
-   `/home/dsh/tmp/bench-20261027-151428.json` (mhd).
+1. **The cost gate fails on the bench model, and it is the stop condition.**
+   Two `screen` runs with `--aa` on this host, 2026-10-28, the same method
+   fingerprint (`2bdcdece60a72f0c`), binaries built from `47a0016`:
 
-   - **TCP carrier:** `l4` clean cost **0.650 s/Gbit** (11.97 Gbit/s, 7.67
-     cores); `l4~aa` 0.635 (12.22 Gbit/s) — the run's own floor on that cell is
-     **2.4 %**, far below the 15 % materiality floor. `l3` 0.209 s/Gbit
-     (21.2 Gbit/s).
-   - **mhd carrier:** the **`l4` arm does not complete**. The warm-up clean
-     cell timed out after 106 s; every measured round then failed in 3–7 s with
-     `iperf3 error: control socket has closed unexpectedly` (three clean
-     samples, plus the `l4~aa` copy failing the same way, so the failure is the
-     carrier and not one build). The `l3` arm completed at **4.21 s/Gbit**
-     (0.55 Gbit/s), three samples spread 3.22–4.80 — a 49 % spread, so the run
-     cannot resolve anything there either. The raw arm logs are under
-     `/home/dsh/tmp/bench-20261027-151428/round1/arm-l4/` (`client.log`,
-     `server.log`): registration and the four-lane mhd pool succeed, then the
-     iperf3 control connection through the L4 path is lost before any
-     measurement.
-   - **Therefore `cpu_s_per_gbit(mhd) ≤ TCP` is NOT established**, and the l3
-     number is ~20× TCP's on the same run. Per the plan's P2 stop condition,
-     the sequence stops here. The remaining phases (P3b/P3c, P4, P5, P6) are
-     not started, and no cost or tail claim may be made about `mhd`.
-   - **Open question this leaves for the human:** the L4-over-mhd control
-     connection dies under the bench's six-service, TCP+UDP-shared-port,
-     namespaced topology while the integration suite passes the same path in
-     one process. The next step is to reproduce that topology (or run the bench
-     arm with `RUST_LOG=debug` on both daemons) and find out whether it is the
-     lane's pool placement under many concurrent visitor channels, the
-     shared-port service pair, or something the bench path does that loopback
-     does not. A real number is not available until that cell completes.
-   - The earlier note that the screen profile does not measure
-     `cpu_s_per_gbit` was wrong: its `cost` scenario is the headline owner of
-     that metric. The failure is the arm's clean cell, not the profile.
+   - **TCP carrier** (`/home/dsh/tmp/bench-20261028-163041.json`): `l4` clean
+     **0.6459 s/Gbit** (11.92 Gbit/s, 7.58 cores); `l4~aa` 0.6529 — the run's
+     own floor is **1.1 %**. `l3` 0.2051 s/Gbit (21.10 Gbit/s).
+   - **mhd carrier** (`/home/dsh/tmp/bench-20261028-163945.json`): `l4` clean
+     **0.9819 s/Gbit** (7.10 Gbit/s, 6.50 cores); `l4~aa` 0.8764 (7.15
+     Gbit/s). That is **1.52×** TCP's per-byte cost against a 1.1 % noise
+     floor, so `cpu_s_per_gbit(mhd) ≤ TCP` is **not established** — it is
+     refuted, by a wide margin.
+   - **Two defects remain in the same arm, both reproduced twice:** the `l3`
+     arm **times out** (the harness's 106 s client bound, two rounds), and
+     `l4` failed one measured round with `iperf3 error: control socket has
+     closed unexpectedly`. The warm-up cell completes now (it did not before
+     `47a0016`), so the arm is no longer dead — but it is not reliable either.
+   - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
+     started, no cost or tail claim may be made about `mhd`, and the phases
+     that would follow are not to be executed on the belief that a later
+     phase fixes the per-byte cost: the engine's own overhead is the gap, not
+     its congestion control or its FEC.
+   - **The decision this leaves for the human** (the plan names it): ship
+     `mhd` as a loss-tail-only carrier with an honest "costs ~1.5× TCP on a
+     clean path, wins on lossy multi-flow tails" claim, or stop the carrier
+     and delete it. Nothing in this branch is released, so both remain open.
+   - The local single-host proxy that guided the work (one forwarded TCP
+     stream through an iperf3 pair, `cpu-split.sh` outside the tree) reads
+     mhd 5.98 Gbit/s at 0.549 s/Gbit against TCP 4.91 at 0.462 — the same
+     ordering, a smaller gap. The bench's namespaced topology amplifies the
+     per-packet cost, which is where the gap lives.
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`
    accounting on the client and the `SessionHealth`/carrier-rule evidence are
    not done. `mhd` streams currently carry those paths through the reliable
-   stream, which is correct but loses the loss-isolation win.
+   stream, which is correct but loses the loss-isolation win. **The `l3` timeout
+   above is this path**: the bench's transparent arm over mhd does not complete,
+   which is the first thing to fix if the carrier is kept.
 3. **P4/P5/P6** — rate-based congestion control, adaptive FEC, bench arms and
    the bilingual docs sweep are untouched. The docs pages were updated only
    where the swap made them false (structure, transport's Noise paragraph,
