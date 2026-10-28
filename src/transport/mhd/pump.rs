@@ -80,7 +80,6 @@ async fn send_run(
 ) -> std::io::Result<()> {
     use crate::transport::dgram::Span;
     use crate::transport::udp_batch::SendBatch;
-    use bytes::Bytes;
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
 
@@ -91,7 +90,6 @@ async fn send_run(
             len: *len,
         })
         .collect();
-    let buf = Bytes::copy_from_slice(run);
     let mut at = 0;
     while at < all.len() {
         socket.writable().await?;
@@ -99,8 +97,8 @@ async fn send_run(
         let outcome = socket.try_io(Interest::WRITABLE, || {
             // A run GSO cannot take, or a kernel without it, falls back to the
             // batched syscall for the same datagrams.
-            match SendBatch::send_gso(socket.as_raw_fd(), peer, &buf, chunk) {
-                Ok(0) | Err(_) => SendBatch::send_spans(socket.as_raw_fd(), peer, &buf, chunk),
+            match SendBatch::send_gso(socket.as_raw_fd(), peer, run, chunk) {
+                Ok(0) | Err(_) => SendBatch::send_spans(socket.as_raw_fd(), peer, run, chunk),
                 Ok(n) => Ok(n),
             }
         });
@@ -151,16 +149,14 @@ async fn flush(
 ) -> std::io::Result<usize> {
     let mut run: Vec<u8> = Vec::with_capacity(SEND_RUN * 2048);
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(SEND_RUN);
-    let mut packet = [0u8; 2048];
     run.clear();
     spans.clear();
     while spans.len() < SEND_RUN {
         let now = Instant::now();
-        let Some(len) = shared.with(|conn| conn.poll_transmit(now, &mut packet)) else {
+        let off = run.len();
+        let Some(len) = shared.with(|conn| conn.poll_transmit(now, &mut run)) else {
             break;
         };
-        let off = run.len();
-        run.extend_from_slice(&packet[..len]);
         spans.push((off, len));
     }
     if spans.is_empty() {

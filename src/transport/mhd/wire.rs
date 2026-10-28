@@ -355,6 +355,87 @@ pub(crate) fn encode(
     Some(total)
 }
 
+/// One reliable stream frame's identity: which stream, where in it, and
+/// whether the range ends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamRange<'a> {
+    /// Which stream.
+    pub(crate) id: u32,
+    /// Where these bytes start in it.
+    pub(crate) offset: u64,
+    /// Whether this range ends the stream.
+    pub(crate) fin: bool,
+    /// The bytes.
+    pub(crate) data: &'a [u8],
+}
+
+/// Append one reliable-stream packet to `out`, answering its length.
+///
+/// The payload is appended straight from the stream's own buffer, so a bulk
+/// transfer is copied once on its way out rather than once into a scratch
+/// array and again into the batch. The caller sizes `out` for the run it is
+/// staging; a frame that would not fit is refused rather than truncated.
+pub(crate) fn encode_stream(
+    out: &mut Vec<u8>,
+    id: u32,
+    number: u32,
+    ack: Option<Ack>,
+    range: StreamRange<'_>,
+) -> Option<usize> {
+    let StreamRange {
+        id: stream,
+        offset,
+        fin,
+        data,
+    } = range;
+    let head = HEAD + ack.map_or(0, |_| ACK);
+    let total = head + STREAM + data.len();
+    if total > MAX_DATAGRAM {
+        return None;
+    }
+    let start = out.len();
+    out.reserve(total);
+    out.resize(start + HEAD, 0);
+    let mut flags = Kind::Stream as u8;
+    if ack.is_some() {
+        flags |= FLAG_ACK;
+    }
+    if fin {
+        flags |= FLAG_FIN;
+    }
+    out[start] = flags;
+    out[start + 1..start + 5].copy_from_slice(&id.to_le_bytes());
+    out[start + 5..start + 9].copy_from_slice(&number.to_le_bytes());
+    if let Some(block) = ack {
+        out.extend_from_slice(&block.largest.to_le_bytes());
+        out.extend_from_slice(&block.bits.to_le_bytes());
+    }
+    out.extend_from_slice(&stream.to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    let len = u16::try_from(data.len()).ok()?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(data);
+    Some(total)
+}
+
+/// Append one control packet (anything but a reliable stream frame) to `out`.
+///
+/// These frames are at most a few dozen bytes, so they are encoded into a
+/// stack buffer and appended; only the stream frame, which carries the bulk of
+/// every transfer, needs the append-straight-from-its-own-buffer path above.
+pub(crate) fn encode_control(
+    out: &mut Vec<u8>,
+    id: u32,
+    number: u32,
+    ack: Option<Ack>,
+    frame: Frame<'_>,
+) -> Option<usize> {
+    let mut scratch = [0u8; MAX_DATAGRAM];
+    let len = encode(&mut scratch, id, number, ack, frame)?;
+    out.extend_from_slice(&scratch[..len]);
+    Some(len)
+}
+
 /// One decoded packet: its identity, its acknowledgement and its frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Packet<'a> {

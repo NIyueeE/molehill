@@ -12,7 +12,7 @@
 //! byte count the peer advertises, not a delta, because a lost delta drifts the
 //! window for ever.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::recovery::{Expiry, Recovery, SentRange};
@@ -123,6 +123,17 @@ pub(crate) struct Conn {
     inbound: VecDeque<u32>,
     /// Control frames waiting for the next pass: a stream one end let go.
     resets: VecDeque<(u32, ResetCode)>,
+    /// Streams whose writer finished but whose finish has not been said yet.
+    ///
+    /// A set rather than a scan: an acknowledgement settles every stream in it,
+    /// and walking the whole table per acknowledgement is one more cost that
+    /// grows with the number of live streams.
+    finishing: BTreeSet<u32>,
+    /// Bytes every stream has written and the peer has not acknowledged.
+    ///
+    /// The credit window is spent on this, and summing it per write would walk
+    /// every stream the connection holds.
+    in_flight: u64,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
     /// A close that waits for what is already queued to leave first.
@@ -161,6 +172,8 @@ impl Conn {
             read: 0,
             inbound: VecDeque::new(),
             resets: VecDeque::new(),
+            finishing: BTreeSet::new(),
+            in_flight: 0,
             closed: None,
             close_after: None,
             keepalive_at: now + KEEPALIVE,
@@ -206,7 +219,7 @@ impl Conn {
     /// which is what makes a slow reader backpressure its writer instead of
     /// filling the sender's memory.
     pub(crate) fn write(&mut self, stream: u32, bytes: &[u8]) -> usize {
-        let room = self.send_credit.saturating_sub(self.in_flight_bytes());
+        let room = self.send_credit.saturating_sub(self.in_flight);
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
@@ -215,12 +228,8 @@ impl Conn {
             return 0;
         }
         state.send.write(&bytes[..take]);
+        self.in_flight += take as u64;
         take
-    }
-
-    /// Bytes this end has written and the peer has not acknowledged.
-    fn in_flight_bytes(&self) -> u64 {
-        self.streams.values().map(|s| s.send.unacked()).sum()
     }
 
     /// Finish a stream: no byte past what is queued will be written.
@@ -254,6 +263,7 @@ impl Conn {
     /// Move a finishing stream along: say the finish, retire it when it is done.
     fn settle(&mut self, stream: u32) {
         let Some(state) = self.streams.get_mut(&stream) else {
+            self.finishing.remove(&stream);
             return;
         };
         if state.local_fin && !state.fin_sent && state.send.unacked() == 0 {
@@ -263,6 +273,11 @@ impl Conn {
             self.resets.push_back((stream, ResetCode::Finished));
         }
         let done = state.abandoned && state.fin_sent && state.send.unacked() == 0;
+        if state.local_fin && !state.fin_sent {
+            self.finishing.insert(stream);
+        } else {
+            self.finishing.remove(&stream);
+        }
         if done {
             self.streams.remove(&stream);
         }
@@ -270,12 +285,9 @@ impl Conn {
 
     /// Settle every finishing stream, after an acknowledgement moved a base.
     fn settle_finished(&mut self) {
-        let waiting: Vec<u32> = self
-            .streams
-            .iter()
-            .filter(|(_, state)| state.local_fin && !state.fin_sent)
-            .map(|(id, _)| *id)
-            .collect();
+        // Taken before the loop: `settle` edits the set, and the ids it removes
+        // are exactly the ones that no longer need settling.
+        let waiting: Vec<u32> = self.finishing.iter().copied().collect();
         for id in waiting {
             self.settle(id);
         }
@@ -376,34 +388,37 @@ impl Conn {
         }
     }
 
-    /// Build the next datagram to send, answering its length.
+    /// Append the next datagram to `out`, answering its length.
     ///
     /// A stream with bytes to send goes first, then a reset, then a credit
     /// update the peer has not seen, then a bare acknowledgement, and finally a
     /// keepalive: an ack that waits behind data is an ack that arrives after the
     /// sender has already re-sent.
-    pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<usize> {
+    ///
+    /// `out` is the run the pump is staging, so a stream frame's payload is
+    /// appended from the stream's own buffer and never staged twice.
+    pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
         if self.closed.is_some() {
             return None;
         }
         let ack = self.acks.packet();
         if let Some((id, offset, want)) = self.next_stream_range() {
             let number = self.recovery.next_number();
-            let mut chunk = [0u8; MAX_STREAM_PAYLOAD];
-            let (len, fin) = {
-                let state = self.streams.get(&id)?;
-                let (bytes, fin) = state.send.range(offset, want)?;
-                let len = bytes.len();
-                chunk[..len].copy_from_slice(bytes);
-                (len, fin)
-            };
-            let frame = Frame::Stream {
-                id,
-                offset,
-                fin,
-                data: &chunk[..len],
-            };
-            let packet_len = wire::encode(out, self.id, number, ack, frame)?;
+            let state = self.streams.get(&id)?;
+            let (bytes, fin) = state.send.range(offset, want)?;
+            let len = bytes.len();
+            let packet_len = wire::encode_stream(
+                out,
+                self.id,
+                number,
+                ack,
+                wire::StreamRange {
+                    id,
+                    offset,
+                    fin,
+                    data: bytes,
+                },
+            )?;
             self.recovery.on_sent(
                 now,
                 number,
@@ -423,7 +438,7 @@ impl Conn {
             return Some(packet_len);
         }
         if let Some((id, code)) = self.resets.pop_front() {
-            let packet_len = wire::encode(
+            let packet_len = wire::encode_control(
                 out,
                 self.id,
                 self.recovery.next_number(),
@@ -436,7 +451,7 @@ impl Conn {
         }
         if self.recv_credit > self.advertised + WINDOW / 4 {
             let number = self.recovery.next_number();
-            let packet_len = wire::encode(
+            let packet_len = wire::encode_control(
                 out,
                 self.id,
                 number,
@@ -452,7 +467,7 @@ impl Conn {
         }
         if self.ack_pending {
             let packet_len =
-                wire::encode(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
+                wire::encode_control(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
             self.ack_pending = false;
             self.keepalive_at = now + KEEPALIVE;
             return Some(packet_len);
@@ -466,47 +481,52 @@ impl Conn {
                 return None;
             }
             let packet_len =
-                wire::encode(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
+                wire::encode_control(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
             return Some(packet_len);
         }
         None
     }
 
     /// The next stream with bytes to send, walking from the cursor.
+    ///
+    /// The walk is two bounded ranges over the table rather than a collected
+    /// vector of ids: a packet is built for every pass, and allocating a list of
+    /// every live stream per packet is a cost that grows with the connection's
+    /// width.
     fn next_stream_range(&mut self) -> Option<(u32, u64, usize)> {
-        let ids: Vec<u32> = self.streams.keys().copied().collect();
-        if ids.is_empty() {
+        if self.streams.is_empty() {
             return None;
         }
-        let start = ids.iter().position(|id| *id >= self.cursor).unwrap_or(0);
-        for step in 0..ids.len() {
-            let id = ids[(start + step) % ids.len()];
-            let state = self.streams.get(&id)?;
+        let cursor = self.cursor;
+        let eligible = |(id, state): (&u32, &StreamState)| {
             // `Finished` ends the peer's *write* direction, not the stream: the
             // other direction is still ours to use (that is what half-close
             // means). Only an abort or a refusal stops our writes too.
-            if state.reset.is_some_and(|code| code != ResetCode::Finished) {
-                continue;
-            }
-            if !state.send.has_unsent() {
-                continue;
-            }
-            let offset = state.send.next_offset();
-            let unsent = (state.send.unacked()).min(STREAM_BURST as u64);
-            let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
-            return Some((id, offset, want));
-        }
-        None
+            let open = state.reset.is_none_or(|code| code == ResetCode::Finished);
+            let queued = state.send.has_unsent();
+            (open && queued).then(|| {
+                let offset = state.send.next_offset();
+                let unsent = (state.send.unacked()).min(STREAM_BURST as u64);
+                let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
+                (*id, offset, want)
+            })
+        };
+        self.streams
+            .range(cursor..)
+            .find_map(eligible)
+            .or_else(|| self.streams.range(..cursor).find_map(eligible))
     }
 
+    /// Move the cursor past the stream that was just served, wrapping to the
+    /// smallest id so the walk starts again where it began.
     fn advance_cursor(&mut self) {
-        let ids: Vec<u32> = self.streams.keys().copied().collect();
-        self.cursor = ids
-            .iter()
-            .find(|id| **id > self.cursor)
-            .copied()
-            .or_else(|| ids.first().copied())
-            .unwrap_or(0);
+        use std::collections::Bound;
+        self.cursor = self
+            .streams
+            .range((Bound::Excluded(self.cursor), Bound::Unbounded))
+            .next()
+            .or_else(|| self.streams.iter().next())
+            .map_or(0, |(id, _)| *id);
     }
 
     /// Feed one datagram from the peer.
@@ -528,7 +548,9 @@ impl Conn {
                 if let Some(range) = sent.range
                     && let Some(state) = self.streams.get_mut(&range.stream)
                 {
-                    state.send.ack(range.offset, usize::from(range.len));
+                    self.in_flight = self
+                        .in_flight
+                        .saturating_sub(state.send.ack(range.offset, usize::from(range.len)));
                 }
             }
             // A loss only rewinds the send point: the bytes are still in the
@@ -655,14 +677,14 @@ mod tests {
             let mut moved = 0;
             loop {
                 let mut progress = false;
-                let mut buf = [0u8; 2048];
+                let mut buf = Vec::new();
                 while let Some(len) = self.a.poll_transmit(now, &mut buf) {
-                    self.a_to_b.push_back(buf[..len].to_vec());
+                    self.a_to_b.push_back(buf[buf.len() - len..].to_vec());
                     moved += 1;
                     progress = true;
                 }
                 while let Some(len) = self.b.poll_transmit(now, &mut buf) {
-                    self.b_to_a.push_back(buf[..len].to_vec());
+                    self.b_to_a.push_back(buf[buf.len() - len..].to_vec());
                     moved += 1;
                     progress = true;
                 }
@@ -683,7 +705,7 @@ mod tests {
         /// The same, but the first datagram in flight is dropped.
         fn pump_dropping_one(&mut self, now: Instant) -> usize {
             let mut moved = 0;
-            let mut buf = [0u8; 2048];
+            let mut buf = Vec::new();
             let mut dropped = false;
             while let Some(len) = self.a.poll_transmit(now, &mut buf) {
                 if !dropped {
@@ -691,14 +713,14 @@ mod tests {
                     moved += 1;
                     continue;
                 }
-                self.a_to_b.push_back(buf[..len].to_vec());
+                self.a_to_b.push_back(buf[buf.len() - len..].to_vec());
                 moved += 1;
             }
             while let Some(datagram) = self.a_to_b.pop_front() {
                 self.b.on_datagram(now, &datagram).unwrap();
             }
             while let Some(len) = self.b.poll_transmit(now, &mut buf) {
-                self.b_to_a.push_back(buf[..len].to_vec());
+                self.b_to_a.push_back(buf[buf.len() - len..].to_vec());
             }
             while let Some(datagram) = self.b_to_a.pop_front() {
                 self.a.on_datagram(now, &datagram).unwrap();

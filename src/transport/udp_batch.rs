@@ -31,9 +31,10 @@ use nix::sys::socket::{
 };
 
 use crate::transport::mhd::MHD_OVERHEAD;
-use bytes::Bytes;
 
 use super::dgram::{BATCH, Span};
+#[cfg(test)]
+use bytes::Bytes;
 
 /// Bytes in one receive region: a GRO run coalesces up to this much before the
 /// kernel hands it back.
@@ -183,7 +184,7 @@ impl SendBatch {
     pub fn send_spans(
         fd: RawFd,
         peer: SocketAddr,
-        buf: &Bytes,
+        buf: &[u8],
         spans: &[Span],
     ) -> io::Result<usize> {
         let n = spans.len().min(BATCH);
@@ -233,7 +234,7 @@ impl SendBatch {
     /// with a short piece anywhere but the end is not eligible at all: a partial
     /// super-packet would silently drop the spans it did not carry, and the
     /// caller has already marked them sent.
-    pub fn send_gso(fd: RawFd, peer: SocketAddr, buf: &Bytes, spans: &[Span]) -> io::Result<usize> {
+    pub fn send_gso(fd: RawFd, peer: SocketAddr, buf: &[u8], spans: &[Span]) -> io::Result<usize> {
         let limit = spans.len().min(BATCH);
         let Some(segment) = spans.first().map(Span::len).filter(|n| *n > 0) else {
             return Ok(0);

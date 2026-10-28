@@ -323,12 +323,12 @@ mod tests {
     /// Move everything both connections want to send, once, and deliver it.
     fn pump_once(a: &Arc<Shared>, b: &Arc<Shared>) {
         let now = Instant::now();
-        let mut buf = [0u8; 2048];
         for (from, to) in [(a, b), (b, a)] {
-            let mut packets = Vec::new();
+            let mut packets: Vec<Vec<u8>> = Vec::new();
             from.with(|conn| {
+                let mut buf = Vec::new();
                 while let Some(len) = conn.poll_transmit(now, &mut buf) {
-                    packets.push(buf[..len].to_vec());
+                    packets.push(buf[buf.len() - len..].to_vec());
                 }
             });
             for packet in &packets {

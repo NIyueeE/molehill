@@ -58,17 +58,19 @@ impl SendBuf {
         self.drained + self.data.len() as u64
     }
 
-    /// Record that everything below upto arrived.
+    /// Record that everything below upto arrived, answering how many bytes the
+    /// base moved.
     ///
     /// An acknowledgement past what was written is a peer mistake and is
     /// clamped, never trusted: it would otherwise drop bytes nobody sent.
-    pub(crate) fn ack(&mut self, offset: u64, len: usize) {
+    pub(crate) fn ack(&mut self, offset: u64, len: usize) -> u64 {
         let written = self.written();
         let start = offset.max(self.base).min(written);
         let end = offset.saturating_add(len as u64).min(written);
         if end <= start {
-            return;
+            return 0;
         }
+        let before = self.base;
         self.acked.insert(start, end);
         // Advance only over the run that starts at the base: a hole above it is
         // exactly what a retransmission is for, and stepping past it would drop
@@ -78,6 +80,7 @@ impl SendBuf {
             self.sent = self.sent.max(self.base);
         }
         self.compact();
+        self.base - before
     }
 
     /// Drop the acknowledged prefix, but only once it pays for the move.
