@@ -183,10 +183,18 @@ suite's.
      What is left is the path from the TUN device through the hub into the
      carrier and back, and the number that has to be explained is
      **≈1.75 ms of service per round trip under load against 0.57 ms idle**
-     with sixteen flows queueing. The next step is the pump-phase tracer the
-     cost investigation used (`MHD_TRACE`, per-phase wall time), applied to
-     this workload; it was not written here because the instrumentation is a
-     temporary change and this session's rounds are the unit of work.
+     with sixteen flows queueing. The pump-phase tracer (`MHD_TRACE`, per-phase
+     wall time) was run on exactly this workload and it says the carrier is
+     **not** the limiter: in the busiest second the pump spends 22 ms building
+     packets, 73 ms in its send syscalls and 496 ms **waiting**, while the
+     layer above spends 11 ms in `poll_read` and 2 ms in `poll_write`. The
+     server-side sender pump reads the same shape (25 / 80 / 675 ms, 12 ms in
+     its reads).
+     So the collapse is above the carrier: something on the hub side offers
+     packets at 576 round trips/s while the lane sits idle 90 % of the time.
+     The next step is the same tracer moved up one layer — the hub's
+     device→channel→lane path and its `write_all` pump — not another look at
+     `mhd`.
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
