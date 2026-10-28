@@ -167,6 +167,26 @@ suite's.
      pipeline sixteen flows, and something serialises them. That is where the
      next investigation starts, and it is worth doing before any claim about
      L3 on mhd.
+
+     What has been ruled out, each by measurement rather than argument:
+
+     - **not CPU** — the two daemons spend 0.36 s + 0.52 s of CPU over the
+       5.5 s the workload runs (about 16 % of one core);
+     - **not per-lane serialisation** — `CLAIM_LANES=4` fails the same three
+       checks with the same rate, so the queue is above the lane;
+     - **not a hub timer** — the transparent path has no per-packet interval
+       (`LANE_TICK` is one second and covers lane health; the flow sweeper is
+       one second and covers eviction);
+     - **not the congestion window alone**, for the same reason as the lane
+       count: four lanes give four windows and change nothing.
+
+     What is left is the path from the TUN device through the hub into the
+     carrier and back, and the number that has to be explained is
+     **≈1.75 ms of service per round trip under load against 0.57 ms idle**
+     with sixteen flows queueing. The next step is the pump-phase tracer the
+     cost investigation used (`MHD_TRACE`, per-phase wall time), applied to
+     this workload; it was not written here because the instrumentation is a
+     temporary change and this session's rounds are the unit of work.
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
