@@ -34,6 +34,16 @@ pub(crate) const MAX_DATAGRAM: usize = 1400;
 const KIND_MASK: u8 = 0b0000_0111;
 const FLAG_ACK: u8 = 0b0000_1000;
 const FLAG_FIN: u8 = 0b0001_0000;
+/// Set on a packet that consumes no packet number and is not acknowledged.
+///
+/// A control packet — a credit update, a reset, a bare acknowledgement, a
+/// keepalive — is never retransmitted, so if it took a number it would leave a
+/// hole in the peer's cumulative frontier the moment it was lost, and nothing
+/// would ever fill it: the frontier would stop advancing and the sender's flight
+/// would never retire. The number it carries repeats the last data packet's, and
+/// this flag is what tells the receiver not to read it as news — which also means
+/// a control packet can never acknowledge a data packet that was in fact lost.
+const FLAG_UNNUMBERED: u8 = 0b0010_0000;
 
 /// flags + connection id + packet number.
 pub(crate) const HEAD: usize = 9;
@@ -344,6 +354,14 @@ pub(crate) fn encode(
     if ack.is_some() {
         flags |= FLAG_ACK;
     }
+    if matches!(
+        frame,
+        Frame::None | Frame::Credit { .. } | Frame::Reset { .. }
+    ) {
+        // Nothing here is retransmitted, so nothing here may hold a number the
+        // peer's frontier would wait for (see `FLAG_UNNUMBERED`).
+        flags |= FLAG_UNNUMBERED;
+    }
     buf[0] = flags;
     buf[1..5].copy_from_slice(&id.to_le_bytes());
     buf[5..9].copy_from_slice(&number.to_le_bytes());
@@ -482,6 +500,9 @@ pub(crate) struct Packet<'a> {
     pub(crate) id: u32,
     /// The packet's number, which is what an acknowledgement names.
     pub(crate) number: u32,
+    /// Whether the number repeats another packet's and must not be acknowledged
+    /// (see [`FLAG_UNNUMBERED`]).
+    pub(crate) unnumbered: bool,
     /// What this packet acknowledges, when it carries a block.
     pub(crate) ack: Option<Ack>,
     /// The one frame it carries.
@@ -574,6 +595,7 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
     Ok(Packet {
         id,
         number,
+        unnumbered: flags & FLAG_UNNUMBERED != 0,
         ack,
         frame,
     })

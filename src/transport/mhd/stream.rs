@@ -109,6 +109,11 @@ impl SendBuf {
         self.fin_at = Some(self.written());
     }
 
+    /// Where the writer finished, once it has.
+    pub(crate) fn finished_at(&self) -> Option<u64> {
+        self.fin_at
+    }
+
     /// Whether the writer finished.
     #[cfg(test)]
     pub(crate) fn finished(&self) -> bool {

@@ -169,6 +169,8 @@ pub(crate) enum Expiry {
 #[derive(Debug)]
 pub(crate) struct Recovery {
     next: u32,
+    /// The number the most recent tracked packet took.
+    last: u32,
     in_flight: BTreeMap<u32, Sent>,
     /// Stream bytes the table holds, kept exact by [`Self::retire`].
     flight_bytes: u64,
@@ -186,6 +188,7 @@ impl Recovery {
     pub(crate) fn new() -> Self {
         Self {
             next: 0,
+            last: 0,
             in_flight: BTreeMap::new(),
             flight_bytes: 0,
             rtt: Rtt::default(),
@@ -199,7 +202,18 @@ impl Recovery {
     pub(crate) fn next_number(&mut self) -> u32 {
         let number = self.next;
         self.next = self.next.wrapping_add(1);
+        self.last = number;
         number
+    }
+
+    /// The number a control packet repeats.
+    ///
+    /// Control packets are not retransmitted, so one that took a fresh number
+    /// would leave a hole in the peer's cumulative frontier as soon as it was
+    /// lost, and nothing would ever fill it. They repeat the last data packet's
+    /// number and are marked so the peer does not read them as news.
+    pub(crate) fn last_number(&self) -> u32 {
+        self.last
     }
 
     /// Bytes on the wire and not yet acknowledged.

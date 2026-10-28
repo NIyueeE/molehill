@@ -134,8 +134,16 @@ pub(crate) struct Conn {
     read: u64,
     /// Streams the peer opened that nothing has taken yet.
     inbound: VecDeque<u32>,
-    /// Control frames waiting for the next pass: a stream one end let go.
+    /// Aborts waiting for the next pass: a stream one end let go of.
     resets: VecDeque<(u32, ResetCode)>,
+    /// Finishes waiting for a packet of their own: (stream, end offset).
+    ///
+    /// A finish normally rides the last data packet. When every byte was already
+    /// acknowledged there is no such packet left to carry it, and the finish needs
+    /// one of its own — a tracked, retransmitted one. A finish carried by an
+    /// unacknowledged control frame is lost with that frame, and the peer's reader
+    /// then waits for an end that will never arrive.
+    pending_fins: VecDeque<(u32, u64)>,
     /// Streams whose writer finished but whose finish has not been said yet.
     ///
     /// A set rather than a scan: an acknowledgement settles every stream in it,
@@ -205,6 +213,7 @@ impl Conn {
             read: 0,
             inbound: VecDeque::new(),
             resets: VecDeque::new(),
+            pending_fins: VecDeque::new(),
             finishing: BTreeSet::new(),
             written: 0,
             cwnd: INITIAL_CWND,
@@ -317,8 +326,11 @@ impl Conn {
         if state.local_fin && !state.fin_sent && state.send.unacked() == 0 {
             state.fin_sent = true;
             // No byte carries the fin now (everything queued is already
-            // acknowledged): the reset says it, after the data has arrived.
-            self.resets.push_back((stream, ResetCode::Finished));
+            // acknowledged), so it needs a packet of its own — and one that is
+            // retransmitted, because a peer that never sees its end waits for it
+            // for ever.
+            let at = state.send.finished_at().unwrap_or(0);
+            self.pending_fins.push_back((stream, at));
         }
         let done = state.abandoned && state.fin_sent && state.send.unacked() == 0;
         if state.local_fin && !state.fin_sent {
@@ -354,7 +366,7 @@ impl Conn {
     pub(crate) fn write_open(&self, stream: u32) -> bool {
         self.streams
             .get(&stream)
-            .is_some_and(|state| state.reset.is_none_or(|code| code == ResetCode::Finished))
+            .is_some_and(|state| state.reset.is_none())
     }
 
     /// Take bytes a stream has received, answering how many were written.
@@ -393,7 +405,7 @@ impl Conn {
             return true;
         }
         self.streams.get(&stream).is_some_and(|s| {
-            // A reset ends the stream wherever it is: the peer aborted it and
+            // An abort ends the stream wherever it is: the peer gave up and
             // whatever is missing will never arrive. A clean finish ends it only
             // once every byte before the end has been read, or a finish that
             // overtook a hole would truncate the stream.
@@ -427,6 +439,7 @@ impl Conn {
     fn has_queued_transmit(&self) -> bool {
         self.ack_pending
             || !self.resets.is_empty()
+            || !self.pending_fins.is_empty()
             || self
                 .streams
                 .values()
@@ -474,89 +487,180 @@ impl Conn {
         }
         let ack = self.acks.packet();
         if self.credit_due() {
-            let number = self.recovery.next_number();
-            let packet_len = wire::encode_control(
-                out,
-                self.id,
-                number,
-                ack,
-                Frame::Credit {
-                    connection: self.recv_credit,
-                },
-            )?;
-            self.advertised = self.recv_credit;
-            self.ack_pending = false;
-            self.keepalive_at = now + KEEPALIVE;
-            return Some(packet_len);
+            return self.transmit_credit(now, out, ack);
         }
-        if let Some((id, offset, want)) = self.next_stream_range() {
-            let number = self.recovery.next_number();
-            let state = self.streams.get(&id)?;
-            let (bytes, fin) = state.send.range(offset, want)?;
-            let len = bytes.len();
-            let packet_len = wire::encode_stream(
-                out,
-                self.id,
-                number,
-                ack,
-                wire::StreamRange {
-                    id,
-                    offset,
-                    fin,
-                    data: bytes,
-                },
-            )?;
-            self.recovery.on_sent(
-                now,
-                number,
-                Some(SentRange {
-                    stream: id,
-                    offset,
-                    len: u16::try_from(len).unwrap_or(u16::MAX),
-                    fin,
-                }),
-            );
-
-            if let Some(state) = self.streams.get_mut(&id) {
-                state.send.mark_sent(len);
-            }
-            self.advance_cursor();
-            self.ack_pending = false;
-            self.keepalive_at = now + KEEPALIVE;
-            return Some(packet_len);
+        if let Some(len) = self.transmit_stream(now, out, ack) {
+            return Some(len);
         }
-        if let Some((id, code)) = self.resets.pop_front() {
-            let packet_len = wire::encode_control(
-                out,
-                self.id,
-                self.recovery.next_number(),
-                ack,
-                Frame::Reset { id, code },
-            )?;
-            self.ack_pending = false;
-            self.keepalive_at = now + KEEPALIVE;
-            return Some(packet_len);
+        if let Some(len) = self.transmit_reset(now, out, ack) {
+            return Some(len);
+        }
+        if let Some(len) = self.transmit_fin(now, out, ack) {
+            return Some(len);
         }
         if self.ack_pending {
             let packet_len =
-                wire::encode_control(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
+                wire::encode_control(out, self.id, self.recovery.last_number(), ack, Frame::None)?;
             self.ack_pending = false;
             self.keepalive_at = now + KEEPALIVE;
             return Some(packet_len);
         }
-        if now >= self.keepalive_at {
-            // One probe per due interval, however long the process was asleep:
-            // a resumed laptop must not fire the whole missed schedule at once.
-            self.keepalive_at = now + KEEPALIVE;
-            if now.saturating_duration_since(self.last_recv) > DEAD_AFTER {
-                self.closed = Some(ResetCode::Aborted);
-                return None;
-            }
-            let packet_len =
-                wire::encode_control(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
-            return Some(packet_len);
+        self.transmit_keepalive(now, out, ack)
+    }
+
+    /// A credit update: where this end's reader has got to.
+    ///
+    /// The credit comes first in a pass because it is the one frame whose delay
+    /// stops the peer outright. A sender blocked on the window has nothing to send,
+    /// so it cannot piggyback the update the way an acknowledgement rides a data
+    /// packet; a receiver whose own outbound queue is always full would otherwise
+    /// never say the window moved.
+    fn transmit_credit(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<u8>,
+        ack: Option<wire::Ack>,
+    ) -> Option<usize> {
+        // A control packet repeats the last data packet's number: it is not
+        // retransmitted, so a number of its own would be a hole in the peer's
+        // frontier that nothing could ever fill (see `wire::FLAG_UNNUMBERED`).
+        let number = self.recovery.last_number();
+        let packet_len = wire::encode_control(
+            out,
+            self.id,
+            number,
+            ack,
+            Frame::Credit {
+                connection: self.recv_credit,
+            },
+        )?;
+        self.advertised = self.recv_credit;
+        self.ack_pending = false;
+        self.keepalive_at = now + KEEPALIVE;
+        Some(packet_len)
+    }
+
+    /// The next stream's bytes, if any stream has unsent data.
+    fn transmit_stream(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<u8>,
+        ack: Option<wire::Ack>,
+    ) -> Option<usize> {
+        let (id, offset, want) = self.next_stream_range()?;
+        let number = self.recovery.next_number();
+        let state = self.streams.get(&id)?;
+        let (bytes, fin) = state.send.range(offset, want)?;
+        let len = bytes.len();
+        let packet_len = wire::encode_stream(
+            out,
+            self.id,
+            number,
+            ack,
+            wire::StreamRange {
+                id,
+                offset,
+                fin,
+                data: bytes,
+            },
+        )?;
+        self.recovery.on_sent(
+            now,
+            number,
+            Some(SentRange {
+                stream: id,
+                offset,
+                len: u16::try_from(len).unwrap_or(u16::MAX),
+                fin,
+            }),
+        );
+        if let Some(state) = self.streams.get_mut(&id) {
+            state.send.mark_sent(len);
         }
-        None
+        self.advance_cursor();
+        self.ack_pending = false;
+        self.keepalive_at = now + KEEPALIVE;
+        Some(packet_len)
+    }
+
+    /// One stream's abort, if one is queued.
+    fn transmit_reset(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<u8>,
+        ack: Option<wire::Ack>,
+    ) -> Option<usize> {
+        let (id, code) = self.resets.pop_front()?;
+        let packet_len = wire::encode_control(
+            out,
+            self.id,
+            self.recovery.last_number(),
+            ack,
+            Frame::Reset { id, code },
+        )?;
+        self.ack_pending = false;
+        self.keepalive_at = now + KEEPALIVE;
+        Some(packet_len)
+    }
+
+    /// A finish with nothing left to ride: a tracked, empty stream frame at the
+    /// stream's end.
+    ///
+    /// It is retransmitted like data, because a peer whose reader never learns the
+    /// stream ended would hold the stream for the connection's life.
+    fn transmit_fin(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<u8>,
+        ack: Option<wire::Ack>,
+    ) -> Option<usize> {
+        let (id, at) = self.pending_fins.pop_front()?;
+        let number = self.recovery.next_number();
+        let packet_len = wire::encode_stream(
+            out,
+            self.id,
+            number,
+            ack,
+            wire::StreamRange {
+                id,
+                offset: at,
+                fin: true,
+                data: &[],
+            },
+        )?;
+        self.recovery.on_sent(
+            now,
+            number,
+            Some(SentRange {
+                stream: id,
+                offset: at,
+                len: 0,
+                fin: true,
+            }),
+        );
+        self.ack_pending = false;
+        self.keepalive_at = now + KEEPALIVE;
+        Some(packet_len)
+    }
+
+    /// The idle probe, when its interval is due.
+    fn transmit_keepalive(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<u8>,
+        ack: Option<wire::Ack>,
+    ) -> Option<usize> {
+        if now < self.keepalive_at {
+            return None;
+        }
+        // One probe per due interval, however long the process was asleep: a
+        // resumed laptop must not fire the whole missed schedule at once.
+        self.keepalive_at = now + KEEPALIVE;
+        if now.saturating_duration_since(self.last_recv) > DEAD_AFTER {
+            self.closed = Some(ResetCode::Aborted);
+            return None;
+        }
+        wire::encode_control(out, self.id, self.recovery.last_number(), ack, Frame::None)
     }
 
     /// The next stream with bytes to send, walking from the cursor.
@@ -631,10 +735,16 @@ impl Conn {
             // is on the wire and not what is owed.
             self.note_retransmits(acked.lost.len());
             for sent in acked.lost {
-                if let Some(range) = sent.range
-                    && let Some(state) = self.streams.get_mut(&range.stream)
-                {
-                    state.send.rewind_to(range.offset);
+                if let Some(range) = sent.range {
+                    if range.len == 0 && range.fin {
+                        // A finish-only packet: nothing to rewind, so queue the
+                        // finish again.
+                        self.pending_fins.push_back((range.stream, range.offset));
+                        continue;
+                    }
+                    if let Some(state) = self.streams.get_mut(&range.stream) {
+                        state.send.rewind_to(range.offset);
+                    }
                 }
             }
             // Grown by one packet per window acknowledged — the additive
@@ -698,15 +808,25 @@ impl Conn {
                 self.ack_pending = true;
             }
             Frame::Reset { id, code } => {
-                if let Some(state) = self.streams.get_mut(&id) {
+                // Only an abort ends a stream wherever it is. A clean finish
+                // rides a tracked frame with its offset (see `pending_fins`), so if
+                // one arrives as a reset it is a peer that predates this dialect —
+                // there is none — and it is ignored rather than guessed at.
+                if code != ResetCode::Finished
+                    && let Some(state) = self.streams.get_mut(&id)
+                {
                     state.reset = Some(code);
                 }
             }
         }
         // Acknowledged only after the frame was accepted: an acknowledgement is
         // the promise that makes the sender forget the bytes, so it may not be
-        // sent for a frame this end rejected.
-        self.acks.insert(packet.number);
+        // sent for a frame this end rejected. A control packet repeats a number
+        // the peer already used and is never retransmitted, so counting it would
+        // acknowledge a data packet that may never have arrived.
+        if !packet.unnumbered {
+            self.acks.insert(packet.number);
+        }
         Ok(())
     }
 
@@ -721,10 +841,14 @@ impl Conn {
         let (expiry, lost) = self.recovery.on_timeout(now);
         self.note_retransmits(lost.len());
         for sent in &lost {
-            if let Some(range) = sent.range
-                && let Some(state) = self.streams.get_mut(&range.stream)
-            {
-                state.send.rewind_to(range.offset);
+            if let Some(range) = sent.range {
+                if range.len == 0 && range.fin {
+                    self.pending_fins.push_back((range.stream, range.offset));
+                    continue;
+                }
+                if let Some(state) = self.streams.get_mut(&range.stream) {
+                    state.send.rewind_to(range.offset);
+                }
             }
         }
         if expiry == Expiry::Dead {
