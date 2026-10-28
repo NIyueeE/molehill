@@ -129,11 +129,12 @@ pub(crate) struct Conn {
     /// and walking the whole table per acknowledgement is one more cost that
     /// grows with the number of live streams.
     finishing: BTreeSet<u32>,
-    /// Bytes every stream has written and the peer has not acknowledged.
+    /// Every byte this end has ever queued for the peer.
     ///
-    /// The credit window is spent on this, and summing it per write would walk
-    /// every stream the connection holds.
-    in_flight: u64,
+    /// The credit window is spent on this, and it is monotonic: a byte counts
+    /// against the window from the moment it is queued until the peer's reader
+    /// has taken it, which is what the peer's absolute credit describes.
+    written: u64,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
     /// A close that waits for what is already queued to leave first.
@@ -173,7 +174,7 @@ impl Conn {
             inbound: VecDeque::new(),
             resets: VecDeque::new(),
             finishing: BTreeSet::new(),
-            in_flight: 0,
+            written: 0,
             closed: None,
             close_after: None,
             keepalive_at: now + KEEPALIVE,
@@ -219,7 +220,15 @@ impl Conn {
     /// which is what makes a slow reader backpressure its writer instead of
     /// filling the sender's memory.
     pub(crate) fn write(&mut self, stream: u32, bytes: &[u8]) -> usize {
-        let room = self.send_credit.saturating_sub(self.in_flight);
+        // The peer's credit is an absolute byte count — where its reader has
+        // got to, plus one window — so the room left is measured against
+        // everything this end has ever queued, not against what is still
+        // unacknowledged. Subtracting the unacknowledged count instead lets a
+        // sender write one extra window per acknowledgement it receives: on a
+        // gigabit transfer that is hundreds of megabytes past the peer's
+        // buffer, every packet of which the peer must drop and therefore never
+        // acknowledge, which is how a healthy lane gets declared dead.
+        let room = self.send_credit.saturating_sub(self.written);
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
@@ -228,7 +237,7 @@ impl Conn {
             return 0;
         }
         state.send.write(&bytes[..take]);
-        self.in_flight += take as u64;
+        self.written += take as u64;
         take
     }
 
@@ -390,10 +399,16 @@ impl Conn {
 
     /// Append the next datagram to `out`, answering its length.
     ///
-    /// A stream with bytes to send goes first, then a reset, then a credit
-    /// update the peer has not seen, then a bare acknowledgement, and finally a
+    /// A credit update the peer has not seen goes first, then a stream with
+    /// bytes to send, then a reset, then a bare acknowledgement, and finally a
     /// keepalive: an ack that waits behind data is an ack that arrives after the
     /// sender has already re-sent.
+    ///
+    /// The credit comes first because it is the one frame whose delay stops the
+    /// peer outright. A sender blocked on the window has nothing to send, so it
+    /// cannot piggyback the update the way an acknowledgement rides a data
+    /// packet; a receiver whose own outbound queue is always full would
+    /// otherwise never say the window moved.
     ///
     /// `out` is the run the pump is staging, so a stream frame's payload is
     /// appended from the stream's own buffer and never staged twice.
@@ -402,6 +417,22 @@ impl Conn {
             return None;
         }
         let ack = self.acks.packet();
+        if self.recv_credit > self.advertised + WINDOW / 4 {
+            let number = self.recovery.next_number();
+            let packet_len = wire::encode_control(
+                out,
+                self.id,
+                number,
+                ack,
+                Frame::Credit {
+                    connection: self.recv_credit,
+                },
+            )?;
+            self.advertised = self.recv_credit;
+            self.ack_pending = false;
+            self.keepalive_at = now + KEEPALIVE;
+            return Some(packet_len);
+        }
         if let Some((id, offset, want)) = self.next_stream_range() {
             let number = self.recovery.next_number();
             let state = self.streams.get(&id)?;
@@ -445,22 +476,6 @@ impl Conn {
                 ack,
                 Frame::Reset { id, code },
             )?;
-            self.ack_pending = false;
-            self.keepalive_at = now + KEEPALIVE;
-            return Some(packet_len);
-        }
-        if self.recv_credit > self.advertised + WINDOW / 4 {
-            let number = self.recovery.next_number();
-            let packet_len = wire::encode_control(
-                out,
-                self.id,
-                number,
-                ack,
-                Frame::Credit {
-                    connection: self.recv_credit,
-                },
-            )?;
-            self.advertised = self.recv_credit;
             self.ack_pending = false;
             self.keepalive_at = now + KEEPALIVE;
             return Some(packet_len);
@@ -548,9 +563,7 @@ impl Conn {
                 if let Some(range) = sent.range
                     && let Some(state) = self.streams.get_mut(&range.stream)
                 {
-                    self.in_flight = self
-                        .in_flight
-                        .saturating_sub(state.send.ack(range.offset, usize::from(range.len)));
+                    state.send.ack(range.offset, usize::from(range.len));
                 }
             }
             // A loss only rewinds the send point: the bytes are still in the
@@ -760,6 +773,10 @@ mod tests {
     fn a_dropped_datagram_is_recovered_without_losing_a_stream() {
         let now = Instant::now();
         let mut link = Link::new();
+        // Settle the opening frames first: a connection advertises its receive
+        // window before it has anything to send, and dropping *that* is not the
+        // loss this test is about.
+        link.pump(now);
         let stream = link.a.open();
         let bytes = payload(8000);
         assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
