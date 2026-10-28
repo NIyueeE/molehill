@@ -389,10 +389,19 @@ impl Recovery {
             .collect();
         if stale.is_empty() {
             // Nothing is past the reordering window yet: the timer fired early,
-            // so this is a probe of a silent path and every outstanding packet
-            // is re-sent, oldest first.
+            // so this is a probe of a silent path and every outstanding packet is
+            // re-sent, oldest first.
+            //
+            // The probed packets leave the table, because they are re-sent as
+            // *new* numbers and will be tracked there. Keeping both copies would
+            // count the same bytes twice in the flight: the congestion window then
+            // closes on a path that merely lost one packet, and every write stalls
+            // until the retransmission timer drains the duplicate. That is a window
+            // that leaks on loss, not a probe.
             self.backoff = self.backoff.saturating_add(1);
             let all: Vec<Sent> = self.in_flight.values().copied().collect();
+            self.in_flight.clear();
+            self.flight_bytes = 0;
             self.arm(now);
             return (Expiry::Timeout, all);
         }
