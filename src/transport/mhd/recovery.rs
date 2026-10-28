@@ -149,6 +149,8 @@ pub(crate) struct Acked {
     /// Whether it advanced the largest number seen, which is what makes it a
     /// round-trip sample.
     pub(crate) progress: bool,
+    /// How many stream bytes it acknowledged, which is what grows the window.
+    pub(crate) bytes: usize,
 }
 
 /// Why the timer fired.
@@ -168,6 +170,8 @@ pub(crate) enum Expiry {
 pub(crate) struct Recovery {
     next: u32,
     in_flight: BTreeMap<u32, Sent>,
+    /// Stream bytes the table holds, kept exact by [`Self::retire`].
+    flight_bytes: u64,
     rtt: Rtt,
     /// When the timer should fire, if anything is in flight.
     timer: Option<Instant>,
@@ -183,6 +187,7 @@ impl Recovery {
         Self {
             next: 0,
             in_flight: BTreeMap::new(),
+            flight_bytes: 0,
             rtt: Rtt::default(),
             timer: None,
             silent: 0,
@@ -197,6 +202,22 @@ impl Recovery {
         number
     }
 
+    /// Bytes on the wire and not yet acknowledged.
+    ///
+    /// Kept as a running total rather than a sum over the table: the window this
+    /// feeds is asked on every write, and a sum over a wide flight per write is
+    /// a cost that grows with the bandwidth-delay product.
+    pub(crate) fn flight_bytes(&self) -> u64 {
+        self.flight_bytes
+    }
+
+    /// Take one packet out of the flight, keeping the byte total exact.
+    fn retire(&mut self, sent: &Sent) {
+        if let Some(range) = sent.range {
+            self.flight_bytes = self.flight_bytes.saturating_sub(u64::from(range.len));
+        }
+    }
+
     /// Record a packet the socket took, and arm the timer for it.
     ///
     /// A packet with no range (an acknowledgement, a credit update) is not
@@ -208,7 +229,8 @@ impl Recovery {
             time: now,
             range,
         };
-        if range.is_some() {
+        if let Some(range) = range {
+            self.flight_bytes += u64::from(range.len);
             self.in_flight.insert(number, sent);
         }
         self.arm(now);
@@ -227,29 +249,53 @@ impl Recovery {
     /// Fold one acknowledgement block in.
     pub(crate) fn on_ack(&mut self, now: Instant, ack: Ack) -> Acked {
         let mut result = Acked::default();
-        // The block covers `largest` and the 64 numbers below it, so nothing
-        // outside that range can be acknowledged or declared lost by it. Bounding
-        // the scan to the window is what keeps an acknowledgement O(window)
-        // instead of O(flight): a wide window holds thousands of packets, and
-        // scanning all of them per acknowledgement is quadratic in the window.
-        let oldest = ack.largest.saturating_sub(64);
-        let window = self.in_flight.range(oldest..=ack.largest);
-        // A packet that had never been acknowledged and is at or below the
-        // largest this block names is the only one that can sample the round
-        // trip: sampling every acknowledgement would fold the peer's delayed
-        // ack timer into the estimate. The sample is taken from the newest
-        // packet this block covers, not from whatever happens to sit at the end
-        // of the flight (a probe has no useful trip time).
-        let sample = window
-            .filter(|(number, _)| ack.contains(**number))
-            .map(|(number, sent)| (*number, sent.time))
-            .max_by_key(|(number, _)| *number);
-        if let Some((_, time)) = sample {
-            result.progress = true;
-            self.rtt.sample(now.saturating_duration_since(time));
-            self.timer = Some(now + self.rtt.rto());
-            self.backoff = 0;
-            self.silent = 0;
+        // The newest packet this block proves arrived, which is what a round-trip
+        // sample is taken from. Both retirement paths feed it: the cumulative
+        // one carries most of a healthy acknowledgement, so a sample taken only
+        // from the bitmap window would never fire and the congestion window
+        // would never grow.
+        let mut newest: Option<(u32, Instant)> = None;
+        let mut note = |sent: &Sent| {
+            if newest.is_none_or(|(number, _)| sent.number > number) {
+                newest = Some((sent.number, sent.time));
+            }
+        };
+        // Everything the frontier names is delivered, however far back it is. That
+        // is the step that retires a wide flight: with a bitmap alone, a
+        // connection with ten thousand packets outstanding could only ever
+        // release the newest sixty-four of them, and the rest would be re-sent
+        // until the connection died.
+        while let Some((&number, _)) = self.in_flight.first_key_value() {
+            if number >= ack.below {
+                break;
+            }
+            if let Some((_, sent)) = self.in_flight.pop_first() {
+                self.retire(&sent);
+                note(&sent);
+                if let Some(range) = sent.range {
+                    result.bytes += usize::from(range.len);
+                }
+                result.newly.push(sent);
+            }
+        }
+        // The bitmap covers `largest` and the 64 numbers below it, so nothing
+        // outside that range can be acknowledged — or declared lost — by it.
+        // Bounding the scan to it is what keeps an acknowledgement O(window)
+        // instead of O(flight). A block whose frontier is already past the
+        // largest number it names has said everything it can: the cumulative
+        // step above took the whole flight.
+        let oldest = ack.below.max(ack.largest.saturating_sub(64));
+        if oldest > ack.largest {
+            if let Some((_, time)) = newest {
+                let sample = now.saturating_duration_since(time);
+                result.progress = true;
+                self.rtt.sample(sample);
+                self.timer = Some(now + self.rtt.rto());
+                self.backoff = 0;
+                self.silent = 0;
+            }
+            self.arm(now);
+            return result;
         }
         // Delivered: everything the block covers and we still hold.
         let acked: Vec<u32> = self
@@ -260,29 +306,41 @@ impl Recovery {
             .collect();
         for number in acked {
             if let Some(sent) = self.in_flight.remove(&number) {
+                self.retire(&sent);
+                note(&sent);
+                if let Some(range) = sent.range {
+                    result.bytes += usize::from(range.len);
+                }
                 result.newly.push(sent);
             }
         }
-        // Lost: three behind the largest within the acknowledgement window.
+        if let Some((_, time)) = newest {
+            let sample = now.saturating_duration_since(time);
+            result.progress = true;
+            self.rtt.sample(sample);
+            self.timer = Some(now + self.rtt.rto());
+            self.backoff = 0;
+            self.silent = 0;
+        }
+        // Lost: three behind the largest, and not named by the bitmap.
         //
-        // The window is 64 packets wide, so a packet *older* than that is
-        // invisible to this block: a later acknowledgement cannot say whether
-        // it arrived. Declaring it lost would be an inference, and on a bursty
-        // path it is a wrong one — acks can be processed in batches, one of
-        // which jumps hundreds of packet numbers, and every packet below its
-        // window would be declared lost and re-sent. Such packets stay in
-        // flight; the retransmission timer below recovers them, at the cost of
-        // one round trip instead of a retransmission storm.
+        // A packet below the frontier is delivered by definition, and one the
+        // bitmap names arrived out of order; what is left in the window with
+        // three later packets already seen is a hole the peer is waiting on.
         let lost: Vec<u32> = self
             .in_flight
             .range(oldest..=ack.largest)
             .filter(|(number, _)| {
-                **number < ack.largest && ack.largest.saturating_sub(**number) >= PACKET_THRESHOLD
+                **number >= ack.below
+                    && **number < ack.largest
+                    && ack.largest.saturating_sub(**number) >= PACKET_THRESHOLD
+                    && !ack.contains(**number)
             })
             .map(|(number, _)| *number)
             .collect();
         for number in lost {
             if let Some(sent) = self.in_flight.remove(&number) {
+                self.retire(&sent);
                 result.lost.push(sent);
             }
         }
@@ -305,6 +363,7 @@ impl Recovery {
         if self.silent >= DEAD_LINK {
             let all: Vec<Sent> = self.in_flight.values().copied().collect();
             self.in_flight.clear();
+            self.flight_bytes = 0;
             return (Expiry::Dead, all);
         }
         let delay = self.rtt.loss_delay();
@@ -326,6 +385,7 @@ impl Recovery {
         let mut lost = Vec::new();
         for number in stale {
             if let Some(sent) = self.in_flight.remove(&number) {
+                self.retire(&sent);
                 lost.push(sent);
             }
         }
@@ -383,6 +443,7 @@ mod tests {
             start + Duration::from_millis(40),
             Ack {
                 largest: second,
+                below: 0,
                 bits: 1, // first is one below largest
             },
         );
@@ -416,6 +477,7 @@ mod tests {
             start + Duration::from_millis(10),
             Ack {
                 largest: later[1],
+                below: 0,
                 bits: 0b1,
             },
         );
@@ -427,6 +489,7 @@ mod tests {
             start + Duration::from_millis(20),
             Ack {
                 largest: later[2],
+                below: 0,
                 bits: 0b11,
             },
         );

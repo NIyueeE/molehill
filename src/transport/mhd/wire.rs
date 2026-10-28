@@ -20,6 +20,7 @@
 //!
 //! All integers are little-endian.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// The largest datagram this carrier sends.
@@ -36,8 +37,8 @@ const FLAG_FIN: u8 = 0b0001_0000;
 
 /// flags + connection id + packet number.
 pub(crate) const HEAD: usize = 9;
-/// largest + bitmap.
-pub(crate) const ACK: usize = 12;
+/// largest + frontier + bitmap.
+pub(crate) const ACK: usize = 16;
 /// stream id + offset + length.
 pub(crate) const STREAM: usize = 14;
 /// stream id + length (an unreliable datagram frame carries no offset).
@@ -123,16 +124,22 @@ impl ResetCode {
     }
 }
 
-/// An acknowledgement block: the highest packet number seen and a bitmap of the
-/// 64 below it.
+/// An acknowledgement block: a cumulative frontier, the highest packet number
+/// seen, and a bitmap of the 64 below it.
 ///
-/// Bit n set means largest - n - 1 arrived. A receiver further behind than this
-/// window is one whose acknowledgement is stale anyway; widening it costs four
-/// bytes on every packet and buys nothing a 64-deep window does not.
+/// The frontier is what makes a wide flight work. A block that only named the
+/// newest 64 numbers could retire nothing older: a sender with ten thousand
+/// packets in flight would re-send the oldest of them for the connection's whole
+/// life, because no later acknowledgement could ever say they arrived — which is
+/// a retransmission storm, not a window. `below` says exactly that: every packet
+/// numbered under it has arrived. The bitmap then covers the reordering window
+/// just above it, where a genuine hole is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Ack {
     /// The highest packet number the receiver has seen.
     pub(crate) largest: u32,
+    /// Every packet numbered below this has arrived.
+    pub(crate) below: u32,
     /// Bit n set means largest - n - 1 arrived.
     pub(crate) bits: u64,
 }
@@ -140,6 +147,9 @@ pub(crate) struct Ack {
 impl Ack {
     /// Whether the block covers this packet number.
     pub(crate) fn contains(self, number: u32) -> bool {
+        if number < self.below {
+            return true;
+        }
         if number == self.largest {
             return true;
         }
@@ -152,20 +162,37 @@ impl Ack {
 }
 
 /// The receiver's view of what has arrived: one acknowledgement under construction.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `below` is the cumulative frontier — every number unter it has arrived — and
+/// `gaps` remembers the numbers above it that arrived out of order, so the
+/// frontier can walk forward as holes are filled. The set is bounded: a peer more
+/// than [`AckSet::AHEAD`] packets ahead of a hole has that data re-sent rather
+/// than remembered, which costs one round trip on a path that bad and no memory
+/// at all on a path that is not.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct AckSet {
     largest: Option<u32>,
     bits: u64,
+    /// Every number below this has arrived.
+    below: u32,
+    /// Numbers above `below` that arrived out of order.
+    gaps: BTreeSet<u32>,
 }
 
 impl AckSet {
+    /// How many out-of-order numbers one receiver may remember.
+    const AHEAD: usize = 256;
+
     /// Record that this packet number arrived. Answers whether it was news.
     pub(crate) fn insert(&mut self, number: u32) -> bool {
+        if number < self.below {
+            return false;
+        }
+        let mut fresh = true;
         match self.largest {
             None => {
                 self.largest = Some(number);
                 self.bits = 0;
-                true
             }
             Some(largest) if number > largest => {
                 let gap = number - largest;
@@ -174,19 +201,28 @@ impl AckSet {
                     self.bits |= 1u64 << (gap - 1);
                 }
                 self.largest = Some(number);
-                true
             }
             Some(largest) => {
                 let behind = largest - number;
-                if behind == 0 || behind > 64 {
+                if behind == 0 {
                     return false;
                 }
-                let bit = 1u64 << (behind - 1);
-                let fresh = self.bits & bit == 0;
-                self.bits |= bit;
-                fresh
+                if behind <= 64 {
+                    let bit = 1u64 << (behind - 1);
+                    fresh = self.bits & bit == 0;
+                    self.bits |= bit;
+                }
             }
         }
+        if number == self.below {
+            self.below = self.below.wrapping_add(1);
+            while self.gaps.remove(&self.below) {
+                self.below = self.below.wrapping_add(1);
+            }
+        } else if self.gaps.len() < Self::AHEAD {
+            self.gaps.insert(number);
+        }
+        fresh
     }
 
     /// The block to put on the wire, or None before anything has arrived.
@@ -194,6 +230,7 @@ impl AckSet {
         match self.largest {
             Some(largest) => Some(Ack {
                 largest,
+                below: self.below,
                 bits: self.bits,
             }),
             None => None,
@@ -313,7 +350,8 @@ pub(crate) fn encode(
     let mut at = HEAD;
     if let Some(block) = ack {
         buf[at..at + 4].copy_from_slice(&block.largest.to_le_bytes());
-        buf[at + 4..at + ACK].copy_from_slice(&block.bits.to_le_bytes());
+        buf[at + 4..at + 8].copy_from_slice(&block.below.to_le_bytes());
+        buf[at + 8..at + ACK].copy_from_slice(&block.bits.to_le_bytes());
         at += ACK;
     }
     match frame {
@@ -408,6 +446,7 @@ pub(crate) fn encode_stream(
     out[start + 5..start + 9].copy_from_slice(&number.to_le_bytes());
     if let Some(block) = ack {
         out.extend_from_slice(&block.largest.to_le_bytes());
+        out.extend_from_slice(&block.below.to_le_bytes());
         out.extend_from_slice(&block.bits.to_le_bytes());
     }
     out.extend_from_slice(&stream.to_le_bytes());
@@ -468,11 +507,13 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
     let mut at = HEAD;
     let ack = if flags & FLAG_ACK != 0 {
         let largest = bytes(at..at + 4)?;
-        let slice = buf.get(at + 4..at + ACK).ok_or(Malformed)?;
+        let below = bytes(at + 4..at + 8)?;
+        let slice = buf.get(at + 8..at + ACK).ok_or(Malformed)?;
         let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
         at += ACK;
         Some(Ack {
             largest,
+            below,
             bits: u64::from_le_bytes(array),
         })
     } else {
@@ -563,6 +604,7 @@ mod tests {
     fn every_frame_round_trips() {
         let ack = Ack {
             largest: 7,
+            below: 2,
             bits: 0b1010_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001,
         };
         let data = [1u8, 2, 3, 4, 5];

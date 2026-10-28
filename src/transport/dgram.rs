@@ -24,7 +24,7 @@ use crate::transport::mhd::MHD_OVERHEAD;
 ///
 /// Portable on purpose: it also bounds the non-Linux batch, where it is the
 /// number of plain `send_to` calls a batch may cost.
-pub const BATCH: usize = 32;
+pub const BATCH: usize = 64;
 
 /// Either a contiguous span of the batch's staging buffer, or a staged
 /// header plus an external payload — the engine segment's own buffer,

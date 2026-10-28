@@ -192,18 +192,12 @@ impl Shared {
 pub(crate) struct StreamIo {
     shared: Arc<Shared>,
     id: u32,
-    /// Reused between polls so a read does not allocate.
-    scratch: Vec<u8>,
 }
 
 impl StreamIo {
     /// Wrap one stream of a connection.
     pub(crate) fn new(shared: Arc<Shared>, id: u32) -> Self {
-        Self {
-            shared,
-            id,
-            scratch: Vec::new(),
-        }
+        Self { shared, id }
     }
 }
 
@@ -214,39 +208,37 @@ impl AsyncRead for StreamIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        // A caller that asked for fewer bytes than had arrived left the rest
-        // here; hand it out before reading the connection again.
-        if !this.scratch.is_empty() {
-            let room = buf.remaining().min(this.scratch.len());
-            buf.put_slice(&this.scratch[..room]);
-            this.scratch.drain(..room);
+        if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        let mut scratch = std::mem::take(&mut this.scratch);
+        let stream = this.id;
         // Register before reading: a datagram that arrives between the read and
         // the park would otherwise find no waker and be lost, and the reader
         // would wait for the pump's next timer instead of the bytes.
         this.shared.park_reader(cx.waker());
-        let (taken, ended, open) = this.shared.with(|conn| {
-            let taken = conn.read(this.id, &mut scratch);
+        // The caller's own buffer is the destination: a staging buffer here
+        // would be one copy per byte into it and another out, and the second
+        // copy only exists to keep a shape the reader does not have.
+        let dst = buf.initialize_unfilled();
+        let (taken, ended, open, credit_due) = this.shared.with(|conn| {
+            let taken = conn.read(stream, dst);
             (
                 taken,
-                conn.peer_finished(this.id) || conn.reset_reason(this.id).is_some(),
-                conn.stream_open(this.id),
+                conn.peer_finished(stream) || conn.reset_reason(stream).is_some(),
+                conn.stream_open(stream),
+                conn.credit_due(),
             )
         });
+        // The reader is what opens the window, and the pump is what says so.
+        // Without this a sender blocked on the window waits for the pump's
+        // keepalive timer, which is a one-to-two second stall per window.
+        if credit_due {
+            this.shared.wake_pump();
+        }
         if taken > 0 {
-            let room = buf.remaining().min(scratch.len());
-            buf.put_slice(&scratch[..room]);
-            if room < scratch.len() {
-                // The caller asked for less than arrived: keep the rest for the
-                // next poll instead of dropping it.
-                scratch.drain(..room);
-                this.scratch = scratch;
-            }
+            buf.advance(taken);
             return Poll::Ready(Ok(()));
         }
-        this.scratch = scratch;
         if ended || !open {
             return Poll::Ready(Ok(()));
         }

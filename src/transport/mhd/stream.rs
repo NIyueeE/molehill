@@ -168,7 +168,14 @@ impl SendBuf {
 /// The bytes of a stream that have arrived, in and out of order.
 #[derive(Debug, Default)]
 pub(crate) struct RecvBuf {
-    /// Out-of-order pieces, keyed by the offset they start at.
+    /// Pieces keyed by the offset they start at.
+    ///
+    /// A piece may start below [`Self::read`]: the reader hands bytes out in
+    /// whatever slice the caller offered, so the piece it is part-way through
+    /// stays where it arrived until it is used up. Nothing is moved to make it
+    /// fit — an earlier version drained the whole buffer per caller chunk,
+    /// which is a memmove of everything still held on every read and measured
+    /// as a memmove per byte carried.
     pieces: BTreeMap<u64, Vec<u8>>,
     /// Everything below this offset has been read out.
     read: u64,
@@ -188,22 +195,91 @@ impl RecvBuf {
     /// A range that starts below the read offset is trimmed, and one that
     /// repeats a range already held is dropped: a retransmission is the same
     /// bytes again, never a different range over the same hole.
+    ///
+    /// A range that continues the piece it follows is **appended to it** rather
+    /// than stored beside it. That is the shape a healthy path produces — the
+    /// sender emits a stream in order, one packet after another — and a piece
+    /// per packet would enter and leave the table once per packet, which is two
+    /// tree operations and an allocation for every 1400 bytes carried. Appending
+    /// costs one copy into a warm buffer.
     pub(crate) fn insert(&mut self, offset: u64, bytes: &[u8]) -> bool {
-        let end = offset + bytes.len() as u64;
-        if bytes.is_empty() || end <= self.read {
+        let (mut offset, mut bytes) = (offset, bytes);
+        if bytes.is_empty() {
             return false;
         }
-        let (offset, bytes) = if offset < self.read {
+        // Bytes the reader has already taken are gone: a retransmission of them
+        // is not news, and keeping it would hand it out twice.
+        if offset < self.read {
             let skip = usize::try_from(self.read - offset).unwrap_or(bytes.len());
-            (self.read, &bytes[skip..])
-        } else {
-            (offset, bytes)
-        };
+            if skip >= bytes.len() {
+                return false;
+            }
+            offset = self.read;
+            bytes = &bytes[skip..];
+        }
+        if let Some((start, held)) = self.pieces.range(..offset).next_back() {
+            let piece_end = start + held.len() as u64;
+            if piece_end > offset {
+                // The range starts inside a piece already held: skip the part
+                // that is there, and keep whatever extends past it.
+                let skip = usize::try_from(piece_end - offset).unwrap_or(bytes.len());
+                if skip >= bytes.len() {
+                    return false;
+                }
+                offset = piece_end;
+                bytes = &bytes[skip..];
+            }
+        }
+        if bytes.is_empty() {
+            return false;
+        }
+        // Never take bytes a piece already ahead of us holds: they have arrived,
+        // and storing them twice would hand them out twice.
+        if let Some((next, _)) = self.pieces.range(offset..).next()
+            && *next < offset + bytes.len() as u64
+        {
+            let keep = usize::try_from(*next - offset).unwrap_or(0);
+            if keep == 0 {
+                return false;
+            }
+            bytes = &bytes[..keep];
+        }
+        if let Some((start, held)) = self.pieces.range(..offset).next_back()
+            && start + held.len() as u64 == offset
+        {
+            let start = *start;
+            if let Some(held) = self.pieces.get_mut(&start) {
+                held.extend_from_slice(bytes);
+            }
+            self.absorb_next(start);
+            return true;
+        }
         if self.pieces.contains_key(&offset) {
             return false;
         }
         self.pieces.insert(offset, bytes.to_vec());
+        self.absorb_next(offset);
         true
+    }
+
+    /// Fold the pieces that now continue `start`'s piece into it.
+    ///
+    /// Only a piece that arrives exactly where another ended can leave two
+    /// adjacent entries; each fold removes one, so the table stays proportional
+    /// to the number of holes rather than to the bytes carried.
+    fn absorb_next(&mut self, start: u64) {
+        loop {
+            let Some(held) = self.pieces.get(&start) else {
+                return;
+            };
+            let end = start + held.len() as u64;
+            let Some(following) = self.pieces.remove(&end) else {
+                return;
+            };
+            if let Some(held) = self.pieces.get_mut(&start) {
+                held.extend_from_slice(&following);
+            }
+        }
     }
 
     /// Mark the stream finished at this offset.
@@ -214,30 +290,47 @@ impl RecvBuf {
         });
     }
 
-    /// Drain the contiguous prefix into out, answering how many bytes were added.
+    /// Move the contiguous prefix into `out`, answering how many bytes were
+    /// written.
     ///
     /// This is the only way bytes leave the buffer, so a caller never sees a
     /// hole: what a lost packet costs is the tail of this stream, and nothing
-    /// else.
-    pub(crate) fn read_into(&mut self, out: &mut Vec<u8>) -> usize {
-        let before = out.len();
+    /// else. Writing straight into the caller's slice is the point: staging the
+    /// prefix in a buffer of this layer's own and then handing out a
+    /// caller-sized slice of it is a second copy per byte, and the memmove that
+    /// keeps the staged remainder in place made it worse than that.
+    pub(crate) fn read_into(&mut self, out: &mut [u8]) -> usize {
+        let mut filled = 0;
         loop {
-            let next = self
-                .pieces
-                .range(self.read..)
-                .next()
-                .map(|(offset, _)| *offset);
-            let Some(offset) = next else { break };
-            if offset > self.read {
-                break; // a hole: the prefix ends here
+            let room = out.len().saturating_sub(filled);
+            if room == 0 {
+                break;
             }
-            let Some(bytes) = self.pieces.remove(&self.read) else {
+            let Some((start, _)) = self.pieces.iter().next() else {
                 break;
             };
-            self.read += bytes.len() as u64;
-            out.extend_from_slice(&bytes);
+            let start = *start;
+            if start > self.read {
+                break; // a hole: the prefix ends here
+            }
+            let Some(held) = self.pieces.get(&start) else {
+                break;
+            };
+            let skip = usize::try_from(self.read - start).unwrap_or(held.len());
+            let take = room.min(held.len() - skip);
+            if take == 0 {
+                // Every byte of this piece has been handed out already.
+                self.pieces.remove(&start);
+                continue;
+            }
+            out[filled..filled + take].copy_from_slice(&held[skip..skip + take]);
+            filled += take;
+            self.read += take as u64;
+            if skip + take == held.len() {
+                self.pieces.remove(&start);
+            }
         }
-        out.len() - before
+        filled
     }
 
     /// Whether the finish arrived and every byte before it has been read.
@@ -265,6 +358,20 @@ mod tests {
         (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
     }
 
+    /// Read everything the buffer holds into a fresh vector, the way a caller
+    /// with an unbounded buffer would.
+    fn drain_all(recv: &mut RecvBuf) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = recv.read_into(&mut chunk);
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+    }
+
     /// The property this half exists for: pieces that arrive in any order
     /// reassemble into exactly the stream that was written, and the read offset
     /// advances only over contiguous bytes.
@@ -286,9 +393,8 @@ mod tests {
             let (start, end) = bounds[index];
             recv.insert(start as u64, &original[start..end]);
         }
-        let mut out = Vec::new();
-        let read = recv.read_into(&mut out);
-        assert_eq!(read, original.len(), "every byte must come out");
+        let out = drain_all(&mut recv);
+        assert_eq!(out.len(), original.len(), "every byte must come out");
         assert_eq!(out, original, "the bytes must be the stream, in order");
     }
 
@@ -299,14 +405,37 @@ mod tests {
         let mut recv = RecvBuf::default();
         assert!(recv.insert(20, b"later"));
         assert!(recv.insert(0, b"first"));
-        let mut out = Vec::new();
+        let mut out = [0u8; 32];
         assert_eq!(recv.read_into(&mut out), 5);
-        assert_eq!(out, b"first");
+        assert_eq!(&out[..5], b"first");
         assert_eq!(recv.hole(), Some((15, 20)), "the missing range is 5..20");
         assert!(recv.insert(5, &[b'x'; 15]), "the hole can be filled");
-        let mut out = Vec::new();
-        assert_eq!(recv.read_into(&mut out), 20);
-        assert_eq!(out, b"xxxxxxxxxxxxxxxlater");
+        assert_eq!(drain_all(&mut recv), b"xxxxxxxxxxxxxxxlater");
+    }
+
+    /// A reader that takes the prefix in slices smaller than the pieces gets the
+    /// same bytes, exactly once: the piece it is part-way through is not handed
+    /// out again, and a retransmission of bytes it already delivered is not
+    /// taken a second time.
+    #[test]
+    fn a_reader_that_takes_small_slices_sees_each_byte_once() {
+        let original = stream_bytes(4096);
+        let mut recv = RecvBuf::default();
+        for (index, chunk) in original.chunks(331).enumerate() {
+            assert!(recv.insert((index * 331) as u64, chunk));
+        }
+        let mut got = Vec::new();
+        let mut small = [0u8; 37];
+        while got.len() < original.len() {
+            // A retransmission of bytes already delivered in front of the read
+            // offset must not duplicate them.
+            let _ = recv.insert(0, &original[..64]);
+            let n = recv.read_into(&mut small);
+            assert!(n > 0, "a full prefix must always make progress");
+            got.extend_from_slice(&small[..n]);
+        }
+        assert_eq!(got, original);
+        assert!(recv.is_complete() || recv.fin_at.is_none());
     }
 
     /// An acknowledgement moves the base and clamps a peer that acks bytes

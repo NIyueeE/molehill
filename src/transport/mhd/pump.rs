@@ -54,7 +54,7 @@ fn tune_socket(socket: &UdpSocket) {
 }
 
 /// How many datagrams one pass hands the kernel at once.
-const SEND_RUN: usize = 16;
+const SEND_RUN: usize = 44;
 
 /// How many connections a listener may hold before it stops admitting new
 /// ones.
@@ -133,6 +133,34 @@ async fn send_run(
     Ok(())
 }
 
+/// The staging buffers one pump reuses between passes.
+///
+/// A pass stages a whole run — up to 45 KiB with the batch this carrier sends —
+/// and allocating it per pass is a 64 KiB allocation, a page-faulting first
+/// touch and a free, once per run. The buffers belong to the pump, so the run is
+/// written into warm memory.
+#[derive(Default)]
+struct Staging {
+    /// The run: every packet of this pass, laid end to end.
+    run: Vec<u8>,
+    /// Each packet's (offset, length) inside `run`.
+    spans: Vec<(usize, usize)>,
+}
+
+impl Staging {
+    fn new() -> Self {
+        Self {
+            run: Vec::with_capacity(SEND_RUN * super::wire::MAX_DATAGRAM),
+            spans: Vec::with_capacity(SEND_RUN),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.run.clear();
+        self.spans.clear();
+    }
+}
+
 /// Drain what the connection wants to say, in as few syscalls as the platform
 /// allows.
 ///
@@ -146,15 +174,13 @@ async fn flush(
     socket: &UdpSocket,
     peer: SocketAddr,
     shared: &Arc<Shared>,
+    staging: &mut Staging,
 ) -> std::io::Result<usize> {
-    let mut run: Vec<u8> = Vec::with_capacity(SEND_RUN * 2048);
-    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(SEND_RUN);
-    run.clear();
-    spans.clear();
+    let Staging { run, spans } = staging;
     while spans.len() < SEND_RUN {
         let now = Instant::now();
         let off = run.len();
-        let Some(len) = shared.with(|conn| conn.poll_transmit(now, &mut run)) else {
+        let Some(len) = shared.with(|conn| conn.poll_transmit(now, run)) else {
             break;
         };
         spans.push((off, len));
@@ -163,7 +189,7 @@ async fn flush(
         return Ok(0);
     }
     let sent = spans.len();
-    send_run(socket, peer, &run, &spans).await?;
+    send_run(socket, peer, run, spans).await?;
     for _ in 0..sent {
         shared.note_sent();
     }
@@ -301,8 +327,10 @@ pub(crate) fn spawn(
         let mut batch = crate::transport::udp_batch::RecvBatch::new(SEND_RUN, 2048);
         #[cfg(not(target_os = "linux"))]
         let mut batch = ();
+        let mut staging = Staging::new();
         loop {
-            let Ok(sent) = flush(&socket, peer, &shared).await else {
+            staging.clear();
+            let Ok(sent) = flush(&socket, peer, &shared, &mut staging).await else {
                 shared.close(ResetCode::Aborted);
                 return;
             };
@@ -330,24 +358,28 @@ pub(crate) fn spawn(
                     arriving.with(|conn| {
                         let _ = conn.on_datagram(now, data);
                     });
-                    arriving.wake_readers();
-                    arriving.wake_writers();
-                    arriving.wake_streams();
                 }) => {
                     if result.is_err() {
                         shared.close(ResetCode::Aborted);
                         return;
                     }
+                    // Once per batch, never once per datagram: a wake-up
+                    // schedules the reader task, so waking it for each of a
+                    // batch's thirty-two datagrams is thirty-two scheduler
+                    // calls to hand out the same bytes.
+                    shared.wake_readers();
+                    shared.wake_writers();
+                    shared.wake_streams();
                 }
                 keep = wait(&shared) => {
                     match keep {
-                        Wake::Signal => {
-                        }
+                        Wake::Signal => {}
                         Wake::Closed => {
                             // One last pass so a queued reset or FIN leaves
                             // before the socket does; a failed send ends the
                             // lane anyway.
-                            let _ = flush(&socket, peer, &shared).await;
+                            staging.clear();
+                            let _ = flush(&socket, peer, &shared, &mut staging).await;
                             shared.finish_close();
                             return;
                         }
@@ -376,8 +408,10 @@ fn spawn_sender(
     shared: Arc<Shared>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut staging = Staging::new();
         loop {
-            let Ok(sent) = flush(&socket, peer, &shared).await else {
+            staging.clear();
+            let Ok(sent) = flush(&socket, peer, &shared, &mut staging).await else {
                 shared.close(ResetCode::Aborted);
                 return;
             };
@@ -391,7 +425,8 @@ fn spawn_sender(
             match wait(&shared).await {
                 Wake::Signal => {}
                 Wake::Closed => {
-                    let _ = flush(&socket, peer, &shared).await;
+                    staging.clear();
+                    let _ = flush(&socket, peer, &shared, &mut staging).await;
                     shared.finish_close();
                     return;
                 }
@@ -723,68 +758,73 @@ fn spawn_dispatcher(
     let mut batch = ();
     tokio::spawn(async move {
         loop {
-            let mut arriving: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+            // One wake per connection per batch. Waking inside the per-datagram
+            // path would schedule the same reader and the same sender once per
+            // datagram, and a batch is thirty-two of them.
+            let mut touched: Vec<Arc<Shared>> = Vec::new();
             let read = tokio::select! {
                 changed = stop.changed() => {
                     let _ = changed;
                     return;
                 }
-                read = receive(&socket, &mut batch, |from, data| {
-                    arriving.push((from, data.to_vec()));
+                read = receive(&socket, &mut batch, |from, datagram| {
+                    let Ok(packet) = crate::transport::mhd::wire::decode(datagram) else {
+                        return;
+                    };
+                    let now = Instant::now();
+                    {
+                        let existing = registry.lock().get(&packet.id).cloned();
+                        if let Some(shared) = existing {
+                            let _ = shared.with(|conn| conn.on_datagram(now, datagram));
+                            if !touched.iter().any(|seen| Arc::ptr_eq(seen, &shared)) {
+                                touched.push(Arc::clone(&shared));
+                            }
+                            return;
+                        }
+                    }
+                    {
+                        let mut table = registry.lock();
+                        if !admit(&mut table, packet.id) {
+                            return;
+                        }
+                        let shared = Shared::new(
+                            Conn::new(packet.id, false),
+                            crate::transport::health::SessionHealth::new(),
+                        );
+                        shared.with(|conn| {
+                            let _ = conn.on_datagram(now, datagram);
+                        });
+                        table.insert(packet.id, Arc::clone(&shared));
+                        drop(table);
+                        let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let task = spawn_sender(Arc::clone(&socket), from, Arc::clone(&shared));
+                        std::mem::forget(task);
+                        let lane = Arc::new(MhdLane {
+                            id,
+                            counters: crate::transport::multiplex::TunnelCounters::for_lane_with(
+                                Some(Arc::clone(&shared.health)),
+                            ),
+                            shared,
+                            noise: None,
+                            nonce: [0u8; crate::protocol::HASH_WIDTH_IN_BYTES],
+                        });
+                        // The lane's owner is gone (the listener dropped): the
+                        // dispatcher keeps routing for the connections it
+                        // already has, and the listener's `stop` ends it. The
+                        // lane itself is dropped here, which closes its
+                        // connection.
+                        let _ = tx.send(lane);
+                    }
                 }) => read,
             };
             if read.is_err() {
                 return;
             }
-            for (from, datagram) in &arriving {
-                let buf = &datagram[..];
-                let Ok(packet) = crate::transport::mhd::wire::decode(buf) else {
-                    continue;
-                };
-                let now = Instant::now();
-                {
-                    let existing = registry.lock().get(&packet.id).cloned();
-                    if let Some(shared) = existing {
-                        shared.with(|conn| {
-                            let _ = conn.on_datagram(now, buf);
-                        });
-                        shared.wake_readers();
-                        shared.wake_writers();
-                        shared.wake_pump();
-                        shared.wake_streams();
-                        continue;
-                    }
-                }
-                {
-                    let mut table = registry.lock();
-                    if !admit(&mut table, packet.id) {
-                        continue;
-                    }
-                    let shared = Shared::new(
-                        Conn::new(packet.id, false),
-                        crate::transport::health::SessionHealth::new(),
-                    );
-                    shared.with(|conn| {
-                        let _ = conn.on_datagram(now, buf);
-                    });
-                    table.insert(packet.id, Arc::clone(&shared));
-                    drop(table);
-                    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let task = spawn_sender(Arc::clone(&socket), *from, Arc::clone(&shared));
-                    std::mem::forget(task);
-                    let lane = Arc::new(MhdLane {
-                        id,
-                        counters: crate::transport::multiplex::TunnelCounters::for_lane_with(Some(
-                            Arc::clone(&shared.health),
-                        )),
-                        shared,
-                        noise: None,
-                        nonce: [0u8; crate::protocol::HASH_WIDTH_IN_BYTES],
-                    });
-                    if tx.send(lane).is_err() {
-                        return;
-                    }
-                }
+            for shared in touched.drain(..) {
+                shared.wake_readers();
+                shared.wake_writers();
+                shared.wake_pump();
+                shared.wake_streams();
             }
             // A socket that always has data would keep this task ready on every
             // await and starve the connection pumps, whose acknowledgements are

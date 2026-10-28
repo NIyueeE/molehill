@@ -52,6 +52,19 @@ pub(crate) const WINDOW: u64 = 32 * 1024 * 1024;
 /// connection-level window alone cannot give.
 const STREAM_BURST: usize = MAX_STREAM_PAYLOAD * 4;
 
+/// The congestion window a connection starts with: ten full packets.
+///
+/// The peer's credit bounds what it can *hold*; this bounds what the path has in
+/// flight, which is what keeps the recovery table proportional to the
+/// bandwidth-delay product instead of to the credit window.
+const INITIAL_CWND: u64 = 10 * MAX_STREAM_PAYLOAD as u64;
+
+/// The most the congestion window may grow to.
+///
+/// A window has to be bounded by something that is not "however much the peer
+/// will take", or the flight becomes the credit window again.
+const MAX_CWND: u64 = 16 * 1024 * 1024;
+
 /// Why a frame could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rejected {
@@ -135,6 +148,25 @@ pub(crate) struct Conn {
     /// against the window from the moment it is queued until the peer's reader
     /// has taken it, which is what the peer's absolute credit describes.
     written: u64,
+    /// Bytes on the wire and not yet acknowledged.
+    ///
+    /// This is what the congestion window bounds. The peer's credit says how much
+    /// it can *hold*; this says how much the path is allowed to have in flight,
+    /// and the two are deliberately different: a 32 MiB credit window on a fast
+    /// path would otherwise put twenty thousand packets in the recovery table,
+    /// where every acknowledgement is a walk of a tree that size. The count lives
+    /// in the recovery table, which is the only thing that removes a packet from
+    /// it.
+    /// The congestion window: the most this end may have in flight.
+    ///
+    /// Grown additively as acknowledgements arrive and never cut on loss — a
+    /// loss is repaired by retransmission, not paid for by halving the pipe for a
+    /// round trip. The rate itself is the pacer's business (see the I/O layer);
+    /// this is the bound that keeps the flight, and therefore the recovery
+    /// table, proportional to the path's bandwidth-delay product.
+    cwnd: u64,
+    /// Bytes acknowledged since the window last grew.
+    acked_since_growth: u64,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
     /// A close that waits for what is already queued to leave first.
@@ -175,6 +207,8 @@ impl Conn {
             resets: VecDeque::new(),
             finishing: BTreeSet::new(),
             written: 0,
+            cwnd: INITIAL_CWND,
+            acked_since_growth: 0,
             closed: None,
             close_after: None,
             keepalive_at: now + KEEPALIVE,
@@ -228,7 +262,12 @@ impl Conn {
         // gigabit transfer that is hundreds of megabytes past the peer's
         // buffer, every packet of which the peer must drop and therefore never
         // acknowledge, which is how a healthy lane gets declared dead.
-        let room = self.send_credit.saturating_sub(self.written);
+        //
+        // The congestion window is the second bound, and it is what the flight —
+        // and therefore the recovery table — is actually sized by.
+        let credit = self.send_credit.saturating_sub(self.written);
+        let window = self.cwnd.saturating_sub(self.recovery.flight_bytes());
+        let room = credit.min(window);
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
@@ -318,8 +357,13 @@ impl Conn {
             .is_some_and(|state| state.reset.is_none_or(|code| code == ResetCode::Finished))
     }
 
-    /// Take bytes a stream has received, answering how many were appended.
-    pub(crate) fn read(&mut self, stream: u32, out: &mut Vec<u8>) -> usize {
+    /// Take bytes a stream has received, answering how many were written.
+    ///
+    /// The caller's own buffer is filled directly. Staging the prefix in a
+    /// buffer of the connection's own and handing it out a caller-sized slice at
+    /// a time is a copy per byte that only exists to serve a shape no reader
+    /// has.
+    pub(crate) fn read(&mut self, stream: u32, out: &mut [u8]) -> usize {
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
@@ -329,6 +373,18 @@ impl Conn {
         // one window, so a peer that fills it meets a reader that drains it.
         self.recv_credit = self.read.saturating_add(WINDOW);
         taken
+    }
+
+    /// Whether the receive window has moved far enough to be worth telling the
+    /// peer about.
+    ///
+    /// The reader is the only thing that moves it, and the reader is not the
+    /// pump: without this predicate the reader cannot ask for a pass, and a
+    /// sender blocked on the window waits for the pump's keepalive timer to
+    /// hear that the window opened. That is a one-to-two second stall on every
+    /// window, which is what a bulk transfer spends its time in.
+    pub(crate) fn credit_due(&self) -> bool {
+        self.recv_credit > self.advertised + WINDOW / 4
     }
 
     /// Whether the peer finished that stream, or the whole connection ended.
@@ -417,7 +473,7 @@ impl Conn {
             return None;
         }
         let ack = self.acks.packet();
-        if self.recv_credit > self.advertised + WINDOW / 4 {
+        if self.credit_due() {
             let number = self.recovery.next_number();
             let packet_len = wire::encode_control(
                 out,
@@ -460,6 +516,7 @@ impl Conn {
                     fin,
                 }),
             );
+
             if let Some(state) = self.streams.get_mut(&id) {
                 state.send.mark_sent(len);
             }
@@ -568,12 +625,33 @@ impl Conn {
             }
             // A loss only rewinds the send point: the bytes are still in the
             // buffer, so the next pass carries them again from the same offset.
+            // Its bytes have already left the flight — the recovery table is the
+            // one thing that removes a packet, and it keeps the byte total — and
+            // they rejoin it when they are sent again, so the window counts what
+            // is on the wire and not what is owed.
             self.note_retransmits(acked.lost.len());
             for sent in acked.lost {
                 if let Some(range) = sent.range
                     && let Some(state) = self.streams.get_mut(&range.stream)
                 {
                     state.send.rewind_to(range.offset);
+                }
+            }
+            // Grown by one packet per window acknowledged — the additive
+            // increase of a per-round-trip rule, not of a per-acknowledgement
+            // one: acknowledgements arrive per packet, so growing on each of them
+            // would open the window by a window in a millisecond, which is not a
+            // window at all. No cut on loss: a loss says the path dropped
+            // something, and halving the pipe for a round trip would pay for it
+            // twice.
+            if acked.progress {
+                self.acked_since_growth += u64::try_from(acked.bytes).unwrap_or(u64::MAX);
+                if self.acked_since_growth >= self.cwnd {
+                    self.acked_since_growth = 0;
+                    self.cwnd = self
+                        .cwnd
+                        .saturating_add(MAX_STREAM_PAYLOAD as u64)
+                        .min(MAX_CWND);
                 }
             }
             // A stream whose every byte is now acknowledged can say its finish
@@ -746,6 +824,15 @@ mod tests {
         (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
     }
 
+    /// Take the contiguous prefix of one stream, the way a caller with a large
+    /// buffer would.
+    fn take(conn: &mut Conn, stream: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 1 << 20];
+        let n = conn.read(stream, &mut buf);
+        buf.truncate(n);
+        buf
+    }
+
     /// The whole stack in memory: what one end writes, the other end reads, byte
     /// for byte, with the stream opened by naming it and accepted from the queue.
     #[test]
@@ -762,8 +849,7 @@ mod tests {
             unreachable!("the peer named a stream, so it must be queued")
         };
         assert_eq!(accepted.id, stream.id, "the id survives the wire");
-        let mut out = Vec::new();
-        link.b.read(accepted.id, &mut out);
+        let out = take(&mut link.b, accepted.id);
         assert_eq!(out, bytes, "every byte, in order");
     }
 
@@ -785,8 +871,7 @@ mod tests {
         let Some(accepted) = link.b.accept() else {
             unreachable!("the stream is named on arrival")
         };
-        let mut out = Vec::new();
-        link.b.read(accepted.id, &mut out);
+        let mut out = take(&mut link.b, accepted.id);
         assert!(
             out.len() < bytes.len(),
             "the dropped datagram must actually cost bytes, got {}",
@@ -800,8 +885,7 @@ mod tests {
         for _ in 0..8 {
             clock += Duration::from_millis(10);
             link.pump(clock);
-            let mut step = Vec::new();
-            link.b.read(accepted.id, &mut step);
+            let step = take(&mut link.b, accepted.id);
             out.extend_from_slice(&step);
             if out.len() == bytes.len() {
                 break;
