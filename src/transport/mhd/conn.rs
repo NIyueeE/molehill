@@ -173,7 +173,14 @@ pub(crate) struct Conn {
     /// this is the bound that keeps the flight, and therefore the recovery
     /// table, proportional to the path's bandwidth-delay product.
     cwnd: u64,
-    /// Bytes acknowledged since the window last grew.
+    /// Whether the window is still looking for the path's capacity.
+    ///
+    /// True until the path drops something: while it is, every acknowledged byte
+    /// buys a byte of window (doubling per round trip). It latches off at the
+    /// first loss and never comes back — a path that has dropped is a path whose
+    /// capacity has been found.
+    slow_start: bool,
+    /// Bytes acknowledged since the window last grew additively.
     acked_since_growth: u64,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
@@ -217,6 +224,7 @@ impl Conn {
             finishing: BTreeSet::new(),
             written: 0,
             cwnd: INITIAL_CWND,
+            slow_start: true,
             acked_since_growth: 0,
             closed: None,
             close_after: None,
@@ -734,6 +742,12 @@ impl Conn {
             // they rejoin it when they are sent again, so the window counts what
             // is on the wire and not what is owed.
             self.note_retransmits(acked.lost.len());
+            if !acked.lost.is_empty() {
+                // The path dropped something: its capacity has been found, and the
+                // window grows additively from here on. Nothing is cut — the loss
+                // itself is repaired by retransmission.
+                self.slow_start = false;
+            }
             for sent in acked.lost {
                 if let Some(range) = sent.range {
                     if range.len == 0 && range.fin {
@@ -747,21 +761,28 @@ impl Conn {
                     }
                 }
             }
-            // Grown by one packet per window acknowledged — the additive
-            // increase of a per-round-trip rule, not of a per-acknowledgement
-            // one: acknowledgements arrive per packet, so growing on each of them
-            // would open the window by a window in a millisecond, which is not a
-            // window at all. No cut on loss: a loss says the path dropped
-            // something, and halving the pipe for a round trip would pay for it
-            // twice.
+            // The window opens in two phases, the way every transport that has to
+            // find a path's capacity does it. Until the path has dropped
+            // something, every acknowledged byte buys a byte of window: the flight
+            // doubles once per round trip, which is what lets a flow of *small*
+            // packets reach the path's capacity in a few round trips instead of
+            // crawling there one big packet per window. After a loss it is
+            // additive — one packet per window acknowledged — and the window is
+            // never cut: a loss is repaired by retransmission, not paid for by
+            // halving the pipe for a round trip.
             if acked.progress {
-                self.acked_since_growth += u64::try_from(acked.bytes).unwrap_or(u64::MAX);
-                if self.acked_since_growth >= self.cwnd {
-                    self.acked_since_growth = 0;
-                    self.cwnd = self
-                        .cwnd
-                        .saturating_add(MAX_STREAM_PAYLOAD as u64)
-                        .min(MAX_CWND);
+                let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
+                if self.slow_start {
+                    self.cwnd = self.cwnd.saturating_add(bytes).min(MAX_CWND);
+                } else {
+                    self.acked_since_growth += bytes;
+                    if self.acked_since_growth >= self.cwnd {
+                        self.acked_since_growth = 0;
+                        self.cwnd = self
+                            .cwnd
+                            .saturating_add(MAX_STREAM_PAYLOAD as u64)
+                            .min(MAX_CWND);
+                    }
                 }
             }
             // A stream whose every byte is now acknowledged can say its finish
@@ -850,6 +871,11 @@ impl Conn {
         // next pass emits the probe (see `poll_transmit`).
         let (expiry, lost) = self.recovery.on_timeout(now);
         self.note_retransmits(lost.len());
+        if !lost.is_empty() {
+            // A timer that re-sent the flight is a path that could not carry it:
+            // the capacity phase is over.
+            self.slow_start = false;
+        }
         for sent in &lost {
             if let Some(range) = sent.range {
                 if range.len == 0 && range.fin {
