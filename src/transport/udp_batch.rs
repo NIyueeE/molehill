@@ -92,12 +92,17 @@ pub struct RecvBatch {
 impl RecvBatch {
     /// A batch for `count` datagrams of up to `buf_len` bytes each.
     ///
-    /// The footprint is unchanged by GRO: the same total is spent on one region
-    /// sized for a coalesced run, because a run is what recvmsg returns.
+    /// The region is sized for a **whole GRO run** whatever the caller's nominal
+    /// batch: the kernel coalesces up to [`GRO_BUF`] of segments into one
+    /// datagram, and `recvmsg` without `MSG_TRUNC` answers only what it copied.
+    /// A region smaller than a run therefore truncates it — the tail is lost
+    /// without an error, which on a bulk transfer is a hole in the stream. `count`
+    /// bounds how many datagrams the caller will see, not how many the kernel
+    /// hands back in one piece.
     pub fn new(count: usize, buf_len: usize) -> Self {
         let total = count.saturating_mul(buf_len);
         Self {
-            region: vec![0u8; total.min(GRO_BUF).max(buf_len.max(1))],
+            region: vec![0u8; GRO_BUF.max(buf_len.max(1)).max(total)],
             spans: Vec::with_capacity(BATCH),
             peer: SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
             count: 0,
@@ -111,32 +116,50 @@ impl RecvBatch {
         self.count = 0;
         self.spans.clear();
         let mut region = std::mem::take(&mut self.region);
+        let room = region.len();
         let mut space = nix::cmsg_space!(i32);
         // The region is put back on every path: a socket with nothing queued
         // answers EAGAIN on most iterations, and losing the buffer to the first
         // one would leave a batch that can never receive again.
+        //
+        // `MSG_TRUNC` makes a run that did not fit report its real length
+        // instead of the truncated one, which is the only way to notice. Silently
+        // keeping the copy would drop the tail of the run, and a dropped tail is
+        // a hole in a stream.
         let received = {
             let mut iov = [IoSliceMut::new(&mut region)];
-            recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut space), MsgFlags::MSG_DONTWAIT).map(
-                |msg| {
-                    let peer = msg.address.as_ref().map_or_else(
-                        || SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
-                        socket_addr,
-                    );
-                    let segment = msg.cmsgs().ok().and_then(|mut cmsgs| {
-                        cmsgs.find_map(|cmsg| match cmsg {
-                            ControlMessageOwned::UdpGroSegments(size) if size > 0 => {
-                                Some(usize::try_from(size).unwrap_or(0))
-                            }
-                            _ => None,
-                        })
-                    });
-                    (msg.bytes, peer, segment)
-                },
+            recvmsg::<SockaddrStorage>(
+                fd,
+                &mut iov,
+                Some(&mut space),
+                MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_TRUNC,
             )
+            .map(|msg| {
+                let peer = msg.address.as_ref().map_or_else(
+                    || SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
+                    socket_addr,
+                );
+                let segment = msg.cmsgs().ok().and_then(|mut cmsgs| {
+                    cmsgs.find_map(|cmsg| match cmsg {
+                        ControlMessageOwned::UdpGroSegments(size) if size > 0 => {
+                            Some(usize::try_from(size).unwrap_or(0))
+                        }
+                        _ => None,
+                    })
+                });
+                (msg.bytes, peer, segment)
+            })
         };
         self.region = region;
         let (len, peer, segment) = received.map_err(io::Error::from)?;
+        if len > room {
+            // The run was bigger than the buffer. Keeping the part that fitted
+            // would hand the caller a run whose segment boundaries lie (the last
+            // piece is cut mid-datagram), so the whole run is dropped and the
+            // peer's recovery re-sends it.
+            tracing::debug!("mhd receive dropped a {len}-byte run: its buffer is {room}");
+            return Ok(0);
+        }
         self.peer = peer;
         // A run with a segment size came from the kernel's GRO; anything else
         // is one datagram, which is what a socket without GRO hands back.
