@@ -184,21 +184,109 @@ enum ReadState {
 enum WriteState {
     Idle,
     /// The record `write[start..end]` is being written to
-    /// the inner stream; it carries `payload_len` plaintext bytes.
+    /// the inner stream; it carries `payload_len` plaintext bytes read from
+    /// `call`.
     WritingMessage {
         start: usize,
         end: usize,
         payload_len: usize,
+        call: Call,
     },
     /// An owned record in flight on a `TAKES_OWNED` transport: the
     /// transport has accepted `offset` bytes of `record` (header +
-    /// ciphertext), which carries `payload_len` plaintext bytes.
+    /// ciphertext), which carries `payload_len` plaintext bytes read from
+    /// `call`.
     WritingOwned {
         record: Bytes,
         offset: usize,
         payload_len: usize,
+        call: Call,
     },
     ShuttingDown,
+}
+
+/// Which caller buffer a record in flight was built from.
+///
+/// A write that could not finish left a record on the wire, and the caller may
+/// come back with a *different* buffer — the stripe multiplexer rotates a frame
+/// to another stream after a `Pending`, and a transport whose credit ran out
+/// makes that ordinary. Reporting the old plaintext length for the new buffer
+/// would claim bytes it never held (the stripe wrote 32778 committed bytes onto
+/// an 8202-byte frame and then sliced past its end). The address and length are
+/// the identity a resumed call has: the same slice, handed back after the wake
+/// it registered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Call {
+    at: usize,
+    len: usize,
+}
+
+impl Call {
+    fn of(buf: &[u8]) -> Self {
+        Self {
+            at: buf.as_ptr() as usize,
+            len: buf.len(),
+        }
+    }
+}
+
+/// Seal one record into a buffer of its own, for a transport that takes owned
+/// records.
+///
+/// The channel boundary copy disappears — the record buffer *is* the transport's
+/// buffer — and the only copy left on this path is the AEAD's own. `zeroed` pays
+/// one memset the encrypt immediately overwrites; the alternative (uninitialized
+/// memory handed to the cipher) is not worth an `unsafe` block here.
+fn seal_owned(
+    transport: &mut TransportState,
+    buf: &[u8],
+    payload_len: usize,
+) -> Result<WriteState, std::io::Error> {
+    let mut record = BytesMut::zeroed(LENGTH_FIELD_LEN + payload_len + TAG_LEN);
+    let message_len = transport
+        .write_message(&buf[..payload_len], &mut record[LENGTH_FIELD_LEN..])
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+    // `message_len` is bounded by MAX_MESSAGE_LEN (u16::MAX); an impossible
+    // overrun is an error, not a truncated record.
+    let len = u16::try_from(message_len).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "noise record length exceeds the u16 wire format",
+        )
+    })?;
+    record[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
+    record.truncate(LENGTH_FIELD_LEN + message_len);
+    Ok(WriteState::WritingOwned {
+        record: record.freeze(),
+        offset: 0,
+        payload_len,
+        call: Call::of(buf),
+    })
+}
+
+/// Seal one record into the pooled framing buffer, for a transport that copies.
+fn seal_in_place(
+    transport: &mut TransportState,
+    buffer: &mut [u8],
+    buf: &[u8],
+    payload_len: usize,
+) -> Result<WriteState, std::io::Error> {
+    let message_len = transport
+        .write_message(&buf[..payload_len], &mut buffer[LENGTH_FIELD_LEN..])
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+    let len = u16::try_from(message_len).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "noise record length exceeds the u16 wire format",
+        )
+    })?;
+    buffer[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
+    Ok(WriteState::WritingMessage {
+        start: 0,
+        end: LENGTH_FIELD_LEN + message_len,
+        payload_len,
+        call: Call::of(buf),
+    })
 }
 
 #[pin_project]
@@ -338,67 +426,21 @@ where
                 WriteState::Idle => {
                     let payload_len = buf.len().min(MAX_MESSAGE_LEN - TAG_LEN);
                     if payload_len > 0 && T::TAKES_OWNED {
-                        // The owned-record path: encrypt into a fresh
-                        // buffer and hand the whole record to the
-                        // transport by ownership. The channel boundary
-                        // copy disappears — the record buffer *is* the
-                        // transport's buffer — and the only copy left on
-                        // this path is the AEAD's own. `zeroed` pays one
-                        // memset the encrypt immediately overwrites; the
-                        // alternative (uninitialized memory handed to the
-                        // cipher) is not worth an unsafe block here.
-                        let mut record = BytesMut::zeroed(LENGTH_FIELD_LEN + payload_len + TAG_LEN);
-                        let message_len = transport
-                            .write_message(&buf[..payload_len], &mut record[LENGTH_FIELD_LEN..])
-                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-                        // `message_len` is bounded by MAX_MESSAGE_LEN
-                        // (u16::MAX); an impossible overrun is an error,
-                        // not a truncated record.
-                        let len = u16::try_from(message_len).map_err(|_| {
-                            std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                "noise record length exceeds the u16 wire format",
-                            )
-                        })?;
-                        record[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
-                        record.truncate(LENGTH_FIELD_LEN + message_len);
-                        *state = WriteState::WritingOwned {
-                            record: record.freeze(),
-                            offset: 0,
-                            payload_len,
-                        };
+                        *state = seal_owned(transport, buf, payload_len)?;
                         continue;
                     }
-                    let message_len = transport
-                        .write_message(
-                            &buf[..payload_len],
-                            &mut write_message_buffer[LENGTH_FIELD_LEN..],
-                        )
-                        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-                    // `message_len` is bounded by MAX_MESSAGE_LEN
-                    // (u16::MAX); an impossible overrun is an error, not
-                    // a truncated record.
-                    let len = u16::try_from(message_len).map_err(|_| {
-                        std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "noise record length exceeds the u16 wire format",
-                        )
-                    })?;
-                    write_message_buffer[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
-                    *state = WriteState::WritingMessage {
-                        start: 0,
-                        end: LENGTH_FIELD_LEN + message_len,
-                        payload_len,
-                    };
+                    *state = seal_in_place(transport, write_message_buffer, buf, payload_len)?;
                 }
                 WriteState::WritingMessage {
                     start,
                     end,
                     payload_len,
+                    call,
                 } => {
                     // Copy the small fields out so the state can be
                     // re-assigned below (the match holds a borrow of it).
                     let (start, end, payload_len) = (*start, *end, *payload_len);
+                    let call = *call;
                     let n = ready!(
                         Pin::new(&mut inner).poll_write(cx, &write_message_buffer[start..end])
                     )?;
@@ -409,22 +451,31 @@ where
                         if let Some(waker) = this.write_clean_waker.take() {
                             waker.wake();
                         }
-                        return Poll::Ready(Ok(payload_len));
+                        if call == Call::of(buf) {
+                            return Poll::Ready(Ok(payload_len));
+                        }
+                        // A different buffer than the one this record was built
+                        // from (see [`Call`]): the record is on the wire, and
+                        // this call has to serve the bytes it was given.
+                        continue;
                     }
                     *state = WriteState::WritingMessage {
                         start,
                         end,
                         payload_len,
+                        call,
                     };
                 }
                 WriteState::WritingOwned {
                     record,
                     offset,
                     payload_len,
+                    call,
                 } => {
                     // The `Bytes` handle clone is O(1); the copy ends the
                     // borrow of the state so it can be re-assigned below.
                     let (record, offset, payload_len) = (record.clone(), *offset, *payload_len);
+                    let call = *call;
                     let n = ready!(inner.as_mut().poll_write_owned(cx, record.slice(offset..)))?;
                     let offset = offset + n;
 
@@ -433,12 +484,16 @@ where
                         if let Some(waker) = this.write_clean_waker.take() {
                             waker.wake();
                         }
-                        return Poll::Ready(Ok(payload_len));
+                        if call == Call::of(buf) {
+                            return Poll::Ready(Ok(payload_len));
+                        }
+                        continue;
                     }
                     *state = WriteState::WritingOwned {
                         record,
                         offset,
                         payload_len,
+                        call,
                     };
                 }
             }
