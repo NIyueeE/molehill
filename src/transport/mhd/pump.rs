@@ -330,9 +330,13 @@ pub(crate) fn spawn(
         let mut staging = Staging::new();
         loop {
             staging.clear();
-            let Ok(sent) = flush(&socket, peer, &shared, &mut staging).await else {
-                shared.close(ResetCode::Aborted);
-                return;
+            let sent = match flush(&socket, peer, &shared, &mut staging).await {
+                Ok(sent) => sent,
+                Err(e) => {
+                    tracing::debug!("mhd pump stopped: {e}");
+                    shared.close(ResetCode::Aborted);
+                    return;
+                }
             };
             if sent > 0 {
                 drain_ready(&socket, &mut batch, &shared, peer);
@@ -411,9 +415,13 @@ fn spawn_sender(
         let mut staging = Staging::new();
         loop {
             staging.clear();
-            let Ok(sent) = flush(&socket, peer, &shared, &mut staging).await else {
-                shared.close(ResetCode::Aborted);
-                return;
+            let sent = match flush(&socket, peer, &shared, &mut staging).await {
+                Ok(sent) => sent,
+                Err(e) => {
+                    tracing::debug!("mhd sender stopped: {e}");
+                    shared.close(ResetCode::Aborted);
+                    return;
+                }
             };
             if sent == SEND_RUN {
                 // More is queued; the listener's dispatcher keeps the
@@ -775,7 +783,10 @@ fn spawn_dispatcher(
                     {
                         let existing = registry.lock().get(&packet.id).cloned();
                         if let Some(shared) = existing {
-                            let _ = shared.with(|conn| conn.on_datagram(now, datagram));
+                            if let Err(reason) = shared.with(|conn| conn.on_datagram(now, datagram))
+                            {
+                                tracing::debug!("mhd listener dropped a datagram: {reason:?}");
+                            }
                             if !touched.iter().any(|seen| Arc::ptr_eq(seen, &shared)) {
                                 touched.push(Arc::clone(&shared));
                             }

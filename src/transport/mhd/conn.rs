@@ -781,20 +781,30 @@ impl Conn {
                     return Err(Rejected::OverWindow);
                 }
                 let known = self.streams.contains_key(&id);
-                if !known {
-                    // The peer opens a stream by naming it; the accept queue is
-                    // what tells its owner.
-                    if id % 2 == u32::from(self.dialer) {
-                        return Err(Rejected::UnknownStream);
+                // One of *our* streams, and it is gone: its handle was dropped and
+                // the connection retired it while the peer still had bytes on the
+                // wire for it. Nobody wants those bytes, and the frame is dropped —
+                // but the packet is still acknowledged below, because a sender that
+                // keeps re-sending a packet nobody will acknowledge counts ten
+                // unanswered retransmissions and declares the whole lane dead. That
+                // is how one short-lived visitor connection was killing the lane
+                // every other visitor shared.
+                let retired = !known && id % 2 == u32::from(self.dialer);
+                if retired {
+                    tracing::debug!(stream = id, "mhd dropped data for a retired stream");
+                } else {
+                    if !known {
+                        // The peer opens a stream by naming it; the accept queue is
+                        // what tells its owner.
+                        self.streams.insert(id, StreamState::default());
+                        self.inbound.push_back(id);
                     }
-                    self.streams.insert(id, StreamState::default());
-                    self.inbound.push_back(id);
-                }
-                let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
-                state.recv.insert(offset, data);
-                if fin {
-                    state.recv.finish(offset + data.len() as u64);
-                    state.peer_fin = true;
+                    let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
+                    state.recv.insert(offset, data);
+                    if fin {
+                        state.recv.finish(offset + data.len() as u64);
+                        state.peer_fin = true;
+                    }
                 }
                 self.ack_pending = true;
             }
