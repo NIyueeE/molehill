@@ -168,14 +168,25 @@ suite's.
      the gate is measured in — roughly 730 000 syscalls per gigabit carried.
      That is the one lever left with a plausible four-figure-µs-per-Gbit
      payoff, and it is *not* the engine's own code.
-   - **A batched receive is the next attempt, and it is unfinished.** The
-     receive side only ever had the GRO path (one run per `recvmsg`); the
-     `recvmmsg` half the module header describes was never written. A first
-     attempt (a run-or-batch mode with hysteresis, buffers per datagram) moved
-     the data but broke the stream path — the striped integration test failed —
-     and was reverted rather than landed half-tested. It is worth finishing:
-     with the run path kept for a coalescing path and `recvmmsg` for one that
-     does not, the bench's receive cost drops by the syscall-per-datagram term.
+   - **A batched receive was tried and is refuted; it is not the gap.** The
+     receive side only ever had the GRO path (one run per `recvmsg`), so the
+     obvious next move was the `recvmmsg` half the module header describes. Two
+     implementations were built and measured: a run-or-batch mode with
+     hysteresis, and a batch-only receive with coalescing switched off. Both
+     moved data; the first broke the striped integration test (a run read out of
+     the wrong buffer — a mode that flips *after* staging a run hands the caller
+     zeros), and the second passed every test but measured **worse on both
+     paths**: loopback 0.653 s/Gbit against 0.549 with GRO, and the bench's
+     `l4` arm **1.10–1.32 s/Gbit against 0.982** (`bench-20261028-191140.json`),
+     with the cell taking 63 s instead of 33. A `recvmmsg` whose queue holds one
+     datagram pays the whole descriptor setup for one packet, so batching a
+     shallow queue costs more than the syscall it saves.
+     **Conclusion: the receive syscall is not where the bench's 0.34 s/Gbit
+     lives.** What is left is the per-packet delivery cost of the path itself —
+     a `veth` charges per datagram, and kernel TCP amortises that into 64 KiB
+     TSO segments while a 1400-byte-packet transport cannot. That cost is not
+     reachable from this engine's code without bigger datagrams, which the plan
+     rules out on loss-amplification grounds.
    - **The decision this leaves for the human** (the plan names it): ship
      `mhd` as a loss-tail-only carrier with an honest "costs ~1.5× TCP on a
      clean path, wins on lossy multi-flow tails" claim, or stop the carrier
