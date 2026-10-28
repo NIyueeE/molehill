@@ -157,6 +157,25 @@ suite's.
      that would follow are not to be executed on the belief that a later
      phase fixes the per-byte cost: the engine's own overhead is the gap, not
      its congestion control or its FEC.
+   - **Where the gap comes from (measured 2026-10-29).** The bench's paths do
+     not coalesce this carrier's datagrams, and the loopback proxy's do — which
+     is why the same binary reads 0.549 s/Gbit on loopback and 0.982 there. Two
+     probes, on a `veth` pair with the bench's addressing: `sendmsg` with
+     `UDP_SEGMENT` is refused with `EINVAL` (so the sender's GSO silently falls
+     back to `sendmmsg`), and 256 datagrams of 1400 bytes arrive as **256
+     `recvmsg` calls** with `UDP_GRO` on and nothing else to receive. The
+     receiver therefore pays one syscall per 1400 bytes in exactly the topology
+     the gate is measured in — roughly 730 000 syscalls per gigabit carried.
+     That is the one lever left with a plausible four-figure-µs-per-Gbit
+     payoff, and it is *not* the engine's own code.
+   - **A batched receive is the next attempt, and it is unfinished.** The
+     receive side only ever had the GRO path (one run per `recvmsg`); the
+     `recvmmsg` half the module header describes was never written. A first
+     attempt (a run-or-batch mode with hysteresis, buffers per datagram) moved
+     the data but broke the stream path — the striped integration test failed —
+     and was reverted rather than landed half-tested. It is worth finishing:
+     with the run path kept for a coalescing path and `recvmmsg` for one that
+     does not, the bench's receive cost drops by the syscall-per-datagram term.
    - **The decision this leaves for the human** (the plan names it): ship
      `mhd` as a loss-tail-only carrier with an honest "costs ~1.5× TCP on a
      clean path, wins on lossy multi-flow tails" claim, or stop the carrier
