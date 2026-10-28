@@ -152,6 +152,21 @@ suite's.
      `l4` failed one measured round with `iperf3 error: control socket has
      closed unexpectedly`. The warm-up cell completes now (it did not before
      `47a0016`), so the arm is no longer dead — but it is not reliable either.
+   - **The `l3` timeout is the transparent path under concurrency, and it is
+     half fixed.** `just l3-accept` (root, three namespaces) is the focused
+     harness, and on mhd it fails where TCP passes. Sixteen concurrent L3
+     flows over one lane lost traffic badly: 14 of 16 timed out. The cause of
+     the first half was a window leak in the probe path — `on_timeout`'s early
+     probe re-sent the flight while keeping it, so the same bytes were counted
+     twice and the congestion window closed on any loss (`8f0f728`). Two flows
+     now time out instead of fourteen, and the lane-lending arm passes.
+     **What is still wrong is throughput, not correctness**: the same 16-flow
+     workload runs at **576 round trips/s on mhd against 17 398 on TCP**
+     (control arm, no tunnel: 23 516). A single flow is 1 760/s against
+     3 472/s, so the collapse is *under concurrency* — the lane does not
+     pipeline sixteen flows, and something serialises them. That is where the
+     next investigation starts, and it is worth doing before any claim about
+     L3 on mhd.
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
