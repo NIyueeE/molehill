@@ -306,7 +306,6 @@ impl<W: AsyncWrite + Unpin> StripeSender<W> {
 
     fn poll_send(&mut self, cx: &mut Context<'_>, frame: &Bytes) -> Poll<io::Result<()>> {
         let k = self.streams.len();
-        let mut tried = 0;
         loop {
             let idx = self.next % k;
             let off = self.committed[idx];
@@ -334,25 +333,22 @@ impl<W: AsyncWrite + Unpin> StripeSender<W> {
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
-                    // The group cannot move this frame right now. Whether the
-                    // stall is a parked committed stripe or every stripe
-                    // refusing it, the wait is the same: the path is not
-                    // taking bytes. Time it for the plan.
+                    // The group cannot move this frame right now: time the wait
+                    // for the plan, and hand the waker back to the caller.
+                    //
+                    // The frame stays with this stripe even when not one byte of
+                    // it has been committed. Rotating it to another stripe on a
+                    // `Pending` looks like a free win and is a trap: `poll_write`
+                    // is allowed to have consumed the bytes already — a record
+                    // layer encrypts them into a record and then parks on the
+                    // transport — so a second stripe would carry the frame again
+                    // while the first one finishes the record it already holds.
+                    // The receiver then reads a frame header followed by a
+                    // different frame's payload, and the group dies on a torn
+                    // frame. One stalled stripe for one frame is the price of
+                    // that being impossible.
                     self.mark_stalled();
-                    if off > 0 {
-                        // The committed stripe parked: its `poll_write`
-                        // registered this task, so suspending here is safe.
-                        return Poll::Pending;
-                    }
-                    // Nothing committed yet: another stripe may take the
-                    // whole frame instead. Every `poll_write` above stored
-                    // its waker, so the group wakes as soon as any stripe
-                    // becomes writable.
-                    self.next = idx + 1;
-                    tried += 1;
-                    if tried == k {
-                        return Poll::Pending;
-                    }
+                    return Poll::Pending;
                 }
             }
         }
@@ -996,27 +992,42 @@ mod tests {
     }
 
     #[test]
-    fn an_uncommitted_frame_rotates_to_a_writable_stripe() {
+    fn a_refused_frame_waits_for_its_own_stripe() {
+        // A stripe that answers `Pending` may nevertheless have consumed the
+        // bytes: a record layer encrypts them into a record and parks on the
+        // transport. Handing the same frame to another stripe would put its bytes
+        // on two streams at once, and the receiver would read the first stream's
+        // frame header followed by the second stream's payload. So the frame stays
+        // where it was first offered, even though the second stripe is idle and
+        // writable.
         let mut sender = StripeSender::new(
             vec![MockWriter::refusing(), MockWriter::accepting(4096)],
             None,
         );
         let payload = [0xAB; 100];
+        let frame = frame_bytes(7, &payload);
         let waker = noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let mut fut = Box::pin(sender.send_owned(frame_bytes(7, &payload)));
         assert!(
-            fut.as_mut().poll(&mut cx).is_ready(),
-            "the frame should complete on the writable stripe"
+            sender.poll_send(&mut cx, &frame).is_pending(),
+            "a refused frame parks rather than moving to another stripe"
         );
-        drop(fut);
-        // The refusing stripe never saw a byte; the frame is whole on the
-        // accepting one.
         assert!(
-            sender.streams[0].written.is_empty(),
-            "the refusing stripe was written to"
+            sender.streams[1].written.is_empty(),
+            "the idle stripe must not be handed a frame another stripe may hold"
         );
-        assert_eq!(sender.streams[1].written, frame_bytes(7, &payload).to_vec());
+        // The stripe that holds the frame becomes writable: the frame completes on
+        // it, and the other stripe still never saw it.
+        sender.streams[0].accept = Some(4096);
+        assert!(
+            sender.poll_send(&mut cx, &frame).is_ready(),
+            "the frame completes on the stripe it was offered to"
+        );
+        assert_eq!(sender.streams[0].written, frame.to_vec());
+        assert!(
+            sender.streams[1].written.is_empty(),
+            "the idle stripe was written to"
+        );
     }
 
     #[test]
