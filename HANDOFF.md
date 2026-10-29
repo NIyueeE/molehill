@@ -700,32 +700,35 @@ suite's.
      mhd 5.98 Gbit/s at 0.549 s/Gbit against TCP 4.91 at 0.462 — the same
      ordering, a smaller gap. The bench's namespaced topology amplifies the
      per-datagram cost, whichever half of the path it is charged to.
-   - **Item (3): the two lending checks fail with the lending switched off, so
-     the lending is not what fails them (2026-10-29).** `just l3-accept` reads
-     thirteen pass and two fail, in the same two places every run:
+   - **Item (3): two defects, and only one of them is the lending (2026-10-29).**
+     `just l3-accept` fails the same two checks every run at its default of sixteen
+     flows. The harness's flow count is a knob (`CONCURRENT_CONNS`), so it was run
+     at three widths with the two-claim topology — four lanes split between a busy
+     claim and an idle one, so two lanes each:
 
-     | check | what the visitor reported |
-     |---|---|
-     | the busy claim stays byte-exact through the lane change | `CONCURRENT conns=16 requests=200 size=64 ok=11/16 in 6.069s` |
-     | with `lend = false` no lane moves, and the claim serves byte-exactly | `ok=13/16 in 6.043s`, and its client log carries **no** allocator line |
+     | flows | flows per slot | lending on | lending off |
+     |---|---|---|---|
+     | 8 | 4 | **8/8, pass** | **8/8, pass** |
+     | 12 | 6 | 10/12, **fail** | 12/12, pass |
+     | 16 | 8 | 11/16, **fail** | 13/16, **fail** |
 
-     The second is the mechanism's own control, and it fails too — so the lane
-     move is not the cause, which is what this page said for two rounds. What the
-     counters say instead, from `MOLEHILL_L3_STATS=1` on that control run:
-     `forwarded=2682 dropped(not_ip=0 malformed=0 unclaimed=0 no_channel=0)` on the
-     client, `forwarded=2701` with `unclaimed=16` on the server (the sixteens are
-     the flows' last packets, after they were closed), and per lane
-     `offered=1452 forwarded=1452` and `offered=1230 forwarded=1230`. **Nothing was
-     dropped and everything offered was forwarded**, so the missing requests never
-     entered the path: the three flows that time out fail at *connection setup*,
-     not in transit.
-     What separates the passing check from these two is flows per lane: the
-     single-claim check runs sixteen flows over four lanes and passes, while the
-     lending topology splits a budget of four between two claims, so the busy one
-     has two lanes and **eight flows each**. The next measurement is therefore the
-     flow-count axis on one claim — 4, 6, 8, 12 flows per lane, the same workload —
-     because a setup failure that appears between four and eight flows per lane is
-     a queue or a table in the hub, not a carrier window.
+     So there are **two** defects, not one:
+     - **A concurrency limit at eight flows per slot**, in both runs: at sixteen
+       flows the static control fails too, and everything the counters can see is
+       clean — the client forwards 2682 packets with
+       `dropped(not_ip=0 malformed=0 unclaimed=0 no_channel=0)`, the server 2701,
+       and each lane's `offered` equals its `forwarded`. Nothing is dropped, so the
+       flows that time out never enter the path: they fail at **connection setup**,
+       and a transparent flow is a carrier stream with its own handshake. Eight of
+       those opened at once on one lane is the shape that costs hundreds of
+       milliseconds each.
+     - **A loss during the move**, visible only where the static control still
+       passes: at twelve flows, lending loses two of twelve and lending-off loses
+       none. That is the defect this page described for two rounds, and it is real
+       — it just is not what fails the sixteen-flow checks.
+     The next measurement is the setup path at eight concurrent opens on one lane,
+     because that is where both runs break and where the two defects are the most
+     tangled.
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`
