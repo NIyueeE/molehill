@@ -699,9 +699,8 @@ carrier,还有两个用于安排诊断性的 carrier 切换(认领一个、隧�
 | 开关 | 输出 | 内容 |
 |---|---|---|
 | `MOLEHILL_MUX_STATS=1` | 每个 tunnel 每秒一行 | yamux 组帧累计计数(`written`、`read`、`bytes`)——即每秒帧数,配上一次 CPU 采样就是每帧 CPU |
-| `MOLEHILL_MHD_STATS=1` | 每进程每秒一行 |
+| `MOLEHILL_MHD_STATS=1` | 每进程每秒一行 | 载体的累计计数与分相计时:两个方向的 run、数据报与负载字节数(`rx_runs`/`rx_datagrams`/`rx_bytes` 与 `tx_*`),以及花在各相上的微秒数——`tx_build`(状态机填充一个 run)、`tx_send`(把 run 交给内核的那次系统调用)、`rx_total`(收到的一个数据报,从入口到返回)及其三段:`decode`、`ack`、`append`(把负载拷进流的接收缓冲)。`tx_build`/`tx_send` 每轮都计时;接收侧的三相**每十六个数据报采样一个**,因此读数要除以各自的 `_n`。这些**只在该开关打开时**采集,因此默认运行不会为它们读时钟 |
 | `MOLEHILL_TUNNEL_STATS=1` | 每进程每秒一行 | 每条多路复用隧道承载的字节数,格式 `序号:已交付/已写入`,按 pool 的 tunnel 顺序编号(旁边的 pool-stats 行才有 tunnel 名)——车道计数在 L4 的对应物,用来判断不同 carrier 上的隧道速率是否有材料性差异。计数本身是每条隧道上每轮 IO 两次 relaxed 原子加;该开关只启动报告线程 |
- mhd 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数、`datagram_b`——最后一个会话自适应到的数据报尺寸,回答尺寸问题就靠它)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain(`ms_out_send`,批量发送)与 ARQ update 的粗粒度分相计时,并在其旁给出限速器在 wire drain 中的那一份(`ms_out_pace`)——这些**只在该开关打开时**采集,因此默认运行不会为它们读时钟 |
 | `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned/carrier/phase`、进行中的切换(`id/target:phase`)、carrier 规则所判定的每条隧道累计 mhd `datagrams_out/retransmits`(非 mhd 隧道为 `-`),以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`、`-handover:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |

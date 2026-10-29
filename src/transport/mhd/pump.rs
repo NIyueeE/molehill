@@ -177,6 +177,7 @@ async fn flush(
     staging: &mut Staging,
 ) -> std::io::Result<usize> {
     let Staging { run, spans } = staging;
+    let build = super::stats::Timing::start(super::stats::enabled());
     while spans.len() < SEND_RUN {
         let now = Instant::now();
         let off = run.len();
@@ -185,11 +186,15 @@ async fn flush(
         };
         spans.push((off, len));
     }
+    build.stop(&super::stats::PHASES.tx_build);
     if spans.is_empty() {
         return Ok(0);
     }
     let sent = spans.len();
+    let posting = super::stats::Timing::start(super::stats::enabled());
     send_run(socket, peer, run, spans).await?;
+    posting.stop(&super::stats::PHASES.tx_send);
+    super::stats::sent_run(sent, run.len());
     for _ in 0..sent {
         shared.note_sent();
     }
@@ -214,13 +219,20 @@ fn drain_ready(
     match outcome {
         Ok(_) => {
             let now = Instant::now();
+            let mut datagrams = 0usize;
+            let mut bytes = 0usize;
             for (from, data) in batch.iter() {
                 if from != peer {
                     continue;
                 }
+                datagrams += 1;
+                bytes += data.len();
                 shared.with(|conn| {
                     let _ = conn.on_datagram(now, data);
                 });
+            }
+            if super::stats::enabled() && datagrams > 0 {
+                super::stats::received_run(datagrams, bytes);
             }
             shared.wake_readers();
             shared.wake_writers();
@@ -267,8 +279,15 @@ async fn receive(
     socket.readable().await?;
     match socket.try_io(Interest::READABLE, || batch.recv(socket.as_raw_fd())) {
         Ok(_) => {
+            let mut datagrams = 0usize;
+            let mut bytes = 0usize;
             for (from, data) in batch.iter() {
+                datagrams += 1;
+                bytes += data.len();
                 on_datagram(from, data);
+            }
+            if super::stats::enabled() {
+                super::stats::received_run(datagrams, bytes);
             }
             Ok(())
         }
@@ -536,6 +555,7 @@ impl MhdLane {
         nonce: crate::protocol::Digest,
     ) -> anyhow::Result<Arc<Self>> {
         use tokio::io::AsyncWriteExt;
+        super::stats::spawn_reporter();
         let lane = Self::dial(peer, id, noise, nonce).await?;
         let mut stream = crate::transport::multiplex::PoolLane::open_stream(&*lane)
             .await
@@ -849,6 +869,7 @@ fn spawn_dispatcher(
 impl MhdListener {
     /// Bind the listener and start one dispatcher per socket.
     pub(crate) fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+        super::stats::spawn_reporter();
         let sockets = bind_listener_sockets(addr)?;
         let bound = sockets[0].local_addr()?;
         let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();

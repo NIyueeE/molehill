@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`MOLEHILL_MHD_STATS=1` reports the carrier's own cost.** One line per second
+  per process carrying the cumulative counters and phase timings: runs,
+  datagrams and payload bytes in each direction, and the microseconds spent
+  filling a run, posting it to the socket, and — sampled one datagram in sixteen
+  — receiving, decoding, acknowledging and copying one. The switch was
+  documented for the engine this release replaces; it now describes what the new
+  one measures. Off by default, so a healthy run never reads the clock for it.
+
 ### Changed
 
 - **BREAKING: `mhd` is now a native multi-stream carrier, and the KCP engine

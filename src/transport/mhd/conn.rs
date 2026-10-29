@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::recovery::{Expiry, Recovery, SentRange};
+use super::stats;
 use super::stream::{RecvBuf, SendBuf};
 use super::wire::{self, AckSet, Frame, MAX_STREAM_PAYLOAD, ResetCode};
 use crate::transport::health::SessionHealth;
@@ -725,8 +726,23 @@ impl Conn {
     }
 
     /// Feed one datagram from the peer.
+    ///
+    /// The whole of it is timed as `rx_total` when the phase switch is on, and
+    /// the three phases inside are timed from a single sampling decision so they
+    /// describe the same datagram (see [`super::stats`]).
     pub(crate) fn on_datagram(&mut self, now: Instant, buf: &[u8]) -> Result<(), Rejected> {
+        let sampled = stats::enabled() && stats::PHASES.timing();
+        let total = stats::Timing::start(sampled);
+        let outcome = self.apply_datagram(now, buf, sampled);
+        total.stop(&stats::PHASES.rx_total);
+        outcome
+    }
+
+    /// The body of [`Conn::on_datagram`], with this datagram's sampling decision.
+    fn apply_datagram(&mut self, now: Instant, buf: &[u8], sampled: bool) -> Result<(), Rejected> {
+        let decode = stats::Timing::start(sampled);
         let packet = wire::decode(buf).map_err(|_| Rejected::Malformed)?;
+        decode.stop(&stats::PHASES.decode);
         if packet.id != self.id {
             return Err(Rejected::Malformed);
         }
@@ -738,72 +754,7 @@ impl Conn {
         }
         self.last_recv = now;
         if let Some(ack) = packet.ack {
-            let acked = self.recovery.on_ack(now, ack);
-            for sent in acked.newly {
-                if let Some(range) = sent.range
-                    && let Some(state) = self.streams.get_mut(&range.stream)
-                {
-                    state.send.ack(range.offset, usize::from(range.len));
-                }
-            }
-            // A loss only rewinds the send point: the bytes are still in the
-            // buffer, so the next pass carries them again from the same offset.
-            // Its bytes have already left the flight — the recovery table is the
-            // one thing that removes a packet, and it keeps the byte total — and
-            // they rejoin it when they are sent again, so the window counts what
-            // is on the wire and not what is owed.
-            self.note_retransmits(acked.lost.len());
-            if !acked.lost.is_empty() {
-                // The path dropped something: its capacity has been found, and the
-                // window grows additively from here on. Nothing is cut — the loss
-                // itself is repaired by retransmission.
-                self.slow_start = false;
-            }
-            for sent in acked.lost {
-                if let Some(range) = sent.range {
-                    if range.len == 0 && range.fin {
-                        // A finish-only packet: nothing to rewind, so queue the
-                        // finish again.
-                        self.pending_fins.push_back((range.stream, range.offset));
-                        continue;
-                    }
-                    if let Some(state) = self.streams.get_mut(&range.stream) {
-                        state.send.rewind_to(range.offset);
-                    }
-                }
-            }
-            // The window opens in two phases, the way every transport that has to
-            // find a path's capacity does it. Until the path has dropped
-            // something, every acknowledged byte buys a byte of window: the flight
-            // doubles once per round trip, which is what lets a flow of *small*
-            // packets reach the path's capacity in a few round trips instead of
-            // crawling there one big packet per window. After a loss it is
-            // additive — one packet per window acknowledged — and the window is
-            // never cut: a loss is repaired by retransmission, not paid for by
-            // halving the pipe for a round trip.
-            if acked.progress {
-                let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
-                if self.slow_start {
-                    // Doubling stops at the ceiling and the additive rule takes
-                    // over, because an unspaced burst that outruns the peer's
-                    // buffer costs the connection its liveness (see
-                    // [`SLOW_START_CEILING`]).
-                    self.cwnd = self.cwnd.saturating_add(bytes).min(SLOW_START_CEILING);
-                } else {
-                    self.acked_since_growth += bytes;
-                    if self.acked_since_growth >= self.cwnd {
-                        self.acked_since_growth = 0;
-                        self.cwnd = self
-                            .cwnd
-                            .saturating_add(MAX_STREAM_PAYLOAD as u64)
-                            .min(MAX_CWND);
-                    }
-                }
-            }
-            // A stream whose every byte is now acknowledged can say its finish
-            // (see `settle`): the acknowledgement is the proof that the reset
-            // will not overtake the data it follows.
-            self.settle_finished();
+            self.apply_ack(now, ack, sampled);
         }
         match packet.frame {
             Frame::None => {}
@@ -836,7 +787,9 @@ impl Conn {
                         self.inbound.push_back(id);
                     }
                     let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
-                    state.recv.insert(offset, data);
+                    stats::around(sampled, &stats::PHASES.append, || {
+                        state.recv.insert(offset, data);
+                    });
                     if fin {
                         state.recv.finish(offset + data.len() as u64);
                         state.peer_fin = true;
@@ -874,6 +827,79 @@ impl Conn {
             self.acks.insert(packet.number);
         }
         Ok(())
+    }
+
+    /// Apply the peer's acknowledgement: retire what it covers, rewind what
+    /// it reports lost, and open the window on the progress it proves.
+    fn apply_ack(&mut self, now: Instant, ack: wire::Ack, sampled: bool) {
+        let ack_timing = stats::Timing::start(sampled);
+        let acked = self.recovery.on_ack(now, ack);
+        for sent in acked.newly {
+            if let Some(range) = sent.range
+                && let Some(state) = self.streams.get_mut(&range.stream)
+            {
+                state.send.ack(range.offset, usize::from(range.len));
+            }
+        }
+        // A loss only rewinds the send point: the bytes are still in the
+        // buffer, so the next pass carries them again from the same offset.
+        // Its bytes have already left the flight — the recovery table is the
+        // one thing that removes a packet, and it keeps the byte total — and
+        // they rejoin it when they are sent again, so the window counts what
+        // is on the wire and not what is owed.
+        self.note_retransmits(acked.lost.len());
+        if !acked.lost.is_empty() {
+            // The path dropped something: its capacity has been found, and the
+            // window grows additively from here on. Nothing is cut — the loss
+            // itself is repaired by retransmission.
+            self.slow_start = false;
+        }
+        for sent in acked.lost {
+            if let Some(range) = sent.range {
+                if range.len == 0 && range.fin {
+                    // A finish-only packet: nothing to rewind, so queue the
+                    // finish again.
+                    self.pending_fins.push_back((range.stream, range.offset));
+                    continue;
+                }
+                if let Some(state) = self.streams.get_mut(&range.stream) {
+                    state.send.rewind_to(range.offset);
+                }
+            }
+        }
+        // The window opens in two phases, the way every transport that has to
+        // find a path's capacity does it. Until the path has dropped
+        // something, every acknowledged byte buys a byte of window: the flight
+        // doubles once per round trip, which is what lets a flow of *small*
+        // packets reach the path's capacity in a few round trips instead of
+        // crawling there one big packet per window. After a loss it is
+        // additive — one packet per window acknowledged — and the window is
+        // never cut: a loss is repaired by retransmission, not paid for by
+        // halving the pipe for a round trip.
+        if acked.progress {
+            let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
+            if self.slow_start {
+                // Doubling stops at the ceiling and the additive rule takes
+                // over, because an unspaced burst that outruns the peer's
+                // buffer costs the connection its liveness (see
+                // [`SLOW_START_CEILING`]).
+                self.cwnd = self.cwnd.saturating_add(bytes).min(SLOW_START_CEILING);
+            } else {
+                self.acked_since_growth += bytes;
+                if self.acked_since_growth >= self.cwnd {
+                    self.acked_since_growth = 0;
+                    self.cwnd = self
+                        .cwnd
+                        .saturating_add(MAX_STREAM_PAYLOAD as u64)
+                        .min(MAX_CWND);
+                }
+            }
+        }
+        // A stream whose every byte is now acknowledged can say its finish
+        // (see `settle`): the acknowledgement is the proof that the reset
+        // will not overtake the data it follows.
+        self.settle_finished();
+        ack_timing.stop(&stats::PHASES.ack);
     }
 
     /// The timer expired: why, and how many packets it put back in the queue.

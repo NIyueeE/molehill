@@ -122,14 +122,21 @@ because each of these was a real defect, not a tuning knob:
   on the stripe it was offered to.
 
 **Verification so far.** `just check` — both hook layers, i.e. the whole chain the
-objective names — is **green on `8983ecb`** (2026-10-29): `cargo fmt --check`, the
+objective names — is **green on `90fc20b`** and again on the phase-timer commit
+(2026-10-29): `cargo fmt --check`, the
 secret scan, `cargo machete`, the docs-alignment gate, ruff lint *and* format,
 pyright, the bench self-check, both clippy passes (default features and the
 minimal `server,client` build), then `cargo audit`, `cargo deny`,
 `cargo outdated` and the full serial suite: **twelve test binaries, all green**,
 304 lib tests among them. `integration_test` is 22/22 under
 `MOLEHILL_DATA_CARRIER=mhd` and 22/22 under `=tcp` with the same tree.
-(`/tmp/just-check.log`, `exit=0`.)
+(`/home/dsh/tmp/v1-cost/check2.log`, `exit=0`.)
+**`just check` on a loaded machine lies.** `pool_test`'s
+`a_saturated_pool_still_serves_the_next_visitor` failed three times in a row
+while the host was still busy from a bench run — and passed three out of three
+on the *same tree* once it was idle, at 9.2–9.8 s against 16.4–16.8 s. It is a
+timing test, not a logic test. Check `/proc/loadavg` before believing a red run
+of it, and never bisect a change against it while a benchmark is running.
 `pool_test` under a *forced* `tcp` still fails the three tests that use the
 diagnostic cross-carrier handover hatch (the server never binds UDP when the
 client declares TCP); that is a harness/diagnostic interaction, not a data-path
@@ -324,16 +331,63 @@ suite's.
      once per 64 KiB TSO segment. **The gap is therefore mostly inside this
      engine's per-datagram path** — measurable, attributable and reachable —
      rather than a property of the path that forbids a fix.
-   - **The next instrument does not exist yet, and that is the next task.** The
-     plan assumes per-phase timers (`MHD_NS_*`) that attribute a result to I/O
-     versus engine; this tree has none (`grep -rn MHD_NS_ src/` is empty — they
-     were the KCP adapter's). Attribution therefore starts with adding them: a
-     nanosecond split of the receive pass (syscall, header decode, stream lookup,
-     payload copy, ack bookkeeping) and of the send pass (frame build, record
-     seal, run build, syscall), reported on the status endpoint and gated behind
-     the stats environment variable. Without that split, any per-datagram
-     "optimisation" of the ~0.55 s/Gbit share is a guess, and four guesses in a
-     row have already cost this branch a day.
+   - **Re-measured from scratch before any of the above (2026-10-29, `90fc20b`).**
+     The `screen` profile, `--aa`, one carrier per run, the same method
+     fingerprint (`2bdcdece60a72f0c`): TCP `l4` **0.6342** s/Gbit (12.25 Gbit/s,
+     7.72 cores) with its twin at 0.6341 — a 0.02 % floor; mhd `l4` **0.9013**
+     (5.56 / 6.65 / 9.12 Gbit/s across three rounds, 6.0 cores) with its twin at
+     0.8827 but rounds of 0.79 / 1.01 / 0.88. The ratio reproduces at **1.42×**,
+     and two things beside it are new: the mhd arm's own A/A spread is **±13 %**,
+     twenty times TCP's, and its `rtt_p99` in the same cell was 330 / 692 /
+     2 358 ms against TCP's 1.8 ms. **The carrier is not yet stable enough for a
+     15 % claim on one run**, which bounds what any optimisation can be *shown*
+     to do; the phase timers below are what that instability gets explained with.
+     (`/home/dsh/tmp/v1-cost/base-tcp.json`, `base-mhd-l4.json`.)
+   - **The instrument exists now, and it answers the question (2026-10-29).**
+     `MOLEHILL_MHD_STATS=1` was documented and absent (the KCP adapter's text
+     survived the swap with no code behind it); it is now implemented in
+     `src/transport/mhd/stats.rs` and the two configuration pages describe it.
+     `tx_build`/`tx_send` are timed on every pass; `rx_total`, `decode`, `ack`
+     and `append` are sampled one datagram in sixteen, so a timestamp pair costs
+     the path about one percent of the work it measures.
+     One `cost` cell at `screen`'s scale, `MOLEHILL_DATA_CARRIER=mhd`, the
+     release binary, the payload carried 30.40 GB (243 Gbit), the cell reading
+     `cpu_s_per_gbit` 0.9096 at 6.655 cores (`bench-20261029-075613`):
+
+     | phase | cumulative | per Gbit | share of the carrier |
+     |---|---|---|---|
+     | sender `tx_build` (566 403 runs, 41.8 µs each) | 23.66 s | 0.097 | 38 % |
+     | sender `tx_send` (509 712 GSO syscalls, 27.0 µs each) | 13.76 s | 0.057 | 22 % |
+     | receiver `rx_total` (0.838 µs per datagram) | 18.2 s | 0.075 | 29 % |
+     | receiver `tx_send` (acks, 10.7 µs each) | 5.47 s | 0.023 | 9 % |
+     | everything else (`rx` acks, receiver `tx_build`) | 1.3 s | 0.005 | 2 % |
+     | **the carrier's own path** | **62.4 s** | **0.257** | 100 % |
+
+     Total CPU for that cell is `cpu_s_per_gbit × 243 Gbit` ≈ 221 s, so **the four
+     timed phases are 28 % of everything this carrier spends**, and they name the
+     carrier's framing and receive path at **0.257 s/Gbit**.
+     The other 72 % — 0.653 s/Gbit — is not a remainder to wave at: it holds the
+     record layer, the `StreamIo` copies between the record layer and the stream
+     buffers, the pool's copy loop, and the kernel, and only the last two of those
+     are shared with the TCP lane. **The tempting reading — "0.653 is TCP's whole
+     0.634, so the gap is exactly the timed phases" — is a coincidence until the
+     untimed carrier work is measured**, because it assumes mhd's above-carrier
+     cost equals TCP's total, which cannot be true while TCP has a carrier cost of
+     its own. Until then the honest claim is: framing and receive cost 0.257 s/Gbit
+     in four named phases, and **at least part of the remaining 0.276 gap is
+     untimed carrier work** — `StreamIo::poll_read`/`poll_write` and the record
+     layer are the two places it can be, and measuring them is the next step.
+     Inside `rx_total`, `append` (the copy into the stream's receive buffer) is
+     52 %, `ack` 12 %, `decode` 5 %, and 30 % is the rest of the datagram's
+     bookkeeping.
+   - **Where the next attempt goes.** `tx_build` first (0.097): 41.8 µs to frame
+     forty-four datagrams is a microsecond each, roughly three times a 1400-byte
+     copy — the ack block is re-encoded per packet, the stream range is a map
+     lookup per packet, and the run is `Vec::extend`ed packet by packet. Then
+     `rx_total` (0.075), where `append` is the piece to look at. `tx_send`
+     (0.057) is the kernel segmenting a sixty-kilobyte `UDP_SEGMENT` write and is
+     not reachable from here without bigger datagrams, which the plan forbids on
+     loss-amplification grounds.
    - **A batched receive was tried and is refuted; it is not the gap.** The
      receive side only ever had the GRO path (one run per `recvmsg`), so the
      obvious next move was the `recvmmsg` half the module header describes. Two

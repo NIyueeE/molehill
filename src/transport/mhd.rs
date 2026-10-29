@@ -49,6 +49,7 @@ pub(crate) mod conn;
 pub(crate) mod lane;
 pub(crate) mod pump;
 pub(crate) mod recovery;
+pub(crate) mod stats;
 pub(crate) mod stream;
 pub(crate) mod wire;
 
