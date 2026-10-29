@@ -479,7 +479,13 @@ def host_provenance(with_calibration: bool = True) -> dict:
     every run, and two runs whose probes disagree are refused (see
     `analysis.comparability`).
     """
-    info = {"identity": hostinfo.host_identity(), "kernel": platform.release()}
+    info = {
+        "identity": hostinfo.host_identity(),
+        "kernel": platform.release(),
+        # The load the run started under: the one number that says whether this
+        # machine was in a state to be measured at all.
+        "loadavg": hostinfo.host_load(),
+    }
     if with_calibration:
         info["calibration"] = hostinfo.host_calibration()
         info["loopback"] = hostinfo.host_loopback()

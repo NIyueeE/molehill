@@ -740,6 +740,19 @@ suite's.
      evidence** — the model's `--aa` floor is the mechanism that was supposed to
      catch this, and it only catches it when the drift is inside the run rather
      than over the whole of it.
+   - **What the next calm window measured, and why the floor is still 200 ms
+     (2026-10-29).** One clean sample got through before the host spiked again:
+     `cpu_s_per_gbit` **0.6723** at 8.97 Gbit/s with `MIN_RTO` at 20 ms, against
+     the committed baseline's median **0.6494** (0.6393–0.6579). So the change that
+     buys the transparent path **4.4×** of latency costs something on the clean
+     bulk path — a retransmission for every ack that arrives later than 20 ms — and
+     one sample cannot say how much. Reverted again, and the trade is now written
+     where the decision is: `recovery.rs` carries both numbers.
+     Which is also why the bench now records the **host load average** in every
+     run's `meta` (`bench/src/bench/hostinfo.py`, `instruments.py`, and a sentence
+     on both benchmarks pages): three cost cells in a row were taken at loads of
+     44, 57 and 49 and none of them was evidence, and a reader of a results file
+     has no way to know that today.
    - **One measurement survived it, and it is a real lead on item (3).** On a calm
      window (load 1.4) the acceptance harness's sixteen-flow arm — one claim, four
      lanes — ran **16/16 in 1.517 s** with `MIN_RTO` at 200 ms and **16/16 in 0.344 s**

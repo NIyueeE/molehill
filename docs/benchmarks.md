@@ -559,11 +559,14 @@ meta.
   method (the fingerprint, the resolved scenario parameters, the topology, the
   conditions, the instrument cadences, the SLO), the provenance (revision, the
   binary's sha256 and its own `--version` line, host identity, both calibration
-  probes) and the arm list; `samples` is one record per arm, round, scenario
+  probes, and the load average the run started under) and the arm list; `samples` is one record per arm, round, scenario
   and cell, each with its metrics, its typed absences and its evidence;
   `summary` is what the analysis derived from those samples — and
   `just bench report` recomputes it, because the samples are the evidence and
-  the summary is a rendering of it.
+  the summary is a rendering of it. The load average is the host's, not the
+  container's: on a shared bench host it is the one field that says whether the
+  machine was in a state to be measured at all, and a run taken under a crowd is
+  refused rather than compared.
 - **`just bench plot` renders exactly the figures this page describes** from
   any results file: the timeline master, the small multiples, the capacity
   curve, the UDP ladder, the drift panels and the cost bars.

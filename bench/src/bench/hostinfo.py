@@ -104,6 +104,30 @@ def _read_first(paths: tuple) -> str:
     return ""
 
 
+def host_load() -> dict:
+    """The load average the run started under, one/five/fifteen minutes.
+
+    The container's `/proc/loadavg` is the *host's*, and the host is shared: on
+    this project's bench host it has been seen to swing between 1 and 87 inside
+    twenty minutes, which is enough to expire the harness's own five-second
+    preflight and to make a timing test fail in the chain and pass on its own.
+    A run taken in such a window is not evidence, so every run records the load
+    it was taken at and a reader can refuse one that was taken under a crowd.
+    Empty where the file does not exist, which is the same typed absence the
+    rest of this module uses.
+    """
+    try:
+        fields = Path("/proc/loadavg").read_text().split()
+    except OSError:
+        return {}
+    # one, five, fifteen: three fields, and anything shorter is a kernel this
+    # does not understand rather than a load of zero.
+    wanted = 3
+    if len(fields) < wanted:
+        return {}
+    return {"one": fields[0], "five": fields[1], "fifteen": fields[2]}
+
+
 def host_identity() -> dict:
     """The host this run happened on: a *stable* identity, not a name.
 
