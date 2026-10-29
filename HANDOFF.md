@@ -121,12 +121,15 @@ because each of these was a real defect, not a tuning knob:
   could land on two streams and tear the receiver's framing. A frame now stays
   on the stripe it was offered to.
 
-**Verification so far.** The full serial suite (`cargo test -- --test-threads=1`,
-twelve binaries) is green on `47a0016`: 304 lib tests, `integration_test` 22/22
-with `MOLEHILL_DATA_CARRIER=mhd` and 22/22 with `=tcp` (serial, separate runs),
-and `pool_test`, `status_api_test`, `log_budget_test`, `session_test`,
-`startup_failure_test`, `noise_keys_test`, `hot_reload_test`, `config_test` and
-`interop_test` green.
+**Verification so far.** `just check` — both hook layers, i.e. the whole chain the
+objective names — is **green on `8983ecb`** (2026-10-29): `cargo fmt --check`, the
+secret scan, `cargo machete`, the docs-alignment gate, ruff lint *and* format,
+pyright, the bench self-check, both clippy passes (default features and the
+minimal `server,client` build), then `cargo audit`, `cargo deny`,
+`cargo outdated` and the full serial suite: **twelve test binaries, all green**,
+304 lib tests among them. `integration_test` is 22/22 under
+`MOLEHILL_DATA_CARRIER=mhd` and 22/22 under `=tcp` with the same tree.
+(`/tmp/just-check.log`, `exit=0`.)
 `pool_test` under a *forced* `tcp` still fails the three tests that use the
 diagnostic cross-carrier handover hatch (the server never binds UDP when the
 client declares TCP); that is a harness/diagnostic interaction, not a data-path
