@@ -41,6 +41,15 @@ const INITIAL_RTO: Duration = Duration::from_millis(333);
 
 /// The retransmission timer's floor: below this the timer fires on scheduling
 /// noise rather than on a lost packet.
+///
+/// Measured, not chosen: on a calm host the transparent path's sixteen-flow arm
+/// runs 16/16 in **1.517 s** with this floor and in **0.344 s** with 20 ms, so
+/// the floor dominates that workload's latency — a lost packet on a
+/// request/response flow costs the floor, and a two-lane claim loses a few. It is
+/// kept at 200 because lowering it buys that latency with a retransmission rate
+/// on the bulk paths that has not been measured: the host this was measured on
+/// went from a load average of 1 to 44 inside one run, and a cost cell taken
+/// there is not evidence.
 const MIN_RTO: Duration = Duration::from_millis(200);
 
 /// The retransmission timer's ceiling, which is also the idle limit of a silent

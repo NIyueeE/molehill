@@ -719,6 +719,27 @@ suite's.
 
      and the same run can have both arms, so it is a property of the lane's flow
      count, not of the run.
+   - **The measurement host is shared, and `/proc/loadavg` is its, not ours
+     (2026-10-29).** The container is not isolated: the load average it reads is
+     the *host's*, and the host swung between **1 and 87** during one afternoon
+     (28 → 15 → 7 → 3.6 → 44 inside twenty minutes). Every bench run taken in a
+     peak failed, and not subtly: `ip netns exec` alone outran the harness's own
+     five-second preflight, and `pool_test`'s timing test failed in three of four
+     `just check` runs and passed 11/11 plus 1/1 standalone on the same tree.
+     **So a run must record the load it was taken at, and a run above a few is not
+     evidence** — the model's `--aa` floor is the mechanism that was supposed to
+     catch this, and it only catches it when the drift is inside the run rather
+     than over the whole of it.
+   - **One measurement survived it, and it is a real lead on item (3).** On a calm
+     window (load 1.4) the acceptance harness's sixteen-flow arm — one claim, four
+     lanes — ran **16/16 in 1.517 s** with `MIN_RTO` at 200 ms and **16/16 in 0.344 s**
+     with it at 20 ms, in the same topology, minutes apart. A strict
+     request/response flow loses a packet every few hundred round trips and each
+     loss then costs the *floor*, so the floor dominates that workload's latency by
+     more than four to one. The floor is still 200 ms: lowering it buys that
+     latency with a retransmission rate on the bulk paths that could not be
+     measured, because the cost cell taken for it came back at a host load of 44.
+     That cell, at a calm host, is the first thing the next window should run.
    - **A flake that blocks the gate, with its own numbers.** `pool_test`'s
      `a_saturated_pool_still_serves_the_next_visitor` failed **three of the last
      four** `just check` runs and passed **11/11 plus 1/1 standalone** on the same
