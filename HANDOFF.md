@@ -597,6 +597,13 @@ suite's.
      remainder is now small enough to be measured: mhd's floor fell from 13 % to
      4.35 %, which is a better instrument than any of the optimisations it can
      now resolve.
+   - **The width change does not touch the transparent path.** `just l3-accept`
+     (root, three namespaces, fifteen checks) reads the same at four workers as at
+     twenty: thirteen pass, and the two that fail are the known sixteen-flow
+     lending pair (`the busy claim lost traffic while a lane was lent`,
+     `lending-off either moved a lane or lost the workload`) — the same two, in the
+     same order, on both widths. The other thirteen include the 16-flow
+     byte-exactness check, so the change is not hiding behind a green summary.
    - **One diagnostic kept**: a lane that decides its peer is gone now logs the
      silence age at `DEBUG` (`id`, `silent_ms`). It exists because a *client-side*
      pool reaping its own lanes is what turns an intermittent 5 s stall into a
