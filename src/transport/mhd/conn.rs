@@ -567,11 +567,17 @@ impl Conn {
         out: &mut Vec<u8>,
         ack: Option<wire::Ack>,
     ) -> Option<usize> {
+        // Sampled, because these run once per packet and a timestamp pair costs
+        // more than the work it measures at this size (see `stats`).
+        let sampled = stats::enabled() && stats::PHASES.timing();
+        let pick = stats::Timing::start(sampled);
         let (id, offset, want) = self.next_stream_range()?;
         let number = self.recovery.next_number();
         let state = self.streams.get(&id)?;
         let (bytes, fin) = state.send.range(offset, want)?;
+        pick.stop(&stats::PHASES.tx_pick);
         let len = bytes.len();
+        let encode = stats::Timing::start(sampled);
         let packet_len = wire::encode_stream(
             out,
             self.id,
@@ -584,6 +590,8 @@ impl Conn {
                 data: bytes,
             },
         )?;
+        encode.stop(&stats::PHASES.tx_encode);
+        let book = stats::Timing::start(sampled);
         self.recovery.on_sent(
             now,
             number,
@@ -598,6 +606,7 @@ impl Conn {
             state.send.mark_sent(len);
         }
         self.advance_cursor();
+        book.stop(&stats::PHASES.tx_book);
         self.ack_pending = false;
         self.keepalive_at = now + KEEPALIVE;
         Some(packet_len)

@@ -95,6 +95,13 @@ pub(crate) struct Phases {
     pub(crate) tx_build: Meter,
     /// One pass posting its run to the socket.
     pub(crate) tx_send: Meter,
+    /// One packet's stream selection: the scheduler's scan and the range the
+    /// send buffer answered with.
+    pub(crate) tx_pick: Meter,
+    /// One packet's framing: the header and the payload copy into the run.
+    pub(crate) tx_encode: Meter,
+    /// One packet's bookkeeping: the flight table and the cursor.
+    pub(crate) tx_book: Meter,
     /// A stream handle's read: the copy out of the receive buffer into the
     /// caller's slice.
     pub(crate) io_read: Meter,
@@ -130,6 +137,9 @@ impl Phases {
             append: Meter::new(),
             tx_build: Meter::new(),
             tx_send: Meter::new(),
+            tx_pick: Meter::new(),
+            tx_encode: Meter::new(),
+            tx_book: Meter::new(),
             io_read: Meter::new(),
             io_write: Meter::new(),
             seal: Meter::new(),
@@ -250,6 +260,12 @@ fn report() {
         tx_build_n = PHASES.tx_build.read().1,
         tx_send_us = PHASES.tx_send.micros(),
         tx_send_n = PHASES.tx_send.read().1,
+        tx_pick_us = PHASES.tx_pick.micros(),
+        tx_pick_n = PHASES.tx_pick.read().1,
+        tx_encode_us = PHASES.tx_encode.micros(),
+        tx_encode_n = PHASES.tx_encode.read().1,
+        tx_book_us = PHASES.tx_book.micros(),
+        tx_book_n = PHASES.tx_book.read().1,
         io_read_us = PHASES.io_read.micros(),
         io_read_n = PHASES.io_read.read().1,
         io_write_us = PHASES.io_write.micros(),

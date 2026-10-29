@@ -400,6 +400,20 @@ suite's.
      that it *closes*: mhd's four measured groups are 98.4 s of its 183 s, and the
      0.231 s/Gbit gap is 0.257 (carrier) + 0.033 (copies) + 0.028 (residue) − 0.059
      (the record layer it wins) = 0.259. Two independent cells, one fingerprint.
+   - **Re-measured after a data loss, and the range is the honest number.** Every
+     artifact this page cites lived under `~/tmp`, and on 2026-10-29 at 10:09 the
+     whole directory was emptied by something outside this repository (the runs'
+     work directories with it; nothing here deletes it — `grep` finds no `rmtree`
+     in the bench). Evidence therefore lives in `target/evidence/` from now on,
+     inside the tree and git-ignored, and the pair was re-taken:
+     **TCP `0.6275 s/Gbit` (12.31 Gbit/s, 7.66 cores) against mhd `0.9646`
+     (7.27 Gbit/s, 6.98 cores) — 1.54×** (`target/evidence/cost-tcp.json`,
+     `cost-mhd.json`). Three same-day mhd cells now read 0.8736, 0.9093 and
+     0.9646; the *ratio* moves with them, from 1.36× to 1.54×, which is the
+     instability again and the reason every claim below is stated as a range with
+     its method rather than as a point. What does not move: the record layer's
+     share (mhd 0.21–0.22, TCP 0.26–0.27 s/Gbit) and the carrier's own
+     0.25–0.26 s/Gbit, which is the part this project owns.
    - **What that means for P2's gate, in one line.** This carrier's own
      incremental cost is **0.29 s/Gbit**; closing the gap means cutting it by
      about eighty percent, and no amount of per-datagram tuning removes the fact
@@ -407,6 +421,20 @@ suite's.
      ours happens in `poll_transmit`. The plan's gate is therefore **refuted with
      a complete account**, not merely unmet — which is the answer the sequence was
      waiting for, and the decision it hands back is the human's.
+   - **The carrier's own 0.257, split per packet (2026-10-29, sampled 1 in 16).**
+     On the sender, per packet inside `tx_build` (35.6 µs for a 42-packet run):
+     stream selection 0.092 µs, framing and the payload copy 0.262 µs, flight
+     table and cursor 0.194 µs — 66 % of the build, with the rest the per-packet
+     lock, the clock read and the loop. **No phase is big enough to be the
+     answer**, which is the same conclusion as the coarse table at finer grain:
+     the cost is spread over six small steps, and the only lever that is not a
+     micro-optimisation is doing them on the thread that produced the payload.
+     That is what the reference implementations do: a QUIC connection is driven
+     by the task that writes to it (`quinn-proto`'s `Connection::poll_transmit`
+     runs from the application's own poll), while here the writer appends to the
+     send buffer and wakes a *different* task, which then reads the payload back
+     across a core boundary. The experiment that follows from this is written
+     below, not guessed at.
    - **Where a real attempt would still go.** `tx_build` is the largest single
      phase inside the carrier (0.083–0.097): 41.8 µs to frame forty-four
      datagrams is a microsecond each, roughly three times a 1400-byte copy — the
@@ -468,6 +496,35 @@ suite's.
      change to loss recovery on every path rather than a local repair. The `us=`
      field stays, because it is one clock read per stream open and it is how the
      stall is visible in any run.
+   - **Compared against a mature implementation, and we already match it.** The
+     obvious question at this point is what a production userspace transport does
+     that this one does not, so `quinn-proto` 0.11.9 was read next to this tree
+     (`/home/dsh/tmp/ref/quinn-proto-0.11.9`, fetched from crates.io). Three of
+     its four cost mechanisms are already here, at the same shape:
+     `Connection::poll_transmit(&mut self, now, max_datagrams, buf: &mut Vec<u8>)`
+     is called with a **caller-owned, reused buffer** exactly like `Staging`;
+     it fills up to `MAX_TRANSMIT_SEGMENTS` datagrams per call for one
+     `sendmsg` with `UDP_SEGMENT`, as `send_run` does; and its send side copies
+     the payload out of the stream's `Bytes` chunks into that buffer, as
+     `encode_stream` does. The second copy is not something a better
+     implementation avoids.
+     The one place it is genuinely different is the **receive** side: quinn's
+     `assembler::Assembler` stores `Bytes` chunks (`insert(&mut self, offset, bytes:
+     Bytes, …)`, `bytes.split_to(...)`), so a datagram's payload is reference
+     counted, never copied, and handed to the reader as a slice — while
+     `RecvBuf::insert` here copies every payload into a fresh `Vec` piece. That is
+     `append`, measured at 0.19–0.44 µs per 1400-byte datagram, or **0.02–0.04
+     s/Gbit** — real, worth having, and one tenth of the 0.25 s/Gbit the carrier
+     owns. Adopting it means the datagram buffer becomes `Bytes` (one allocation
+     per received run instead of one `Vec` per datagram) and `wire::decode`
+     reports a payload *range* rather than a slice, which is a contained change to
+     `udp_batch.rs`, `conn.rs` and `stream.rs`.
+     **What that says about the gate**: the difference between this carrier and a
+     mature one is not a missing mechanism, it is where the work happens — the
+     kernel's socket layer amortises a TCP stream's per-byte cost over a
+     `sk_buff` it owns, and a userspace carrier pays per datagram for the same
+     bytes. Quoting a reference implementation cannot change that; it can only
+     shave the copies, which is what the item above is.
    - **The decision this leaves for the human** (the plan names it): ship
      `mhd` as a loss-tail-only carrier with an honest "costs ~1.5× TCP on a
      clean path, wins on lossy multi-flow tails" claim, or stop the carrier
