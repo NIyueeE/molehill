@@ -700,28 +700,36 @@ suite's.
      mhd 5.98 Gbit/s at 0.549 s/Gbit against TCP 4.91 at 0.462 — the same
      ordering, a smaller gap. The bench's namespaced topology amplifies the
      per-datagram cost, whichever half of the path it is charged to.
-   - **Item (3): every in-process queue is now excluded, and the check is the
-     carrier's (2026-10-29).** Three measurements, each with its own instrument:
+   - **Item (3): the stalled flows stall at their first reply (2026-10-29).**
+     Three more instruments, each answering one question:
 
-     | question | instrument | result |
+     | question | instrument | answer |
      |---|---|---|
-     | does a batch wait in a slot's queue? | `queue_wait_max_ms`, new: the age from `try_send` to the pump taking it | **0 ms** in all four logs at sixteen flows |
-     | do the daemons hold bytes? | `Conn::waiting` (`unsent` / `unacked`) | **0 ms unsent**; unacked never above 206 ms = `MIN_RTO` |
-     | is the carrier slow? | `rr-1`, the model's single-connection round trip | TCP p50 **0.060–0.066 ms**, mhd **0.089–0.096 ms** |
+     | does the kernel drop these packets? | per-interface `rx_drop`/`tx_drop`/errs in all three namespaces, printed after the arm | **one packet** across the whole arm (`l3srv0 tx_drop=1`) |
+     | where does a stalled flow stop? | the visitor now reports its progress (`timed out after k/200 round trips`) | **`0/200`**: it connected, read the banner, and the first reply never came |
+     | is the peer's credit what blocks it? | `credit_blocked` on the `mhd stalled` line | **false** in every sample; the only wait is 200–232 ms of flight = `MIN_RTO` |
 
-     And the check itself is the carrier's, not the harness's: with
-     `MOLEHILL_DATA_CARRIER=tcp` `just l3-accept` passes **15 of 15** and its
-     sixteen-flow visitors finish in **0.09–0.14 s**; on mhd it passes 12 or 13 and
-     the same visitors take **6 s** — which is the *timeout* of the two or three
-     flows that never finish, not a slow path. So a subset of flows loses its bytes
-     silently, with every queue in both daemons measured empty.
-     `read_gap_max_ms` is not the instrument for this: 1807 ms of it appears on a
-     *passing* TCP run, because the gap includes the idle time between the last
-     read and shutdown. It measures idleness, not stalls.
-     What is left is the transparent path's own packet handling between the two
-     TUN devices — the `IpFrames` reader, the injection loop, or the guest's TCP
-     over the TUN — and none of it has an age instrument yet. That is the next
-     step, and it is the same shape as the two above: a wait, not a drop.
+     So a flow's request goes out, its reply never arrives, and nothing in either
+     daemon nor in the kernel accounts for it. The cliff is sharp and reproducible:
+
+     | lanes for the busy claim | flows per lane | visitor |
+     |---|---|---|
+     | 4 | 4 | 16/16 in 0.09–1.9 s |
+     | 2 | 8 | 5/16, 13/16, 15/16 — the rest stall 6 s |
+
+     and the same run can have both arms, so it is a property of the lane's flow
+     count, not of the run.
+   - **A flake that blocks the gate, with its own numbers.** `pool_test`'s
+     `a_saturated_pool_still_serves_the_next_visitor` failed **three of the last
+     four** `just check` runs and passed **11/11 plus 1/1 standalone** on the same
+     tree, with the stall instrument on. Its scenario — saturate one lane with
+     `ENGINE_STREAM_CAP + 8` visitors, drop them, then demand one more — is the
+     same shape as the two defects above, and the instrument shows a lost packet
+     costing 200 ms and, with backoff, up to **714 ms**. So the flake and the L3
+     cliff are probably one defect wearing three coats: something that makes a
+     *new* stream's first bytes on a busy-then-quiet lane take far longer than the
+     timer suggests.
+
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`

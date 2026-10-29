@@ -238,6 +238,31 @@ dev_snapshot() {
     cpu_ticks "$SRV_PID" server >>"$out"
 }
 
+# Kernel drops per interface, for one arm.
+#
+# An interface that drops in the kernel is invisible to every counter the daemons
+# keep: the packet never reaches them, so nothing is "refused" and nothing is
+# "lost", and a flow simply stops. That is the one place a "the tunnel lost my
+# flow" report can still hide, so the arms that matter record it.
+drop_snapshot() {
+    local out="$1"
+    : >"$out"
+    for ns in "$NS_CLI" "$NS_SRV" "$NS_VIS"; do
+        ip netns exec "$ns" cat /proc/net/dev 2>/dev/null \
+            | awk -v ns="$ns" '/:/ { gsub(":", "", $1); print ns, $1, $4, $5, $12, $13 }' \
+            >>"$out"
+    done
+}
+
+# The interfaces that dropped anything, with their four counter columns.
+drop_report() {
+    local file="$1"
+    awk '$3 + $4 + $5 + $6 > 0 {
+        printf "  %s %-10s rx_err=%s rx_drop=%s tx_err=%s tx_drop=%s\n",
+               $1, $2, $3, $4, $5, $6
+    }' "$file"
+}
+
 # utime + stime of one process, in ticks. The tokio runtime's threads are all
 # in this process, so one number covers the whole data path.
 cpu_ticks() {
@@ -660,6 +685,7 @@ echo "================= MANY FLOWS ================="
 # that is per-core (one reader, one channel task per direction) shows up as a
 # rate that does not grow with the flow count.
 dev_snapshot "$LOG/many.before"
+drop_snapshot "$LOG/many.drops"
 MANY_START=$(date +%s.%N)
 MANY_RC=0
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
@@ -675,6 +701,8 @@ awk -v s="$MANY_START" -v e="$MANY_END" -v c="$CONCURRENT_CONNS" -v n="$CONCURRE
     printf "%d flows x %d round trips of %d B in %.3fs, %.0f round trips/s aggregate \
 (diagnostic, not a benchmark)\n", c, n, b, d, c * n / d
 }'
+echo "--- kernel drops on that arm (any interface with one) ---"
+drop_report "$LOG/many.drops"
 wire_report "many ${CONCURRENT_CONNS}x${CONCURRENT_REQUESTS}x${SMALL_BYTES}B" \
     "$LOG/many.before" "$LOG/many.after" "$LOG/many.report"
 

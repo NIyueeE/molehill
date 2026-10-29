@@ -46,12 +46,15 @@ def pattern(size: int) -> bytes:
     return (bytes(range(256)) * (size // 256 + 1))[:size]
 
 
-def round_trips(sock: socket.socket, count: int, size: int) -> bool:
-    """N strict request/response cycles: nothing is sent until the reply is in.
+def round_trips(sock: socket.socket, count: int, size: int) -> int:
+    """N strict request/response cycles; answers how many completed.
 
-    One outstanding request at a time is the point — it keeps each round trip
-    its own small segment, which is the workload whose packet sizes decide what
-    header compression could save.
+    Nothing is sent until the reply is in, which is the point: one outstanding
+    request keeps each round trip its own small segment, the workload whose
+    packet sizes decide what header compression could save. The count is
+    returned rather than a bool because "the flow stalled at request 0" and "the
+    flow was slow but finished" are different defects and only the count tells
+    them apart.
     """
     blob = pattern(size)
     for i in range(count):
@@ -59,24 +62,29 @@ def round_trips(sock: socket.socket, count: int, size: int) -> bool:
         got = recv_exactly(sock, len(blob))
         if got != blob:
             print(f"REQUESTS FAIL at {i}: got {len(got)} bytes", flush=True)
-            return False
+            return i
     print(f"REQUESTS n={count} size={size} ok", flush=True)
-    return True
+    return count
 
 
 def one_flow(
     target: tuple, index: int, requests: int, size: int, timeout: float
 ) -> str:
     """One connection's worth of strict round trips; returns "" when it passed."""
+    done = 0
     try:
         with socket.create_connection(target, timeout=timeout) as sock:
             banner = recv_exactly(sock, len(PREFIX))
             if banner != PREFIX:
                 return f"flow {index}: expected {PREFIX!r}, got {banner!r}"
-            if not round_trips(sock, requests, size):
-                return f"flow {index}: round trips did not match"
+            done = round_trips(sock, requests, size)
     except OSError as exc:
-        return f"flow {index}: {exc}"
+        # The count is what makes a stall diagnosable: zero means the first
+        # reply never came, which points at the path; a high number means the
+        # flow was merely slow.
+        return f"flow {index}: {exc} after {done}/{requests} round trips"
+    if done != requests:
+        return f"flow {index}: round trips did not match ({done}/{requests})"
     return ""
 
 
@@ -136,7 +144,7 @@ def run(args: argparse.Namespace) -> bool:
             if banner != PREFIX:
                 print(f"VISITOR FAIL expected {PREFIX!r}, got {banner!r}", flush=True)
                 return False
-            ok = round_trips(sock, args.requests, args.size)
+            ok = round_trips(sock, args.requests, args.size) == args.requests
             verdict = "VISITOR OK" if ok else "VISITOR FAIL requests"
         elif args.size:
             blob = pattern(args.size)

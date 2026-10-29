@@ -121,6 +121,20 @@ pub(crate) struct StreamHandle {
     pub(crate) id: u32,
 }
 
+/// Which bound refused a partial write.
+///
+/// The two wait for different things: the congestion window waits for an
+/// acknowledgement, the peer's credit waits for its *reader*. A stream that
+/// stalls with the credit refusing is waiting on the far end's application, and
+/// nothing this connection sends will move it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// This end's congestion window had no room in flight.
+    Window,
+    /// The peer's advertised credit had no room for new bytes.
+    Credit,
+}
+
 /// A connection between two of this carrier's endpoints.
 #[derive(Debug)]
 pub(crate) struct Conn {
@@ -143,6 +157,8 @@ pub(crate) struct Conn {
     /// When a stall line was last written, so one long stall costs one line a
     /// second rather than one per pass.
     stall_logged_at: Option<Instant>,
+    /// Which bound refused the last partial write (see [`Conn::write`]).
+    last_refusal: Option<Refusal>,
     recovery: Recovery,
     acks: AckSet,
     ack_pending: bool,
@@ -235,6 +251,7 @@ impl Conn {
             cursor: u32::from(dialer),
             unsent_at: None,
             stall_logged_at: None,
+            last_refusal: None,
             recovery: Recovery::new(),
             acks: AckSet::default(),
             ack_pending: false,
@@ -319,6 +336,16 @@ impl Conn {
             // [`Conn::waiting`] reports. One clock read per short write, never
             // per packet — and a write the window accepted whole clocks nothing.
             self.unsent_at.get_or_insert_with(Instant::now);
+            // Which bound refused, recorded because the two wait for different
+            // things: the congestion window waits for an acknowledgement, the
+            // peer's credit waits for its *reader*. A stream that stalls with
+            // its budget refusing is waiting on the far end's application, and
+            // nothing this connection does will move it.
+            self.last_refusal = Some(if credit <= window {
+                Refusal::Credit
+            } else {
+                Refusal::Window
+            });
         }
         if take == 0 {
             return 0;
@@ -810,6 +837,14 @@ impl Conn {
             unsent.map_or(0, |d| d.as_millis()),
             unacked.map_or(0, |d| d.as_millis()),
         ))
+        .inspect(|_| {
+            // The caller logs it; the reason travels with the age.
+        })
+    }
+
+    /// Whether the last refusal was the peer's credit (see [`Conn::write`]).
+    pub(crate) fn credit_blocked(&self) -> bool {
+        matches!(self.last_refusal, Some(Refusal::Credit))
     }
 
     /// Feed one datagram from the peer.
