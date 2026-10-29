@@ -536,6 +536,26 @@ suite's.
      per-round throughput, three rounds each of a stable and an unstable cell: if
      the slow rounds retransmit more, the instability is recovery; if they do not,
      it is scheduling.
+   - **The swing is not recovery (measured the same day).** The same cell, four
+     rounds, `MOLEHILL_POOL_STATS=1` beside `MOLEHILL_MHD_STATS=1`, the per-tunnel
+     `mhd_health` pair read at the end of each round
+     (`target/evidence/instability.json`):
+
+     | round | s/Gbit | Gbit/s | datagrams out | retransmits | retransmit share |
+     |---|---|---|---|---|---|
+     | 0 | 0.8901 | 8.99 | 425 876 | 107 | 0.03 % |
+     | 1 | 0.9328 | 8.58 | 592 926 | 153 | 0.03 % |
+     | 2 | 0.9779 | 8.18 | 577 702 | 100 | 0.02 % |
+     | 3 | 0.8038 | 9.95 | 395 542 | 90 | 0.02 % |
+
+     Throughput swings 1.2× and the retransmit share does not move: on a clean cell
+     the carrier loses almost nothing in every round, so the swing is **not**
+     recovery. What moves with it is cost per byte, in the wrong direction — the
+     slow rounds spend *more* CPU per byte than the fast one — which is the
+     signature of work that grows when the bytes arrive differently, not of work
+     repeated. The next suspect is the receive side's scheduling (the per-pass
+     wake-ups and the channel between the dispatcher and the lanes) rather than
+     loss recovery, and the same four-round shape measures it.
      **What that says about the gate**: the difference between this carrier and a
      mature one is not a missing mechanism, it is where the work happens — the
      kernel's socket layer amortises a TCP stream's per-byte cost over a
