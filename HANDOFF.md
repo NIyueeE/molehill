@@ -152,6 +152,24 @@ suite's.
      `l4` failed one measured round with `iperf3 error: control socket has
      closed unexpectedly`. The warm-up cell completes now (it did not before
      `47a0016`), so the arm is no longer dead — but it is not reliable either.
+   - **Re-measured 2026-10-29 in one profile, both carriers, three samples
+     each, after slow start:** mhd `l4` clean **0.9645 / 0.8958 / 0.8994**
+     (median 0.899) against TCP **0.6424 / 0.6369 / 0.6297** (median 0.637) —
+     **1.41×**, still refuted. The liveness fixes did not move the per-byte
+     cost, which is what the analysis predicted: the cost is the path's
+     per-datagram delivery, not the carrier's bookkeeping.
+     (`/home/dsh/tmp/bench-20261029-054214.json` mhd,
+     `/home/dsh/tmp/bench-20261029-054422.json` TCP.)
+   - **The `smoke` profile's `l4` arm fails, and it is pre-existing.** Runs of
+     that profile hang at the visitor's connect (successive runs took 246 s,
+     651 s, 1 375 s and 1 410 s before their timeout) — and they do so with the
+     **last known-good binary** (`47a0016`, built in a worktree) exactly as
+     with the current one, while the TCP carrier completes the same cells in the
+     same topology. The `screen` profile — the one the 0.9819 figure came from —
+     still completes mhd `l4` in 33 s. So that failure is profile-and-path
+     specific, not a regression from the liveness work; the `screen` numbers are
+     the comparable ones, and the `smoke` arm needs the investigation the
+     `screen` arm already got.
    - **The `l3` timeout is the transparent path under concurrency, and it is
      half fixed.** `just l3-accept` (root, three namespaces) is the focused
      harness, and on mhd it fails where TCP passes. Sixteen concurrent L3
@@ -159,42 +177,38 @@ suite's.
      the first half was a window leak in the probe path — `on_timeout`'s early
      probe re-sent the flight while keeping it, so the same bytes were counted
      twice and the congestion window closed on any loss (`8f0f728`). Two flows
-     now time out instead of fourteen, and the lane-lending arm passes.
-     **What is still wrong is throughput, not correctness**: the same 16-flow
-     workload runs at **576 round trips/s on mhd against 17 398 on TCP**
-     (control arm, no tunnel: 23 516). A single flow is 1 760/s against
-     3 472/s, so the collapse is *under concurrency* — the lane does not
-     pipeline sixteen flows, and something serialises them. That is where the
-     next investigation starts, and it is worth doing before any claim about
-     L3 on mhd.
+     now time out instead of fourteen.
+     **The rest of it was the congestion window, and that is now fixed.**
+     Sixteen concurrent L3 flows of 64-byte round trips ran at **576 round
+     trips/s aggregate against 17 398 on TCP**, with the carrier's pump idle
+     ninety percent of the time. An 8 MiB *initial* window made the same arm
+     pass, which identified the cause rather than guessing at it: the window
+     grew additively from the first acknowledgement — congestion avoidance
+     from the start — so it opened as a function of *bytes acked*, and a
+     workload of small packets needs tens of thousands of acknowledgements to
+     reach a window the path could carry in a few round trips.
+     The window now opens in slow start (every acknowledged byte buys a byte of
+     window) up to a two-megabyte ceiling, latches onto the additive rule at the
+     first loss, and is never cut (`6a20a9e`, `0536741`). **Same arm, after:
+     2 990 round trips/s — 5.2× — and it passes.** A single flow went from
+     1 760/s to 1 794/s, i.e. unchanged, which is the point: the fix was for the
+     concurrency collapse, not for latency.
 
-     What has been ruled out, each by measurement rather than argument:
+     What the window fix needed to be safe, and why:
 
-     - **not CPU** — the two daemons spend 0.36 s + 0.52 s of CPU over the
-       5.5 s the workload runs (about 16 % of one core);
-     - **not per-lane serialisation** — `CLAIM_LANES=4` fails the same three
-       checks with the same rate, so the queue is above the lane;
-     - **not a hub timer** — the transparent path has no per-packet interval
-       (`LANE_TICK` is one second and covers lane health; the flow sweeper is
-       one second and covers eviction);
-     - **not the congestion window alone**, for the same reason as the lane
-       count: four lanes give four windows and change nothing.
+     - the ceiling, because the doubling outgrew the peer's socket buffer and
+       the path dropped everything long enough for the pool to **reap a live
+       lane** (`reaped dead tunnels ... reason="dead"`, seen in a bench arm);
+     - a dead lane is now declared on twenty seconds of *silence from the
+       peer*, not on ten expired timers: a peer whose buffer is full drops
+       every datagram but its keepalives still arrive, which is what tells
+       "saturated" from "gone".
 
-     What is left is the path from the TUN device through the hub into the
-     carrier and back, and the number that has to be explained is
-     **≈1.75 ms of service per round trip under load against 0.57 ms idle**
-     with sixteen flows queueing. The pump-phase tracer (`MHD_TRACE`, per-phase
-     wall time) was run on exactly this workload and it says the carrier is
-     **not** the limiter: in the busiest second the pump spends 22 ms building
-     packets, 73 ms in its send syscalls and 496 ms **waiting**, while the
-     layer above spends 11 ms in `poll_read` and 2 ms in `poll_write`. The
-     server-side sender pump reads the same shape (25 / 80 / 675 ms, 12 ms in
-     its reads).
-     So the collapse is above the carrier: something on the hub side offers
-     packets at 576 round trips/s while the lane sits idle 90 % of the time.
-     The next step is the same tracer moved up one layer — the hub's
-     device→channel→lane path and its `write_all` pump — not another look at
-     `mhd`.
+     **Still open in this arm:** the two lane-lending checks. Under a live lane
+     change the sixteen-flow workload drops to 8/16 flows ok — an idle claim's
+     lane moves to the busy claim while its flows are running, and half of them
+     time out. That is the lending mechanism, not the carrier, and it is the
+     next thing to investigate on this path.
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
