@@ -238,6 +238,26 @@ suite's.
      is: the hub's per-lane queues, the serve path's Noise record layer, or the
      block of code the two paths share. That question has one instrumented
      answer and it is the next measurement to take.
+   - **Reproduced on loopback, and narrowed to the round trip.** A probe service
+     on one lane, with a bulk transfer running on another, over a two-service
+     config (`/home/dsh/tmp/cost2/probe.sh`): connect a fresh TCP visitor to the
+     probe's exposed port, send four bytes, wait for the echo. Times are
+     milliseconds, median and worst:
+
+     | carrier | bulk streams | connect | round trip (median / worst) |
+     |---|---|---|---|
+     | tcp | 4 | 0.2 / 1.6 | **1.9 / 9.4** |
+     | mhd | 1 | 0.2 / 1.4 | 2.2 / 11.3 |
+     | mhd | 4 | 0.4 / 3.7 | **42.8 / 1 596** |
+     | mhd | 6 | 0.3 / 3.2 | 9.9 / 657 |
+
+     So the TCP *accept* is fine on both carriers (0.2–0.4 ms), and the stall is
+     the first data round trip of a new stream: from 2.2 ms with one bulk stream
+     to a 1.6-second worst case with four. A second and a half is the shape of a
+     timer, not of queueing — the same class of defect as the lost wake-up fixed
+     in the first round, but on the stream-open path. The next measurement is
+     that path with the phase tracer: `open_stream` → hello → ack, and where the
+     handshake's wake-up goes missing while the window is held by bulk streams.
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
