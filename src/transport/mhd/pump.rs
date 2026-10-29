@@ -657,6 +657,10 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
     ) -> Result<crate::transport::multiplex::CarrierStream, crate::transport::multiplex::LaneError>
     {
         use tokio::io::AsyncWriteExt;
+        // One clock read per stream open, and the only number that says whether
+        // a visitor's first byte waited on this carrier: `open_channel` is the
+        // Noise handshake, and the hello and its acknowledgement follow it.
+        let opening = Instant::now();
         let mut stream = self.open_channel().await?;
         let hello = crate::protocol::Hello::DataChannelTunnelHello(
             crate::protocol::CURRENT_PROTO_VERSION,
@@ -678,7 +682,11 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
             .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
         match ack {
             crate::protocol::Ack::Ok => {
-                tracing::debug!(lane = self.id, "mhd stream opened and acknowledged");
+                tracing::debug!(
+                    lane = self.id,
+                    us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    "mhd stream opened and acknowledged"
+                );
                 Ok(stream)
             }
             _ => Err(crate::transport::multiplex::LaneError::Closed),

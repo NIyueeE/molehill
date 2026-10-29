@@ -434,6 +434,40 @@ suite's.
      above: GSO and GRO are working, so a pass already carries 44 datagrams in
      one syscall and comes back as one run. Batching a path that is already
      batched can only add work — which is what both implementations measured.
+   - **The other question, measured the same day, and it does not go better
+     (2026-10-29).** Success criterion 3 asks whether the carrier wins *one* cell
+     beyond the run's own noise — a `loss1`/`loss5` throughput cell or a
+     multi-flow `rr-*` p99. The `dev` profile's three cells were run at
+     `--condition loss1`, one carrier per run, `control` and `l4` and an A/A twin,
+     three rounds (`loss1-tcp.json`, `loss1-mhd.json`, fingerprint
+     `5735319b28a1bd44`):
+
+     | cell | control | TCP `l4` | mhd `l4` |
+     |---|---|---|---|
+     | `bulk-1` P1 | 4.41 Gbit/s | 3.80 (3/3) | 3.96 but **1 of 3 failed** |
+     | `bulk-n` P8 | 31.2 | **14.93 (3/3)** | **0 of 3 — every attempt failed** |
+     | `rr-16` c16 | 614.9/s | **608.7/s** | **541.3/s (−11 %)** |
+     | `rr-16` p99 | 246.2 ms | 246.4 | 246.4 (the condition's own floor) |
+
+     The twins bound the noise: TCP's `l4~aa` is within 1.4 % on every cell, and
+     mhd's within 1.5 % on `rr-16`, so the 11 % is real. The failures are typed by
+     the harness — `client timed out after 25s` and `iperf3 error: unable to
+     receive results` — on the eight-stream bulk, three times out of three, while
+     TCP carries the same cell next to it. **The carrier does not win a loss cell;
+     it fails one TCP completes.**
+   - **The 502 ms stall survives the obvious fix, and the floor is why.** The
+     opening stream's end is a numbered packet, so its acknowledgement is the
+     connection's first round-trip sample: the dialer was made to wait for it,
+     bounded at 50 ms, before the lane was returned. Measured with the carrier's
+     own new `us=` field on `mhd stream opened and acknowledged`, under the same
+     probe: **502 053 and 502 498 µs — unchanged.** Two reasons, and the second is
+     the one that matters: no sample arrived inside the wait (a bulk load keeps the
+     pump busy), and *even with one* `Recovery::rto` clamps to `MIN_RTO`, which is
+     **200 ms** — forty times the round trip a healthy path here reports. Reverted
+     and recorded: a fix for this stall has to move the recovery floor, which is a
+     change to loss recovery on every path rather than a local repair. The `us=`
+     field stays, because it is one clock read per stream open and it is how the
+     stall is visible in any run.
    - **The decision this leaves for the human** (the plan names it): ship
      `mhd` as a loss-tail-only carrier with an honest "costs ~1.5× TCP on a
      clean path, wins on lossy multi-flow tails" claim, or stop the carrier
