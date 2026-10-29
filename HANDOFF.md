@@ -279,26 +279,61 @@ suite's.
      After them the probe read 6/9/24 probes per run with 4–5 timeouts, against
      8/25/37 with 0–3 before: not a win, and possibly a regression, so they are
      not in the tree. The diagnosis stands, the fix does not exist yet.
-     **What the next attempt needs is a tighter experiment**, because this one's
-     variance is larger than the effect: a fixed probe count and window, repeated
-     runs, the distribution reported rather than one median, and the drop counter
-     as the primary signal (it moved by tens of thousands and needs no statistics).
-   - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
-     started, no cost or tail claim may be made about `mhd`, and the phases
-     that would follow are not to be executed on the belief that a later
-     phase fixes the per-byte cost: the engine's own overhead is the gap, not
-     its congestion control or its FEC.
-   - **Where the gap comes from (measured 2026-10-29).** The bench's paths do
-     not coalesce this carrier's datagrams, and the loopback proxy's do — which
-     is why the same binary reads 0.549 s/Gbit on loopback and 0.982 there. Two
-     probes, on a `veth` pair with the bench's addressing: `sendmsg` with
-     `UDP_SEGMENT` is refused with `EINVAL` (so the sender's GSO silently falls
-     back to `sendmmsg`), and 256 datagrams of 1400 bytes arrive as **256
-     `recvmsg` calls** with `UDP_GRO` on and nothing else to receive. The
-     receiver therefore pays one syscall per 1400 bytes in exactly the topology
-     the gate is measured in — roughly 730 000 syscalls per gigabit carried.
-     That is the one lever left with a plausible four-figure-µs-per-Gbit
-     payoff, and it is *not* the engine's own code.
+     **The tighter experiment was then run, and the fourth attempt failed too.**
+     `probe2.sh` — a fixed 25 ms probe cadence, three repeated runs, the drop
+     counter as the primary signal — measured the abort-on-drop change against
+     the baseline: drops **27 139 / 31 909 / 38 678** against **39 687 / 40 539
+     / 56 188** with no timeouts 0/2/2 against 3/3/4. The counter moved by a
+     third, which is inside the baseline's own spread (39 687–56 188), and p50
+     went 13.2/636.6/43.2 → 70.7/94.1/72.5 ms, i.e. the probe's variance is
+     still larger than any effect. Reverted, not landed. **Stopping here on this
+     defect** (three-strikes, AGENTS.md §9): the diagnosis is sound, four fix
+     attempts produced no measurable win, and the next attempt needs a different
+     instrument — a per-phase trace of the stream-open path *with the bulk load
+     held constant*, not another protocol change measured through this probe.
+   - **Therefore the sequence stops here** — the gate is red and the plan says a
+     failed P2 gate stops the phases. What no longer holds is the *reason* it was
+     called unreachable: see the correction below. P3b/P3c, P4, P5 and P6 stay
+     unstarted, and no cost or tail claim may be made about `mhd`.
+   - **Where the gap comes from: the earlier answer was wrong. This is the
+     correction (2026-10-29).** The record said the bench's `veth` paths refuse
+     `UDP_SEGMENT` with `EINVAL`, that the sender therefore always falls back to
+     `sendmmsg`, and that the receiver pays one `recvmsg` per 1400 bytes. **That
+     is false, and the probe that produced it was the defect:** `UDP_SEGMENT`'s
+     control message carries a **`u16`**, and a four-byte payload is rejected by
+     the kernel's own length check with `EINVAL` — which is exactly the error
+     the probe reported. With a `u16` payload the same `sendmsg` is accepted:
+     - **the product already emits GSO on that path.** Temporary counters in
+       `send_run` (reverted; the tree carries none) logged, in one two-second
+       transfer over a 1500-MTU `veth` pair at 6.0 Gbit/s, **24 000+ successful
+       GSO batches of 44 spans** and no bulk fallback, and both sockets accepted
+       `UDP_GRO` (no `refused GRO` line).
+     - **GRO pairs with GSO and with nothing else.** Through a *forwarding* hop —
+       three namespaces, `net.ipv4.ip_forward=1`, the shape the bench has — one
+       GSO super-packet of 32 × 1400 bytes arrives as **one 44 800-byte run**
+       with `UDP_GRO` and as 32 datagrams without it; a plain burst of 256
+       datagrams is **256 `recvmsg` calls either way**, because separate skbs are
+       not coalesced.
+     So the per-byte syscall cost on the gate's path is a forty-fourth of the
+     datagram count, not one per datagram, and the claim that the gap is "not
+     the engine's own code" is withdrawn. What the numbers say now: the same
+     binary reads 0.549 s/Gbit on loopback and 0.982 on `veth`, with the same
+     1400-byte datagrams — so the path contributes roughly 0.35 s/Gbit and this
+     engine's own per-datagram work (parse, stream lookup, copy, ack
+     bookkeeping, once per 1400 bytes) roughly 0.55. Kernel TCP pays that work
+     once per 64 KiB TSO segment. **The gap is therefore mostly inside this
+     engine's per-datagram path** — measurable, attributable and reachable —
+     rather than a property of the path that forbids a fix.
+   - **The next instrument does not exist yet, and that is the next task.** The
+     plan assumes per-phase timers (`MHD_NS_*`) that attribute a result to I/O
+     versus engine; this tree has none (`grep -rn MHD_NS_ src/` is empty — they
+     were the KCP adapter's). Attribution therefore starts with adding them: a
+     nanosecond split of the receive pass (syscall, header decode, stream lookup,
+     payload copy, ack bookkeeping) and of the send pass (frame build, record
+     seal, run build, syscall), reported on the status endpoint and gated behind
+     the stats environment variable. Without that split, any per-datagram
+     "optimisation" of the ~0.55 s/Gbit share is a guess, and four guesses in a
+     row have already cost this branch a day.
    - **A batched receive was tried and is refuted; it is not the gap.** The
      receive side only ever had the GRO path (one run per `recvmsg`), so the
      obvious next move was the `recvmmsg` half the module header describes. Two
@@ -313,20 +348,22 @@ suite's.
      datagram pays the whole descriptor setup for one packet, so batching a
      shallow queue costs more than the syscall it saves.
      **Conclusion: the receive syscall is not where the bench's 0.34 s/Gbit
-     lives.** What is left is the per-packet delivery cost of the path itself —
-     a `veth` charges per datagram, and kernel TCP amortises that into 64 KiB
-     TSO segments while a 1400-byte-packet transport cannot. That cost is not
-     reachable from this engine's code without bigger datagrams, which the plan
-     rules out on loss-amplification grounds.
+     lives.** That still holds, and the reason it is not there is the correction
+     above: GSO and GRO are working, so a pass already carries 44 datagrams in
+     one syscall and comes back as one run. Batching a path that is already
+     batched can only add work — which is what both implementations measured.
    - **The decision this leaves for the human** (the plan names it): ship
      `mhd` as a loss-tail-only carrier with an honest "costs ~1.5× TCP on a
      clean path, wins on lossy multi-flow tails" claim, or stop the carrier
      and delete it. Nothing in this branch is released, so both remain open.
+     The correction above changes what the honest claim would have to say — the
+     gap is ours to close, not the path's to forbid — but it does not change the
+     fact that today's numbers are 1.41× TCP.
    - The local single-host proxy that guided the work (one forwarded TCP
      stream through an iperf3 pair, `cpu-split.sh` outside the tree) reads
      mhd 5.98 Gbit/s at 0.549 s/Gbit against TCP 4.91 at 0.462 — the same
      ordering, a smaller gap. The bench's namespaced topology amplifies the
-     per-packet cost, which is where the gap lives.
+     per-datagram cost, whichever half of the path it is charged to.
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`
