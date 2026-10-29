@@ -601,6 +601,35 @@ suite's.
      remainder is now small enough to be measured: mhd's floor fell from 13 % to
      4.35 %, which is a better instrument than any of the optimisations it can
      now resolve.
+   - **Item (2), the cell that fails under one percent loss: what was fixed and
+     what was not (2026-10-29).** Two changes, both measured:
+     - **An abandoned stream now aborts instead of half-closing, and a reset goes
+       ahead of stream data.** `settle` queued a *finish* for a dropped handle,
+       which ends only our write direction and leaves the peer sending into a
+       reader that is gone; and `transmit_reset` sat behind `transmit_stream`, so
+       on a busy lane it was never reached. Re-measured on the failing cell: the
+       `dropped data for a retired stream` lines went from **68 492** in one
+       failed round to **0**, i.e. 96 MB of the visitor's bytes that used to be
+       pushed into abandoned streams are no longer sent. The earlier attempt at
+       this was reverted because it was measured on stream-open latency, which is
+       the wrong instrument for it.
+     - **`INITIAL_RTO` is 333 ms, the value RFC 9002 §6.2.1 gives the same state,
+       instead of 500.** A lane whose first handshake packet is lost waits it
+       before it can open anything, and four lanes dialed under one percent loss
+       measured establishment of **504 ms** with 500 here. With 333 the same
+       measurement reads **335.4–336.4 ms** and the stream after it 1.5 ms.
+     Neither closes the cell: `bulk-n` under `loss1` still fails about half the
+     time, in two modes — a visitor that cannot connect at 0.3–0.4 s, and a result
+     exchange that dies at 17–18 s after a transfer that ran. **The second mode's
+     evidence is new**: the failure is not in the data path at all. The visitor
+     goes away (`stripe destination write failed: Broken pipe`), the stripe group
+     finishes, and its *send* direction keeps running for **ten seconds** until
+     the half-close grace cuts it (`stripe half-close grace expired; cutting the
+     other direction`), because `send.abort()` on that task does not take effect
+     at an await point. A torn-down group therefore holds a stream and its share
+     of a lane for ten seconds, which is the next thing to fix and is measurable
+     on its own: the gap between `stripe group finished` and `stripe send
+     direction finished`.
    - **The width change does not touch the transparent path.** `just l3-accept`
      (root, three namespaces, fifteen checks) reads the same at four workers as at
      twenty: thirteen pass, and the two that fail are the known sixteen-flow

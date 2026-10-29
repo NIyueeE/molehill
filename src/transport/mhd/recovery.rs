@@ -28,10 +28,16 @@ const PACKET_THRESHOLD: u32 = 3;
 const TIME_THRESHOLD_NUM: u32 = 9;
 const TIME_THRESHOLD_DEN: u32 = 8;
 
-/// The retransmission timer before any round trip has been measured: long
-/// enough that a slow path is not mistaken for a dead one on the first packet,
-/// short enough that a lost handshake is re-sent inside the caller's budget.
-const INITIAL_RTO: Duration = Duration::from_millis(500);
+/// The retransmission timer before any round trip has been measured.
+///
+/// 333 ms is the value RFC 9002 §6.2.1 gives the same state (`kInitialRto`), and
+/// this carrier had been using half a second. The difference is not academic: a
+/// lane whose first handshake packet is lost waits this timer before it can open
+/// anything, and a pool of four lanes dialed under one percent loss measured
+/// **504 ms** of establishment with 500 ms here, which is long enough to surface
+/// as a visitor arriving before the pool is ready. Backoff doubles from here, so
+/// a genuinely slow path still gets its second, fourth and eighth chance.
+const INITIAL_RTO: Duration = Duration::from_millis(333);
 
 /// The retransmission timer's floor: below this the timer fires on scheduling
 /// noise rather than on a lost packet.

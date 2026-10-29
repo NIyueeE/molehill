@@ -345,12 +345,23 @@ impl Conn {
         };
         if state.local_fin && !state.fin_sent && state.send.unacked() == 0 {
             state.fin_sent = true;
-            // No byte carries the fin now (everything queued is already
-            // acknowledged), so it needs a packet of its own — and one that is
-            // retransmitted, because a peer that never sees its end waits for it
-            // for ever.
-            let at = state.send.finished_at().unwrap_or(0);
-            self.pending_fins.push_back((stream, at));
+            if state.abandoned {
+                // The handle was dropped, so nothing will read this stream again:
+                // a finish would only end *our* write direction and leave the
+                // peer sending into a reader that is gone. Nobody wants those
+                // bytes and they queue ahead of everything the lane still owes
+                // the visitor — the abandoned streams of one torn-down transfer
+                // have measured 96 MB of them, which is what starves the results
+                // exchange that follows. An abort ends both directions.
+                self.resets.push_back((stream, ResetCode::Aborted));
+            } else {
+                // No byte carries the fin now (everything queued is already
+                // acknowledged), so it needs a packet of its own — and one that
+                // is retransmitted, because a peer that never sees its end waits
+                // for it for ever.
+                let at = state.send.finished_at().unwrap_or(0);
+                self.pending_fins.push_back((stream, at));
+            }
         }
         let done = state.abandoned && state.fin_sent && state.send.unacked() == 0;
         if state.local_fin && !state.fin_sent {
@@ -509,10 +520,16 @@ impl Conn {
         if self.credit_due() {
             return self.transmit_credit(now, out, ack);
         }
-        if let Some(len) = self.transmit_stream(now, out, ack) {
+        // A reset goes before stream data: an abort is the one frame whose
+        // delay costs the peer real bytes, because the peer is still sending
+        // into a stream whose reader is gone. Behind a busy lane's data the
+        // reset branch was never reached — every call found a stream with bytes
+        // — so the peer learned about the abandonment only when the window
+        // closed.
+        if let Some(len) = self.transmit_reset(now, out, ack) {
             return Some(len);
         }
-        if let Some(len) = self.transmit_reset(now, out, ack) {
+        if let Some(len) = self.transmit_stream(now, out, ack) {
             return Some(len);
         }
         if let Some(len) = self.transmit_fin(now, out, ack) {
@@ -834,6 +851,15 @@ impl Conn {
                 if code != ResetCode::Finished
                     && let Some(state) = self.streams.get_mut(&id)
                 {
+                    // The peer ended this stream in both directions. One line,
+                    // because a stream that a visitor was reading is exactly the
+                    // kind of thing a "the connection just closed" report needs
+                    // evidence for.
+                    tracing::debug!(
+                        stream = id,
+                        code = ?code,
+                        "mhd peer reset a stream"
+                    );
                     state.reset = Some(code);
                 }
             }
