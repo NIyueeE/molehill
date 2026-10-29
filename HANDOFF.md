@@ -163,16 +163,22 @@ suite's.
      per-datagram delivery, not the carrier's bookkeeping.
      (`/home/dsh/tmp/bench-20261029-054214.json` mhd,
      `/home/dsh/tmp/bench-20261029-054422.json` TCP.)
-   - **The `smoke` profile's `l4` arm fails, and it is pre-existing.** Runs of
-     that profile hang at the visitor's connect (successive runs took 246 s,
-     651 s, 1 375 s and 1 410 s before their timeout) — and they do so with the
-     **last known-good binary** (`47a0016`, built in a worktree) exactly as
-     with the current one, while the TCP carrier completes the same cells in the
-     same topology. The `screen` profile — the one the 0.9819 figure came from —
-     still completes mhd `l4` in 33 s. So that failure is profile-and-path
-     specific, not a regression from the liveness work; the `screen` numbers are
-     the comparable ones, and the `smoke` arm needs the investigation the
-     `screen` arm already got.
+   - **The `cost` scenario hangs on `mhd` at full scale, and only at full
+     scale.** I first wrote this down as "the `smoke` profile's `l4` arm fails",
+     which was wrong: what actually happens is `--scenarios cost` with the *cost
+     scenario's own* params (`scale: 1.0`, six bulk streams) — the profile only
+     supplied the round count. At that scale the arm hangs at the visitor's
+     connect (successive runs took 246 s, 651 s, 1 375 s and 1 410 s before
+     their timeout), with the **last known-good binary** (`47a0016`, built in a
+     worktree) exactly as with the current one, while **TCP completes the same
+     cells** in the same topology. `screen` — the same scenario at
+     `scale: 0.5` — completes `mhd` in 33 s.
+     So this is a **load-dependent stall in `mhd`**, the same theme as the L3
+     lending failure below, and not a regression from the liveness work: it
+     reproduces on the pre-slow-start binary. The `screen` numbers are the
+     comparable ones; the full-scale stall is the next measurement to take, and
+     it should be taken with the serve path instrumented rather than from the
+     bench's connect timeout.
    - **The `l3` timeout is the transparent path under concurrency, and it is
      half fixed.** `just l3-accept` (root, three namespaces) is the focused
      harness, and on mhd it fails where TCP passes. Sixteen concurrent L3
@@ -222,6 +228,16 @@ suite's.
      that the move's drain waits on the carrier's write path while the lane is
      already saturated, and that the wait is charged to the flows on the
      *other* lanes.
+   - **One theme covers both of the above, and it is the thing to fix next:**
+     `mhd` stalls under high concurrency — sixteen L3 flows with a lane move,
+     and the cost scenario's six streams at full scale — while TCP carries the
+     same loads. Both stalls are load-dependent, both reproduce with a
+     pre-slow-start binary, and both sit above the per-packet path (the
+     L3 verdict was that the carrier's own pump is idle ninety percent of the
+     time while the workload waits). What is *not* yet known is where the wait
+     is: the hub's per-lane queues, the serve path's Noise record layer, or the
+     block of code the two paths share. That question has one instrumented
+     answer and it is the next measurement to take.
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
