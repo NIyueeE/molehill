@@ -713,22 +713,27 @@ suite's.
      | 16 | 8 | 11/16, **fail** | 13/16, **fail** |
 
      So there are **two** defects, not one:
-     - **A concurrency limit at eight flows per slot**, in both runs: at sixteen
-       flows the static control fails too, and everything the counters can see is
-       clean — the client forwards 2682 packets with
-       `dropped(not_ip=0 malformed=0 unclaimed=0 no_channel=0)`, the server 2701,
-       and each lane's `offered` equals its `forwarded`. Nothing is dropped, so the
-       flows that time out never enter the path: they fail at **connection setup**,
-       and a transparent flow is a carrier stream with its own handshake. Eight of
-       those opened at once on one lane is the shape that costs hundreds of
-       milliseconds each.
+     - **A concurrency limit at eight flows per slot**, in both runs, and it is a
+       **data stall, not a setup failure**. The visitor's failure is a *read*
+       timeout: it connects and then waits for the backend's five-byte `echo:`
+       banner, so a flow that reports `timed out` has already established. (An
+       earlier note here said the opposite; the visitor's own code says
+       otherwise.) Everything the counters can see is clean — the client forwards
+       2682 packets with `dropped(not_ip=0 malformed=0 unclaimed=0 no_channel=0)`,
+       the server 2701 with one unclaimed, each lane's `offered` equals its
+       `forwarded`, and both directions are counted (`forwarded` device→lane,
+       `injected` lane→device) with neither at zero. **Nothing is dropped and
+       nothing is refused**, so the missing bytes are waiting in a queue no counter
+       timestamps: the slot's queue into the carrier, or the carrier's own send
+       buffer.
      - **A loss during the move**, visible only where the static control still
        passes: at twelve flows, lending loses two of twelve and lending-off loses
        none. That is the defect this page described for two rounds, and it is real
        — it just is not what fails the sixteen-flow checks.
-     The next measurement is the setup path at eight concurrent opens on one lane,
-     because that is where both runs break and where the two defects are the most
-     tangled.
+     Both need the same instrument before either can be fixed: a per-second queue
+     **age** (the time a batch waits from enqueue to the writer taking it), in the
+     L3 slot and in the carrier's send buffer, so a stall names the queue it waits
+     in. That is the next round's work.
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`
