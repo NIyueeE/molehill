@@ -312,6 +312,10 @@ pub struct Stats {
     pub last_write_ms: AtomicU64,
     pub max_write_gap_ms: AtomicU64,
     pub max_write_gap_at_ms: AtomicU64,
+    /// The longest a batch waited in a slot's queue (see [`Self::note_queue_wait`]).
+    pub max_queue_wait_ms: AtomicU64,
+    /// When that wait happened, unix milliseconds.
+    pub max_queue_wait_at_ms: AtomicU64,
     /// Packets the device offered in the last complete second, and the same for
     /// what this end forwarded, with the counters they were measured against.
     ///
@@ -446,6 +450,23 @@ impl Stats {
             per_second(forwarded.saturating_sub(was_forwarded), elapsed),
             Ordering::Relaxed,
         );
+    }
+
+    /// One batch's wait in a slot's queue, from the moment the device offered it
+    /// to the moment the pump took it.
+    ///
+    /// This is the one wait the transparent path can grow that no packet counter
+    /// sees: a batch is *accepted* by the queue (`offered` counts it) and sits
+    /// there while the pump is busy in `write_all` on a carrier that is not
+    /// taking bytes. A flow whose request waits here times out exactly as if the
+    /// packet had been dropped.
+    pub fn note_queue_wait(&self, waited: std::time::Duration) {
+        let ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        if ms > self.max_queue_wait_ms.load(Ordering::Relaxed) {
+            self.max_queue_wait_ms.store(ms, Ordering::Relaxed);
+            self.max_queue_wait_at_ms
+                .store(unix_ms(), Ordering::Relaxed);
+        }
     }
 
     /// One batch the carrier accepted: close the previous write gap.

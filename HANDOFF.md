@@ -700,46 +700,28 @@ suite's.
      mhd 5.98 Gbit/s at 0.549 s/Gbit against TCP 4.91 at 0.462 — the same
      ordering, a smaller gap. The bench's namespaced topology amplifies the
      per-datagram cost, whichever half of the path it is charged to.
-   - **Item (3): the stall is not in the carrier, and there are two defects
-     (2026-10-29).** `just l3-accept` fails its flow-count checks at sixteen flows,
-     and the harness's flow count is a knob (`CONCURRENT_CONNS`), so it was run at
-     three widths with the two-claim topology — four lanes split between a busy
-     claim and an idle one, so two lanes each:
+   - **Item (3): every in-process queue is now excluded, and the check is the
+     carrier's (2026-10-29).** Three measurements, each with its own instrument:
 
-     | flows | flows per slot | lending on | lending off |
-     |---|---|---|---|
-     | 8 | 4 | **8/8, pass** | **8/8, pass** |
-     | 12 | 6 | 10/12, **fail** | 12/12, pass |
-     | 16 | 8 | 11/16, **fail** | 13/16, **fail** |
+     | question | instrument | result |
+     |---|---|---|
+     | does a batch wait in a slot's queue? | `queue_wait_max_ms`, new: the age from `try_send` to the pump taking it | **0 ms** in all four logs at sixteen flows |
+     | do the daemons hold bytes? | `Conn::waiting` (`unsent` / `unacked`) | **0 ms unsent**; unacked never above 206 ms = `MIN_RTO` |
+     | is the carrier slow? | `rr-1`, the model's single-connection round trip | TCP p50 **0.060–0.066 ms**, mhd **0.089–0.096 ms** |
 
-     That is a concurrency limit at eight flows per slot *and* a loss during the
-     move, and neither is the carrier's send path. The instrument that settles it
-     is new (`Conn::waiting` + a `mhd stalled` line): a connection now reports how
-     long its bytes have waited in the **send buffer** (unsent) and in the
-     **flight** (sent, unacknowledged), once a second while either clears 200 ms.
-     Measured across a full acceptance run at sixteen flows:
-
-     | log | lines | unsent max | unacked max |
-     |---|---|---|---|
-     | lending client | 1 | **0 ms** | 205 ms |
-     | lending-off client | 0 | — | — |
-     | lending server | 3 | **0 ms** | 203 ms |
-     | lending-off server | 1 | **0 ms** | 206 ms |
-
-     **No byte waits unsent anywhere**, and the only wait in the flight is 200–206
-     ms, which is `MIN_RTO` — a retransmission doing its job. So the carrier
-     delivers what it is given; the flows that time out lose their bytes in the
-     transparent path or the guest, not here. (An earlier run of the same probe
-     reported 2.3–7.7 *seconds* of unsent; that was the clock's own bug — the
-     stamp was set on every write and cleared only when no stream existed, so it
-     measured "time since the last write" rather than "time bytes have been
-     waiting". It is worth writing down because the wrong reading pointed straight
-     at the window.)
-     The sixteen-flow loss is also not specific to the lending runs: this
-     acceptance run failed the single-claim check as well (14/16), where the
-     earlier ones passed it. So the next work on item (3) is in the transparent
-     path — the hub's slot pump, the TUN read, or the guest — and the carrier is
-     excluded by measurement.
+     And the check itself is the carrier's, not the harness's: with
+     `MOLEHILL_DATA_CARRIER=tcp` `just l3-accept` passes **15 of 15** and its
+     sixteen-flow visitors finish in **0.09–0.14 s**; on mhd it passes 12 or 13 and
+     the same visitors take **6 s** — which is the *timeout* of the two or three
+     flows that never finish, not a slow path. So a subset of flows loses its bytes
+     silently, with every queue in both daemons measured empty.
+     `read_gap_max_ms` is not the instrument for this: 1807 ms of it appears on a
+     *passing* TCP run, because the gap includes the idle time between the last
+     read and shutdown. It measures idleness, not stalls.
+     What is left is the transparent path's own packet handling between the two
+     TUN devices — the `IpFrames` reader, the injection loop, or the guest's TCP
+     over the TUN — and none of it has an age instrument yet. That is the next
+     step, and it is the same shape as the two above: a wait, not a drop.
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`

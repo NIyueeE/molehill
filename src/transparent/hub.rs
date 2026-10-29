@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
@@ -294,7 +295,7 @@ impl TunHub {
     fn join(
         &self,
         endpoint: Endpoint,
-        queue: mpsc::Sender<Bytes>,
+        queue: mpsc::Sender<(Instant, Bytes)>,
         lane: Option<LaneId>,
         carrier: Option<Carrier>,
     ) -> Result<MemberGuard> {
@@ -705,7 +706,7 @@ impl Routes {
     fn join(
         &self,
         endpoint: Endpoint,
-        queue: mpsc::Sender<Bytes>,
+        queue: mpsc::Sender<(Instant, Bytes)>,
         lane: Option<LaneId>,
         carrier: Option<Carrier>,
     ) -> Result<usize> {
@@ -988,10 +989,12 @@ impl Routes {
                     // answer: a refusal is as much evidence as an acceptance.
                     entry.counters.offer(count, bytes);
                     let lane_absent = entry.queue.is_none();
-                    let sent = entry
-                        .queue
-                        .as_ref()
-                        .is_some_and(|queue| queue.try_send(frames.freeze()).is_ok());
+                    // The batch carries when it was offered: a queue that is
+                    // accepted but not drained is the one wait this path can
+                    // have and no counter sees, so the pump ages it.
+                    let sent = entry.queue.as_ref().is_some_and(|queue| {
+                        queue.try_send((Instant::now(), frames.freeze())).is_ok()
+                    });
                     if sent {
                         entry.forwarded += count;
                         entry.counters.enqueued_packets += count;
@@ -1155,7 +1158,7 @@ struct ClaimSlots {
 /// One lane's place in a claim's set.
 struct MemberSlot {
     /// The queue of the lane that holds this slot, while one does.
-    queue: Option<mpsc::Sender<Bytes>>,
+    queue: Option<mpsc::Sender<(Instant, Bytes)>>,
     /// Set when the claim's owner has asked this lane to end: new flows are
     /// placed elsewhere, and the lane's task stops once the flows it already
     /// has are gone (`flows` reaches zero).
@@ -1252,7 +1255,7 @@ impl ClaimSlots {
     fn place(
         &mut self,
         endpoint: Endpoint,
-        queue: mpsc::Sender<Bytes>,
+        queue: mpsc::Sender<(Instant, Bytes)>,
         lane: Option<LaneId>,
         carrier: Option<Carrier>,
     ) -> usize {
@@ -1580,7 +1583,7 @@ where
 {
     let stats = hub.stats();
     let (reader, mut writer) = tokio::io::split(conn);
-    let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
+    let (tx, mut rx) = mpsc::channel::<(Instant, Bytes)>(QUEUE);
     let guard = hub.join(endpoint, tx, lane, carrier)?;
     let slot = guard.slot;
 
@@ -1589,7 +1592,8 @@ where
     // segment run instead of N of each.
     let pump_stats = Arc::clone(&stats);
     let pump = tokio::spawn(async move {
-        while let Some(batch) = rx.recv().await {
+        while let Some((offered_at, batch)) = rx.recv().await {
+            pump_stats.note_queue_wait(offered_at.elapsed());
             if writer.write_all(&batch).await.is_err() {
                 break;
             }
@@ -1712,6 +1716,7 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
                 "l3-stats: role={role} forwarded={} dropped(not_ip={} malformed={} \
                  unclaimed={} no_channel={}) channel_errors={} read_gap_max_ms={} \
                  read_gap_at_ms={} write_gap_max_ms={} write_gap_at_ms={} \
+                 queue_wait_max_ms={} \
                  offered_per_s={} forwarded_per_s={}",
                 stats.forwarded.load(std::sync::atomic::Ordering::Relaxed),
                 stats.dropped_not_ip.load(std::sync::atomic::Ordering::Relaxed),
@@ -1725,6 +1730,7 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
                 stats.max_read_gap_at_ms.load(std::sync::atomic::Ordering::Relaxed),
                 stats.max_write_gap_ms.load(std::sync::atomic::Ordering::Relaxed),
                 stats.max_write_gap_at_ms.load(std::sync::atomic::Ordering::Relaxed),
+                stats.max_queue_wait_ms.load(std::sync::atomic::Ordering::Relaxed),
                 stats
                     .device_offered_rate
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -1875,7 +1881,7 @@ mod tests {
         let web = claim();
         // A queue of one: the second batch cannot be accepted while the first
         // is still in it.
-        let (queue, held) = mpsc::channel::<Bytes>(1);
+        let (queue, held) = mpsc::channel::<(Instant, Bytes)>(1);
         let slot = routes.join(web, queue, None, None).unwrap();
 
         let batch = |packet: &[u8]| {
@@ -1920,7 +1926,7 @@ mod tests {
     fn a_missing_lane_is_counted_apart_and_remembered_when_replaced() {
         let routes = Routes::new();
         let web = claim();
-        let (first, held) = mpsc::channel::<Bytes>(4);
+        let (first, held) = mpsc::channel::<(Instant, Bytes)>(4);
         let slot = routes.join(web, first, Some(LaneId::new(7)), None).unwrap();
 
         let mut frames = bytes::BytesMut::new();
@@ -1964,7 +1970,7 @@ mod tests {
 
         // A replacement takes a slot of its own: it starts from nothing, so
         // two lanes of one claim cannot lend each other's evidence.
-        let (second, _held2) = mpsc::channel::<Bytes>(4);
+        let (second, _held2) = mpsc::channel::<(Instant, Bytes)>(4);
         let slot = routes
             .join(web, second, Some(LaneId::new(8)), None)
             .unwrap();
@@ -1996,8 +2002,8 @@ mod tests {
         let routes = Routes::new();
         let loaded = claim();
         let idle = Endpoint::new(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)), 9999);
-        let (q1, held1) = mpsc::channel::<Bytes>(4);
-        let (q2, held2) = mpsc::channel::<Bytes>(4);
+        let (q1, held1) = mpsc::channel::<(Instant, Bytes)>(4);
+        let (q2, held2) = mpsc::channel::<(Instant, Bytes)>(4);
         // Both claims' first lanes are id 1 — that is the collision.
         routes.join(loaded, q1, Some(LaneId::new(1)), None).unwrap();
         routes.join(idle, q2, Some(LaneId::new(1)), None).unwrap();
@@ -2061,7 +2067,7 @@ mod tests {
     fn a_drain_is_asked_by_lane_and_answers_whether_this_end_is_empty() {
         let routes = Routes::new();
         let web = claim();
-        let (queue, _held) = mpsc::channel::<Bytes>(4);
+        let (queue, _held) = mpsc::channel::<(Instant, Bytes)>(4);
         let slot = routes
             .join(web, queue, Some(LaneId::new(11)), None)
             .unwrap();
@@ -2119,7 +2125,7 @@ mod tests {
     fn a_lane_whose_flows_went_quiet_is_drain_ready() {
         let routes = Routes::new();
         let web = claim();
-        let (queue, _held) = mpsc::channel::<Bytes>(4);
+        let (queue, _held) = mpsc::channel::<(Instant, Bytes)>(4);
         let slot = routes
             .join(web, queue, Some(LaneId::new(21)), None)
             .unwrap();
@@ -2207,7 +2213,7 @@ mod tests {
         for (slot, queue) in [(0usize, &mut rx_first), (1usize, &mut rx_second)] {
             match flows.iter().find(|(placed, _)| *placed == slot) {
                 Some((_, packet)) => {
-                    let frames = queue.try_recv().unwrap();
+                    let (_, frames) = queue.try_recv().unwrap();
                     assert_eq!(
                         &frames[4 + crate::protocol::VNET_HDR_LEN..],
                         &packet[..],
