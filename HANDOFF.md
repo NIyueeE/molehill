@@ -519,6 +519,23 @@ suite's.
      per received run instead of one `Vec` per datagram) and `wire::decode`
      reports a payload *range* rather than a slice, which is a contained change to
      `udp_batch.rs`, `conn.rs` and `stream.rs`.
+   - **And it is under this host's measurement floor.** The zero-copy receive is
+     worth 0.02–0.04 s/Gbit against cells whose own A/A twin spreads by **13 %**
+     of 0.87–0.96, i.e. ±0.11–0.13 s/Gbit. The improvement is a fifth of the noise:
+     it could be landed, but it could not be *shown*, and this page has refused
+     four changes for exactly that reason. So it is written down rather than
+     built, and it stops being buildable the moment the number it targets is
+     smaller than the number that measures it.
+   - **The measurement floor is now the problem, and it has a target.** Every
+     remaining carrier item is 0.02–0.10 s/Gbit while the same 30 GB cell reads
+     0.8736, 0.9093 and 0.9646 across three same-day runs, with per-round
+     throughput of 5.56 / 6.65 / 9.12 Gbit/s — a **1.6× swing inside one run**.
+     A carrier that is stable would make every item above measurable, and the
+     swing itself is a defect a visitor would feel. The next instrument is the
+     per-round `mhd_health` pair (`datagrams_out`/`retransmits`) beside the
+     per-round throughput, three rounds each of a stable and an unstable cell: if
+     the slow rounds retransmit more, the instability is recovery; if they do not,
+     it is scheduling.
      **What that says about the gate**: the difference between this carrier and a
      mature one is not a missing mechanism, it is where the work happens — the
      kernel's socket layer amortises a TCP stream's per-byte cost over a
