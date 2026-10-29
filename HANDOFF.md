@@ -700,6 +700,32 @@ suite's.
      mhd 5.98 Gbit/s at 0.549 s/Gbit against TCP 4.91 at 0.462 — the same
      ordering, a smaller gap. The bench's namespaced topology amplifies the
      per-datagram cost, whichever half of the path it is charged to.
+   - **Item (3): the two lending checks fail with the lending switched off, so
+     the lending is not what fails them (2026-10-29).** `just l3-accept` reads
+     thirteen pass and two fail, in the same two places every run:
+
+     | check | what the visitor reported |
+     |---|---|
+     | the busy claim stays byte-exact through the lane change | `CONCURRENT conns=16 requests=200 size=64 ok=11/16 in 6.069s` |
+     | with `lend = false` no lane moves, and the claim serves byte-exactly | `ok=13/16 in 6.043s`, and its client log carries **no** allocator line |
+
+     The second is the mechanism's own control, and it fails too — so the lane
+     move is not the cause, which is what this page said for two rounds. What the
+     counters say instead, from `MOLEHILL_L3_STATS=1` on that control run:
+     `forwarded=2682 dropped(not_ip=0 malformed=0 unclaimed=0 no_channel=0)` on the
+     client, `forwarded=2701` with `unclaimed=16` on the server (the sixteens are
+     the flows' last packets, after they were closed), and per lane
+     `offered=1452 forwarded=1452` and `offered=1230 forwarded=1230`. **Nothing was
+     dropped and everything offered was forwarded**, so the missing requests never
+     entered the path: the three flows that time out fail at *connection setup*,
+     not in transit.
+     What separates the passing check from these two is flows per lane: the
+     single-claim check runs sixteen flows over four lanes and passes, while the
+     lending topology splits a budget of four between two claims, so the busy one
+     has two lanes and **eight flows each**. The next measurement is therefore the
+     flow-count axis on one claim — 4, 6, 8, 12 flows per lane, the same workload —
+     because a setup failure that appears between four and eight flows per lane is
+     a queue or a table in the hub, not a carrier window.
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`
