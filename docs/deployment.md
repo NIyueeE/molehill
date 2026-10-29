@@ -861,6 +861,21 @@ The client variant is the same file with
 `Volume=/etc/molehill/client.toml:/app/client.toml:ro` and
 `Exec=client.toml`.
 
+## Runtime threads
+
+A molehill process runs its I/O on a Tokio runtime sized to `min(4, available
+cores)` worker threads; `TOKIO_WORKER_THREADS` overrides that count. Fewer
+threads is usually the better trade here: the data plane is a few tasks that
+never block, and a worker with nothing to run still looks for work, so each extra
+one spends CPU on bytes another thread is already moving. Four is the widest
+setting at which the UDP carrier's CPU per byte stayed level with the TCP
+carrier's on the benchmark host; going to one thread per core cost roughly a
+third more CPU for the same delivered bytes.
+
+Raise it with `TOKIO_WORKER_THREADS` when a process serves enough concurrent
+services that four threads, not the CPU, are the limit — a busy server with many
+independent claims is the case to measure, not to assume.
+
 ## Network requirements
 
 - The **server** must be reachable from the Internet: `server.control.bind_addr`, `server.data.bind_addr` (when set) and every registered `remote_bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server). Add the matching **UDP** port as well: the data plane tries mhd, so the mhd listener binds `server.data.bind_addr` — the control port by default — and TCP plus UDP coexist on that port number.

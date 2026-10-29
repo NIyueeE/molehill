@@ -686,6 +686,17 @@ impl Conn {
         // resumed laptop must not fire the whole missed schedule at once.
         self.keepalive_at = now + KEEPALIVE;
         if now.saturating_duration_since(self.last_recv) > DEAD_AFTER {
+            // One line, at the moment a lane decides its peer is gone: the age
+            // is the evidence, and a lane that dies having heard nothing since it
+            // was created is a different defect from one that went quiet under
+            // load.
+            tracing::debug!(
+                id = self.id,
+                silent_ms =
+                    u64::try_from(now.saturating_duration_since(self.last_recv).as_millis())
+                        .unwrap_or(u64::MAX),
+                "mhd lane declared dead: the peer has been silent"
+            );
             self.closed = Some(ResetCode::Aborted);
             return None;
         }

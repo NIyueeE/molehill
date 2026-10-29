@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Noise is per stream, so every data channel is still encrypted exactly when
   `data_enable` says so. **No configuration key changes**: the data plane's
   keys were already carrier-neutral.
+- **The process sizes its runtime instead of taking one thread per core.** A
+  molehill process now starts `min(4, available cores)` worker threads, and
+  `TOKIO_WORKER_THREADS` overrides it. The data plane is a few tasks that never
+  block, so a worker per core spends real CPU looking for work: on the benchmark
+  host the same delivered bytes cost about a third more CPU at one thread per
+  core than at four, for both carriers. Throughput moves far less than cost, and
+  a deployment that serves many concurrent services can raise the count.
 - **BREAKING: the data-plane carrier is named `mhd`.** The carrier is this
   repository's own implementation, so it carries this project's name instead
   of another project's. The rename is end to end: the feature (`kcp` →

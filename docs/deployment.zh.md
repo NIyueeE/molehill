@@ -790,6 +790,17 @@ WantedBy=multi-user.target
 `Volume=/etc/molehill/client.toml:/app/client.toml:ro` 与
 `Exec=client.toml` 换掉。
 
+## 运行时线程
+
+molehill 进程的 I/O 跑在 Tokio 运行时上,工作线程数为 `min(4, 可用核数)`;
+环境变量 `TOKIO_WORKER_THREADS` 可以覆盖它。通常线程越少越划算:数据面只是
+几个从不阻塞的任务,而空闲的工作线程仍会去找活干,于是多出来的线程会把 CPU
+花在别的线程已经在搬运的字节上。四是在基准主机上让 UDP 载体的每字节 CPU 与
+TCP 载体持平的最大值;放宽到每核一个线程,同样的字节大约多花三分之一的 CPU。
+
+当单个进程承载足够多的并发服务、瓶颈是四个线程而不是 CPU 时,用
+`TOKIO_WORKER_THREADS` 调高它——这是需要测量的判断,不要照搬。
+
 ## 网络要求
 
 - **服务端**必须能从互联网访问:`server.control.bind_addr`、

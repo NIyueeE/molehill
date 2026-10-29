@@ -556,6 +556,37 @@ suite's.
      repeated. The next suspect is the receive side's scheduling (the per-pass
      wake-ups and the channel between the dispatcher and the lanes) rather than
      loss recovery, and the same four-round shape measures it.
+   - **The runtime width was costing a quarter of the CPU — for both carriers
+     (2026-10-29).** The `cost` cell, mhd, four rounds at each width
+     (`target/evidence/mhd-workers*.json`, `tcp-w2.json`, `default4-*.json`):
+
+     | worker threads | mhd s/Gbit | TCP s/Gbit | ratio |
+     |---|---|---|---|
+     | 2 | 0.51 | 0.39 | 1.32× |
+     | 3 | 0.60 | — | — |
+     | 4 | 0.66 | 0.49 | 1.34× |
+     | 6 | 0.81 | — | — |
+     | 8 | 0.92 | — | — |
+     | 20 (one per core) | 0.93 | 0.64 | 1.45× |
+
+     A worker thread with nothing to run still looks for work, and both daemons
+     started one per core. The width is a *multiplicative* win — both carriers get
+     roughly a quarter cheaper — so **the ratio does not move** (1.32–1.45×), which
+     is the cleanest confirmation yet that the gap is the carrier's own
+     per-datagram work rather than a tuning artefact. Throughput moves much less
+     than cost: mhd carried 6.8 Gbit/s at two threads and 8.0 at four, against
+     12.1 for TCP at either.
+     The product now starts `min(4, cores)` workers with `TOKIO_WORKER_THREADS`
+     overriding it (`src/main.rs`, `docs/deployment*`, CHANGELOG), because four is
+     the widest setting that still ties the TCP carrier's cost.
+   - **One diagnostic kept**: a lane that decides its peer is gone now logs the
+     silence age at `DEBUG` (`id`, `silent_ms`). It exists because a *client-side*
+     pool reaping its own lanes is what turns an intermittent 5 s stall into a
+     half-empty pool (`reaped dead tunnels reason="dead" from=4 to=2`, once in ten
+     cells), and the age is the evidence that separates "the peer vanished" from
+     "we never heard it at all". Twelve server-side reaps of `silent_ms=20009`
+     were observed in four clean cells — retired lanes ageing out, harmless — and
+     no client-side one reproduced on demand since.
      **What that says about the gate**: the difference between this carrier and a
      mature one is not a missing mechanism, it is where the work happens — the
      kernel's socket layer amortises a TCP stream's per-byte cost over a

@@ -8,8 +8,39 @@ use molehill_rathole::{Cli, run};
 use tokio::{signal, sync::broadcast};
 use tracing::{debug, info};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// How many runtime workers a process gets unless the environment says otherwise.
+///
+/// The data plane is a handful of hot tasks that never block: a worker per core
+/// lends them nothing and costs a great deal. Tokio's workers spin briefly for
+/// work before they park, so on a wide machine the idle ones burn CPU that the
+/// carrier is charged for — measured on a twenty-core bench host, the same
+/// workload cost `0.93 s` of CPU per Gbit at twenty workers and `0.64` at four,
+/// with the delivered throughput moving by less than a tenth. Four is the
+/// widest setting that still ties the TCP carrier's cost; a deployment that
+/// wants more sets `TOKIO_WORKER_THREADS`, which is read here and honoured.
+const DEFAULT_WORKERS: usize = 4;
+
+/// The workers this process will start.
+fn workers() -> usize {
+    let cores =
+        std::thread::available_parallelism().map_or(DEFAULT_WORKERS, std::num::NonZero::get);
+    std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| cores.min(DEFAULT_WORKERS))
+}
+
+fn main() -> Result<()> {
+    let workers = workers();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    runtime.block_on(entry())
+}
+
+async fn entry() -> Result<()> {
     let args = Cli::parse();
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
