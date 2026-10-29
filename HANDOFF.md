@@ -719,6 +719,16 @@ suite's.
 
      and the same run can have both arms, so it is a property of the lane's flow
      count, not of the run.
+   - **What that re-opens: the "the carrier is unstable" reading.** Earlier in this
+     log the mhd arm's own A/A spread (13 % in one run, 21 % across another's
+     rounds) was read as the carrier being unstable, against TCP's 0.97 %. With
+     the host swinging between 1 and 87, part of that is the host drifting between
+     the arms of a run, and the *interleaving* the model uses (`--aa` twins, and
+     the A/B round order) is the only thing that separates the two. The claim is
+     therefore **doubtful, not established**: what survives is that the runtime
+     width change took the same arm's floor from 13 % to 4.35 % on a quiet host,
+     which is a real improvement; what does not survive is the inference that the
+     carrier itself was the unstable part.
    - **The measurement host is shared, and `/proc/loadavg` is its, not ours
      (2026-10-29).** The container is not isolated: the load average it reads is
      the *host's*, and the host swung between **1 and 87** during one afternoon
