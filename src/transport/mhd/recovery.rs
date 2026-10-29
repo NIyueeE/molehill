@@ -428,6 +428,16 @@ impl Recovery {
         self.in_flight.len()
     }
 
+    /// How long the oldest packet still in flight has been waiting.
+    ///
+    /// The flight is keyed by packet number, so its first entry is the oldest
+    /// send: an age that keeps growing while nothing retires it is a stall with
+    /// no loss to explain it, which is the shape both open defects have.
+    pub(crate) fn oldest_flight_age(&self, now: Instant) -> Option<Duration> {
+        let (_, sent) = self.in_flight.iter().next()?;
+        Some(now.saturating_duration_since(sent.time))
+    }
+
     /// The round-trip estimate, for the congestion controller and the pacer.
     #[cfg(test)]
     pub(crate) fn rtt(&self) -> Rtt {

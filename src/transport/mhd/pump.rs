@@ -200,6 +200,9 @@ async fn flush(
     send_run(socket, peer, run, spans).await?;
     posting.stop(&crate::transport::stats::PHASES.tx_send);
     crate::transport::stats::sent_run(sent, run.len());
+    if let Some((unsent_ms, unacked_ms)) = shared.with(|conn| conn.stall_report(Instant::now())) {
+        tracing::debug!(unsent_ms, unacked_ms, "mhd stalled: bytes waiting");
+    }
     for _ in 0..sent {
         shared.note_sent();
     }

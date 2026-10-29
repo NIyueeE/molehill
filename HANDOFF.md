@@ -700,10 +700,10 @@ suite's.
      mhd 5.98 Gbit/s at 0.549 s/Gbit against TCP 4.91 at 0.462 — the same
      ordering, a smaller gap. The bench's namespaced topology amplifies the
      per-datagram cost, whichever half of the path it is charged to.
-   - **Item (3): two defects, and only one of them is the lending (2026-10-29).**
-     `just l3-accept` fails the same two checks every run at its default of sixteen
-     flows. The harness's flow count is a knob (`CONCURRENT_CONNS`), so it was run
-     at three widths with the two-claim topology — four lanes split between a busy
+   - **Item (3): the stall is not in the carrier, and there are two defects
+     (2026-10-29).** `just l3-accept` fails its flow-count checks at sixteen flows,
+     and the harness's flow count is a knob (`CONCURRENT_CONNS`), so it was run at
+     three widths with the two-claim topology — four lanes split between a busy
      claim and an idle one, so two lanes each:
 
      | flows | flows per slot | lending on | lending off |
@@ -712,28 +712,34 @@ suite's.
      | 12 | 6 | 10/12, **fail** | 12/12, pass |
      | 16 | 8 | 11/16, **fail** | 13/16, **fail** |
 
-     So there are **two** defects, not one:
-     - **A concurrency limit at eight flows per slot**, in both runs, and it is a
-       **data stall, not a setup failure**. The visitor's failure is a *read*
-       timeout: it connects and then waits for the backend's five-byte `echo:`
-       banner, so a flow that reports `timed out` has already established. (An
-       earlier note here said the opposite; the visitor's own code says
-       otherwise.) Everything the counters can see is clean — the client forwards
-       2682 packets with `dropped(not_ip=0 malformed=0 unclaimed=0 no_channel=0)`,
-       the server 2701 with one unclaimed, each lane's `offered` equals its
-       `forwarded`, and both directions are counted (`forwarded` device→lane,
-       `injected` lane→device) with neither at zero. **Nothing is dropped and
-       nothing is refused**, so the missing bytes are waiting in a queue no counter
-       timestamps: the slot's queue into the carrier, or the carrier's own send
-       buffer.
-     - **A loss during the move**, visible only where the static control still
-       passes: at twelve flows, lending loses two of twelve and lending-off loses
-       none. That is the defect this page described for two rounds, and it is real
-       — it just is not what fails the sixteen-flow checks.
-     Both need the same instrument before either can be fixed: a per-second queue
-     **age** (the time a batch waits from enqueue to the writer taking it), in the
-     L3 slot and in the carrier's send buffer, so a stall names the queue it waits
-     in. That is the next round's work.
+     That is a concurrency limit at eight flows per slot *and* a loss during the
+     move, and neither is the carrier's send path. The instrument that settles it
+     is new (`Conn::waiting` + a `mhd stalled` line): a connection now reports how
+     long its bytes have waited in the **send buffer** (unsent) and in the
+     **flight** (sent, unacknowledged), once a second while either clears 200 ms.
+     Measured across a full acceptance run at sixteen flows:
+
+     | log | lines | unsent max | unacked max |
+     |---|---|---|---|
+     | lending client | 1 | **0 ms** | 205 ms |
+     | lending-off client | 0 | — | — |
+     | lending server | 3 | **0 ms** | 203 ms |
+     | lending-off server | 1 | **0 ms** | 206 ms |
+
+     **No byte waits unsent anywhere**, and the only wait in the flight is 200–206
+     ms, which is `MIN_RTO` — a retransmission doing its job. So the carrier
+     delivers what it is given; the flows that time out lose their bytes in the
+     transparent path or the guest, not here. (An earlier run of the same probe
+     reported 2.3–7.7 *seconds* of unsent; that was the clock's own bug — the
+     stamp was set on every write and cleared only when no stream existed, so it
+     measured "time since the last write" rather than "time bytes have been
+     waiting". It is worth writing down because the wrong reading pointed straight
+     at the window.)
+     The sixteen-flow loss is also not specific to the lending runs: this
+     acceptance run failed the single-claim check as well (14/16), where the
+     earlier ones passed it. So the next work on item (3) is in the transparent
+     path — the hub's slot pump, the TUN read, or the guest — and the carrier is
+     excluded by measurement.
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`

@@ -133,6 +133,16 @@ pub(crate) struct Conn {
     streams: BTreeMap<u32, StreamState>,
     /// Where the round-robin cursor stands.
     cursor: u32,
+    /// When a stream last had bytes the scheduler could not put on the wire.
+    ///
+    /// `None` while everything queued has been handed to the pump; set on the
+    /// first write that finds nothing sendable (window closed), cleared when the
+    /// scheduler next finds work. It is the send-buffer half of [`Conn::waiting`]
+    /// and it costs two `Instant` reads per write call, not per packet.
+    unsent_at: Option<Instant>,
+    /// When a stall line was last written, so one long stall costs one line a
+    /// second rather than one per pass.
+    stall_logged_at: Option<Instant>,
     recovery: Recovery,
     acks: AckSet,
     ack_pending: bool,
@@ -223,6 +233,8 @@ impl Conn {
             next_stream: u32::from(dialer),
             streams: BTreeMap::new(),
             cursor: u32::from(dialer),
+            unsent_at: None,
+            stall_logged_at: None,
             recovery: Recovery::new(),
             acks: AckSet::default(),
             ack_pending: false,
@@ -301,6 +313,13 @@ impl Conn {
             return 0;
         };
         let take = usize::try_from(room).map_or(0, |room| room.min(bytes.len()));
+        if take < bytes.len() {
+            // The window took less than the caller offered, so from this instant
+            // there are bytes nobody has put on the wire: that is the age
+            // [`Conn::waiting`] reports. One clock read per short write, never
+            // per packet — and a write the window accepted whole clocks nothing.
+            self.unsent_at.get_or_insert_with(Instant::now);
+        }
         if take == 0 {
             return 0;
         }
@@ -512,6 +531,13 @@ impl Conn {
         if let Some(len) = self.transmit_stream(now, out, ack) {
             return Some(len);
         }
+        // Nothing went out for a stream, so either no stream has bytes or every
+        // one that does is blocked. Only the first stops the clock: an age that
+        // keeps growing means bytes nobody could put on the wire, which is what
+        // [`Conn::waiting`] exists to name.
+        if !self.streams.values().any(|state| state.send.has_unsent()) {
+            self.unsent_at = None;
+        }
         if let Some(len) = self.transmit_reset(now, out, ack) {
             return Some(len);
         }
@@ -711,6 +737,7 @@ impl Conn {
     /// width.
     fn next_stream_range(&mut self) -> Option<(u32, u64, usize)> {
         if self.streams.is_empty() {
+            self.unsent_at = None;
             return None;
         }
         let cursor = self.cursor;
@@ -743,6 +770,46 @@ impl Conn {
             .next()
             .or_else(|| self.streams.iter().next())
             .map_or(0, |(id, _)| *id);
+    }
+
+    /// How long this connection's bytes have been waiting, in either place.
+    ///
+    /// Two queues can hold a byte and neither is visible from the outside: the
+    /// send buffer, when the scheduler cannot hand it to the wire (window
+    /// closed, or the pump starved), and the flight, when the wire took it and
+    /// no acknowledgement came back. A stall that the drop counters cannot see
+    /// is one of these two ages growing, so it is worth one line when it does.
+    pub(crate) fn waiting(&self, now: Instant) -> (Option<Duration>, Option<Duration>) {
+        let unsent = self.unsent_at.map(|at| now.saturating_duration_since(at));
+        (unsent, self.recovery.oldest_flight_age(now))
+    }
+
+    /// The ages worth one log line, at most once a second.
+    ///
+    /// A stall the drop counters cannot see is a byte waiting in one of the two
+    /// queues [`Conn::waiting`] reports. Two hundred milliseconds is forty times
+    /// the round trip a healthy path here measures, so anything above it is not a
+    /// queue doing its job.
+    pub(crate) fn stall_report(&mut self, now: Instant) -> Option<(u128, u128)> {
+        const FLOOR: Duration = Duration::from_millis(200);
+        const EVERY: Duration = Duration::from_secs(1);
+        let (unsent, unacked) = self.waiting(now);
+        let worst = unsent.unwrap_or_default().max(unacked.unwrap_or_default());
+        if worst < FLOOR {
+            self.stall_logged_at = None;
+            return None;
+        }
+        if self
+            .stall_logged_at
+            .is_some_and(|at| now.saturating_duration_since(at) < EVERY)
+        {
+            return None;
+        }
+        self.stall_logged_at = Some(now);
+        Some((
+            unsent.map_or(0, |d| d.as_millis()),
+            unacked.map_or(0, |d| d.as_millis()),
+        ))
     }
 
     /// Feed one datagram from the peer.
