@@ -204,11 +204,21 @@ suite's.
        every datagram but its keepalives still arrive, which is what tells
        "saturated" from "gone".
 
-     **Still open in this arm:** the two lane-lending checks. Under a live lane
-     change the sixteen-flow workload drops to 8/16 flows ok — an idle claim's
-     lane moves to the busy claim while its flows are running, and half of them
-     time out. That is the lending mechanism, not the carrier, and it is the
-     next thing to investigate on this path.
+     **Still open in this arm: the two lane-lending checks, and they are
+     load-dependent.** With sixteen concurrent flows an idle claim's lane moves
+     to the busy claim while its flows run, and half of them time out (8/16 ok
+     in 6.4 s, against a 1.07 s pass for the same workload without a move).
+     At **eight** flows the *whole* acceptance run passes, lending included —
+     so the move is correct and the drain is fine; what it does not survive is
+     sixteen flows. TCP runs the same two claims and the same sixteen flows and
+     passes, which is why this is filed as a carrier-side stall under the move
+     rather than a defect in the lending mechanism.
+     The next step is to instrument the move window itself — the drain, the
+     lane's close, and the re-registration on the busy claim — with the same
+     per-phase tracer, at sixteen flows. The hypothesis worth testing first is
+     that the move's drain waits on the carrier's write path while the lane is
+     already saturated, and that the wait is charged to the flows on the
+     *other* lanes.
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
