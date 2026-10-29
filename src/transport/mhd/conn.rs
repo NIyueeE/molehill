@@ -65,6 +65,17 @@ const INITIAL_CWND: u64 = 10 * MAX_STREAM_PAYLOAD as u64;
 /// will take", or the flight becomes the credit window again.
 const MAX_CWND: u64 = 16 * 1024 * 1024;
 
+/// Where the doubling phase stops.
+///
+/// Slow start doubles the flight per round trip, and this carrier has no pacer to
+/// space the result: a window that outgrows the peer's socket buffer makes the
+/// path drop *everything* for a while, and a sender that then hears nothing for
+/// ten timers declares a live lane dead (`reaped dead tunnels ... reason="dead"`
+/// in a bench arm's log, twice). Two megabytes is what a bulk transfer reaches in
+/// a few round trips anyway, and it is small enough that the peer's receive buffer
+/// absorbs the burst while the additive phase takes over.
+const SLOW_START_CEILING: u64 = 2 * 1024 * 1024;
+
 /// Why a frame could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rejected {
@@ -773,7 +784,11 @@ impl Conn {
             if acked.progress {
                 let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
                 if self.slow_start {
-                    self.cwnd = self.cwnd.saturating_add(bytes).min(MAX_CWND);
+                    // Doubling stops at the ceiling and the additive rule takes
+                    // over, because an unspaced burst that outruns the peer's
+                    // buffer costs the connection its liveness (see
+                    // [`SLOW_START_CEILING`]).
+                    self.cwnd = self.cwnd.saturating_add(bytes).min(SLOW_START_CEILING);
                 } else {
                     self.acked_since_growth += bytes;
                     if self.acked_since_growth >= self.cwnd {
@@ -888,7 +903,19 @@ impl Conn {
             }
         }
         if expiry == Expiry::Dead {
-            self.closed = Some(ResetCode::Aborted);
+            // Silence is what makes a path dead, not a count of timers. A peer
+            // whose socket buffer is full drops everything and answers nothing,
+            // but it is alive — and the keepalives it still sends prove it, so the
+            // connection keeps probing instead of closing a lane the pool would
+            // have to rebuild. Only a peer that has sent nothing at all for
+            // `DEAD_AFTER` is gone, and that check is in `poll_transmit`.
+            if now.saturating_duration_since(self.last_recv) > DEAD_AFTER {
+                self.closed = Some(ResetCode::Aborted);
+            } else {
+                // Report it as the probe it turned into, so the pump does not
+                // treat the connection as ended.
+                return (Expiry::Timeout, lost.len());
+            }
         }
         (expiry, lost.len())
     }
