@@ -131,12 +131,16 @@ minimal `server,client` build), then `cargo audit`, `cargo deny`,
 304 lib tests among them. `integration_test` is 22/22 under
 `MOLEHILL_DATA_CARRIER=mhd` and 22/22 under `=tcp` with the same tree.
 (`/home/dsh/tmp/v1-cost/check2.log`, `exit=0`.)
-**`just check` on a loaded machine lies.** `pool_test`'s
-`a_saturated_pool_still_serves_the_next_visitor` failed three times in a row
-while the host was still busy from a bench run — and passed three out of three
-on the *same tree* once it was idle, at 9.2–9.8 s against 16.4–16.8 s. It is a
-timing test, not a logic test. Check `/proc/loadavg` before believing a red run
-of it, and never bisect a change against it while a benchmark is running.
+**`just check` is intermittently red on one timing test.**
+`pool_test`'s `a_saturated_pool_still_serves_the_next_visitor` has now failed
+twice inside `just check` — once with the host busy from a bench run, once on an
+idle one — and passed **six times out of six** standalone on the same two trees,
+at 9.2–10.2 s against 133–150 s for the failures. Its failure signature is a pool
+that reports `size: 1, count: 2, grows: 0`, i.e. a pool that never attempted to
+repair, which is a liveness gap worth its own investigation rather than a load
+artefact; the earlier note here blamed load, and the second occurrence falsifies
+that. Until it is understood: a red run of *this test alone* is not evidence
+about a change, and a green `just check` is what the gate means.
 `pool_test` under a *forced* `tcp` still fails the three tests that use the
 diagnostic cross-carrier handover hatch (the server never binds UDP when the
 client declares TCP); that is a harness/diagnostic interaction, not a data-path
@@ -604,6 +608,39 @@ suite's.
      `lending-off either moved a lane or lost the workload`) — the same two, in the
      same order, on both widths. The other thirteen include the 16-flow
      byte-exactness check, so the change is not hiding behind a green summary.
+   - **The phase table at the new default, and why item (1) ends here
+     (2026-10-29).** One instrumented cell at four workers
+     (`target/evidence/phases-w4.json`, `phases-w4b.json`), 246.7 Gbit carried,
+     158 CPU-seconds in total:
+
+     | phase | seconds | s/Gbit | share of all CPU |
+     |---|---|---|---|
+     | record layer `seal` (sender) | 21.58 | 0.0875 | 13.7 % |
+     | record layer `open` (receiver) | 20.85 | 0.0845 | 13.2 % |
+     | `tx_build` (sender) | 17.53 | 0.0711 | 11.1 % |
+     | `rx_total` (receiver) | 13.47 | 0.0546 | 8.5 % |
+     | `tx_send` (sender) | 10.35 | 0.0420 | 6.6 % |
+     | `io_write` / `tx_send` (acks) / `io_read` | 10.35 | 0.0421 | 6.6 % |
+     | **measured total** | **95.10** | **0.3855** | **60.2 %** |
+
+     The record layer is the largest single line and it is **cheaper than TCP's**
+     (0.172 against 0.264 s/Gbit, because 31.8 KB records amortise better than
+     10.8 KB ones). What is left is 0.214 s/Gbit of carrier work spread over five
+     phases of 0.012–0.071 each.
+     Sampled per packet, `tx_build`'s 0.91 µs turn is stream selection 0.054,
+     framing and copy 0.342, flight table 0.164, and **0.352 for the connection
+     lock plus `poll_transmit`'s preamble** — and no single one of those is worth
+     more than ~3 % of the cell. Batching the lock over eight packets would save
+     ~0.22 µs of the 0.91 and land at 2.7–3.2 %; the clock read is 3 %; the two
+     payload copies are load-bearing (the send buffer must hold the bytes for ARQ,
+     and GSO needs one contiguous run, so neither copy can go). **Every remaining
+     item is under the 4.35 % floor this run can resolve**, and the one change
+     big enough to clear it is architectural — one task owning a connection's
+     socket and its stream buffers, so the payload is never read back across a
+     core — which is a redesign, not an optimisation of this one.
+     So item (1) ends here, with the numbers that say so, and the work moves to
+     the failure that costs more than 3 %: an eight-stream bulk cell that mhd
+     cannot carry under one percent loss.
    - **One diagnostic kept**: a lane that decides its peer is gone now logs the
      silence age at `DEBUG` (`id`, `silent_ms`). It exists because a *client-side*
      pool reaping its own lanes is what turns an intermittent 5 s stall into a

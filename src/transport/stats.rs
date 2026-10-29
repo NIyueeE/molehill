@@ -102,6 +102,9 @@ pub(crate) struct Phases {
     pub(crate) tx_encode: Meter,
     /// One packet's bookkeeping: the flight table and the cursor.
     pub(crate) tx_book: Meter,
+    /// One packet's whole turn: the connection lock, `poll_transmit`'s preamble
+    /// and the three phases above.
+    pub(crate) tx_call: Meter,
     /// A stream handle's read: the copy out of the receive buffer into the
     /// caller's slice.
     pub(crate) io_read: Meter,
@@ -140,6 +143,7 @@ impl Phases {
             tx_pick: Meter::new(),
             tx_encode: Meter::new(),
             tx_book: Meter::new(),
+            tx_call: Meter::new(),
             io_read: Meter::new(),
             io_write: Meter::new(),
             seal: Meter::new(),
@@ -260,6 +264,8 @@ fn report() {
         tx_build_n = PHASES.tx_build.read().1,
         tx_send_us = PHASES.tx_send.micros(),
         tx_send_n = PHASES.tx_send.read().1,
+        tx_call_us = PHASES.tx_call.micros(),
+        tx_call_n = PHASES.tx_call.read().1,
         tx_pick_us = PHASES.tx_pick.micros(),
         tx_pick_n = PHASES.tx_pick.read().1,
         tx_encode_us = PHASES.tx_encode.micros(),

@@ -181,7 +181,12 @@ async fn flush(
     while spans.len() < SEND_RUN {
         let now = Instant::now();
         let off = run.len();
-        let Some(len) = shared.with(|conn| conn.poll_transmit(now, run)) else {
+        let sampled =
+            crate::transport::stats::enabled() && crate::transport::stats::PHASES.timing();
+        let call = crate::transport::stats::Timing::start(sampled);
+        let filled = shared.with(|conn| conn.poll_transmit(now, run));
+        call.stop(&crate::transport::stats::PHASES.tx_call);
+        let Some(len) = filled else {
             break;
         };
         spans.push((off, len));
