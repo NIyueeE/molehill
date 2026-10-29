@@ -579,6 +579,24 @@ suite's.
      The product now starts `min(4, cores)` workers with `TOKIO_WORKER_THREADS`
      overriding it (`src/main.rs`, `docs/deployment*`, CHANGELOG), because four is
      the widest setting that still ties the TCP carrier's cost.
+   - **The pair after the width change, with its own floors (2026-10-29).**
+     `screen`, `--aa`, `--arms l4`, three rounds, one carrier per run
+     (`target/evidence/final-tcp.json`, `final-mhd.json`):
+
+     | | l4 median | rounds | A/A twin | run's floor |
+     |---|---|---|---|---|
+     | TCP | **0.4830** | 0.4689–0.4910 | 0.4848 | 0.97 % |
+     | mhd | **0.6494** | 0.6393–0.6579 | 0.6791 | 4.35 % |
+
+     **1.34×**, gap **0.166 s/Gbit**, far outside both floors. Against the start of
+     the same session (mhd 0.90–0.96, TCP 0.62–0.64, gap ~0.29) both carriers are
+     ~25 % cheaper per byte and the carrier's excess has **halved in absolute
+     terms** — half of the 0.257 s/Gbit recorded earlier was runtime contention
+     rather than carrier work, which is what the width sweep says it had to be.
+     The *ratio* is unchanged, so the gate is still red; what changed is that the
+     remainder is now small enough to be measured: mhd's floor fell from 13 % to
+     4.35 %, which is a better instrument than any of the optimisations it can
+     now resolve.
    - **One diagnostic kept**: a lane that decides its peer is gone now logs the
      silence age at `DEBUG` (`id`, `silent_ms`). It exists because a *client-side*
      pool reaping its own lanes is what turns an intermittent 5 s stall into a
