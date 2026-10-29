@@ -177,7 +177,7 @@ async fn flush(
     staging: &mut Staging,
 ) -> std::io::Result<usize> {
     let Staging { run, spans } = staging;
-    let build = super::stats::Timing::start(super::stats::enabled());
+    let build = crate::transport::stats::Timing::start(crate::transport::stats::enabled());
     while spans.len() < SEND_RUN {
         let now = Instant::now();
         let off = run.len();
@@ -186,15 +186,15 @@ async fn flush(
         };
         spans.push((off, len));
     }
-    build.stop(&super::stats::PHASES.tx_build);
+    build.stop(&crate::transport::stats::PHASES.tx_build);
     if spans.is_empty() {
         return Ok(0);
     }
     let sent = spans.len();
-    let posting = super::stats::Timing::start(super::stats::enabled());
+    let posting = crate::transport::stats::Timing::start(crate::transport::stats::enabled());
     send_run(socket, peer, run, spans).await?;
-    posting.stop(&super::stats::PHASES.tx_send);
-    super::stats::sent_run(sent, run.len());
+    posting.stop(&crate::transport::stats::PHASES.tx_send);
+    crate::transport::stats::sent_run(sent, run.len());
     for _ in 0..sent {
         shared.note_sent();
     }
@@ -231,8 +231,8 @@ fn drain_ready(
                     let _ = conn.on_datagram(now, data);
                 });
             }
-            if super::stats::enabled() && datagrams > 0 {
-                super::stats::received_run(datagrams, bytes);
+            if crate::transport::stats::enabled() && datagrams > 0 {
+                crate::transport::stats::received_run(datagrams, bytes);
             }
             shared.wake_readers();
             shared.wake_writers();
@@ -286,8 +286,8 @@ async fn receive(
                 bytes += data.len();
                 on_datagram(from, data);
             }
-            if super::stats::enabled() {
-                super::stats::received_run(datagrams, bytes);
+            if crate::transport::stats::enabled() {
+                crate::transport::stats::received_run(datagrams, bytes);
             }
             Ok(())
         }
@@ -555,7 +555,6 @@ impl MhdLane {
         nonce: crate::protocol::Digest,
     ) -> anyhow::Result<Arc<Self>> {
         use tokio::io::AsyncWriteExt;
-        super::stats::spawn_reporter();
         let lane = Self::dial(peer, id, noise, nonce).await?;
         let mut stream = crate::transport::multiplex::PoolLane::open_stream(&*lane)
             .await
@@ -869,7 +868,6 @@ fn spawn_dispatcher(
 impl MhdListener {
     /// Bind the listener and start one dispatcher per socket.
     pub(crate) fn bind(addr: SocketAddr) -> std::io::Result<Self> {
-        super::stats::spawn_reporter();
         let sockets = bind_listener_sockets(addr)?;
         let bound = sockets[0].local_addr()?;
         let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();

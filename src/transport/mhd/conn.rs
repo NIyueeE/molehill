@@ -16,10 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::recovery::{Expiry, Recovery, SentRange};
-use super::stats;
 use super::stream::{RecvBuf, SendBuf};
 use super::wire::{self, AckSet, Frame, MAX_STREAM_PAYLOAD, ResetCode};
 use crate::transport::health::SessionHealth;
+use crate::transport::stats;
 
 /// How often an idle connection proves the path still carries it.
 ///
@@ -729,7 +729,7 @@ impl Conn {
     ///
     /// The whole of it is timed as `rx_total` when the phase switch is on, and
     /// the three phases inside are timed from a single sampling decision so they
-    /// describe the same datagram (see [`super::stats`]).
+    /// describe the same datagram (see [`crate::transport::stats`]).
     pub(crate) fn on_datagram(&mut self, now: Instant, buf: &[u8]) -> Result<(), Rejected> {
         let sampled = stats::enabled() && stats::PHASES.timing();
         let total = stats::Timing::start(sampled);

@@ -107,6 +107,10 @@ pub use noise_stream::NoiseStream;
 #[cfg(feature = "noise")]
 pub(crate) use noise::NoiseKeys;
 
+/// The opt-in phase timers (`MOLEHILL_MHD_STATS`): the carrier's own path and
+/// the record layer both report into the same counters, so one run prices both.
+pub(crate) mod stats;
+
 #[cfg(all(feature = "mhd", any(feature = "client", feature = "server")))]
 pub(crate) mod mhd;
 

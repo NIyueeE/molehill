@@ -221,7 +221,11 @@ impl AsyncRead for StreamIo {
         // copy only exists to keep a shape the reader does not have.
         let dst = buf.initialize_unfilled();
         let (taken, ended, open, credit_due) = this.shared.with(|conn| {
-            let taken = conn.read(stream, dst);
+            let taken = crate::transport::stats::around(
+                crate::transport::stats::enabled(),
+                &crate::transport::stats::PHASES.io_read,
+                || conn.read(stream, dst),
+            );
             (
                 taken,
                 conn.peer_finished(stream) || conn.reset_reason(stream).is_some(),
@@ -265,7 +269,13 @@ impl AsyncWrite for StreamIo {
         // Same rule as the read side: parked before the credit is re-read, so a
         // credit update between the two cannot be missed.
         this.shared.park_writer(cx.waker());
-        let written = this.shared.with(|conn| conn.write(this.id, buf));
+        let written = this.shared.with(|conn| {
+            crate::transport::stats::around(
+                crate::transport::stats::enabled(),
+                &crate::transport::stats::PHASES.io_write,
+                || conn.write(this.id, buf),
+            )
+        });
         if written > 0 {
             this.shared.wake_pump();
             return Poll::Ready(Ok(written));

@@ -21,6 +21,14 @@
 //! second like `MOLEHILL_MUX_STATS`'s framing counters: a reader who knows the
 //! window takes the first and the last line and divides.
 
+#![cfg_attr(
+    not(all(feature = "mhd", feature = "noise")),
+    allow(
+        dead_code,
+        reason = "the counters are read by the mhd carrier and the record layer; \n                 a build with neither still compiles the module, and nothing \n                 records into it"
+    )
+)]
+
 use std::ffi::OsStr;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -87,6 +95,16 @@ pub(crate) struct Phases {
     pub(crate) tx_build: Meter,
     /// One pass posting its run to the socket.
     pub(crate) tx_send: Meter,
+    /// A stream handle's read: the copy out of the receive buffer into the
+    /// caller's slice.
+    pub(crate) io_read: Meter,
+    /// A stream handle's write: the copy from the caller's slice into the send
+    /// buffer.
+    pub(crate) io_write: Meter,
+    /// Sealing one record (the Noise write path), copied and encrypted.
+    pub(crate) seal: Meter,
+    /// Opening one record (the Noise read path), verified and decrypted.
+    pub(crate) open: Meter,
     /// Runs received, and the runs, datagrams and bytes they carried.
     pub(crate) rx_runs: Meter,
     /// Runs sent.
@@ -112,6 +130,10 @@ impl Phases {
             append: Meter::new(),
             tx_build: Meter::new(),
             tx_send: Meter::new(),
+            io_read: Meter::new(),
+            io_write: Meter::new(),
+            seal: Meter::new(),
+            open: Meter::new(),
             rx_runs: Meter::new(),
             tx_runs: Meter::new(),
             rx_datagrams: AtomicU64::new(0),
@@ -228,6 +250,14 @@ fn report() {
         tx_build_n = PHASES.tx_build.read().1,
         tx_send_us = PHASES.tx_send.micros(),
         tx_send_n = PHASES.tx_send.read().1,
+        io_read_us = PHASES.io_read.micros(),
+        io_read_n = PHASES.io_read.read().1,
+        io_write_us = PHASES.io_write.micros(),
+        io_write_n = PHASES.io_write.read().1,
+        seal_us = PHASES.seal.micros(),
+        seal_n = PHASES.seal.read().1,
+        open_us = PHASES.open.micros(),
+        open_n = PHASES.open.read().1,
         "mhd-stats: cumulative phase timings"
     );
 }

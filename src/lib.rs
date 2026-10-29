@@ -169,6 +169,10 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // Raise `nofile` limit on linux and mac
     let _ = fdlimit::raise_fd_limit();
 
+    // The opt-in phase reporter, whichever carrier ends up carrying the data:
+    // a run that prices the record layer has to be able to see it on both.
+    crate::transport::stats::spawn_reporter();
+
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
     let config_path = args
         .config_path

@@ -429,7 +429,11 @@ where
                         *state = seal_owned(transport, buf, payload_len)?;
                         continue;
                     }
-                    *state = seal_in_place(transport, write_message_buffer, buf, payload_len)?;
+                    *state = crate::transport::stats::around(
+                        crate::transport::stats::enabled(),
+                        &crate::transport::stats::PHASES.seal,
+                        || seal_in_place(transport, write_message_buffer, buf, payload_len),
+                    )?;
                 }
                 WriteState::WritingMessage {
                     start,
@@ -606,9 +610,12 @@ where
                             // region is already initialized) that only pays
                             // a memset for `ReadBuf::uninit` callers.
                             let out = read_buf.initialize_unfilled_to(plaintext_len);
-                            let n = transport
-                                .read_message(ciphertext, out)
-                                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+                            let n = crate::transport::stats::around(
+                                crate::transport::stats::enabled(),
+                                &crate::transport::stats::PHASES.open,
+                                || transport.read_message(ciphertext, out),
+                            )
+                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                             if n > 0 {
                                 read_buf.advance(n);
                                 return Poll::Ready(Ok(()));
@@ -621,9 +628,12 @@ where
                         // The caller's buffer is smaller than the record (or
                         // the record is empty): stage the plaintext and
                         // serve it progressively.
-                        let n = transport
-                            .read_message(ciphertext, &mut this.bufs.payload[..])
-                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+                        let n = crate::transport::stats::around(
+                            crate::transport::stats::enabled(),
+                            &crate::transport::stats::PHASES.open,
+                            || transport.read_message(ciphertext, &mut this.bufs.payload[..]),
+                        )
+                        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                         *this.payload_len = n;
                         if n > 0 {
                             *state = ReadState::ServingPayload { served: 0 };

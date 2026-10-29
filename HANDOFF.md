@@ -380,13 +380,41 @@ suite's.
      Inside `rx_total`, `append` (the copy into the stream's receive buffer) is
      52 %, `ack` 12 %, `decode` 5 %, and 30 % is the rest of the datagram's
      bookkeeping.
-   - **Where the next attempt goes.** `tx_build` first (0.097): 41.8 µs to frame
-     forty-four datagrams is a microsecond each, roughly three times a 1400-byte
-     copy — the ack block is re-encoded per packet, the stream range is a map
-     lookup per packet, and the run is `Vec::extend`ed packet by packet. Then
-     `rx_total` (0.075), where `append` is the piece to look at. `tx_send`
-     (0.057) is the kernel segmenting a sixty-kilobyte `UDP_SEGMENT` write and is
-     not reachable from here without bigger datagrams, which the plan forbids on
+   - **The budget closes, and it does not favour this carrier (2026-10-29, same
+     day, the record layer and the stream copies now timed).** Two `cost` cells in
+     one profile, one carrier each, the same release binary, the switch on:
+     mhd `0.8736 s/Gbit` (26.24 GB, 32.36 s, 5.51 cores) against TCP `0.6432`
+     (47.6 GB, 32.25 s, 7.53 cores) — **1.36×**. The per-Gbit decomposition, every
+     figure measured rather than inferred:
+
+     | component | mhd | TCP | how it was read |
+     |---|---|---|---|
+     | record layer (`seal` + `open`) | **0.207** | **0.266** | 26.5 µs per 31.8 KB record against 9.7–13.6 µs per 10.8 KB — the same 0.83–0.90 ns per byte, and mhd's bigger records make it *cheaper* |
+     | the carrier's own framing, send and receive | **0.257** | — | the four phases of the previous table |
+     | the stream handle's two copies (`io_read`, `io_write`) | 0.033 | — | 2.86 s + 3.94 s |
+     | everything else (pool, kernel, wakeups, the guest loop) | 0.405 | 0.377 | the residue of each total |
+     | **total** | **0.874** | **0.643** | `cpu_s_per_gbit` |
+
+     The residue is a residue, so the honest statement is the difference of two
+     measured totals, not a measured 0.405. What makes the table worth trusting is
+     that it *closes*: mhd's four measured groups are 98.4 s of its 183 s, and the
+     0.231 s/Gbit gap is 0.257 (carrier) + 0.033 (copies) + 0.028 (residue) − 0.059
+     (the record layer it wins) = 0.259. Two independent cells, one fingerprint.
+   - **What that means for P2's gate, in one line.** This carrier's own
+     incremental cost is **0.29 s/Gbit**; closing the gap means cutting it by
+     about eighty percent, and no amount of per-datagram tuning removes the fact
+     that TCP's equivalent work happens inside the kernel's socket layer while
+     ours happens in `poll_transmit`. The plan's gate is therefore **refuted with
+     a complete account**, not merely unmet — which is the answer the sequence was
+     waiting for, and the decision it hands back is the human's.
+   - **Where a real attempt would still go.** `tx_build` is the largest single
+     phase inside the carrier (0.083–0.097): 41.8 µs to frame forty-four
+     datagrams is a microsecond each, roughly three times a 1400-byte copy — the
+     ack block is re-encoded per packet, the stream range is a map lookup per
+     packet, and the run is `Vec::extend`ed packet by packet. Then `rx_total`
+     (0.064), where `append` is the piece to look at, then `tx_send` (0.054), which
+     is the kernel segmenting a sixty-kilobyte `UDP_SEGMENT` write and is not
+     reachable from here without bigger datagrams, which the plan forbids on
      loss-amplification grounds.
    - **A batched receive was tried and is refuted; it is not the gap.** The
      receive side only ever had the GRO path (one run per `recvmsg`), so the
