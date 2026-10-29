@@ -258,6 +258,31 @@ suite's.
      in the first round, but on the stream-open path. The next measurement is
      that path with the phase tracer: `open_stream` → hello → ack, and where the
      handshake's wake-up goes missing while the window is held by bulk streams.
+   - **It is the per-stream Noise handshake, and what holds it up is a stream
+     nobody retires.** Instrumenting `open_stream` split the 502 ms exactly:
+     `open_channel` (which is the Noise KK handshake) **502.3–503.9 ms**, hello
+     **4 µs**, ack 0.2–1.7 ms. 502 ms is `INITIAL_RTO` — the sending side of that
+     lane never sent data, so it has no round-trip sample, and one lost handshake
+     packet costs the whole initial timer.
+     Why the packet is lost is the finding that matters: the client's log has
+     **39 576 `dropped data for a retired stream`** in one probe run — a peer
+     sending megabytes into streams whose reader is gone. A visitor's connection
+     ends, the client drops its handle, and `close_stream` half-closes the stream
+     (a *finish*), which tells the peer "my write direction is over" and leaves it
+     sending. The lane then carries data nobody will read, and a new stream's
+     handshake queues behind it.
+     **Three fixes were written, measured and reverted** — the honest record is
+     that they did not show a win: abort instead of finishing on a dropped handle;
+     send control frames before stream data in `poll_transmit` (the reset branch
+     was unreachable while any stream had bytes, exactly like the credit frame in
+     the first round); repeat a reset three times because it is unacknowledged.
+     After them the probe read 6/9/24 probes per run with 4–5 timeouts, against
+     8/25/37 with 0–3 before: not a win, and possibly a regression, so they are
+     not in the tree. The diagnosis stands, the fix does not exist yet.
+     **What the next attempt needs is a tighter experiment**, because this one's
+     variance is larger than the effect: a fixed probe count and window, repeated
+     runs, the distribution reported rather than one median, and the drop counter
+     as the primary signal (it moved by tens of thousands and needs no statistics).
    - **Therefore the sequence stops here.** P3b/P3c, P4, P5 and P6 are not
      started, no cost or tail claim may be made about `mhd`, and the phases
      that would follow are not to be executed on the belief that a later
