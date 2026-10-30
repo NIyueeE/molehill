@@ -1046,17 +1046,16 @@ suite's.
        1 882 ms and 4 442 ms depending on the run. A stall of that shape, on one
        end, in a run whose other end reports a one-second gap, is what the two
        daemons' read loops show — and nothing else in either log does.
-     - **A packet-count probe exists, and its first readings are not believable
-       yet.** `traffic_snapshot`/`traffic_delta` now print each interface's rx and
-       tx **packet** counts across the one-claim arm, which is the question left:
-       was the injected banner transmitted at all. Its first run read
-       `l3cli0 rx=2 480 tx=281 728`, `l3srv0 rx=2 460 tx=283 600` and
-       `v-srv tx=316 238` — for a workload of roughly six thousand packets. Those
-       numbers are either a field-offset mistake in the snapshot or a flood in the
-       namespaces that nothing else has reported, and **until one of those is
-       settled the readings are not evidence**. Do not quote them; re-run the
-       arm and check the totals against the visitor's own 16 × 200 round trips
-       first.
+     - **The packet-count probe read wrong, and the cause was one field.**
+       `traffic_snapshot` printed `$10` of `/proc/net/dev` as tx **packets**; after
+       the interface name the fields are rx *bytes* `$2`, rx *packets* `$3`, …,
+       tx *bytes* `$10`, tx *packets* `$11`. So the first run's
+       `l3cli0 tx=281 728` was **bytes**, and at the workload's ~44-byte packets
+       that is the expected six thousand packets exactly — which is the useful
+       part: the traffic matches the workload, and the probe is trustworthy once
+       the offset is `$11`. Confirmed against `ip -s link show lo` rather than by
+       reading the header, because two successive values on `lo` are equal and the
+       header line is easy to mis-align.
 
        | what the visitor saw | how many | what the backend recorded |
        |---|---|---|

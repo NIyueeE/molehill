@@ -329,7 +329,7 @@ traffic_snapshot() {
     : >"$out"
     for ns in "$NS_CLI" "$NS_SRV" "$NS_VIS"; do
         ip netns exec "$ns" cat /proc/net/dev 2>/dev/null \
-            | awk -v ns="$ns" '/:/ { gsub(":", "", $1); print ns, $1, $3, $10 }' \
+            | awk -v ns="$ns" '/:/ { gsub(":", "", $1); print ns, $1, $3, $11 }' \
             >>"$out"
     done
 }
