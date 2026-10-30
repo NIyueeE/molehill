@@ -973,7 +973,44 @@ suite's.
        throughput and RSS numbers, for instance). They are not KCP claims — they
        are old-method numbers — and they need a sweep measured with the current
        model, which is a release-ritual job rather than a correction.
-   - **A profiler exists after all, and the profile confirms the shape
+   - **The copy is the second-largest item, and it is `rep movsb` (2026-10-30).**
+     The same system-wide profile puts **5.01 % of every sample inside a single
+     libc address**, and disassembling it confirms what it is:
+     `162b87: f3 a4  rep movsb` — glibc's `memcpy`. With the daemon at ~25 % of
+     the profile that is on the order of a fifth of its time in copying, which
+     makes the copies the biggest thing after the AEAD and the only item left
+     that a code change could remove.
+     - The three following libc addresses (1.45 %, 1.04 %) are the same routine's
+       other entry points, so the family is larger than the single symbol.
+     - **Which copy, exactly, is still unattributed.** The callchains resolve to
+       addresses (`perf report` cannot name libc's internals without debug
+       symbols, and `-p` on the daemons sampled almost only kernel addresses), so
+       "5 % is mhd's own copies" is *not* established — some of it belongs to
+       iperf3 and the python probes in the same profile. The four sites that could
+       be it are already metered: `append` (batch into the receive buffer),
+       `io_read` (receive buffer out to the caller), `io_write` (caller into the
+       send buffer) and `tx_encode` (send buffer into the GSO run).
+     - **The arithmetic that makes this actionable:** removing one of the two
+       copies on the receive side is worth ~0.3 µs of a 5.2 µs per-datagram
+       user-space budget, i.e. ~6 % of user time or ~4.4 % of total CPU against a
+       4.35 % floor. It is *at* the boundary, not comfortably past it — which is
+       the honest reason it was not attempted with the rounds left, and the reason
+       the next attempt should remove two copies at once (receive *and* send) so
+       the effect is unambiguous.
+   - **The ratio at HEAD, measured with its floors (2026-10-30).** Six rounds per
+     arm with the A/A twin, one cell per carrier:
+
+     | carrier | `cpu_s_per_gbit` | twin | A/A diff | floor | host load |
+     |---|---|---|---|---|---|
+     | mhd | 0.6570 [0.6348..0.7062] | 0.6470 | **0.16 %** | 7.34 % | 2.3 |
+     | tcp | 0.4568 [0.4376..0.5096] | 0.4815 | 5.59 % | 11.59 % | 6.7 |
+
+     So mhd 0.652 against TCP 0.469 is **1.39×**, and the floors are 7.3 % and
+     11.6 % — the host was not quiet enough for better, so the *magnitude* of the
+     gap is only good to about ±0.18. It is consistent with the committed 1.34×
+     and with the 1.37× measured under `loss1`, and the ratio has not moved: the
+     credit-leak fix changed whether the cell passes, not what a byte costs.
+   - **A profiler exists after all, and the profile confirms the shape   - **A profiler exists after all, and the profile confirms the shape
      (2026-10-30).** `perf` was not installed, but `apt-get install linux-perf`
      works and the container has `CAP_SYS_ADMIN` (which `perfmon_capable()`
      accepts even at `perf_event_paranoid=2`). Kernel symbols stay restricted, so
