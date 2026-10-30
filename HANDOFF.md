@@ -634,65 +634,67 @@ suite's.
      so far is the visitor giving up, and nothing in the daemon's own logs says
      why.
 
-   - **Item (2) has a mechanism now, and it is the connection-wide credit
-     (2026-10-30, host load 2.6).** Six rounds of `bulk-n` at `loss1` with the
-     `--aa` twin landed **3 of 14** samples, and — the part that matters — the
-     twin failed the same way as the arm, so this is the carrier and not the
-     arm's configuration. Every failure is one shape: `stderr.txt` says
-     `warning: Failed to read JSON data size`, `exit 1`, and the transfer that
-     preceded it is healthy (**10.4 Gbit/s** aggregate on 8 streams in the
-     server's own log). So the data path works and the *result exchange* does
-     not: ~15 KB of JSON on iperf3's control connection, after the bulk streams
-     have finished.
-     - **What the instrument caught.** The server's `mhd stalled` line — built
-       for exactly this and never before seen firing in a failing cell — reports
-       **21 samples with `credit_blocked=true`**, `unsent_ms` **200 ms to
-       2 209 ms**, and the last of them at **04:00:27.334**, which is **19 ms
-       after** iperf3 gave up (`27.315`). The 13 `credit_blocked=false` samples
-       beside them are the ordinary flight-age kind. The bytes the results needed
-       were sitting in the send buffer, and the carrier was not allowed to put
-       them on the wire.
-     - **Why it is a design defect, not a tuning one.** `Conn::send_credit` is a
-       **connection-wide** byte window: `recv_credit = read + WINDOW`, where
-       `read` is everything consumed across every stream. One stream whose reader
-       is slow therefore pins the window for all of them, and a small message on
-       an idle stream queues behind up to 32 MiB of another stream's data. A
-       multiplexer with only a connection window has this by construction —
-       yamux and HTTP/2 both carry a per-stream window beside it for this reason.
-     - **The fix this points at** is per-stream flow control in the wire: a
-       credit per stream id, acknowledged by the reader, with the connection
-       window kept as the aggregate. Dialect 6.0 is still in development, so the
-       frame may be extended in place under the same number (§5). Not attempted
-       in this round — it is a wire change and wants its own measurement.
-     - **What it does not explain.** The first four stream opens cost **335 ms**
-       each (`INITIAL_RTO` plus a lost first packet at 1 % loss) against
-       **1.0–1.5 ms** for every open after them. That is a separate, much smaller
-       cost, and all 16 opens happen in the first two seconds — there is no
-       stream churn to blame.
+   - **Item (2): the cell now passes 6 of 7, and the fix was a window leak
+     (2026-10-30).** Three earlier runs of this cell — 3 of 14, then 1 of 14 —
+     were **all taken on a stale binary**: the results files say
+     `provenance.binaries[0].stale: true`, because the binary in
+     `target/release/` was from `1fbbd63` while HEAD had moved four commits on.
+     The model recorded the field and it says so, which is the §10 rule doing
+     its job; the paragraphs below stay as **context**, not evidence, and the
+     numbers that count are the ones from the fresh build.
+     - **Measured, with the run's own control.** `bulk-n` at `loss1`, six rounds
+       per arm, `--aa` beside an A/B of two builds, host load 1.6 (one minute),
+       both binaries `stale: false`:
+
+       | arm | build | passed |
+       |---|---|---|
+       | `l4` | `2c1d83a`, before the fix | **1 / 7** (5 × no results, 2 × no connect) |
+       | `l4~aa` | the same build again | **1 / 7** (5 × no results, 1 × no connect) |
+       | `l4~b` | `d8eff14`, with the fix | **6 / 7** (1 × no connect) |
+
+       The twin agrees with its own arm sample for sample, so the arms are not
+       drifting; the fix is worth five of the seven samples, and the *result
+       exchange* shape — the dominant one — is gone. What is left is the other
+       shape, `unable to connect to server`, which was already in the record as
+       a separate defect and is **not** fixed by this.
+     - **What the defect was.** The credit a peer is granted follows
+       consumption, and `Conn::read` was the only place `read` advanced. Two
+       sites discarded received bytes without counting them: a frame arriving
+       for a stream already retired, and `settle` removing a stream that ended
+       with unread bytes. So every short-lived stream narrowed the lane by its
+       unread bytes for as long as the connection lived — the window never
+       reopened, and a lane carrying many short connections ends up
+       `credit_blocked` with every reader up to date. Fixed by
+       `release_unread`/`advance_read`. Which is also why the earlier "3 of 14"
+       looked like a design limit: it was a leak that had already eaten most of
+       the window by the second round.
+     - **What the earlier captures still tell us, at the level of code that has
+       not changed since.** The server's `mhd stalled` line fires with
+       `credit_blocked=true` (21 of 34 samples in one round), `unsent_ms` 200 ms
+       to 2 209 ms, the last one 19 ms after iperf3 gave up; the transfer before
+       it is healthy at **10.4 Gbit/s** on 8 streams; the first four stream opens
+       cost **335 ms** each (`INITIAL_RTO` plus one lost packet at 1 % loss)
+       against 1.0–1.5 ms for every open after them. Those lines describe
+       `conn.rs` and `pump.rs` as they still are, but the runs they came from do
+       not satisfy §10, so they are leads, not measurements.
+     - **What is still open on this cell:** the connect shape. One sample of
+       seven now fails at `iperf3 -c` with `Connection refused`, and the earlier
+       table put that failure at 0.3–0.4 s — which is `INITIAL_RTO` again. The
+       next probe is the visitor's own connect timing against a lane whose first
+       stream open costs the timer.
      - **The 74 057 `dropped data for a retired stream` lines are a symptom.**
        That count was already learned the hard way (§ above, the revert): it goes
        to zero without the failure rate moving, because a reset ahead of queued
        data discards bytes the visitor still wanted.
-
-     - **A second defect, found by that instrument and now fixed: the window
-       leaked one dead stream at a time (2026-10-30).** `recv_credit = read +
-       WINDOW`, and `read` was advanced in exactly one place — `Conn::read`, the
-       reader. A stream that ended holding unread bytes discarded them at two
-       sites (the retired-frame drop in `apply_datagram`, and `settle` removing
-       the stream) and **neither advanced `read`**. So every short-lived stream
-       narrowed the lane by its unread bytes, permanently: a lane carrying many
-       short connections with readers that are perfectly up to date reports
-       `credit_blocked`, the window never reopens, and the failure rate grows
-       through a run rather than appearing.
-       Fixed by `release_unread`/`advance_read`: the bytes a stream will never
-       deliver are counted as consumed, which is the only honest answer, since
-       the alternative is a window the peer was charged for and can never reuse.
-       A unit test asserts the window comes back and that releasing twice does
-       not hand it out twice.
-       **Not yet measured.** The cell is `bulk-n` at `loss1` (3 of 14 samples,
-       `credit_blocked` on 21 of 34 stall samples); it needs a calm host, and the
-       instrument that reports the backlog (`mhd stalled … backlog_streams=`)
-       now exists to say whether the leak was the whole of it.
+     - **The design question is still open, and it is not what this round
+       measured.** `Conn::send_credit` is a **connection-wide** byte window:
+       `recv_credit = read + WINDOW`, where `read` is everything consumed across
+       every stream. A multiplexer with only a connection window blocks every
+       stream on one slow reader's progress — yamux and HTTP/2 both carry a
+       per-stream window beside it for this reason. The leak above was fixed
+       *inside* that design; whether the design itself still needs the per-stream
+       window is unmeasured, and the instrument that would say so is the
+       `backlog_streams` / `backlog_worst_bytes` pair now on the stall line.
 
    - **The width change does not touch the transparent path.** `just l3-accept`
      (root, three namespaces, fifteen checks) reads the same at four workers as at
