@@ -36,6 +36,10 @@ PREFIX = b"echo:"
 #: and including `tcpi_unacked`, which sits at offset 24.
 TCP_INFO_UNACKED_END = 28
 
+#: Enough for a banner plus one echo of the largest request the harness sends,
+#: and small enough that a diagnostic cannot drain a flow that is still working.
+BLIND_READ_LIMIT = 4096
+
 
 def recv_exactly(sock: socket.socket, want: int) -> bytes:
     """Read up to `want` bytes, stopping early only at end of stream."""
@@ -106,6 +110,33 @@ def round_trips(sock: socket.socket, count: int, size: int) -> int:
     return count
 
 
+def blind_write(sock: socket.socket, size: int) -> str:
+    """Write one request after a banner that never came, and listen for a second.
+
+    A stalled flow never sends anything — it is waiting for the banner — so the
+    forward direction is untested for exactly the flows that fail, and "the
+    return path lost the reply" and "both paths are silent" look the same from
+    outside. One blind write splits them: an echo back means only the return path
+    is broken, silence means both.
+
+    Reported as `then got=N` bytes: `N` of five means the banner arrived late,
+    more than five means the request reached the backend. The flow still fails —
+    this is a diagnostic, not a retry.
+    """
+    try:
+        sock.sendall(pattern(size))
+        sock.settimeout(1.0)
+        got = bytearray()
+        while len(got) < BLIND_READ_LIMIT:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+    except OSError as exc:
+        return f" then {type(exc).__name__} after the blind write"
+    return f" then got={len(got)}"
+
+
 def one_flow(
     target: tuple, index: int, requests: int, size: int, timeout: float
 ) -> str:
@@ -123,7 +154,10 @@ def one_flow(
             try:
                 banner = recv_exactly(sock, len(PREFIX))
             except OSError as exc:
-                return f"flow {index}: {exc} before the banner ({socket_state(sock)})"
+                return (
+                    f"flow {index}: {exc} before the banner ({socket_state(sock)})"
+                    f"{blind_write(sock, size)}"
+                )
             if banner != PREFIX:
                 return f"flow {index}: expected {PREFIX!r}, got {banner!r}"
             # The flow's own five-tuple, so a failure can be followed past this

@@ -1110,13 +1110,30 @@ suite's.
        for it. Every instrument this harness has now says the same thing, and the
        one that could say more is a packet capture inside the namespaces
        (`tcpdump`/`tshark`, neither installed).
-     - **The next probe is therefore a blind-write one.** A stalled flow never
-       sends because it is waiting for the banner, so the forward direction is
-       untested for exactly the flows that fail. Having the probe write its first
-       request *before* reading the banner would say whether the visitor→backend
-       direction works for those flows; if it does, the defect is confined to the
-       return path, and if it does not, both directions fail and the 5-tuple
-       placement is the place to look.
+     - **The blind write ran, and the defect is the return path alone
+       (2026-10-30, load 0.85).** A stalled flow never sends, so the forward
+       direction was untested for exactly the flows that fail. The probe now
+       writes one request *after* the banner times out and listens for a second,
+       and the backend's own per-connection counters close the loop:
+
+       | flow | what the visitor saw | what the backend recorded |
+       |---|---|---|
+       | 0, 2, 12, 14 (stalled) | `pending=0 rto_ms=201 unacked=0`, then `TimeoutError` after the blind write | `reads=1 bytes=64` — **the blind write arrived and was echoed** |
+       | 15, 10, 8, 11 (passed) | 200 round trips | `reads=200 bytes=12800` |
+
+       So the **forward direction works for the same five-tuple that fails**: the
+       64-byte request crossed, the echo answered it, and that answer never
+       arrived — exactly like the banner before it. Placement, claims, lanes and
+       the client's device-read are therefore all exercised successfully by the
+       same flow that cannot hear a reply.
+     - **Which leaves one direction and one sentence.** Echo → client device read
+       → lane → server inject → visitor socket is silent for these flows while
+       every counter along it reports delivery — frame traces, both ends'
+       per-member counts, all three namespaces' interface deltas, and `nstat`'s
+       routing, listen-queue and TCP error counters. The next instrument has to
+       see the packet itself inside the namespaces, and neither `tcpdump` nor
+       `tshark` is installed; installing one is the honest next step rather than
+       another counter.
 
      - **The `unclaimed` counter names a real defect: the first SYN of every
        flow is dropped at arm start (2026-10-30, load ~1).** Sixteen frames per
