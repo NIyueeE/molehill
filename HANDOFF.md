@@ -973,7 +973,44 @@ suite's.
        throughput and RSS numbers, for instance). They are not KCP claims — they
        are old-method numbers — and they need a sweep measured with the current
        model, which is a release-ritual job rather than a correction.
-   - **Item (1)'s gap is *all* user space, and that rules out a whole class of
+   - **A profiler exists after all, and the profile confirms the shape
+     (2026-10-30).** `perf` was not installed, but `apt-get install linux-perf`
+     works and the container has `CAP_SYS_ADMIN` (which `perfmon_capable()`
+     accepts even at `perf_event_paranoid=2`). Kernel symbols stay restricted, so
+     a profile of the *release* binary shows only addresses — build one with
+     `CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1 cargo build
+     --release` and pass it with `--binary`, and user symbols resolve at full
+     optimisation. This is the method the item-(1) work was missing.
+
+     System-wide sampling at 1 999 Hz for eight seconds of a `cost` cell
+     (`/tmp/sym.data`, 174 804 samples), restricted to the daemon's binary:
+
+     | symbol | share of all samples |
+     |---|---|
+     | `ring_core_…_chacha20_poly1305_seal_avx2` | **8.08 %** |
+     | `ring_core_…_chacha20_poly1305_open_avx2` | **7.87 %** |
+     | `mhd::conn::Conn::on_datagram` | 1.38 % |
+     | `mhd::pump::flush` (closure) | 1.06 % |
+
+     **Nothing else reaches one percent.** The two AEAD symbols are ~16 % of the
+     whole system's cycles while the daemon is ~25 % of it, so the record layer is
+     ~26 % of the daemon's own time — the same share the committed budget gives it
+     — and the remaining three quarters are spread across hundreds of sub-1 %
+     sites in the per-packet path.
+     - **What that means for item (1):** there is **no hotspot to fix**. The one
+       large item is the AEAD, and it is already the fastest implementation
+       available (AVX2, from `ring`), so it is not a lever. What is left is
+       diffuse per-byte work — copies, framing, locks — which is exactly what an
+       architectural reduction in copies would remove, and exactly why no bounded
+       change has moved the ratio: this file has now measured and reverted the two
+       candidates (lock consolidation, and the syscall half) and the profile
+       explains why both were flat.
+     - **Honest bound on the claim:** the percentages are of the *whole system*
+       profile, not of the daemon alone, because `perf report --comms` does not
+       re-base them. The daemon's share (25 %) and the phase table's independent
+       26 % agree, which is why the ratio is stated as ~26 % rather than read off
+       the profile directly.
+   - **Item (1)'s gap is *all* user space, and that rules out a whole class of   - **Item (1)'s gap is *all* user space, and that rules out a whole class of
      fixes (2026-10-30).** `cpu_s_per_gbit` is `utime + stime`, and the sum cannot
      say which half to attack — so the instruments now record the split
      (`cpu_user_s` / `cpu_sys_s` in a sample's evidence, from
