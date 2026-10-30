@@ -1126,14 +1126,29 @@ suite's.
        arrived — exactly like the banner before it. Placement, claims, lanes and
        the client's device-read are therefore all exercised successfully by the
        same flow that cannot hear a reply.
-     - **Which leaves one direction and one sentence.** Echo → client device read
-       → lane → server inject → visitor socket is silent for these flows while
-       every counter along it reports delivery — frame traces, both ends'
-       per-member counts, all three namespaces' interface deltas, and `nstat`'s
-       routing, listen-queue and TCP error counters. The next instrument has to
-       see the packet itself inside the namespaces, and neither `tcpdump` nor
-       `tshark` is installed; installing one is the honest next step rather than
-       another counter.
+     - **The backend never retransmitted, so its replies were acknowledged
+       (2026-10-30, load 0.95).** The echo service now reports its own kernel's
+       `tcpi_total_retrans` on the connection's closing line, which is the one
+       number that separates "the reply was lost on the way" from "the reply was
+       never needed again":
+
+       | flows | backend reads | backend retransmissions |
+       |---|---|---|
+       | 5, 4, 10, 9, 13 (stalled) | **1** (the blind write) | **0** |
+       | 3, 15, 8 (passed) | 200 | 0 |
+
+       A reply stays unacknowledged in `tcpi_unacked` and is resent while it is
+       not; `retrans=0` means every byte the backend sent — the five-byte banner
+       and the 64-byte echo — was **acknowledged**.
+     - **Which is the sharpest fact in this whole section, and it is a
+       contradiction to resolve rather than a cause.** The visitor's socket is
+       ESTABLISHED with an empty receive queue, and the backend's replies were
+       acknowledged. Both cannot be true of the same socket unless the
+       acknowledgement came from something that is not the visitor's socket. That
+       is where the next investigation starts: not "where did the packet go" but
+       "who acknowledged it", and the answer is inside the client namespace's
+       stack, where the claim's address is a local address.
+
 
      - **The `unclaimed` counter names a real defect: the first SYN of every
        flow is dropped at arm start (2026-10-30, load ~1).** Sixteen frames per
