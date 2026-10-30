@@ -1307,7 +1307,19 @@ suite's.
        1 882 ms and 4 442 ms depending on the run. A stall of that shape, on one
        end, in a run whose other end reports a one-second gap, is what the two
        daemons' read loops show — and nothing else in either log does.
-     - **The accept queue was one of the two defects, and it is fixed
+     - **Two consecutive green acceptance runs, and the objective's other
+     criteria checked mechanically (2026-10-30).** The suite that passes once may
+     be a good draw, so it was run again at a load of 12–14: **16 PASS, exit 0**,
+     every arm **16/16** (0.109 s / 0.090 s / 1.134 s / 1.122 s / 1.128 s). Two
+     runs in a row at load 12–14 is a much stronger statement than one at load 1,
+     and the lending arm — the intermittent one — passed both.
+   - **"No new configuration key" is verified, not assumed.** `git diff
+     v0.11.2..HEAD -- src/config/` touches two files and **every changed line is
+     prose**: `KCP` → `mhd` in documentation comments and in the removal messages
+     that tell a reader which key to delete. No field, no `serde` attribute, no
+     alias, no new table. The branch adds no key and removes nothing a user could
+     still write.
+   - **The accept queue was one of the two defects, and it is fixed
        (2026-10-30).** The backend called `srv.listen(8)` while the arm opens
        **sixteen** connections at once, so the excess sat in the accept queue —
        the kernel completes the handshake, the *application* has not accepted, and
