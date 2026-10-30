@@ -807,8 +807,20 @@ suite's.
        carrier-write gap stop and restart at the **same millisecond** for
        **1.66 s** (`read_gap_at_ms == write_gap_at_ms`). A single whole-path
        stall, not one flow's, and the same field reads **5.0 s** in an arm that
-       passed. A four-worker runtime is the first thing to rule out: the L3
-       topology puts a client, a server and two python probes on one box.
+       passed.
+     - **The control says the tunnel is the unstable part, not the host.** The
+       same run measures the same sixteen threads straight at the service, with
+       no tool in the path. Across three runs that control read **22 774**,
+       **23 829** and **22 945** round trips/s — a **4 %** spread — while the
+       tunnel read **2 498**, **3 883** and **633**: a **6×** spread, and 9–36×
+       slower. So "the shared host explains it" cannot carry this arm: a probe
+       stable to 4 % in the same instant on the same host is exactly the contrast
+       the arm exists for, and what moves is the tool. This also supersedes the
+       width reading — the control was never the thing that changed.
+     - **Runtime width is not the cause.** `TOKIO_WORKER_THREADS=8` on the same
+       topology read **12/15** (three failures, both lending checks among them)
+       against **14/15** at four workers, with the tunnel arm at **629** round
+       trips/s: no better. Excluded, like the three mechanisms before it.
      - **Still not established:** whether the stalled flows' requests reach the
        backend. The echo service's log interleaves `RECV` lines from its
        per-connection threads with no connection tag, so a per-flow read count
