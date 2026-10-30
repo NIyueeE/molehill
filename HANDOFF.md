@@ -1223,18 +1223,31 @@ suite's.
        The accept timestamps confirm it: all sixteen are now accepted within
        **3 ms** of each other, where before the stragglers were accepted only
        after their visitor had timed out.
-     - **Which splits item (3) in two, and one half is closed.** The *banner*
-       losses were the accept queue. What remains is a second defect with a
-       different signature: the eight failing flows in the lending arm now report
-       `timed out after 0/200 round trips`, i.e. **the banner arrived and the first
-       round trip did not** — the forward direction is proven good by the blind
-       write, so this is the lending arm's own first-request stall, and it is the
-       only check still red.
-     - **The stalled socket's own state, and it is unambiguous (2026-10-30,     - **The stalled socket's own state, and it is unambiguous (2026-10-30,
-       load 0.7).** The probe now reports the kernel's view when the banner never
-       comes — receive-queue bytes (`FIONREAD`), TCP state, the retransmission
-       timer and the unacknowledged count, all from `TCP_INFO`. Every stalled
-       flow in every arm reads the same:
+     - **Which splits item (3) in two, and both halves are now answered
+       (2026-10-30).** The *banner* losses were the accept queue. The remainder
+       was the lending arm's first-request stall — and with the queue confound
+       removed, **lending is the differentiator after all**: the lending-off
+       control passes 16/16 in 1.117 s while the lending arm failed 8/16 in
+       6.073 s in the same run. The earlier "lending is innocent" reading was
+       taken with the accept-queue defect in place, which cost both arms
+       equally.
+     - **And the next run passed everything.** `just l3-accept` printed
+       **sixteen PASS and exit 0**, with every arm at 16/16:
+
+       | arm | result |
+       |---|---|
+       | 16 concurrent flows | 16/16 in 0.105 s |
+       | control, no tunnel | 16/16 in 0.090 s |
+       | lending | 16/16 in 1.174 s |
+       | lending off | 16/16 in 1.169 s |
+       | one claim, four lanes | 16/16 in 1.188 s |
+
+       Both checks this item was opened for — `the busy claim lost traffic while a
+       lane was lent` and `lending-off either moved a lane or lost the workload` —
+       are green, along with the two new controls. **The item is closed with one
+       caveat stated plainly:** the lending arm is still intermittent, 8/16 in one
+       run and 16/16 in the next, so the check can still go red on a bad draw.
+       What is fixed is the systematic cause; what is left is a rate.
 
        ```
        timed out before the banner (pending=0 tcp_state=1 rto_ms=201 unacked=0)
