@@ -957,6 +957,22 @@ suite's.
      on both benchmarks pages): three cost cells in a row were taken at loads of
      44, 57 and 49 and none of them was evidence, and a reader of a results file
      has no way to know that today.
+   - **The benchmarks pages describe the carrier that exists now
+     (2026-10-30).** Both pages still carried a ~275-line section measuring the
+     **KCP** carrier this release deletes, plus the switch value
+     `MOLEHILL_DATA_CARRIER=kcp` — a value the code now warns about and ignores —
+     and the configuration row `[client.data.tcp|kcp].tunnels`. All of it is
+     replaced: the carrier axis is stated as a *path condition* (a clean path
+     carries mhd, `--condition udp_blocked` carries the fallback), the two
+     diagnostic switches are named with what they do, and the KCP-era figures are
+     pointed at `benches/records/` as published history with the reason they are
+     not a baseline. Both languages, same 13 sections each, and the docs gate is
+     green.
+     - **What remains of that debt:** the *other* tables on those pages still
+       quote figures from the model this one replaced (the per-decision table's
+       throughput and RSS numbers, for instance). They are not KCP claims — they
+       are old-method numbers — and they need a sweep measured with the current
+       model, which is a release-ritual job rather than a correction.
    - **The per-datagram lock is not a lever, measured and reverted
      (2026-10-30).** The phase table charges 0.352 µs of the 0.91 µs per-packet
      turn to "lock + preamble", and the send path took the connection's mutex

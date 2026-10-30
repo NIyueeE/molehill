@@ -100,13 +100,13 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   `[client.data].tunnels` for a forwarding arm and a transparent claim's
   **lane budget** for an L3 one — one connection per lane, because a claim never
   multiplexes. The data plane's **carrier is not an arm axis either**: the
-  product chooses it at runtime (KCP, falling back to TCP), so there is no key
+  product chooses it at runtime (mhd, falling back to TCP), so there is no key
   to write and no arm field to set. The contrast lives in the *path* —
   `--condition udp_blocked --condition-leg tunnel` drops UDP on the leg the
-  carrier crosses, so the KCP attempt cannot be established and the run measures
+  carrier crosses, so the mhd attempt cannot be established and the run measures
   the fallback, with the fallback line and `carrier="tcp"` in the pool's own
-  output as its evidence — while a clean run carries KCP. To isolate one carrier
-  instead (a KCP-only run under loss, say), set `MOLEHILL_DATA_CARRIER=kcp` in
+  output as its evidence — while a clean run carries mhd. To isolate one carrier
+  instead (an mhd-only run under loss, say), set `MOLEHILL_DATA_CARRIER=mhd` in
   the environment the bench is launched from: a run records the `MOLEHILL_*`
   switches it inherited as instrumentation, so the forcing is auditable. The shape itself is
   derived from the service type (a forwarding service multiplexes, a claim never
@@ -445,7 +445,7 @@ the run and the harness restores it on teardown, failing loudly if it cannot —
 a leftover 1280 would poison every later run on the host. The reason the axis
 exists at all: `lo` is MTU 65536, so without it every datagram fits in one
 fragment and the cost of a lost fragment is unmeasurable. Read the two classes
-together with the `carrier = "kcp"` row below.
+together with the `carrier` rows below.
 
 ### The shaping scope
 
@@ -673,8 +673,8 @@ to two).
 | `tunnels` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at four tunnels; loss5 head-of-line max 2.5 s vs 1.6 s; and on the pinned pool's own cells 8 flows read 3.34 Gbit/s on `loss1` against 5.92 at two) |
 | `tunnels` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at one tunnel); yamux ceiling `count × 64` concurrent connections, `count × 56` after placement's own ceiling |
 | `tunnels` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8), and on a clean jumbo path 22.81 Gbit/s against 12.85 at one |
-| `carrier` (forced) | `tcp` | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |
-| `carrier` (forced) | `kcp` | only when TCP data tunnels are blocked or throttled, or to A/B a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0 % loss, 20 ms maximum inter-packet gap vs 100+ ms for the TCP arms) |
+| `carrier` (forced) | `mhd` (default) | the carrier the product chooses for itself on a path that carries UDP, and the one the `cost` metric is quoted for: `cpu_s_per_gbit` 0.65 against TCP's 0.48 on the same cell. `MOLEHILL_DATA_CARRIER=mhd` pins it, which also makes the pool's carrier rule inert |
+| `carrier` (forced) | `tcp` | the fallback when UDP is blocked or throttled: `MOLEHILL_DATA_CARRIER=tcp` pins it for an arm that needs the fallback's own numbers rather than the path that produces it |
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
@@ -816,282 +816,27 @@ averaging 65 212 bytes with it. That fix is in the shipping binary; the probe
 is [`bench/src/bench/utils/l3/tcp_tso_census.py`](../bench/src/bench/utils/l3/tcp_tso_census.py),
 and "What is left is per-packet syscall cost" below now reads differently.
 
-### The carrier axis: TCP versus KCP (2026-10-10, this model)
+### The carrier axis is a path condition now
 
-`mode` and `carrier` are independent, so the two axes are measured apart:
-`l3` / `l3-mux` are the same L3 arm over TCP with and without the multiplexer,
-and `l3-kcp` / `l3-mux-kcp` are the same pair over KCP. Every figure below is
-one results file, two measured rounds per arm, the A/A twin in the run as its
-own noise floor, and the condition named on the row — `clean` is an unshaped
-path, `tunnel` means the shaping lands on the link the carrier crosses.
+The product chooses its carrier at runtime — mhd, falling back to TCP — so there
+is no build to compare and no key to set. The contrast lives in the *condition*:
+a clean path carries mhd, `--condition udp_blocked` carries the TCP fallback, and
+the same binary measured once per path is the comparison. Two switches isolate a
+single carrier; both are diagnostics, both are recorded as instrumentation, and
+neither is a deployment setting:
 
-**Clean path, one bulk flow** (`--profile smoke --condition clean`, L3 arms, the
-control arm is the same topology with no tool in it):
+- `MOLEHILL_DATA_CARRIER=mhd` / `=tcp` pins one carrier for the whole run. It
+  also makes the pool's own carrier rule inert — a forced carrier is the run's
+  answer, not a preference to be argued with, and the pool refuses to move a
+  tunnel under it.
+- `MOLEHILL_CARRIER_SWITCH_AT=<seconds>` moves every claim to the other carrier
+  after that many seconds, so the cost of a live move can be measured before any
+  policy that decides one exists.
 
-| Arm | Mode / carrier | Throughput | CPU per Gbit | Wire per visitor byte |
-|---|---|---|---|---|
-| control | — (no tool) | 41.813 Gbit/s | — | 1.0010 |
-| `l3` | direct / tcp | 4.173 Gbit/s | 0.855 s | 1.0745 |
-| `l3-mux` | multiplex / tcp | 2.995 Gbit/s | 1.435 s | 1.0898 |
-| `l3-kcp` | direct / kcp | 2.188 Gbit/s | 2.554 s | 1.1483 |
-| `l3-mux-kcp` | multiplex / kcp | 2.511 Gbit/s | 2.310 s | 1.1414 |
-| `l3~aa` | direct / tcp (the same arm twice) | 4.008 Gbit/s | 0.868 s | 1.0746 |
-
-Read it as two costs that stack: the multiplexer costs **28 %** of the bulk
-throughput and **68 %** more CPU per byte (`l3` → `l3-mux`), and the KCP carrier
-costs **48 %** of it and **3×** the CPU per byte (`l3` → `l3-kcp`) on a path with
-nothing wrong with it. The same ordering holds for one connection doing
-request-response round trips (`rr-1`: 16 283/s at p99 0.070 ms on `l3`,
-13 866/s at 0.086 ms on `l3-mux`, 9 742/s at 0.137 ms on `l3-kcp`), while
-16 concurrent connections finish within 12 % of each other on every arm — that
-scenario is bounded by the probe, not by the carrier.
-
-**Loss on the carrier's own leg** (`--condition-leg tunnel`), one bulk flow:
-
-| Condition (tunnel leg) | control | `l4` (mux/tcp) | `l4-kcp` | `l3` (direct/tcp) | `l3-kcp` | A/A twin |
-|---|---|---|---|---|---|---|
-| `loss1` — 10 ms delay, 1 % loss | 4.425 | 2.506 | **0.395** | 2.030 | **0.413** | 2.810 |
-| `loss1_rate100` — 100 Mbit/s, 20 ms, 1 % loss | 0.096 | 0.093 | **failed, 3/3 rounds** | 0.089 | 0.059 | 0.095 |
-
-All figures Gbit/s. KCP is **five to six times behind TCP** once the path loses
-packets, in both architectures, and on the rate-limited lossy leg the
-multiplexed KCP arm does not finish its test at all: three rounds out of three
-died with `iperf3: control socket has closed unexpectedly`, and the daemon's own
-debug log names the cause — `KCP session dead link`. The visitor's connection
-dies with the session, where a TCP carrier would simply have slowed down.
-
-The mechanism is in the carrier's own counters (`MOLEHILL_KCP_STATS=1`, the
-sender's side of a 3-second cell): **22 % of the datagrams it sent were
-retransmissions** and the path's own loss accounted for a fraction of that. With
-`nc=1` the ARQ has no congestion control — the pacer's only signal is a PONG
-that fails to arrive within 2.5 s — so a window-sized burst goes into whatever
-queue the path has; the standing queue delays the acknowledgements past KCP's
-escalating RTO, the retransmissions enlarge the queue, and on a rate-limited
-path the ARQ exhausts its 20-retransmit budget and declares the peer dead. That
-is a congestion collapse, self-inflicted, and it is the thing to fix before the
-carrier is worth choosing for a lossy path.
-
-**Where the carrier stands across the whole workload.** The `dev` profile — every
-scenario, four measured rounds plus a warm-up, one condition, the A/A twin in the
-run — on a jumbo path, with the shipped build:
-
-| Scenario | `l3` (TCP carrier) | `l3-kcp` | `l3~aa` (the twin) |
-|---|---|---|---|
-| `bulk-1` (1 flow) | 7.554 Gbit/s | 7.136 | 7.496 |
-| `bulk-n` (8 flows) | 6.023 Gbit/s | **7.418** | 6.243 |
-| `bulk-pair` | 13.644 Gbit/s | 12.357 | 13.827 |
-| `rr-1` | 14 167/s @0.086 ms | 10 177/s @0.133 ms | 16 139/s @0.079 ms |
-| `rr-16` | 32 984/s @1.317 ms | 30 264/s @1.312 ms | 32 994/s @1.309 ms |
-| `churn-16` | 7 139/s @2.374 ms | 6 779/s @2.417 ms | 7 209/s @2.291 ms |
-| `udp-pace` (loss) | 0.802 % | 0.835 % | 0.790 % |
-| `udp-ladder` @2 Gbit/s (loss) | 0.60 % | 1.05 % | 0.60 % |
-
-Read against the twin's spread, that is: **level on one bulk flow and on churn,
-19 % ahead on eight flows, behind on short round trips** (`rr-1` −28 %, `rr-16`
-−8 %, at equal p99), and **roughly twice the inner-UDP loss** at every offered
-rate on the ladder (0.60 → 1.05 % at 2 Gbit/s, 0.55 → 1.04 % at 5 Gbit/s). The
-last one is the quality gap to keep in mind rather than a throughput one: UDP
-cannot recover what the carrier drops, and what drops it is the same hub that
-serves the TCP carrier — the difference is how fast the carrier's writer drains
-the endpoint's channel behind it.
-
-**The long-haul cell is the one that is still behind, and it is the path's
-queues, not the carrier's arithmetic.** On `rtt100` (100 ms each way, no loss
-configured) the TCP carrier moves 0.461 Gbit/s and `l3-kcp` 0.178 — 2.6× behind,
-the widest gap left anywhere in this model. The carrier's own counters say why:
-**21 % of the datagrams it sent never reached the receiver** on a path that drops
-nothing on purpose, and **28 % of what it sent was recovery traffic** — split
-4 239 RTO-driven resends against 2 163 fast-retransmit ones, i.e. mostly the
-sender timing out on acknowledgements that were merely late. The mechanism is a
-whole window going out at once: 2 048 segments is 16 MiB at a jumbo datagram
-size, a bottleneck queue holds a thousand packets, and the ARQ has no congestion
-control to spread the difference.
-
-Two repairs were tried against that, and the measurements chose between them:
-
-* **RTO headroom — kept.** The reference's timeout is `srtt + max(interval,
-  4·rttvar)`, so this adapter's 10 ms flush interval is also the timeout's only
-  margin; on a low-jitter 200 ms path the timeout lands at **205 ms** and the
-  acknowledgements arrive at 200 ms plus the receiver's own batching. A margin of
-  `srtt/8` (nothing changes below an 80 ms round trip) cuts RTO-driven resends by
-  **42 %** and the wire ratio from **1.20 to 1.09** on that cell, with throughput
-  flat (0.178 against 0.169–0.197 across the runs).
-* **Pacing the burst to the bandwidth-delay product — measured, and left out.**
-  Capping the send rate at `window / srtt` (655 Mbit/s on this cell) is the
-  textbook answer to a bursting sender, and as first built it was **35 % worse**:
-  0.114 [0.104..0.124] against 0.175 [0.160..0.181] Gbit/s over three rounds
-  each. The reason was not the rate, it was the refusal: a datagram the pacer
-  would not take was **dropped**, so every act of rate control became a loss
-  event with a recovery round trip behind it. Parking refusals instead (below)
-  makes the same cap worth **+21 %** on that cell — 0.204 [0.176..0.244] against
-  0.169 [0.154..0.201] — but the wire ratio grows by **14 %** with it, so it is a
-  trade rather than a win and stays out of the shipped path until something
-  decides that trade. Its numbers are here so the decision can be made on them.
-* **Parking what the pacer or the kernel refuses — kept.** The drain used to
-  discard a datagram it could not send (a denied span, a partial `sendmmsg`, an
-  `EAGAIN`) and let the ARQ re-send it a round trip later. Holding it instead, in
-  order and bounded by half the retransmission timeout, is worth **12 % on the
-  lossy leg** — 1.824 [1.822..1.855] against 1.627 [1.521..1.732] Gbit/s, ranges
-  disjoint — at an identical wire ratio, and it is neutral on the clean and
-  long-haul cells. The bound matters: a parked datagram the engine also times out
-  goes on the wire twice, which is where the pacing experiment's 14 % of extra
-  wire bytes comes from.
-
-**And the signal itself was wrong.****And the signal itself was wrong.** That PONG timeout is the pacer's only
-input, and it fires on *any* late PONG — including one queued behind a peer that
-is busy sending, which is exactly the state a fast path is in. The cut is 25 %
-and the recovery is 5 % per four clean PONGs, so one heavy transfer ratchets the
-rate down four times (12 → 3.8 Gbit/s, measured on the stats line) and leaves it
-there: the *next* transfer in that session reads a fraction of what the same
-transfer reads on a fresh session. Measured on a jumbo path, `bulk-n` twice in
-one session: **7.79 then 7.67 Gbit/s** after the fix, against **6.18 then 1.00**
-before it, and a `bulk-1` cell followed by `bulk-n` read 7.19 then 7.44 against
-7.1 then 2.0. The fix is the one the signal was missing: a late PONG only means
-congestion when the send window is **not** moving — a peer that is acknowledging
-data is working, whatever its keepalive looks like — so the pacer now holds its
-rate while progress is being made, and still cuts when a session stalls. The
-slow regimes confirm it costs nothing: `rtt100` 0.169 → 0.182 Gbit/s and `loss5`
-unchanged to three decimals.
-
-A window *byte* budget was tried alongside this, to stop the buffers growing 5.7×
-on a jumbo path, and it is **falsified**: it did not touch the collapse (the
-pacer was the cause) and it cost the lossy leg two thirds of its throughput —
-0.45 against 1.67 Gbit/s on `loss1` with jumbo datagrams — because a window
-barely one bandwidth-delay product wide leaves fast retransmit nothing to ride
-on. The windows stay segment-counted and, on a lossy path, wider than the BDP is
-the point.
-
-**The one place KCP won.** On the same `loss1_rate100` leg, 16 concurrent
-connections of short round trips (`rr-16`) came out *ahead* on both KCP arms —
-338.6/s for `l3-kcp` and 337.8/s for `l4-kcp` against 323.2 control, 328.0 `l4`,
-335.3 `l3` and 323.3 for the A/A twin — with the best p99 of any arm (92.8 ms
-for `l4-kcp`, against 286.2 ms for the control). Fast retransmit is worth
-something on a lossy path; it is the bulk path where the missing congestion
-control costs more than the recovery gains.
-
-**The lever that did work: the datagram size follows the path.** Every number
-above was taken with the carrier pinned at 1400-byte datagrams — KCP's protocol
-default — because the adaptation that existed was shrink-only: it lowered the
-size for a small path and never raised it. The per-datagram cost that ceilings
-the carrier (a UDP send, a receive, a header, an acknowledgement and a loss
-event, all *per datagram*) is therefore paid 5.7× more often than a jumbo path
-requires. Letting the size follow the kernel's path-MTU answer, up to an 8 KiB
-ceiling, measures (two rounds an arm, the A/B twin beside it, `l3-kcp`, one bulk
-flow):
-
-| Condition | pinned at 1400 | follows the path | CPU per Gbit |
-|---|---|---|---|
-| clean, jumbo link (`--link-mtu 9000`) | 2.170 Gbit/s | **3.026 Gbit/s (+39 %)** | 2.556 → **1.829 s (−28 %)** |
-| `loss1`, jumbo link | 0.407 | **1.713 (+4.2×)** | 1.749 → **1.051 (−40 %)** |
-| `loss1`, 1500-byte link | 0.406 | 0.434 (neutral) | 1.734 → 1.743 |
-| `loss1_rate100`, jumbo link, `rr-16` | 337.8/s | 350.5/s (+3.8 %) | — |
-
-The third row is the safety property, and it is why this is done by following
-the probe rather than by raising a constant: on a 1500-byte path the datagram
-stays at what that path carries, so the change is neutral there, while the wire
-ratio improves in every jumbo row (1.1483 → 1.0892 on clean).
-
-**With both fixes, a jumbo path brings the two carriers level — for one flow.**
-The same cell that the table above measures at a pinned 1400, re-measured with
-the TUN MTU at 8000 *and* the link at 9000, one bulk flow, the A/A twin in the
-run:
-
-| Arm | `bulk-1` (1 flow) | CPU per Gbit | `bulk-n` (8 flows) |
-|---|---|---|---|
-| `l3` (TCP carrier) | 7.340 Gbit/s | 0.305 s | 5.460 |
-| `l3-kcp` | 6.996 Gbit/s | 0.745 s | **7.548 Gbit/s** |
-| `l3~aa` (the twin) | 6.982 Gbit/s | 0.305 s | 6.447 |
-| `l4` (forwarding) | 7.766 Gbit/s | 0.235 s | 23.170 |
-
-So on a path that carries jumbo datagrams: one bulk flow is a tie — `l3-kcp`
-6.996 against the TCP carrier's 7.340, whose own twin reads 6.982, i.e. the three
-are inside the run's 15 % noise floor — and **eight flows come out ahead of the
-TCP carrier** (7.548 against 5.460 and a twin at 6.447, so the gap clears the
-floor). The cost is CPU: 2.4× per byte, unchanged all along. What the carrier
-does not win is short round trips (28 648/s against 31 364/s, at the same p99)
-or the lossy regimes above.
-
-**The failure itself was then fixed, and it was the rule, not the size.****The failure itself was then fixed, and it was the rule, not the size.** The
-`KCP session dead link` above is the engine's reference behaviour: a segment
-retransmitted twenty times ends the session. That conflates two different
-things — a peer that is *gone* and a peer that is *slow*. On a rate-limited
-path the acknowledgements sit behind megabytes of shaped traffic, so a segment
-collects its twenty retransmissions while the peer is answering everything
-else, and a live session is closed. Measured on the same `loss1_rate100` leg,
-the multiplexed arm failed `bulk-1` in **every** round before this change and
-completes **both** rounds after it (0.058–0.059 Gbit/s, 17 % fewer wire bytes
-than the direct arm and a third less CPU per byte), and the direct arm's CPU per
-byte fell by a fifth. The rule now needs both: the retransmit count *and* a send
-window that has not moved for five seconds — a gone peer stops acknowledging,
-a slow one keeps acknowledging something.
-
-**The obvious fixes were tried, and they are wrong.** `nc = 0` (the engine's
-own congestion control) as an A/B against the shipped build on `loss1_rate100`
-measured 0.002 Gbit/s against 0.043 on bulk and 256/s against 344/s on `rr-16`:
-its window collapses on a lossy path and does not recover. Capping the send
-window to what fits the path instead of blasting 2.8 MiB into it (2048 → 256
-segments, an A/B on the same condition) left the bulk cell where it was (0.039
-against 0.044 Gbit/s) and did not stop the multiplexed arm's dead link. So the
-missing piece is not a window size either: the carrier's recovery loop retransmits
-**24 % of its output** on that leg against a 1 % loss rate, and it needs a
-controller driven by what the path actually delivers — which is a redesign of
-the adapter's pacing, not a constant.
-
-What this means for the guidance: `carrier = "kcp"` stays a choice for paths
-where TCP tunnels are blocked or throttled, not a general improvement, and the
-bulk-collapse above is a reason to prefer it only where the workload is
-many short interactions. The open work — and the reason this section exists in
-this shape — is a carrier whose pacing reacts to the path's rate instead of to a
-2.5-second timeout; the model A/Bs it against the current build with
-`--ab-arm l3-kcp --binary-b <other build>` on these same conditions.
-
-Which setting to pick, and why:
-[configuration.md](configuration.md#choosing-your-configuration-decision-tree);
-for what a per-decision figure is and is not comparable with, see
-[Comparability](#comparability).
-
-### The carrier move on a live claim (2026-10-11, this model)
-
-The product no longer only chooses a carrier when a connection is made: a
-transparent claim's lane is measured while it runs, and a lane whose carrier is
-refusing a material share of what the peer offers it is handed over to the
-other one. This is the per-decision measurement for that move, and it is
-**pre-registered here before the run that decides it**, in this page's own
-terms:
-
-- **The contrast is a path condition, not a build.** Both arms are the same
-  binary; the control pins one carrier with `MOLEHILL_DATA_CARRIER=kcp`, which
-  makes the policy inert (a forced carrier is the run's answer), and the
-  candidate leaves it unset so the policy runs. The switch is recorded as
-  instrumentation, so the two files compare.
-- **The metrics are the ones the decision would move**: `udp_recv_mbit` and
-  `udp_loss_pct` on the ladder's divergence cells (the rates at which the two
-  carriers are known to part company), with `cpu_s_per_gbit` and
-  `rss_peak_mib` as the cost the move is allowed to have.
-- **A difference is a claim only past both floors** — the metric's materiality
-  and the run's own `--aa` noise — as everywhere else on this page.
-- **The workload has to give the switch somewhere to show.** A lane change
-  cannot reorder a flow, so a running flow finishes on the carrier it started
-  on and only flows that *begin* afterwards can ride the replacement. A round
-  therefore has to be long enough to contain the three-tick confirmation, the
-  peer's quiet window (three seconds) and several fresh flows after them.
-
-**What is measured now.** With the chain fixed (reports matched to their claim
-before the lane id, and a handover retiring on the 3-second quiet window rather
-than the flow table's 60-second eviction), the measurement this section asks
-for has been run: `l3`, `loss1_buf` on the tunnel leg, ladder first so the
-policy fires, 4 rounds with `--aa`, forced-KCP control against policy-live.
-The policy fired on the loaded claim in **every** candidate round and the
-handover completed inside the round; the 5 Gbit/s cell read **13.7 % and 7.4 %
-loss at 2.9-3.1 Gbit/s** in exactly the two rounds whose handover finished
-before that cell began, against the held carrier's **65.5-67.0 % at ~1.04
-Gbit/s** in the others — 3x the delivery, with the round timestamps naming the
-split. The cost is stated beside it: `syscalls_per_s` +31 % on that cell (a
-claim by the model's own floors; TCP's per-datagram work against KCP's batched
-send), while `cpu_s_per_gbit` in the captured rounds improves. Churn after the
-switch is level. The earlier three "no claim" campaigns are superseded: their
-runs predate the report-matching fix, so their evidence was partially
-misattributed, and their handovers did not complete inside a round.
+The figures that shaped a TCP-versus-KCP axis are published history in
+`benches/records/`: they measure a carrier this release deletes, their arms can no
+longer be built, and they are not a baseline. What compares today is the table
+each scenario prints, tool against the control arm of the same run.
 
 ## The transparent-L3 wire question (the acceptance harness)
 
@@ -1297,7 +1042,7 @@ your own host.
   with `clean#2` of another: the return stage — the recovery axis — is judged
   against the baseline's *return*, not against its fresh start.
 - **The tunnel pool is pinned, so its size *is* a setting.** A build
-  establishes `[client.data.tcp|kcp].tunnels` connections at service start and
+  establishes `[client.data].tunnels` connections at service start and
   keeps them (a dead one is repaired). The `MOLEHILL_POOL_STATS` line reports
   the configured `count` beside the live `size`: a `size` below `count` is a
   pool whose repair is being refused, and an arm's width is a method parameter
