@@ -423,6 +423,7 @@ impl TunHub {
             self.routes.stats.count_no_channel_by(1);
             return;
         };
+        trace_frame(&endpoint, slot, self.direction, &info);
         let mut batch = batches.remove(&(endpoint, slot)).unwrap_or_default();
         let converted = frame::device_to_wire(frame, self.format, wire, scratch, &mut |out| {
             batch.push(out, wire)
@@ -1647,6 +1648,7 @@ where
                         continue;
                     };
                     hub.touch(&endpoint, &info);
+                    trace_frame_in(&endpoint, slot, hub.direction(), &info);
                     if let Err(e) = hub.inject_wire(frame, wire).await {
                         break Err(anyhow::Error::from(e))
                             .with_context(|| format!("Failed to inject a packet for {endpoint}"));
@@ -1675,6 +1677,60 @@ where
     drop(guard);
     pump.abort();
     result
+}
+
+/// One frame reaching this end from a lane: the other half of
+/// [`trace_frame`].
+///
+/// Together the pair brackets the carrier: a frame logged here was delivered by
+/// it, so a packet that appears as `out` on one end and never as `in` on the
+/// other was lost between the two — and one that appears as `in` and still
+/// never reaches the visitor was lost after it, in this end's own device.
+fn trace_frame_in(endpoint: &Endpoint, slot: usize, direction: Direction, info: &PacketInfo) {
+    if !tracing::enabled!(target: "molehill::transparent", tracing::Level::DEBUG) {
+        return;
+    }
+    tracing::debug!(
+        target: "molehill::transparent",
+        "l3 frame in claim={endpoint} slot={slot} key={:016x} end={} proto={} src={} dst={}",
+        flow::key(info),
+        match direction {
+            Direction::Source => "client",
+            Direction::Destination => "server",
+        },
+        info.protocol,
+        place_text(info.src, info.src_port),
+        place_text(info.dst, info.dst_port),
+    );
+}
+
+/// One frame leaving the device for a lane: the per-packet half of
+/// [`trace_placement`].
+///
+/// Placement says where a flow went; this says whether a particular packet ever
+/// left at all. A flow whose first reply is missing is either "this end never
+/// had that packet" or "this end had it and the loss is further on", and no
+/// counter can tell those apart — a frame the device hands over is counted as
+/// `forwarded` either way.
+///
+/// `DEBUG`, and one line per packet: a trace to be turned on for minutes, never
+/// left on.
+fn trace_frame(endpoint: &Endpoint, slot: usize, direction: Direction, info: &PacketInfo) {
+    if !tracing::enabled!(target: "molehill::transparent", tracing::Level::DEBUG) {
+        return;
+    }
+    tracing::debug!(
+        target: "molehill::transparent",
+        "l3 frame out claim={endpoint} slot={slot} key={:016x} end={} proto={} src={} dst={}",
+        flow::key(info),
+        match direction {
+            Direction::Source => "client",
+            Direction::Destination => "server",
+        },
+        info.protocol,
+        place_text(info.src, info.src_port),
+        place_text(info.dst, info.dst_port),
+    );
 }
 
 /// One placement, on the record: the line that makes a *flow's* fate legible.

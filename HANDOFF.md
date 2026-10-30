@@ -1017,12 +1017,40 @@ suite's.
        window or drop-count one, and it is the same shape the very first
        instrument reported: `timed out after 0/200` after reading the banner —
        except that for these flows even the banner is missing.
-     - **The next probe** is the client's own injection for those four flows: the
-       lane handed the frame over and `injected` counted it, so the packet either
-       never reached the device or the namespace then dropped it without touching
-       an interface counter. A per-flow line where the client injects a frame —
-       claim, slot, five-tuple — would say which, and the flow-placement trace
-       added this week is already the place that knowledge exists.
+     - **The carrier is cleared to the frame, and the packet dies after
+       injection (2026-10-30, load 1.3–1.7).** Two per-packet traces — `l3 frame
+       out` where this end hands a frame to a lane, `l3 frame in` where the far
+       end receives it — settle the tunnel half outright. A one-claim arm with
+       four dead flows (`12/16 in 6.024 s`) read:
+
+       | visitor port | client `out` | server `in` | hand-off |
+       |---|---|---|---|
+       | 54778 (dead) | 4 | **4** | 0.50 ms |
+       | 54822 (dead) | 4 | **4** | — |
+       | 54882 (dead) | 4 | **4** | — |
+       | 54890 (dead) | 3 | **3** | — |
+       | 54738 (live) | 206 | 206 | — |
+
+       Every frame the client handed over arrived, with the timestamps half a
+       millisecond apart. So the lane lost nothing, and the banner — five copies
+       of it, the echo's own retransmissions — reached the server's **device
+       write** and then vanished with no counter moving anywhere: the `nstat`
+       probe added this round (routing errors, discards, listen-queue overflows,
+       TCP errors and timeouts) reads **empty in all three namespaces**, and so
+       does the interface-drop delta.
+     - **The timing is the remaining clue.** For that dead flow the first banner
+       crossed at `09:16:39.405` and the next three at `09:16:44.412` — **5.006 s
+       later, within 0.4 ms of each other**, exactly the visitor's timeout. So the
+       packet after the first was held for five seconds and then released in a
+       burst, which is why the earlier runs' `read_gap_max_ms` reads 761 ms,
+       1 882 ms and 4 442 ms depending on the run. A stall of that shape, on one
+       end, in a run whose other end reports a one-second gap, is what the two
+       daemons' read loops show — and nothing else in either log does.
+     - **The next probe is packet counts, not drop counts.** `drop_snapshot`
+       records the four error/drop columns per interface; the question left is
+       whether the injected banner was *transmitted* on the server's `v-vis` at
+       all. Adding the rx/tx **packet** columns to the same delta answers it
+       without a product change.
 
        | what the visitor saw | how many | what the backend recorded |
        |---|---|---|
