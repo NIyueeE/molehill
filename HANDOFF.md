@@ -867,7 +867,36 @@ suite's.
      on both benchmarks pages): three cost cells in a row were taken at loads of
      44, 57 and 49 and none of them was evidence, and a reader of a results file
      has no way to know that today.
-   - **The `MIN_RTO` trade ran, and this run's own floor is wider than the
+   - **The `MIN_RTO` trade is settled: 20 ms does not cost more, it fails
+     (2026-10-30).** Two builds differing only in that constant, six rounds per
+     arm with the A/A twin beside them, on a host at load ~1.5:
+
+     | arm | build | result |
+     |---|---|---|
+     | `l4` | `MIN_RTO` 200 ms | **5 of 6** cells, 0.6779 [0.6276..0.7018] |
+     | `l4~aa` | the same build again | **5 of 6**, 0.6640 [0.6493..0.6724] |
+     | `l4~b` | `MIN_RTO` 20 ms | **0 of 6** — every one `control socket has closed unexpectedly` |
+
+     The A/A floor came down to **1.74 %** with six rounds (it was 5.07 % with
+     two), which is below the 4.35 % materiality floor — so the instrument can
+     now resolve this cell, and the answer is not a cost difference but a
+     categorical one: at 20 ms the connection dies, every time.
+   - **And the dead-link rule was the first suspect, correctly (2026-10-30).**
+     `DEAD_LINK` counts *retransmissions*, and the count only measures silence
+     through the timer: at the default floor ten backed-off retries span minutes,
+     at 20 ms they span a fraction of a second, so a busy host's ordinary
+     scheduling delay was being read as a dead lane. `DEAD_FLOOR` now requires
+     five seconds of silence as well — a no-op at the current setting, and a
+     genuine correctness improvement to the rule.
+   - **But it does not rescue 20 ms.** A second A/B with the floor in place had
+     the 20 ms build fail every sample again (`14.74 s`, `17.70 s`, `16.60 s`,
+     `21.01 s` — each dying early) before the host reached a load of 8.3 and the
+     run was stopped as unusable, that time with the *200 ms* arm failing a cell
+     too. So the dead-link rule is not what makes 20 ms fail; something else
+     about a timer shorter than the path's own acknowledgement spacing is, most
+     likely the spurious-retransmission pressure the constant's comment always
+     warned about. That is the next thing to measure, and the decision stands.
+   - **The `MIN_RTO` trade ran, and this run's own floor is wider than the   - **The `MIN_RTO` trade ran, and this run's own floor is wider than the
      effect it was asked to resolve (2026-10-30).** Two release builds of
      `9ee4666` — `target/evidence/molehill-rto200` and `molehill-rto20`, the only
      difference being `MIN_RTO` — were compared as an interleaved A/B with the
