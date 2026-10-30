@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — receiving, decoding, acknowledging and copying one. The switch was
   documented for the engine this release replaces; it now describes what the new
   one measures. Off by default, so a healthy run never reads the clock for it.
+- **A flow that stalls can be followed from the visitor to its lane.** At
+  `DEBUG` the transparent path logs one line per **newly placed** flow: the
+  claim, the member slot it was routed to, the flow identity both ends compute
+  for it, and its five-tuple. One line per flow, not per packet, so a busy log
+  gains a line when a connection arrives and nothing afterwards. The L3
+  acceptance probe prints each connection's own address beside its flow number,
+  which is what joins the two ends of that trace.
 
 ### Changed
 

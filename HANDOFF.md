@@ -774,6 +774,47 @@ suite's.
      *new* stream's first bytes on a busy-then-quiet lane take far longer than the
      timer suggests.
 
+   - **Item (3) re-measured in a calm window, and its attribution was wrong
+     (2026-10-30, load 0.3–1.5).** Three `just l3-accept` runs back to back read
+     **14/15**, **13/15**, **13/15**, and *which* checks failed moved between them.
+     That alone kills the earlier reading of a fixed pair of lending checks:
+     - **Lending is not the cause.** The lending-*off* control arm — same two
+       claims, same budget, `lend = false`, so no lane ever moves — fails exactly
+       like the lending arm (`8/16`, `6/16`, `0/200` per stalled flow), and the
+       lending arm itself **passed once** (`PASS the busy claim stays byte-exact
+       through the lane change`, 16/16 in 1.696 s). The check that failed in all
+       three runs is the *sixteen-flow arm itself*, in whichever section reached
+       it first.
+     - **The cliff is a flake, not a cliff.** The same 16 flows over the same two
+       lanes measured `16/16 in 0.094 s`, `14/16 in 5.010 s` and `6/16 in 6.102 s`
+       in one afternoon. The old table's "4 flows/lane passes, 8 fails" was a
+       host-load boundary: at load ~1 the 8-per-lane arm runs in **94 ms**, twenty
+       times faster than the pass it used to record.
+     - **The missing instrument now exists.** `Routes::pick` emits one `DEBUG`
+       line per **newly placed** flow — claim, slot, the `flow::key` both ends
+       compute, and the five-tuple — and `visitor.py` prints `FLOW <n>
+       local=<ip:port>` so a visitor's flow number can be followed onto the
+       tunnel. Both are per-flow, not per-packet, and cost one comparison per
+       packet when off.
+     - **What it answered, and what it did not.** All 16 flows are placed on
+       **both** ends, 8/8 across the two slots, all inside one second, so nothing
+       is misrouted or unplaced; two flows never received even the banner, and ten
+       read it and then got no reply to any of their 200 round trips. Every
+       counter stays at zero — `unclaimed`, `no_channel`, `overflow`,
+       `queue_wait_max_ms`, and all four columns of `/proc/net/dev` in all three
+       namespaces — so the loss is not at any place this code books a loss.
+     - **The one stall-shaped fact.** In the client, the device-read gap and the
+       carrier-write gap stop and restart at the **same millisecond** for
+       **1.66 s** (`read_gap_at_ms == write_gap_at_ms`). A single whole-path
+       stall, not one flow's, and the same field reads **5.0 s** in an arm that
+       passed. A four-worker runtime is the first thing to rule out: the L3
+       topology puts a client, a server and two python probes on one box.
+     - **Still not established:** whether the stalled flows' requests reach the
+       backend. The echo service's log interleaves `RECV` lines from its
+       per-connection threads with no connection tag, so a per-flow read count
+       cannot be read out of it — the next instrument is a per-connection counter
+       written at `CLOSED`, in the same commit as whatever probes it.
+
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
    the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`

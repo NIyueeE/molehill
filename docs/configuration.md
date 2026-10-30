@@ -794,7 +794,7 @@ The level says who has to act, not how alarming the event sounds:
 | `ERROR` | a human has to do something; the tool cannot fix it | a registration the server rejected, a listener that cannot accept, the backoff giving up |
 | `WARN` | the software handled it, and it is worth one line | a config key that was removed and is ignored, a token the server rejected |
 | `INFO` | lifecycle: something started, stopped or changed state | a service registered, a control channel established, a shutdown |
-| `DEBUG` | one connection's or one session's business | a visitor whose local service refused the connection, a data channel that ended, a retry after the first |
+| `DEBUG` | one connection's or one session's business | a visitor whose local service refused the connection, a data channel that ended, a retry after the first, the lane a new flow was placed on |
 
 Consequences worth stating, because they are what keeps a busy log readable:
 

@@ -77,6 +77,13 @@ def one_flow(
             banner = recv_exactly(sock, len(PREFIX))
             if banner != PREFIX:
                 return f"flow {index}: expected {PREFIX!r}, got {banner!r}"
+            # The flow's own five-tuple, so a failure can be followed past this
+            # process: the client logs the identity it placed, and its
+            # `src=<visitor>:<port>` is the only thing that joins the two. Without
+            # it "flow 7 timed out" names a number that appears nowhere on the
+            # tunnel.
+            local = sock.getsockname()
+            print(f"FLOW {index} local={local[0]}:{local[1]}", flush=True)
             done = round_trips(sock, requests, size)
     except OSError as exc:
         # The count is what makes a stall diagnosable: zero means the first

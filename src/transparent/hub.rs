@@ -35,6 +35,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -850,10 +851,23 @@ impl Routes {
     /// remembered — which is what makes a lane change (a lane joining, a lane
     /// being lent) unable to move a flow that is already talking.
     fn pick(&self, info: &PacketInfo, direction: Direction) -> Option<(Endpoint, usize)> {
-        let mut table = self.table.lock().ok()?;
-        let endpoint = table.endpoint_for(info, direction)?;
-        let slot = table.lookup_endpoint_mut(&endpoint)?.route(info)?;
-        Some((endpoint, slot))
+        let (found, new) = {
+            let mut table = self.table.lock().ok()?;
+            let endpoint = table.endpoint_for(info, direction)?;
+            let claim = table.lookup_endpoint_mut(&endpoint)?;
+            let known = claim.flows.len();
+            let slot = claim.route(info)?;
+            // Placement happens once per flow, so "the table grew" is exactly
+            // "this packet is a new flow" — and the trace below is emitted once
+            // for it rather than once per packet. The lock is released before
+            // the line is written: a subscriber can block, and this mutex is the
+            // one every lane on both ends takes.
+            ((endpoint, slot), claim.flows.len() > known)
+        };
+        if new {
+            trace_placement(found.0, found.1, direction, info);
+        }
+        Some(found)
     }
 
     /// Note that one flow was seen arriving from one of the claim's lanes.
@@ -1661,6 +1675,47 @@ where
     drop(guard);
     pump.abort();
     result
+}
+
+/// One placement, on the record: the line that makes a *flow's* fate legible.
+///
+/// Placement is the only decision this path makes about a flow, and it is made
+/// once — so a flow that never gets a reply can be traced from the end that
+/// placed it: which claim, which member slot, and the identity both ends
+/// compute for it ([`flow::key`]). Without this line a stalled flow in an
+/// acceptance run is a `timed out after 0/200 round trips` with no way to tell
+/// "never placed" from "placed and then lost", which is the ambiguity that kept
+/// two defects open.
+///
+/// `DEBUG`, and one line per **new flow**, not per packet: a per-flow trace.
+fn trace_placement(endpoint: Endpoint, slot: usize, direction: Direction, info: &PacketInfo) {
+    if !tracing::enabled!(target: "molehill::transparent", tracing::Level::DEBUG) {
+        return;
+    }
+    tracing::debug!(
+        target: "molehill::transparent",
+        "l3 flow placed claim={endpoint} slot={slot} key={:016x} end={} proto={} src={} dst={}",
+        flow::key(info),
+        match direction {
+            Direction::Source => "client",
+            Direction::Destination => "server",
+        },
+        info.protocol,
+        place_text(info.src, info.src_port),
+        place_text(info.dst, info.dst_port),
+    );
+}
+
+/// An address with its port, when the packet carries one.
+///
+/// A portless packet — ICMP, and every fragment after the first — has no port to
+/// print, and the trace says so rather than inventing one.
+fn place_text(addr: IpAddr, port: Option<u16>) -> String {
+    match (addr, port) {
+        (IpAddr::V6(ip), Some(port)) => format!("[{ip}]:{port}"),
+        (addr, Some(port)) => format!("{addr}:{port}"),
+        (addr, None) => addr.to_string(),
+    }
 }
 
 /// The parsed packet, when the frame is one this service claimed.
