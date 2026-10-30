@@ -659,6 +659,11 @@ suite's.
        `ps -eo rss,comm --sort=-rss` before starting a long measurement — if a
        `rustc` for `thread-store`/`core-plugins` is running, that is not this
        repository's build and it is competing for the same 13 GiB.
+     - **A symbol-bearing build is a memory event.** Building with
+       `CARGO_PROFILE_RELEASE_DEBUG=1` to profile raised `oom_kill` from 21 to
+       **23** in one round (a 36 MB binary, and `-C debuginfo` is expensive to
+       compile). Profiling is worth it, but not alongside another build, and the
+       counter should be read before and after.
      - **Verified after the cleanup (2026-10-30):** four full `just check` runs
        and a dozen bench runs left `oom_kill` at **20** — no new kills — with
        `target/debug` growing by about a gigabyte instead of accumulating another
