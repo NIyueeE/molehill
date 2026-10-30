@@ -936,6 +936,41 @@ suite's.
        topology read **12/15** (three failures, both lending checks among them)
        against **14/15** at four workers, with the tunnel arm at **629** round
        trips/s: no better. Excluded, like the three mechanisms before it.
+     - **The per-flow question is answered, and it moves the defect
+       (2026-10-30, load 1.3, `just l3-accept` with the flow trace on).** The
+       lending arm lost **11 of 16** flows (`5/16 in 6.284 s`) against **13/16**
+       for the lending-off control, and the backend's own `CLOSED` lines —
+       written this time by the new instrument — say exactly what happened to
+       each one:
+
+       | what the visitor saw | how many | what the backend recorded |
+       |---|---|---|
+       | 200/200 round trips | 5 | `reads=200 bytes=12800` |
+       | `timed out after 0/200` | 5 | `reads=110–113 bytes≈7 KB error=ConnectionResetError` |
+       | never got the banner | 6 | `reads=0 bytes=0` |
+
+       So **the requests do reach the backend** — that hypothesis is dead — and
+       five flows carried more than a hundred round trips before their socket to
+       the echo service was **reset**. The six that never moved a byte were
+       still *accepted*: the echo answered the handshake and sent its banner, and
+       the banner never arrived. The loss is therefore on the **return** path (6
+       flows) and in a **mid-transfer reset** (5 flows), not in the outbound
+       direction.
+     - **Every carrier-side explanation is closed for this run.** The one
+       `mhd stalled` line the server wrote reads `unsent_ms=0 unacked_ms=208
+       credit_blocked=false`, and the new backlog fields beside it are all zero
+       (`backlog_streams=0`, `backlog_bytes=0`): nothing was waiting to go out,
+       no reader was behind, and no credit was being withheld. Both ends placed
+       **16 of 16** flows, and no reset, no dead lane and no drop appears in
+       either daemon's log. What that leaves is the client's forwarding path —
+       its socket to the backend was closed under it — and the frame it injects
+       back into the device.
+     - **The next run must turn `MOLEHILL_L3_STATS=1` on.** The per-member
+       counters (`injected`, `unclaimed`, `no_channel`, `overflow`, `peer_refused`)
+       are the only place that can say whether the six lost banners were
+       injected and dropped by the kernel, or never injected at all — and this run
+       had the switch off, which is why the question is still open with the
+       answer written down one level away.
      - **The per-flow question has an instrument now (2026-10-30).** The echo
        service printed `PEER` and then per-read `RECV` lines from one thread per
        connection, interleaved and untagged, so a per-flow read count could not
