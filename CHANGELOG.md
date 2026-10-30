@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gains a line when a connection arrives and nothing afterwards. The L3
   acceptance probe prints each connection's own address beside its flow number,
   which is what joins the two ends of that trace.
+- **A stalled carrier says which side is behind.** The `mhd stalled` line carries
+  the receive backlog beside the two ages it already reported: how many streams
+  hold bytes nobody has read, which stream holds the most of them, and how much
+  in total. A connection blocked on the peer's credit and a connection whose own
+  reader owes the peer a megabyte both used to look like silence — the first
+  waits, the second does not — and the line now fires on either, at most once a
+  second.
 
 ### Changed
 

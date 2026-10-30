@@ -135,6 +135,36 @@ enum Refusal {
     Credit,
 }
 
+/// What this end is holding that its own readers have not taken.
+///
+/// The receive-side mirror of [`Conn::waiting`]. The credit this end advertises
+/// follows **consumption**, so a stream whose reader stopped is the one fact
+/// that can stall the *peer* while nothing here is waiting to go out, and no
+/// other counter sees it. The worst stream is named because "one reader pinned
+/// the window" and "everyone is behind" are different defects with different
+/// fixes — the first is what a per-stream window bounds, the second is a link
+/// that is simply too slow.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Backlog {
+    /// How many streams hold bytes nobody has read.
+    pub(crate) streams: usize,
+    /// The stream holding the most, and how many bytes.
+    pub(crate) worst: Option<(u32, u64)>,
+    /// Everything held, across every stream.
+    pub(crate) total: u64,
+}
+
+/// One stall line's worth of facts, already sampled.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Stall {
+    /// How long the oldest byte nobody could put on the wire has waited.
+    pub(crate) unsent_ms: u128,
+    /// How long the oldest byte in flight has waited for an acknowledgement.
+    pub(crate) unacked_ms: u128,
+    /// What this end's own readers owe the peer.
+    pub(crate) backlog: Backlog,
+}
+
 /// A connection between two of this carrier's endpoints.
 #[derive(Debug)]
 pub(crate) struct Conn {
@@ -817,12 +847,21 @@ impl Conn {
     /// queues [`Conn::waiting`] reports. Two hundred milliseconds is forty times
     /// the round trip a healthy path here measures, so anything above it is not a
     /// queue doing its job.
-    pub(crate) fn stall_report(&mut self, now: Instant) -> Option<(u128, u128)> {
+    ///
+    /// The same line fires on a **receive backlog**, and that is the half this
+    /// end's own ages cannot show: a stream whose reader stopped does not wait
+    /// here at all — it stops the *peer*, through the credit — so a connection
+    /// blocked on the far end's credit and a connection whose own reader owes
+    /// the peer a megabyte were, until this, the same absence of log lines.
+    pub(crate) fn stall_report(&mut self, now: Instant) -> Option<Stall> {
         const FLOOR: Duration = Duration::from_millis(200);
+        /// A reader that is a second behind keeps kilobytes here, never this.
+        const BACKLOG: u64 = 1024 * 1024;
         const EVERY: Duration = Duration::from_secs(1);
         let (unsent, unacked) = self.waiting(now);
+        let backlog = self.backlog();
         let worst = unsent.unwrap_or_default().max(unacked.unwrap_or_default());
-        if worst < FLOOR {
+        if worst < FLOOR && backlog.total < BACKLOG {
             self.stall_logged_at = None;
             return None;
         }
@@ -833,13 +872,28 @@ impl Conn {
             return None;
         }
         self.stall_logged_at = Some(now);
-        Some((
-            unsent.map_or(0, |d| d.as_millis()),
-            unacked.map_or(0, |d| d.as_millis()),
-        ))
-        .inspect(|_| {
-            // The caller logs it; the reason travels with the age.
+        Some(Stall {
+            unsent_ms: unsent.map_or(0, |d| d.as_millis()),
+            unacked_ms: unacked.map_or(0, |d| d.as_millis()),
+            backlog,
         })
+    }
+
+    /// What this end's readers have left unread, per the whole connection.
+    pub(crate) fn backlog(&self) -> Backlog {
+        let mut out = Backlog::default();
+        for (&id, state) in &self.streams {
+            let held = state.recv.held();
+            if held == 0 {
+                continue;
+            }
+            out.streams += 1;
+            out.total += held;
+            if out.worst.is_none_or(|(_, most)| held > most) {
+                out.worst = Some((id, held));
+            }
+        }
+        out
     }
 
     /// Whether the last refusal was the peer's credit (see [`Conn::write`]).

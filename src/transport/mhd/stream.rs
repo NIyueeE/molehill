@@ -295,6 +295,25 @@ impl RecvBuf {
         });
     }
 
+    /// Bytes that have arrived and not yet been read out of this stream.
+    ///
+    /// The number a stalled reader is measured by: the connection's credit
+    /// follows consumption, not arrival, so a stream whose reader has stopped
+    /// is invisible in every other counter while it holds the window back. This
+    /// is the per-stream half of that story, and the reason it is computed
+    /// rather than tracked: a piece may start below the read offset, so the
+    /// answer is the pieces' extents clipped to the reader's position.
+    pub(crate) fn held(&self) -> u64 {
+        self.pieces
+            .iter()
+            .map(|(&at, piece)| {
+                let len = piece.len() as u64;
+                let start = self.read.saturating_sub(at).min(len);
+                len - start
+            })
+            .sum()
+    }
+
     /// Move the contiguous prefix into `out`, answering how many bytes were
     /// written.
     ///
@@ -401,6 +420,38 @@ mod tests {
         let out = drain_all(&mut recv);
         assert_eq!(out.len(), original.len(), "every byte must come out");
         assert_eq!(out, original, "the bytes must be the stream, in order");
+    }
+
+    /// What a stalled reader is measured by: bytes that arrived and were not
+    /// read out — including the part of a piece the reader is in the middle of,
+    /// and including bytes behind a hole, because those are held too.
+    #[test]
+    fn held_counts_what_arrived_and_nobody_read() {
+        let original = stream_bytes(600);
+        let mut recv = RecvBuf::default();
+        recv.insert(0, &original[..300]);
+        recv.insert(300, &original[300..]);
+        assert_eq!(recv.held(), 600, "everything arrived and nothing was read");
+
+        let mut chunk = [0u8; 128];
+        assert_eq!(recv.read_into(&mut chunk), 128);
+        assert_eq!(
+            recv.held(),
+            600 - 128,
+            "the reader's own progress is the difference"
+        );
+
+        let mut rest = [0u8; 4096];
+        assert_eq!(recv.read_into(&mut rest), 600 - 128);
+        assert_eq!(recv.held(), 0, "a drained stream holds nothing");
+
+        // A hole does not make the bytes behind it free: the peer sent them,
+        // this end has them, and the credit the peer will be granted counts
+        // them until they are read.
+        let mut holed = RecvBuf::default();
+        holed.insert(0, &original[..100]);
+        holed.insert(200, &original[200..300]);
+        assert_eq!(holed.held(), 200, "a hole holds its own bytes as well");
     }
 
     /// A hole stops one stream at the hole and says where the next piece is; it

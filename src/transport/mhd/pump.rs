@@ -200,12 +200,16 @@ async fn flush(
     send_run(socket, peer, run, spans).await?;
     posting.stop(&crate::transport::stats::PHASES.tx_send);
     crate::transport::stats::sent_run(sent, run.len());
-    if let Some((unsent_ms, unacked_ms)) = shared.with(|conn| conn.stall_report(Instant::now())) {
+    if let Some(stall) = shared.with(|conn| conn.stall_report(Instant::now())) {
         let credit_blocked = shared.with(|conn| conn.credit_blocked());
         tracing::debug!(
-            unsent_ms,
-            unacked_ms,
+            unsent_ms = stall.unsent_ms,
+            unacked_ms = stall.unacked_ms,
             credit_blocked,
+            backlog_streams = stall.backlog.streams,
+            backlog_worst_stream = stall.backlog.worst.map_or(0, |(id, _)| id),
+            backlog_worst_bytes = stall.backlog.worst.map_or(0, |(_, held)| held),
+            backlog_bytes = stall.backlog.total,
             "mhd stalled: bytes waiting"
         );
     }
