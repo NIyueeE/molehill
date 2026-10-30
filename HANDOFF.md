@@ -634,6 +634,18 @@ suite's.
      so far is the visitor giving up, and nothing in the daemon's own logs says
      why.
 
+   - **A `sudo` bench run leaves root-owned files behind, and two of them
+     break the session (2026-10-30).** `just bench` and `just l3-accept` run
+     under `sudo`, and two things they touch every time end up owned by root:
+     `.git/index`, which the bench's own `git status` refreshes — fixed with
+     `--no-optional-locks` — and files inside
+     `~/.cache/molehill-bench/venv`, which `uv` writes when it re-syncs. The
+     first makes every later `git` command fail with
+     `.git/index: Permission denied`; the second makes `just check` fail in
+     `bench-selfcheck` with `Permission denied` on `uv_cache.json`. Both are
+     repaired with one `sudo chown -R dsh:dsh` over the path named in the error,
+     and neither is a repository fault.
+
    - **Item (2): the cell now passes 6 of 7, and the fix was a window leak
      (2026-10-30).** Three earlier runs of this cell — 3 of 14, then 1 of 14 —
      were **all taken on a stale binary**: the results files say
