@@ -936,6 +936,36 @@ suite's.
        topology read **12/15** (three failures, both lending checks among them)
        against **14/15** at four workers, with the tunnel arm at **629** round
        trips/s: no better. Excluded, like the three mechanisms before it.
+     - **The carrier is cleared, with both ends' counters agreeing
+       (2026-10-30, load 0.8, `MOLEHILL_L3_STATS=1`).** The same arm, re-run:
+       eleven of sixteen flows passed and five stalled, and the per-member
+       counters say *nothing was lost between the two daemons*:
+
+       | lane | client offered → | client injected ← | server injected → | server offered ← |
+       |---|---|---|---|---|
+       | 1 | 1429 | 625 | 1429 | 625 |
+       | 2 | 820 | 1640 | 820 | 1640 |
+
+       Each direction of each lane is mirrored exactly on the other end, with
+       `no_channel=0`, `overflow=0`, `disconnected=0` and
+       `peer_refused=0` everywhere, and `queue_wait_max_ms=0`. So the lane
+       delivered every packet that was offered to it, in both directions, and the
+       carrier's queues were never the constraint.
+     - **What the device boundary says instead.** In that same run the client's
+       **device read** stalled for **4 442 ms** (`read_gap_max_ms`) while its
+       carrier write never stalled (`write_gap_max_ms=1`), and the server's read
+       stalled **1 882 ms**. A 4.4-second silence on the read side, with the
+       write side healthy, is the visitor's packets not reaching this end's TUN —
+       so the loss is at the device/routing boundary, not in the carrier. The
+       claim counters agree that almost nothing was refused: seventeen packets
+       `unclaimed` on the server, everything else zero.
+     - **Which makes the next probe a kernel-side one, and a cheap one:** the
+       TUN's own queue counters (`tx_dropped`/`rx_dropped` on `l3cli0` and
+       `l3srv0` for *this* arm, not the many-flows arm the snapshot currently
+       covers) plus the client's read loop. A device whose queue fills while the
+       daemon is between reads drops silently, and that is exactly the shape
+       "request never arrived, reply never came" takes from every other counter's
+       point of view.
      - **The per-flow question is answered, and it moves the defect
        (2026-10-30, load 1.3, `just l3-accept` with the flow trace on).** The
        lending arm lost **11 of 16** flows (`5/16 in 6.284 s`) against **13/16**
