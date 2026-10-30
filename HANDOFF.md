@@ -691,24 +691,23 @@ suite's.
        against 1.0–1.5 ms for every open after them. Those lines describe
        `conn.rs` and `pump.rs` as they still are, but the runs they came from do
        not satisfy §10, so they are leads, not measurements.
-     - **What is still open on this cell:** the connect shape. One sample of
-       seven now fails at `iperf3 -c` with `Connection refused`, and the earlier
-       table put that failure at 0.3–0.4 s — which is `INITIAL_RTO` again. The
-       next probe is the visitor's own connect timing against a lane whose first
-       stream open costs the timer.
-     - **The 74 057 `dropped data for a retired stream` lines are a symptom.**
-       That count was already learned the hard way (§ above, the revert): it goes
-       to zero without the failure rate moving, because a reset ahead of queued
-       data discards bytes the visitor still wanted.
-     - **The design question is still open, and it is not what this round
-       measured.** `Conn::send_credit` is a **connection-wide** byte window:
-       `recv_credit = read + WINDOW`, where `read` is everything consumed across
-       every stream. A multiplexer with only a connection window blocks every
-       stream on one slow reader's progress — yamux and HTTP/2 both carry a
-       per-stream window beside it for this reason. The leak above was fixed
-       *inside* that design; whether the design itself still needs the per-stream
-       window is unmeasured, and the instrument that would say so is the
-       `backlog_streams` / `backlog_worst_bytes` pair now on the stall line.
+     - **Re-verified, and the remaining shape is the tool's listener, not the
+       carrier (2026-10-30, load 0.57).** Six more rounds on a fresh build
+       (`stale: false`): **5 of 7** on the arm and **7 of 7** on its A/A twin —
+       **12 of 14**, and both failures are the `unable to connect to server`
+       shape rather than the result-exchange one. With `stdbuf -oL` now on the
+       sink, the artifacts for those two samples are readable and they say the
+       backend was **not** the problem: its log carries `Server listening on
+       2402 (test #1)` and it never accepted a connection, while the visitor's
+       `meta.json` records `wall_s: 0.02` and `exit 1`. Twenty milliseconds and
+       no connection made means nothing was listening on the address the arm
+       dials — the *tool's* exposed port — at that instant, moments after
+       `wait_target` had found it up.
+     - **Which makes the last mile of item (2) a listener-lifetime question, not
+       a carrier one.** The same discipline the sink now gets — is the thing I
+       am about to measure actually up — has to apply to the subject's own
+       endpoint, and the harness already probes it (`wait_target`) without
+       asking whether it stays up between the probe and the first dial.
 
    - **The width change does not touch the transparent path.** `just l3-accept`
      (root, three namespaces, sixteen checks) reads the same at four workers as at
