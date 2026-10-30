@@ -951,21 +951,22 @@ suite's.
        `peer_refused=0` everywhere, and `queue_wait_max_ms=0`. So the lane
        delivered every packet that was offered to it, in both directions, and the
        carrier's queues were never the constraint.
-     - **What the device boundary says instead.** In that same run the client's
-       **device read** stalled for **4 442 ms** (`read_gap_max_ms`) while its
-       carrier write never stalled (`write_gap_max_ms=1`), and the server's read
-       stalled **1 882 ms**. A 4.4-second silence on the read side, with the
-       write side healthy, is the visitor's packets not reaching this end's TUN —
-       so the loss is at the device/routing boundary, not in the carrier. The
-       claim counters agree that almost nothing was refused: seventeen packets
-       `unclaimed` on the server, everything else zero.
-     - **Which makes the next probe a kernel-side one, and a cheap one:** the
-       TUN's own queue counters (`tx_dropped`/`rx_dropped` on `l3cli0` and
-       `l3srv0` for *this* arm, not the many-flows arm the snapshot currently
-       covers) plus the client's read loop. A device whose queue fills while the
-       daemon is between reads drops silently, and that is exactly the shape
-       "request never arrived, reply never came" takes from every other counter's
-       point of view.
+     - **What the timing says, and what it does not.** In that same run the
+       client's **device read** was silent for **4 442 ms** (`read_gap_max_ms`,
+       inside that arm's own window) while its carrier write never stalled
+       (`write_gap_max_ms=1`), and the server's read was silent 1 882 ms. That is
+       consistent with two very different stories and **does not choose between
+       them**: either the visitors' packets were dropped before this end's TUN, or
+       the visitors simply had nothing to send because they were waiting for
+       replies. The mirrored per-lane counts above cannot distinguish them
+       either. The claim counters refuse almost nothing (seventeen `unclaimed`
+       on the server, everything else zero), which is one fact against wholesale
+       dropping and is not decisive.
+     - **The probe that does choose between them, and it is cheap:** the TUN's own
+       queue counters across *this* arm. `drop_snapshot` currently runs once,
+       before the many-flows arm, so nothing reads `l3cli0`/`l3srv0` around the
+       lending arm at all — a device whose queue fills while the daemon is between
+       reads drops silently there, and `tx_dropped` moving would settle it.
      - **The per-flow question is answered, and it moves the defect
        (2026-10-30, load 1.3, `just l3-accept` with the flow trace on).** The
        lending arm lost **11 of 16** flows (`5/16 in 6.284 s`) against **13/16**
