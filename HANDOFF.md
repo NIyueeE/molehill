@@ -908,11 +908,16 @@ suite's.
        topology read **12/15** (three failures, both lending checks among them)
        against **14/15** at four workers, with the tunnel arm at **629** round
        trips/s: no better. Excluded, like the three mechanisms before it.
-     - **Still not established:** whether the stalled flows' requests reach the
-       backend. The echo service's log interleaves `RECV` lines from its
-       per-connection threads with no connection tag, so a per-flow read count
-       cannot be read out of it — the next instrument is a per-connection counter
-       written at `CLOSED`, in the same commit as whatever probes it.
+     - **The per-flow question has an instrument now (2026-10-30).** The echo
+       service printed `PEER` and then per-read `RECV` lines from one thread per
+       connection, interleaved and untagged, so a per-flow read count could not
+       be read out of the log at all. Every connection now ends with one line
+       that names it — `CLOSED <ip>:<port> reads=<n> bytes=<b>` plus
+       `error=<kind>` when the peer reset it — so the question "did this flow's
+       requests reach the backend, and with how much" is one `grep` against the
+       address the probe printed for that flow (`FLOW <n> local=<ip>:<port>`).
+       A reset is recorded rather than raised: one failed flow must not take the
+       harness down with a traceback.
      - **A fifth run, after the carrier's window leak was fixed (2026-10-30,
        load 1.6):** **13/15**. The plain sixteen-flow arm passed **16/16 in
        1.122 s** and the control **16/16 in 0.091 s** (**23 513** round trips/s

@@ -23,16 +23,31 @@ PREFIX = b"echo:"
 
 
 def serve_one(conn: socket.socket, addr: tuple) -> None:
-    print(f"PEER {addr[0]}:{addr[1]}", flush=True)
-    with conn:
-        conn.sendall(PREFIX)
-        while True:
-            data = conn.recv(65536)
-            if not data:
-                break
-            print(f"RECV {len(data)}B", flush=True)
-            conn.sendall(data)
-    print("CLOSED", flush=True)
+    peer = f"{addr[0]}:{addr[1]}"
+    print(f"PEER {peer}", flush=True)
+    reads = 0
+    total = 0
+    failure = ""
+    # Every connection ends with one line that names it. The per-read lines
+    # above cannot be attributed — one thread per connection interleaves them —
+    # so "which flow reached the backend, and with how much" was a question this
+    # log could not answer.
+    try:
+        with conn:
+            conn.sendall(PREFIX)
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                reads += 1
+                total += len(data)
+                print(f"RECV {len(data)}B", flush=True)
+                conn.sendall(data)
+    except OSError as exc:
+        # A reset is an outcome, not a crash: the summary carries it, and one
+        # failed flow must not take the harness down with a traceback.
+        failure = f" error={type(exc).__name__}"
+    print(f"CLOSED {peer} reads={reads} bytes={total}{failure}", flush=True)
 
 
 def main() -> int:
