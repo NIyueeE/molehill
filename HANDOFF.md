@@ -793,6 +793,26 @@ suite's.
      on both benchmarks pages): three cost cells in a row were taken at loads of
      44, 57 and 49 and none of them was evidence, and a reader of a results file
      has no way to know that today.
+   - **The `MIN_RTO` trade is staged as an interleaved A/B and not yet run
+     (2026-10-30).** Two release builds of `ad0feec` are on disk —
+     `target/evidence/molehill-rto200` and `molehill-rto20`, the only
+     difference being `MIN_RTO` — so "what does 20 ms cost the clean bulk path"
+     no longer needs two 70-second builds to ask. One run answers it, and the
+     model's own A/B is what makes it a measurement rather than a comparison of
+     two afternoons:
+
+     ```bash
+     sudo -n env MOLEHILL_DATA_CARRIER=mhd just bench --profile screen \
+       --arms l4 --ab-arm l4 \
+       --binary "$PWD/target/evidence/molehill-rto200" \
+       --binary-b "$PWD/target/evidence/molehill-rto20" \
+       --rounds 3 --aa --out <file>
+     ```
+
+     The first attempt was killed in its warm-up round: the host went from a
+     load of 1.4 to **47.9 (one minute) / 97.5 (five)** while the binaries were
+     built, and the harness's own five-second `ip netns exec` preflight timed
+     out. That is the environment again — the binaries survive it.
    - **One measurement survived it, and it is a real lead on item (3).** On a calm
      window (load 1.4) the acceptance harness's sixteen-flow arm — one claim, four
      lanes — ran **16/16 in 1.517 s** with `MIN_RTO` at 200 ms and **16/16 in 0.344 s**
