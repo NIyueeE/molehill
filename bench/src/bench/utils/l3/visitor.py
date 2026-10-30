@@ -22,12 +22,19 @@ is the pass signal.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import socket
+import struct
 import sys
+import termios
 import threading
 import time
 
 PREFIX = b"echo:"
+
+#: How much of `struct tcp_info` the timeout diagnostic needs: everything up to
+#: and including `tcpi_unacked`, which sits at offset 24.
+TCP_INFO_UNACKED_END = 28
 
 
 def recv_exactly(sock: socket.socket, want: int) -> bytes:
@@ -39,6 +46,38 @@ def recv_exactly(sock: socket.socket, want: int) -> bytes:
             break
         got += chunk
     return bytes(got)
+
+
+def socket_state(sock: socket.socket) -> str:
+    """What the kernel says about a socket that is not producing its first reply.
+
+    Three facts separate cases that look identical from outside: how many bytes
+    have arrived and nobody has read (`FIONREAD`), the TCP state, and how many
+    segments are in flight unacknowledged, with the retransmission timer the
+    kernel currently holds. "Arrived and unread" would be this probe's fault,
+    "never arrived, nothing unacked" the far end's, and "never arrived, unacked"
+    the path's — and the timer says how long the kernel intends to wait, which is
+    what turns "it took five seconds" into a number.
+    """
+    pending = struct.unpack("i", fcntl.ioctl(sock, termios.FIONREAD, b"\0\0\0\0"))[0]
+    level = getattr(socket, "TCP_INFO", None)
+    if level is None:
+        return f"pending={pending}"
+    try:
+        info = sock.getsockopt(socket.IPPROTO_TCP, level, 32)
+    except OSError:
+        return f"pending={pending}"
+    if len(info) < TCP_INFO_UNACKED_END:
+        return f"pending={pending}"
+    # struct tcp_info: tcpi_state, tcpi_ca_state, tcpi_retransmits, tcpi_probes,
+    # tcpi_backoff, tcpi_options, the window-scale byte, a pad, then u32 tcpi_rto
+    # and — after ato, snd_mss and rcv_mss — u32 tcpi_unacked.
+    rto_us = struct.unpack("I", info[8:12])[0]
+    unacked = struct.unpack("I", info[24:28])[0]
+    return (
+        f"pending={pending} tcp_state={info[0]} "
+        f"rto_ms={rto_us // 1000} unacked={unacked}"
+    )
 
 
 def pattern(size: int) -> bytes:
@@ -81,7 +120,10 @@ def one_flow(
             # only evidence either leaves behind. This is the line that tells
             # them apart.
             print(f"CONNECTED {index} {local[0]}:{local[1]}", flush=True)
-            banner = recv_exactly(sock, len(PREFIX))
+            try:
+                banner = recv_exactly(sock, len(PREFIX))
+            except OSError as exc:
+                return f"flow {index}: {exc} before the banner ({socket_state(sock)})"
             if banner != PREFIX:
                 return f"flow {index}: expected {PREFIX!r}, got {banner!r}"
             # The flow's own five-tuple, so a failure can be followed past this

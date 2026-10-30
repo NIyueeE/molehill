@@ -1085,6 +1085,39 @@ suite's.
        1 882 ms and 4 442 ms depending on the run. A stall of that shape, on one
        end, in a run whose other end reports a one-second gap, is what the two
        daemons' read loops show — and nothing else in either log does.
+     - **The stalled socket's own state, and it is unambiguous (2026-10-30,
+       load 0.7).** The probe now reports the kernel's view when the banner never
+       comes — receive-queue bytes (`FIONREAD`), TCP state, the retransmission
+       timer and the unacknowledged count, all from `TCP_INFO`. Every stalled
+       flow in every arm reads the same:
+
+       ```
+       timed out before the banner (pending=0 tcp_state=1 rto_ms=201 unacked=0)
+       ```
+
+       `tcp_state=1` is **ESTABLISHED**; `pending=0` says nothing arrived;
+       `unacked=0` says nothing this end sent is outstanding; and `rto_ms=201`
+       says the timer is a healthy derived value, not a backed-off one. So the
+       visitor's connection is up, empty and idle, and no segment it sent is
+       waiting for an acknowledgement — the banner is not being held anywhere on
+       the visitor's side, and nothing there is retrying.
+     - **What that pins down.** Combined with the rest of this section — the
+       frame traces putting the banner in the server's hand 0.5 ms after the
+       client let go of it, the per-lane counts mirrored exactly, all three
+       namespaces' interface deltas empty, and `nstat`'s routing, listen-queue
+       and TCP error counters empty — the banner is transmitted, arrives at the
+       visitor namespace, and never reaches a socket that is demonstrably waiting
+       for it. Every instrument this harness has now says the same thing, and the
+       one that could say more is a packet capture inside the namespaces
+       (`tcpdump`/`tshark`, neither installed).
+     - **The next probe is therefore a blind-write one.** A stalled flow never
+       sends because it is waiting for the banner, so the forward direction is
+       untested for exactly the flows that fail. Having the probe write its first
+       request *before* reading the banner would say whether the visitor→backend
+       direction works for those flows; if it does, the defect is confined to the
+       return path, and if it does not, both directions fail and the 5-tuple
+       placement is the place to look.
+
      - **The `unclaimed` counter names a real defect: the first SYN of every
        flow is dropped at arm start (2026-10-30, load ~1).** Sixteen frames per
        one-claim arm are counted `unclaimed` on the server, consistently
