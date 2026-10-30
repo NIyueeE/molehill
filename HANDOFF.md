@@ -703,11 +703,28 @@ suite's.
        no connection made means nothing was listening on the address the arm
        dials — the *tool's* exposed port — at that instant, moments after
        `wait_target` had found it up.
-     - **Which makes the last mile of item (2) a listener-lifetime question, not
-       a carrier one.** The same discipline the sink now gets — is the thing I
-       am about to measure actually up — has to apply to the subject's own
-       endpoint, and the harness already probes it (`wait_target`) without
-       asking whether it stays up between the probe and the first dial.
+     - **The readiness probe's gap, and what happened when it was closed
+       (2026-10-30).** The run's readiness step probes the arm's declared
+       endpoint, which is the **echo** port for every arm — so a scenario that
+       measures the *iperf* port starts against a listener nothing had confirmed,
+       which is a real gap in the model's own rule that an arm is ready when the
+       workload's first packet would succeed.
+     - **Closing it turned 12 of 14 into 0 of 14, and the reason is worth
+       keeping.** Probing the iperf port with an ordinary connect made every
+       sample fail with `iperf3 error: control socket has closed unexpectedly`:
+       the sink runs as `iperf3 -s -1`, which serves **exactly one test**, and the
+       probe *is* a test — it consumes the sink and the real client then finds
+       nothing. Reverted. If the gap is closed later it must be closed by making
+       the sink multi-test for its lifetime (it is already killed per sample) or
+       by a check that does not complete a connection.
+     - **And the failed experiment answers the question anyway.** The probe's
+       connection was accepted and forwarded to the sink — that is what consumed
+       it — so the **tool's iperf listener is up whenever a sample runs**. The
+       twenty-millisecond `Connection refused` is therefore *not* a missing
+       listener on the tool's side: it is a refusal delivered back through the
+       tunnel, which means the backend was the side that refused (or the tool
+       closed the forwarded connection), and the sink's own single-test nature is
+       the first thing to look at rather than the carrier.
 
    - **The width change does not touch the transparent path.** `just l3-accept`
      (root, three namespaces, sixteen checks) reads the same at four workers as at
