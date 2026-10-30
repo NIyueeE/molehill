@@ -681,7 +681,19 @@ suite's.
      repaired with one `sudo chown -R dsh:dsh` over the path named in the error,
      and neither is a repository fault.
 
-   - **Item (2) is closed: the cell passes every sample (2026-10-30, load
+   - **The other `loss1` cells are clean too (2026-10-30, load 5.5).**
+     `bulk-1`, `bulk-pair`, `rr-1` and `rr-16` at `loss1`, two rounds each with
+     the A/A twin: **24 of 24 samples passed**, both arms 12 of 12.
+
+     | cell | `throughput_gbps` (arm) | same build again | `cpu_s_per_gbit` |
+     |---|---|---|---|
+     | `bulk-1` | 3.97 [3.92..4.02] | 3.67 [3.65..3.69] | 0.584 / 0.570 |
+     | `bulk-pair` | 7.14 [7.09..7.19] | 6.92 [6.90..6.94] | 0.617 / 0.619 |
+
+     So the whole `loss1` condition is measurable again, on a host at load 5.5 —
+     which is the other half of what this item asked for ("re-measure the loss1
+     cells"), and the first time it has been true in this file's history.
+   - **Item (2) is closed: the cell passes every sample   - **Item (2) is closed: the cell passes every sample (2026-10-30, load
      2.6 / 4.0 / 4.9).** `bulk-n` at `loss1`, six rounds, both builds fresh:
 
      | arm | result |
