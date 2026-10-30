@@ -681,7 +681,25 @@ suite's.
      repaired with one `sudo chown -R dsh:dsh` over the path named in the error,
      and neither is a repository fault.
 
-   - **The other `loss1` cells are clean too (2026-10-30, load 5.5).**
+   - **Both carriers now pass that cell, and the price is visible in the same
+     numbers (2026-10-30).** The TCP twin of `bulk-n` at `loss1`, three rounds
+     with its own A/A twin, on the same host twenty minutes later:
+
+     | carrier | `throughput_gbps` | same build again | `cpu_s_per_gbit` |
+     |---|---|---|---|
+     | `mhd` | 9.47 [9.02..10.41] | 9.91 [5.57..10.58] | 0.6431 / 0.6542 |
+     | `tcp` | **16.14** [11.59..16.62] | 15.89 [8.38..16.21] | **0.4666 / 0.4738** |
+     | both | 8 of 8 and 14 of 14 samples passed | | |
+
+     So the cell's failure is gone for both carriers and what is left is a
+     *rate*: **mhd carries 60 % of what TCP does under one percent loss**
+     (9.5–9.9 against 15.9–16.1 Gbit/s), and costs **1.37×** per byte
+     (0.643–0.654 against 0.467–0.474). Both A/A pairs agree to within 1.7 %, so
+     the ratio is far outside either run's scatter even though the two runs are
+     not one campaign — state it as a cross-run comparison, which is what it is.
+     That 1.37× is the same gap item (1) has been chasing (1.34× committed), now
+     measured at the condition that used to fail outright.
+   - **The other `loss1` cells are clean too   - **The other `loss1` cells are clean too (2026-10-30, load 5.5).**
      `bulk-1`, `bulk-pair`, `rr-1` and `rr-16` at `loss1`, two rounds each with
      the A/A twin: **24 of 24 samples passed**, both arms 12 of 12.
 
