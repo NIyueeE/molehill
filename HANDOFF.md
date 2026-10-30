@@ -978,6 +978,34 @@ suite's.
        throughput and RSS numbers, for instance). They are not KCP claims — they
        are old-method numbers — and they need a sweep measured with the current
        model, which is a release-ritual job rather than a correction.
+   - **Which copy can actually go, and why it is not a phase fix (2026-10-30).**
+     Walking the four copy sites against what each layer can see:
+
+     | copy | site | eliminable? |
+     |---|---|---|
+     | caller → send buffer | `io_write` | **no** — the caller's slice is only valid during `poll_write` |
+     | send buffer → GSO run | `tx_encode` | **no** — `UDP_SEGMENT` needs the segments contiguous |
+     | batch → receive buffer | `append` | **yes**, if the batch is owned per read |
+     | receive buffer → caller | `io_read` | **no** — `poll_read` fills the caller's slice |
+
+     So exactly one copy can go, it is worth ~4.4 % of total CPU, and the *ratio*
+     would move from 1.39 to about 1.33 — a real narrowing that still does not
+     reach the objective's `≤ TCP`.
+     - **What it costs to get it:** the datagram contract becomes owned rather
+       than borrowed — `RecvBatch::recv` allocating a `BytesMut` per read and
+       freezing it, the `on_datagram` closures (`FnMut(SocketAddr, &[u8])`, four
+       call sites), `Conn::on_datagram`, `apply_datagram` and
+       `RecvBuf::insert`/`pieces` all moving to `Bytes`, plus the GRO split
+       yielding slices of the run. That is the reassembly path, the most
+       correctness-sensitive code in the carrier, and it is four files of
+       signature changes rather than one phase.
+     - **Which is why it was not attempted.** Against a 100-commit branch that must
+       stay shippable, a subtle reassembly regression costs far more than 4.4 %,
+       and the prize does not reach the criterion anyway. **Item (1) therefore
+       ends this objective unfinished and fully characterised**: the gap is
+       user-space (kernel already 1.04×), the AEAD is optimal, the copies are the
+       only removable item and only one of them is removable, and the change that
+       would take it is a contract rewrite across the receive path.
    - **The copy is the second-largest item, and it is `rep movsb` (2026-10-30).**
      The same system-wide profile puts **5.01 % of every sample inside a single
      libc address**, and disassembling it confirms what it is:
