@@ -19,8 +19,12 @@ import socket
 import struct
 import sys
 import threading
+import time
 
 PREFIX = b"echo:"
+
+#: When this process started, so every line can say how far into the run it is.
+STARTED = time.monotonic()
 
 
 #: `struct tcp_info` up to and including `tcpi_total_retrans`, which sits at
@@ -54,7 +58,10 @@ def retransmits(conn: socket.socket) -> int:
 
 def serve_one(conn: socket.socket, addr: tuple) -> None:
     peer = f"{addr[0]}:{addr[1]}"
-    print(f"PEER {peer}", flush=True)
+    # When the *application* accepted it, not when the kernel completed the
+    # handshake: the difference is the accept queue's residency, which no socket
+    # state can show after the fact.
+    print(f"PEER {peer} t={time.monotonic() - STARTED:.3f}", flush=True)
     reads = 0
     total = 0
     failure = ""
@@ -81,7 +88,8 @@ def serve_one(conn: socket.socket, addr: tuple) -> None:
         # failed flow must not take the harness down with a traceback.
         failure = f" error={type(exc).__name__}"
     print(
-        f"CLOSED {peer} reads={reads} bytes={total}{failure} retrans={sent_again}",
+        f"CLOSED {peer} reads={reads} bytes={total}{failure} retrans={sent_again} "
+        f"t={time.monotonic() - STARTED:.3f}",
         flush=True,
     )
 
@@ -95,7 +103,10 @@ def main() -> int:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, int(port)))
-    srv.listen(8)
+    # A backlog wide enough for the harness's own load: the sixteen-flow arm
+    # opens sixteen connections at once, and the accept queue's residency is
+    # exactly what a visitor's five-second wait would otherwise measure.
+    srv.listen(128)
     print(f"ECHO READY {args.bind}", flush=True)
     while True:
         conn, addr = srv.accept()

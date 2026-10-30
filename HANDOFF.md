@@ -1201,7 +1201,36 @@ suite's.
        1 882 ms and 4 442 ms depending on the run. A stall of that shape, on one
        end, in a run whose other end reports a one-second gap, is what the two
        daemons' read loops show — and nothing else in either log does.
-     - **The stalled socket's own state, and it is unambiguous (2026-10-30,
+     - **The accept queue was one of the two defects, and it is fixed
+       (2026-10-30).** The backend called `srv.listen(8)` while the arm opens
+       **sixteen** connections at once, so the excess sat in the accept queue —
+       the kernel completes the handshake, the *application* has not accepted, and
+       no banner is sent. That is precisely the shape measured: visitor
+       ESTABLISHED, nothing pending, nothing unacked, `0B of 5B` of banner, and
+       the backend's own `CLOSED … reads=0` written only after the visitor had
+       given up.
+
+       With the backlog at **128**, three of the four tunnel arms pass **16/16**
+       and the verdict goes from **13/15 to 15/16**:
+
+       | arm | before | after |
+       |---|---|---|
+       | 16 concurrent flows | 8–16 of 16 | **16/16 in 0.111 s** |
+       | lending | 2–13 of 16 | 8/16 in 6.073 s (still failing) |
+       | lending off | 5–16 of 16 | **16/16 in 1.117 s** |
+       | one claim | 11–16 of 16 | **16/16 in 1.122 s** |
+
+       The accept timestamps confirm it: all sixteen are now accepted within
+       **3 ms** of each other, where before the stragglers were accepted only
+       after their visitor had timed out.
+     - **Which splits item (3) in two, and one half is closed.** The *banner*
+       losses were the accept queue. What remains is a second defect with a
+       different signature: the eight failing flows in the lending arm now report
+       `timed out after 0/200 round trips`, i.e. **the banner arrived and the first
+       round trip did not** — the forward direction is proven good by the blind
+       write, so this is the lending arm's own first-request stall, and it is the
+       only check still red.
+     - **The stalled socket's own state, and it is unambiguous (2026-10-30,     - **The stalled socket's own state, and it is unambiguous (2026-10-30,
        load 0.7).** The probe now reports the kernel's view when the banner never
        comes — receive-queue bytes (`FIONREAD`), TCP state, the retransmission
        timer and the unacknowledged count, all from `TCP_INFO`. Every stalled
