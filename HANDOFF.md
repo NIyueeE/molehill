@@ -829,31 +829,45 @@ suite's.
      on both benchmarks pages): three cost cells in a row were taken at loads of
      44, 57 and 49 and none of them was evidence, and a reader of a results file
      has no way to know that today.
-   - **The `MIN_RTO` trade is staged as an interleaved A/B and still not run
-     (2026-10-30).** Two release builds of `9ee4666` are on disk —
-     `target/evidence/molehill-rto200` and `molehill-rto20`, the only
-     difference being `MIN_RTO`, each copied out before the next build so
-     neither is older than the tree it came from — and one run answers "what
-     does 20 ms cost the clean bulk path". The model's own A/B is what makes it
-     a measurement rather than a comparison of two afternoons:
+   - **The `MIN_RTO` trade ran, and this run's own floor is wider than the
+     effect it was asked to resolve (2026-10-30).** Two release builds of
+     `9ee4666` — `target/evidence/molehill-rto200` and `molehill-rto20`, the only
+     difference being `MIN_RTO` — were compared as an interleaved A/B with the
+     A/A twin beside them, on the calmest window of the day (load
+     **0.67 / 1.07 / 13.13**):
 
-     ```bash
-     sudo -n env MOLEHILL_DATA_CARRIER=mhd just bench --profile screen \
-       --arms l4 --ab-arm l4 \
-       --binary "$PWD/target/evidence/molehill-rto200" \
-       --binary-b "$PWD/target/evidence/molehill-rto20" \
-       --rounds 3 --aa --out <file>
-     ```
+     | arm | build | `cpu_s_per_gbit` |
+     |---|---|---|
+     | `l4` | `MIN_RTO` 200 ms | **0.6712** [0.6568..0.6856] |
+     | `l4~aa` | the same build again | **0.6388** [0.6365..0.6411] |
+     | `l4~b` | `MIN_RTO` 20 ms | **0.6662** [one sample] |
 
-     Two attempts, both killed by the host and not by the code. The first died
-     in its warm-up round when the load went from 1.4 to **47.9 / 97.5** and the
-     harness's own five-second `ip netns exec` preflight timed out. The second
-     started at 1.6, produced one good warm-up sample (**0.6384 s/Gbit** on the
-     200 ms build, against the committed median 0.6494) and then met a load of
-     **29–104**: one cell took **3 748 s** and the client gave up after 106 s, so
-     the run was killed with its namespaces and `iperf3` leftovers cleaned up.
-     The binaries survive both, so the next calm window starts from the command
-     above.
+     **The A/A floor is 5.07 %**, against a materiality floor of 4.35 % and the
+     +3.5 % one earlier sample hinted at. So the run cannot resolve the trade in
+     either direction — but it does say that the 20 ms build's point estimate is
+     *below* the 200 ms build's, which is not what the earlier single sample
+     suggested, and it removes that sample as a reason to keep the floor where
+     it is. What it would take is stated by the model itself: most of this
+     cell's metrics read "too noisy for rounds to fix — longer workloads, not
+     more of them", so the next attempt should lengthen the workload rather than
+     add rounds, on a host whose one-, five- and fifteen-minute loads are all
+     under two.
+     - **Both binaries are flagged `stale: true`, and the flag is wrong here.**
+       `src/main.rs` has an mtime of 08:21 with no content change — `git status`
+       is clean and `git diff` on it is empty — so the model's mtime comparison
+       fired on a touch. Both binaries report `9ee4666` and `src/` has not
+       changed since that commit (the three commits after it are `bench/` and
+       this file). Verified rather than assumed, because the round before this
+       one shipped a genuinely stale binary.
+     - **Three of four attempts never reached a table.** They died in warm-up or
+       round 0, each time on the harness's own five-second `ip netns exec`
+       preflight or a cell that took 1 561 s, at loads of 47.9 / 97.5,
+       29–104 and 3 / 32 / 77. Only the fourth, cut to two rounds, finished.
+     - **A signal too small to claim:** `iperf3 error: control socket has closed
+       unexpectedly` appeared **0 of 6** times on the 200 ms build, **1 of 6** on
+       its twin and **2 of 6** on the 20 ms build. Same class as item (2)'s
+       result-exchange failure; three samples out of eighteen is not evidence of
+       anything, and it is recorded so the next run counts it deliberately.
    - **One measurement survived it, and it is a real lead on item (3).** On a calm
      window (load 1.4) the acceptance harness's sixteen-flow arm — one claim, four
      lanes — ran **16/16 in 1.517 s** with `MIN_RTO` at 200 ms and **16/16 in 0.344 s**
