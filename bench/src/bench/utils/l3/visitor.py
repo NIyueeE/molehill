@@ -74,6 +74,13 @@ def one_flow(
     done = 0
     try:
         with socket.create_connection(target, timeout=timeout) as sock:
+            local = sock.getsockname()
+            # Printed before the banner, on purpose: "the connection was never
+            # made" and "the connection was made and the first reply never came"
+            # are different defects, and a `timed out` on the banner read is the
+            # only evidence either leaves behind. This is the line that tells
+            # them apart.
+            print(f"CONNECTED {index} {local[0]}:{local[1]}", flush=True)
             banner = recv_exactly(sock, len(PREFIX))
             if banner != PREFIX:
                 return f"flow {index}: expected {PREFIX!r}, got {banner!r}"
@@ -82,7 +89,6 @@ def one_flow(
             # `src=<visitor>:<port>` is the only thing that joins the two. Without
             # it "flow 7 timed out" names a number that appears nowhere on the
             # tunnel.
-            local = sock.getsockname()
             print(f"FLOW {index} local={local[0]}:{local[1]}", flush=True)
             done = round_trips(sock, requests, size)
     except OSError as exc:
