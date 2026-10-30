@@ -634,6 +634,36 @@ suite's.
      so far is the visitor giving up, and nothing in the daemon's own logs says
      why.
 
+   - **The interruptions were OOM, not load, and the cgroup is 13 GiB
+     (2026-10-30).** Every "the run died on its own" in this file has a second
+     explanation, and it is not the host's load average:
+
+     | reading | value |
+     |---|---|
+     | `memory.max` | **13 GiB** (not unlimited — an earlier entry in this file wrongly read it as `max`) |
+     | `memory.peak` | **13.03 GiB**, i.e. the limit was reached |
+     | `memory.events` | `oom_kill 20`, `max 301 233` |
+
+     Twenty kills in this container's lifetime. Two things were feeding it:
+     `target/debug/incremental` had grown to **74 GB** across many ~900 MB
+     sessions (every feature-set permutation of `cargo clippy` adds one, and
+     cargo *loads* them), and **the harness builds its own crates in the same
+     cgroup** — `codex_thread_store`, `codex_core_plugins` and friends were
+     compiling at 660–680 MB of RSS per `rustc` while a bench run was in flight.
+     So "the host spiked" and "my run vanished" have been the same event all
+     along, and the process that vanished was often the one holding the bigger
+     share.
+     - **What to do about it:** the incremental cache was deleted (74 GB); keep
+       it from coming back by running builds with `CARGO_INCREMENTAL=0`, prefer
+       one `--release` build over many debug-feature permutations, and check
+       `ps -eo rss,comm --sort=-rss` before starting a long measurement — if a
+       `rustc` for `thread-store`/`core-plugins` is running, that is not this
+       repository's build and it is competing for the same 13 GiB.
+     - **It also re-reads part of this file's history:** the `MIN_RTO` attempts
+       that "died to host load" (47.9/97.5, 29–104, 3/32/77) were at least partly
+       OOM kills of the run's own daemons, which is consistent with cells that
+       took 1 561 s and 3 748 s before giving up.
+
    - **A `sudo` bench run leaves root-owned files behind, and two of them
      break the session (2026-10-30).** `just bench` and `just l3-accept` run
      under `sudo`, and two things they touch every time end up owned by root:
