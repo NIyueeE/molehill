@@ -45,11 +45,18 @@ const INITIAL_RTO: Duration = Duration::from_millis(333);
 /// Measured, not chosen: on a calm host the transparent path's sixteen-flow arm
 /// runs 16/16 in **1.517 s** with this floor and in **0.344 s** with 20 ms, so
 /// the floor dominates that workload's latency — a lost packet on a
-/// request/response flow costs the floor, and a two-lane claim loses a few. It is
-/// kept at 200 because lowering it buys that latency with a retransmission rate
-/// on the bulk paths that has not been measured: the host this was measured on
-/// went from a load average of 1 to 44 inside one run, and a cost cell taken
-/// there is not evidence.
+/// request/response flow costs the floor, and a two-lane claim loses a few.
+///
+/// It is kept at 200 because 20 ms does not merely cost more, it **fails**:
+/// an interleaved A/B of two builds differing only in this constant, six rounds
+/// per arm with the A/A twin beside them, had the 20 ms build fail **six of six**
+/// bulk cells with `control socket has closed unexpectedly` against **one of
+/// six** at 200 ms. The mechanism is [`DEAD_LINK`], which counts retransmissions
+/// rather than seconds: ten retries at 20 ms is a fraction of a second of
+/// silence, which a busy host produces routinely, so lanes were being declared
+/// dead. [`DEAD_FLOOR`] now puts a five-second floor under that rule, which is a
+/// no-op at this setting and the thing that would have to exist before the floor
+/// could be lowered — and lowering it is worth measuring again once it does.
 const MIN_RTO: Duration = Duration::from_millis(200);
 
 /// The retransmission timer's ceiling, which is also the idle limit of a silent
@@ -62,6 +69,22 @@ const MAX_RTO: Duration = Duration::from_secs(30);
 /// Without it a black-holed path is a connection that backs off to the ceiling
 /// and stays there, holding a lane that will never carry anything.
 const DEAD_LINK: u32 = 10;
+
+/// The shortest silence that can end a path, whatever the timer's floor is.
+///
+/// `DEAD_LINK` counts unanswered retransmissions, and that count only measures
+/// silence *through the retransmission timer* — which is fine at the default
+/// floor, where ten backed-off retries span minutes, and wrong at a cheap one,
+/// where they span a fraction of a second. Measured: a build with `MIN_RTO` at
+/// 20 ms failed **six of six** bulk cells with `control socket has closed
+/// unexpectedly`, against **one of six** at 200 ms, because a busy host's
+/// ordinary few hundred milliseconds of scheduling delay was being read as a
+/// dead lane.
+///
+/// Five seconds is more than twice the keepalive interval and a quarter of the
+/// silence limit, so a genuinely dead path is still ended by the count, and a
+/// cheap timer can no longer end one by itself.
+const DEAD_FLOOR: Duration = Duration::from_secs(5);
 
 /// The range of one stream a packet carried, kept so a loss can be re-sent
 /// without the stream having to say what it was.
@@ -194,6 +217,8 @@ pub(crate) struct Recovery {
     timer: Option<Instant>,
     /// Retransmission timers that expired without an acknowledgement.
     silent: u32,
+    /// When the current run of silent timers began: the first of them.
+    silent_since: Option<Instant>,
     /// The backoff applied to the timer since the last acknowledgement.
     backoff: u32,
 }
@@ -209,6 +234,7 @@ impl Recovery {
             rtt: Rtt::default(),
             timer: None,
             silent: 0,
+            silent_since: None,
             backoff: 0,
         }
     }
@@ -320,8 +346,7 @@ impl Recovery {
                 result.progress = true;
                 self.rtt.sample(sample);
                 self.timer = Some(now + self.rtt.rto());
-                self.backoff = 0;
-                self.silent = 0;
+                self.heard();
             }
             self.arm(now);
             return result;
@@ -348,8 +373,7 @@ impl Recovery {
             result.progress = true;
             self.rtt.sample(sample);
             self.timer = Some(now + self.rtt.rto());
-            self.backoff = 0;
-            self.silent = 0;
+            self.heard();
         }
         // Lost: three behind the largest, and not named by the bitmap.
         //
@@ -389,7 +413,8 @@ impl Recovery {
             return (Expiry::Loss, Vec::new());
         }
         self.silent += 1;
-        if self.silent >= DEAD_LINK {
+        let since = *self.silent_since.get_or_insert(now);
+        if self.silent >= DEAD_LINK && now.saturating_duration_since(since) >= DEAD_FLOOR {
             let all: Vec<Sent> = self.in_flight.values().copied().collect();
             self.in_flight.clear();
             self.flight_bytes = 0;
@@ -435,6 +460,13 @@ impl Recovery {
     #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Something arrived from the peer: the run of silent timers is over.
+    fn heard(&mut self) {
+        self.backoff = 0;
+        self.silent = 0;
+        self.silent_since = None;
     }
 
     /// How long the oldest packet still in flight has been waiting.
@@ -556,6 +588,42 @@ mod tests {
         assert_eq!(expiry, Expiry::Loss);
         assert_eq!(resent.len(), 1, "the stale packet is re-sent");
         assert_eq!(recovery.in_flight(), 0);
+    }
+
+    /// A cheap retransmission timer must not end a path on its own.
+    ///
+    /// The count rule measures silence *through the timer*, so a low floor turns
+    /// a few hundred milliseconds of a busy host into "ten unanswered
+    /// retransmissions". The floor on the silence is what keeps the count
+    /// honest: the same ten retries are enough after five seconds and not
+    /// before.
+    #[test]
+    fn ten_silent_retries_need_five_seconds_of_silence() {
+        let now = Instant::now();
+        let mut recovery = Recovery::new();
+        send_one(&mut recovery, now, 0);
+        // Nine behind it, all inside the last second: one more must not kill.
+        recovery.silent = DEAD_LINK - 1;
+        recovery.silent_since = Some(now.checked_sub(Duration::from_secs(1)).unwrap());
+        recovery.timer = Some(now);
+        let (expiry, _) = recovery.on_timeout(now);
+        assert_ne!(
+            expiry,
+            Expiry::Dead,
+            "a second of silence is not a dead path"
+        );
+
+        // The same tenth retry, with the silence old enough to mean it.
+        if recovery.in_flight() == 0 {
+            send_one(&mut recovery, now, 100);
+        }
+        recovery.silent = DEAD_LINK - 1;
+        let long_ago = DEAD_FLOOR + Duration::from_secs(1);
+        recovery.silent_since = Some(now.checked_sub(long_ago).unwrap());
+        recovery.timer = Some(now);
+        let (expiry, resent) = recovery.on_timeout(now);
+        assert_eq!(expiry, Expiry::Dead, "five seconds of silence ends it");
+        assert!(!resent.is_empty(), "a dead path reports what it held");
     }
 
     /// Silence backs the timer off and, after the limit, calls the path dead

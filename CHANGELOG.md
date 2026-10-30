@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cheap retransmission timer can no longer end a healthy path.** The carrier
+  ends a path after ten unanswered retransmissions, and that count measures
+  silence only *through the timer*: at the default floor ten backed-off retries
+  span minutes, but at a cheaper one they span a fraction of a second, so a busy
+  host's ordinary scheduling delay was being read as a dead lane — a build whose
+  floor was 20 ms failed six of six bulk cells with
+  `control socket has closed unexpectedly`, against one of six at 200 ms. A path
+  must now also have been silent for five seconds, which changes nothing at the
+  default and is what a lower floor would need before it could be considered.
 - **A stream that ends without being read gives its window back.** The carrier
   grants a peer credit by consumption, so bytes a stream held when it was
   retired — its handle dropped, or the peer still sending into it — were counted
