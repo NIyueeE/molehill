@@ -999,20 +999,31 @@ suite's.
        `many` arm alone has passed at 16/16 in 0.093–1.122 s and failed at
        8/16 and 14/16 — four failures in nine runs — so the two "lending" checks
        were failing because they run sixteen flows, not because they lend.
-     - **Where the asymmetry is created, per the counters.** In the one-claim
-       arm, one lane's four flows ended `forwarded=616 injected=616` on the
-       client and `injected=616 offered=211` on the server — the tunnel mirrored
-       616 in each direction, and the server's device then produced replies for
-       only **211** of them, while the other three lanes were within a few percent
-       of 1:1. So what goes wrong happens **after** the packets leave the tunnel,
-       on one lane's flows, and it is a reply-count asymmetry rather than a
-       packet loss: every counter that could book a loss (`no_channel`,
-       `overflow`, `unclaimed`, `queue_wait`, kernel drops) reads zero or
-       sixteen. Both ends' device reads also went quiet for about a second
-       (client **761 ms**, server **1 028 ms**) in the same arm.
-     - **The next probe is the server's device-to-namespace hop**, not the
-       carrier: a packet injected into `l3srv0` that the namespace then drops
-       never reaches the routing counters this harness reads.
+     - **The stalled flows never carry a byte, and the backend says so itself.**
+       In the one-claim arm the echo service's own per-connection lines split the
+       sixteen flows exactly in two: **eleven** read `reads=200 bytes=12800`
+       (200 × 64 B, the whole workload) and **four** read `reads=0 bytes=0` —
+       and those four are precisely the flows that printed no `FLOW` line, i.e.
+       the four that timed out at `0/200`. So their connection was accepted, the
+       banner was sent, and **the banner never reached the visitor**, which is
+       why not one request ever existed to be lost. The per-lane counters agree:
+       the lane carrying them shows `forwarded=616` out and `offered=211` back,
+       mirrored exactly on both ends, so nothing was dropped *inside* the tunnel.
+     - **Which names the lost packet: the first reply on a fresh flow.** Every
+       loss counter the harness can read is zero — `no_channel`, `overflow`,
+       `unclaimed` (sixteen packets), `queue_wait_max_ms`, and the kernel's own
+       `rx_drop`/`tx_drop` deltas across the arm — so the banner is lost between
+       the lane and the visitor, on the return path, for a flow that has just
+       been placed. That is a *per-flow first-reply* defect, not a throughput,
+       window or drop-count one, and it is the same shape the very first
+       instrument reported: `timed out after 0/200` after reading the banner —
+       except that for these flows even the banner is missing.
+     - **The next probe** is the client's own injection for those four flows: the
+       lane handed the frame over and `injected` counted it, so the packet either
+       never reached the device or the namespace then dropped it without touching
+       an interface counter. A per-flow line where the client injects a frame —
+       claim, slot, five-tuple — would say which, and the flow-placement trace
+       added this week is already the place that knowledge exists.
 
        | what the visitor saw | how many | what the backend recorded |
        |---|---|---|
