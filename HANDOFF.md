@@ -711,7 +711,7 @@ suite's.
        `backlog_streams` / `backlog_worst_bytes` pair now on the stall line.
 
    - **The width change does not touch the transparent path.** `just l3-accept`
-     (root, three namespaces, fifteen checks) reads the same at four workers as at
+     (root, three namespaces, sixteen checks) reads the same at four workers as at
      twenty: thirteen pass, and the two that fail are the known sixteen-flow
      lending pair (`the busy claim lost traffic while a lane was lent`,
      `lending-off either moved a lane or lost the workload`) — the same two, in the
@@ -977,26 +977,42 @@ suite's.
        So the cell is not losing traffic and not short of window: it either runs
        at within ten percent of a direct path or it stalls, and nothing in
        between has been seen.
-     - **The trigger is still the second claim, and that is now the only
-       variable left.** One claim with two lanes passes (`16/16 in 0.106 s`,
-       above); two claims with four lanes stall — with lending on **and** with it
-       off, which is what makes "lending" the wrong name for this defect. Both
-       failing arms share exactly one thing the passing ones do not: an `idle`
-       claim holding two lanes that carry nothing, on the same TUN device and the
-       same runtime. The next probe is what those two silent lanes cost the busy
-       claim's flows — they share the hub's single routing lock and the device's
-       read loop, and nothing yet measures either.
-     - **The probe that does choose between them, and it is cheap:** the TUN's own
-       queue counters across *this* arm. `drop_snapshot` currently runs once,
-       before the many-flows arm, so nothing reads `l3cli0`/`l3srv0` around the
-       lending arm at all — a device whose queue fills while the daemon is between
-       reads drops silently there, and `tx_dropped` moving would settle it.
-     - **The per-flow question is answered, and it moves the defect
-       (2026-10-30, load 1.3, `just l3-accept` with the flow trace on).** The
-       lending arm lost **11 of 16** flows (`5/16 in 6.284 s`) against **13/16**
-       for the lending-off control, and the backend's own `CLOSED` lines —
-       written this time by the new instrument — say exactly what happened to
-       each one:
+     - **The second claim was never the trigger, and a control proves it
+       (2026-10-30, load 0.3).** The harness gained a fourth tunnel arm — the
+       same sixteen flows, the same four lanes, **one** claim, lending off — so
+       "a sibling claim starves the busy one" and "four lanes cost more than two"
+       stop being the same experiment. It **failed too** (`12/16 in 6.039 s`),
+       and in that run every tunnel arm failed while the direct control passed
+       `16/16 in 0.099 s` at **21 327** round trips/s:
+
+       | arm | configuration | result |
+       |---|---|---|
+       | `many` | 1 claim, default budget | **8/16 in 5.075 s** |
+       | control | straight at the service | 16/16 in 0.099 s |
+       | lending | 2 claims, 4 lanes, lend on | 11/16 in 6.061 s |
+       | lending off | 2 claims, 4 lanes, no lend | 12/16 in 6.048 s |
+       | **one claim** | 1 claim, 4 lanes, no lend | **12/16 in 6.039 s** |
+
+       So the claim count, the lane count and the lending decision are all
+       cleared: the sixteen-flow arm is **intermittently** slow, in every
+       configuration. Reading the runs that have both shapes, the plain
+       `many` arm alone has passed at 16/16 in 0.093–1.122 s and failed at
+       8/16 and 14/16 — four failures in nine runs — so the two "lending" checks
+       were failing because they run sixteen flows, not because they lend.
+     - **Where the asymmetry is created, per the counters.** In the one-claim
+       arm, one lane's four flows ended `forwarded=616 injected=616` on the
+       client and `injected=616 offered=211` on the server — the tunnel mirrored
+       616 in each direction, and the server's device then produced replies for
+       only **211** of them, while the other three lanes were within a few percent
+       of 1:1. So what goes wrong happens **after** the packets leave the tunnel,
+       on one lane's flows, and it is a reply-count asymmetry rather than a
+       packet loss: every counter that could book a loss (`no_channel`,
+       `overflow`, `unclaimed`, `queue_wait`, kernel drops) reads zero or
+       sixteen. Both ends' device reads also went quiet for about a second
+       (client **761 ms**, server **1 028 ms**) in the same arm.
+     - **The next probe is the server's device-to-namespace hop**, not the
+       carrier: a packet injected into `l3srv0` that the namespace then drops
+       never reaches the routing counters this harness reads.
 
        | what the visitor saw | how many | what the backend recorded |
        |---|---|---|

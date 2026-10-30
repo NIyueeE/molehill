@@ -878,6 +878,45 @@ echo "--- lending-off client log (the allocator's lines, expected: none) ---"
 grep "Lane allocator" "$LOG/nolend-client.log" || echo "(none)"
 
 echo
+echo "================= ONE CLAIM, THE SAME FOUR LANES ================="
+# The control that tells the two candidate causes apart. Both arms above stall
+# the sixteen-flow load, and they differ from the arm that passes in *two* ways:
+# a second claim, and twice the lane budget. This one keeps the budget and the
+# load and removes the claim, so "the busy claim is starved by a sibling that
+# carries nothing" and "four lanes cost more than two" stop being the same
+# experiment.
+kill "$NOLEND_SRV" "$NOLEND_CLI" 2>/dev/null || true
+sleep 0.5
+IDLE_CLAIM=""
+CLAIM_LANES=4
+LENDING=off
+write_configs
+echo "--- client.toml (one claim, four lanes) ---"
+cat "$LOG/client.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/solo-server.log" 2>&1 &
+SOLO_SRV=$!
+PIDS+=("$SOLO_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the one-claim server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/solo-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/solo-client.log" 2>&1 &
+SOLO_CLI=$!
+PIDS+=("$SOLO_CLI")
+
+SOLO_RC=0
+drop_snapshot "$LOG/solo.drops.before"
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/solo-visitor.log" 2>&1 || SOLO_RC=$?
+drop_snapshot "$LOG/solo.drops.after"
+cat "$LOG/solo-visitor.log"
+echo "--- kernel drops across it (any interface that moved) ---"
+drop_delta "$LOG/solo.drops.before" "$LOG/solo.drops.after"
+
+echo
 echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
 # `[server.data].max_tunnels` is the server operator's global cap on live
 # carrier connections — and a claim's lane is one of them, which is the half
@@ -889,6 +928,7 @@ echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
 kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
 kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
 kill "$NOLEND_SRV" "$NOLEND_CLI" 2>/dev/null || true
+kill "$SOLO_SRV" "$SOLO_CLI" 2>/dev/null || true
 sleep 0.5
 IDLE_CLAIM=""
 CLAIM_LANES=2
@@ -1074,6 +1114,12 @@ if [ "$VALVE_REFUSED" -eq 1 ]; then
     pass "the operator's valve refuses a claim's surplus lane, naming the cap"
 else
     fail "the operator's valve never refused the lane over the cap"
+fi
+
+if [ "$SOLO_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/solo-visitor.log"; then
+    pass "one claim on the same four lanes carries the same load"
+else
+    fail "one claim on the same four lanes carries the same load (exit $SOLO_RC)"
 fi
 
 if [ "$VALVE_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/valve-visitor.log"; then
