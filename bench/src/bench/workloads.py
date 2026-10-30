@@ -238,13 +238,49 @@ def iperf_sink(ctx: Ctx, tag: str, port: int):
             stderr=fh,
         )
     try:
-        yield proc
+        yield Sink(proc, log, port)
     finally:
         with contextlib.suppress(OSError):
             proc.kill()
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
         time.sleep(0.2)
+
+
+@dataclass
+class Sink:
+    """One iperf3 server the harness started, and its own account of itself."""
+
+    proc: subprocess.Popen
+    log: Path
+    port: int
+
+    def ready(self, timeout: float = 15.0) -> bool:
+        """Is this sink serving — by its own log, and by the kernel's table?
+
+        Both halves are needed. `wait_listener` alone asks whether *something*
+        listens on the port; a sink that died at startup leaves it free, and a
+        sample taken against it reports `Connection refused` from the visitor,
+        which reads as a failure of the tool under test. That is not
+        hypothetical: one round of a seven-round bulk A/B had a **zero-byte**
+        sink log and was charged to the arm. The banner is the sink's own word
+        that it bound and is accepting, and the process still being alive is
+        the other half of the same fact.
+        """
+        end = time.time() + timeout
+        announced = False
+        while time.time() < end:
+            if self.proc.poll() is not None:
+                return False
+            if not announced:
+                with contextlib.suppress(OSError):
+                    announced = "Server listening" in self.log.read_text(
+                        errors="replace"
+                    )
+            if announced:
+                return wait_listener(self.port)
+            time.sleep(0.02)
+        return False
 
 
 def wait_listener(port: int, timeout: float = 15.0) -> bool:
@@ -442,10 +478,10 @@ def run_bulk(ctx: Ctx, params: dict) -> list:
     tag = f"P{params['streams']}"
     with (
         measured(ctx, topology.ECHO_PORT) as window,
-        iperf_sink(ctx, tag, port),
+        iperf_sink(ctx, tag, port) as sink,
     ):
-        if not wait_listener(port):
-            return [Cell("", False, reason="the iperf3 sink never listened")]
+        if not sink.ready():
+            return [Cell("", False, reason="the iperf3 sink never started")]
         result = iperf.iperf_result(
             _dial(ctx, {**params, "port": port}),
             params["streams"],
@@ -471,10 +507,9 @@ def run_bulk_pair(ctx: Ctx, params: dict) -> list:
     with measured(ctx, topology.ECHO_PORT) as window:
         sinks = [iperf_sink(ctx, f"pair-{p}", p) for p in ports]
         try:
-            for m in sinks:
-                m.__enter__()
-            if not all(wait_listener(p) for p in ports):
-                return [Cell("", False, reason="an iperf3 sink never listened")]
+            started = [m.__enter__() for m in sinks]
+            if not all(sink.ready() for sink in started):
+                return [Cell("", False, reason="an iperf3 sink never started")]
 
             def worker(index: int, port: int) -> None:
                 results[index] = iperf.iperf_result(
@@ -641,10 +676,10 @@ def run_udp_ladder(ctx: Ctx, params: dict) -> list:
         cell = f"{rate_mbit:g}M"
         with (
             measured(ctx, topology.IPERF_UDP_PORT, kind="udp") as window,
-            iperf_sink(ctx, f"udp{rate_mbit:g}", topology.IPERF_UDP_PORT),
+            iperf_sink(ctx, f"udp{rate_mbit:g}", topology.IPERF_UDP_PORT) as sink,
         ):
-            if not wait_listener(topology.IPERF_UDP_PORT):
-                return [Cell(cell, False, reason="the UDP sink never listened")]
+            if not sink.ready():
+                return [Cell(cell, False, reason="the UDP sink never started")]
             result = iperf.iperf_result(
                 iperf.IperfDial(
                     topology.IPERF_UDP_PORT,
@@ -932,10 +967,10 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     if streams > 0:
         with (
             measured(ctx, topology.ECHO_PORT) as window,
-            iperf_sink(ctx, f"stage-{label}", port),
+            iperf_sink(ctx, f"stage-{label}", port) as sink,
         ):
-            if not wait_listener(port):
-                return Cell(label, False, reason="the iperf3 sink never listened")
+            if not sink.ready():
+                return Cell(label, False, reason="the iperf3 sink never started")
             t0 = time.time()
             result = iperf.iperf_result(
                 iperf.IperfDial(
@@ -1081,10 +1116,10 @@ def _capacity_level(ctx: Ctx, level: int, settle: float, params: dict) -> Cell:
     try:
         with (
             measured(ctx, topology.ECHO_PORT) as window,
-            iperf_sink(ctx, f"ramp-{level}", port),
+            iperf_sink(ctx, f"ramp-{level}", port) as sink,
         ):
-            if not wait_listener(port):
-                return Cell(f"L{level}", False, reason="the iperf3 sink never listened")
+            if not sink.ready():
+                return Cell(f"L{level}", False, reason="the iperf3 sink never started")
             t0 = time.time()
             result = iperf.iperf_result(
                 iperf.IperfDial(

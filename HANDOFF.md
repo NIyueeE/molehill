@@ -653,10 +653,20 @@ suite's.
        | `l4~b` | `d8eff14`, with the fix | **6 / 7** (1 × no connect) |
 
        The twin agrees with its own arm sample for sample, so the arms are not
-       drifting; the fix is worth five of the seven samples, and the *result
-       exchange* shape — the dominant one — is gone. What is left is the other
-       shape, `unable to connect to server`, which was already in the record as
-       a separate defect and is **not** fixed by this.
+       drifting, and the *result exchange* shape — the dominant one — is gone
+       from the fixed arm entirely.
+     - **The seventh sample was not the carrier's, and the harness now refuses
+       that shape.** Its `stderr` said `Connection refused`, but the evidence
+       says otherwise: `meta.json` records `wall_s: 0.02` (not the 0.3–0.4 s
+       timer stall the older record blamed) with `connected: []`, and the sink's
+       own log is **zero bytes** — the iperf3 server for that sample never
+       started, so nothing was listening and the kernel answered with a reset in
+       twenty milliseconds. `wait_listener` only asked whether *something*
+       listened; `Sink::ready` now also requires the sink's own banner and the
+       process still being alive, so a sample taken against a backend that never
+       came up is a named harness fault (`the iperf3 sink never started`) instead
+       of a failure charged to the tool under test. Seven of seven fixed-arm
+       samples are therefore accounted for: **six measured, one void**.
      - **What the defect was.** The credit a peer is granted follows
        consumption, and `Conn::read` was the only place `read` advanced. Two
        sites discarded received bytes without counting them: a frame arriving
