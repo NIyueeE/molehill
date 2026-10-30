@@ -973,13 +973,32 @@ suite's.
        throughput and RSS numbers, for instance). They are not KCP claims — they
        are old-method numbers — and they need a sweep measured with the current
        model, which is a release-ritual job rather than a correction.
-   - **The biggest unexplained number left in item (1): the receiver's
-     `tx_build` (2026-10-30).** In the same instrumented cell, the side that only
-     sends acknowledgements spends **24.0 µs per run** in `tx_build` (583 562
-     runs, 14.0 s — **8.9 % of the run's 158 CPU-seconds**, more than any single
-     phase in the committed budget), while the side that actually posts bulk data
-     spends 0.97 µs per run there. That is backwards: building a run of *acks*
-     should be the cheapest work in the connection.
+   - **A correction first: the "24 µs receiver" number was a mis-assigned role
+     (2026-10-30).** Reading the same instrumented cell by *datagrams per run*
+     rather than per run settles it, and the two sides swap places:
+
+     | process | datagrams / run | `tx_build` per run | **per datagram** |
+     |---|---|---|---|
+     | client (sends acks) | 1.0 | 0.97 µs | 0.99 µs |
+     | server (posts bulk) | 38.9 | 23.99 µs | **0.617 µs** |
+
+     So the 24 µs is a run of **39 datagrams**, not one, and there is no anomaly:
+     the sender spends 0.617 µs per datagram framing and copying a 1400-byte
+     packet into its GSO run, which is the per-packet turn the committed budget
+     already carries as `tx_build` 0.0711 s/Gbit. The entry that called this
+     "backwards, 8.9 % of CPU, bigger than any phase in the budget" was reading a
+     per-run cost as a per-datagram one; deleted.
+     - **What the cell *does* say at HEAD**, now with the right denominators: the
+       record layer is ~22 s per side of a 158 CPU-second run (**26.9 %**, the same
+       share the budget was built on), `tx_build` is 0.62 µs per datagram on the
+       sender, and `tx_send` is 21.7 µs per run of 39 datagrams — 0.56 µs of
+       syscall per datagram. Those three are 0.26 of the 0.64 s/Gbit, and none of
+       them is a surprise; the split has not moved.
+     - **The lesson worth keeping:** a phase counter divided by its own event count
+       is only interpretable once you know what an event *is*, and this file now
+       has three phases whose events are runs, one whose event is a write and
+       several whose event is a datagram. Dividing the wrong one produced a
+       40-fold error and a confident, wrong diagnosis.
 
      `poll_transmit` is not the answer on inspection — `AckSet::packet` copies
      three fields, `next_stream_range` walks a two-entry map, and the credit frame
