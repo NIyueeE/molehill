@@ -908,6 +908,15 @@ suite's.
        per-connection threads with no connection tag, so a per-flow read count
        cannot be read out of it — the next instrument is a per-connection counter
        written at `CLOSED`, in the same commit as whatever probes it.
+     - **A fifth run, after the carrier's window leak was fixed (2026-10-30,
+       load 1.6):** **13/15**. The plain sixteen-flow arm passed **16/16 in
+       1.122 s** and the control **16/16 in 0.091 s** (**23 513** round trips/s
+       against the tunnel's **2 741**), so the leak fix changed nothing here —
+       expected, because a lane in this topology carries one long stream, not
+       many short ones. The two that failed are the same pair: the lending arm
+       **8/16 in 6.360 s** and the lending-off arm **15/16 in 6.049 s**. The
+       lending arm is the worse of the two in every run that has both, which is
+       the one thing the flake does say consistently.
 
 2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
    not yet wired into the UDP-forwarding and transparent paths; the header MAC,
