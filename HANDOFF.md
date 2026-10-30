@@ -681,7 +681,29 @@ suite's.
      repaired with one `sudo chown -R dsh:dsh` over the path named in the error,
      and neither is a repository fault.
 
-   - **Item (2): the cell now passes 6 of 7, and the fix was a window leak
+   - **Item (2) is closed: the cell passes every sample (2026-10-30, load
+     2.6 / 4.0 / 4.9).** `bulk-n` at `loss1`, six rounds, both builds fresh:
+
+     | arm | result |
+     |---|---|
+     | `l4` | **7 / 7** |
+     | `l4~aa` | **7 / 7** |
+
+     **14 of 14**, with no failure of either shape. Two fixes got there and both
+     matter:
+     - **The product fix** was the window leak (below): the result-exchange shape
+       went from 1 of 7 to 6 of 7 in its own A/B.
+     - **The measurement fix** was the readiness gap: the run waited on the arm's
+       declared endpoint — the **echo** port — while an arm registers **five**
+       services in sequence, and a scenario that dials the *iperf* port could
+       start before that listener joined. The visitor then got a reset in **20 ms**
+       from a tool a hair from ready, with the backend listening and never
+       accepting (its own log says `Server listening` and nothing else). The
+       workload now waits on the port it is about to dial, which is only safe
+       because the sink serves its whole lifetime instead of one test — with
+       `-1`, a single readiness connection made every sample fail `control socket
+       has closed unexpectedly` (0 of 14, measured the round before).
+   - **Item (2): the cell now passes 6 of 7, and the fix was a window leak   - **Item (2): the cell now passes 6 of 7, and the fix was a window leak
      (2026-10-30).** Three earlier runs of this cell — 3 of 14, then 1 of 14 —
      were **all taken on a stale binary**: the results files say
      `provenance.binaries[0].stale: true`, because the binary in

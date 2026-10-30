@@ -212,9 +212,12 @@ class Backend:
 def iperf_sink(ctx: Ctx, tag: str, port: int):
     """A one-off iperf3 server inside the client namespace.
 
-    `-1` handles exactly one test and exits: iperf3's server is single-test by
-    design, and a wedged one turns every later sample into a timeout. The bind
-    is the arm's `backend_bind`, which is not cosmetic — an iperf3 UDP server
+    It serves its whole lifetime rather than one test, because a readiness probe
+    has to be able to reach the tool's port without consuming the sample: with
+    `-1` a single probe connection made every iperf3 client fail with `control
+    socket has closed unexpectedly` (measured: 0 of 14 samples). The sink is
+    killed after every sample either way, so a wedged one cannot outlive it. The
+    bind is the arm's `backend_bind`, which is not cosmetic — an iperf3 UDP server
     left on the wildcard learns the visitor as its peer, `connect()`s outbound
     and then answers nothing addressed to the owned address (measured: the run
     ends on an ICMP port-unreachable with `OutDatagrams 1 / NoPorts 1`).
@@ -232,7 +235,6 @@ def iperf_sink(ctx: Ctx, tag: str, port: int):
                     "-oL",
                     "iperf3",
                     "-s",
-                    "-1",
                     "-B",
                     ctx.arm.backend_bind,
                     "-p",
@@ -250,6 +252,23 @@ def iperf_sink(ctx: Ctx, tag: str, port: int):
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
         time.sleep(0.2)
+
+
+def wait_dial_port(ctx: Ctx, port: int, timeout: float = 30.0) -> bool:
+    """Is the port this workload is about to dial actually open yet?
+
+    The run's readiness step probes the arm's declared endpoint, which is the
+    **echo** port — and an arm exposes several services, registered one after
+    another, so the echo port can be up while the iperf one is still joining. A
+    sample that dials the later port then gets a reset in twenty milliseconds
+    from a tool that is a hair from ready (measured: one sample of fourteen, with
+    the backend listening and never accepting).
+
+    The model's own rule is that an arm is ready when the workload's first packet
+    would succeed, so the probe belongs on the port the workload dials — which is
+    only safe because the sink now serves more than one connection.
+    """
+    return ctx.topo.wait_target(ctx.arm.dial_host, port, timeout=timeout)
 
 
 @dataclass
@@ -485,6 +504,8 @@ def run_bulk(ctx: Ctx, params: dict) -> list:
     ):
         if not sink.ready():
             return [Cell("", False, reason="the iperf3 sink never started")]
+        if not wait_dial_port(ctx, port):
+            return [Cell("", False, reason="the tool never listened on the iperf port")]
         result = iperf.iperf_result(
             _dial(ctx, {**params, "port": port}),
             params["streams"],
@@ -513,6 +534,10 @@ def run_bulk_pair(ctx: Ctx, params: dict) -> list:
             started = [m.__enter__() for m in sinks]
             if not all(sink.ready() for sink in started):
                 return [Cell("", False, reason="an iperf3 sink never started")]
+            if not all(wait_dial_port(ctx, p) for p in ports):
+                return [
+                    Cell("", False, reason="the tool never listened on a pair port")
+                ]
 
             def worker(index: int, port: int) -> None:
                 results[index] = iperf.iperf_result(
@@ -974,6 +999,10 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         ):
             if not sink.ready():
                 return Cell(label, False, reason="the iperf3 sink never started")
+            if not wait_dial_port(ctx, port):
+                return Cell(
+                    label, False, reason="the tool never listened on the iperf port"
+                )
             t0 = time.time()
             result = iperf.iperf_result(
                 iperf.IperfDial(
