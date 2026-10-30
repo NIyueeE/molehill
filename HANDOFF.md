@@ -999,6 +999,17 @@ suite's.
        yielding slices of the run. That is the reassembly path, the most
        correctness-sensitive code in the carrier, and it is four files of
        signature changes rather than one phase.
+     - **And even that one is not profitably removable, on arithmetic.** An owned
+       datagram needs a buffer that outlives the read, so the region becomes
+       per-read instead of reused. The safe way to get one is `vec![0u8; n]` —
+       `recvmsg` needs *initialised* memory (`IoSliceMut` cannot point at
+       uninitialised bytes, and the safe uninitialised route, `BorrowedCursor`,
+       only serves `Read::read_buf`, not `recvmsg`). Zeroing a whole GRO run is
+       ~55 KB per read, i.e. **~1.4 KB of memset per datagram, ≈0.14 µs** at
+       memory bandwidth — against the **~0.3 µs** the copy costs. The change buys
+       about half of what it was supposed to, which lands *below* the 4.35 %
+       floor. Escaping the memset means new `unsafe` in a module that does not
+       have it, and the lint policy wants a waiver argued for, not added late.
      - **Which is why it was not attempted.** Against a 100-commit branch that must
        stay shippable, a subtle reassembly regression costs far more than 4.4 %,
        and the prize does not reach the criterion anyway. **Item (1) therefore
