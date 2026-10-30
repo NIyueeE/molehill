@@ -263,6 +263,31 @@ drop_report() {
     }' "$file"
 }
 
+# What one arm cost, counters and all: the difference between two snapshots,
+# interface by interface.
+#
+# `drop_report` above answers "has anything dropped since boot", which on a
+# fresh topology is always no. The question these arms ask is "did *this* run
+# drop anything", and only a delta answers it. A TUN whose queue fills while the
+# daemon is between reads drops silently, and that is one of the two shapes the
+# sixteen-flow stall can still take (see HANDOFF.md).
+drop_delta() {
+    local before="$1" after="$2"
+    awk '
+        FILENAME == ARGV[1] { key = $1 " " $2; was[key] = $3 " " $4 " " $5 " " $6; next }
+        {
+            key = $1 " " $2
+            if (!(key in was)) next
+            split(was[key], b, " ")
+            rx_err = $3 - b[1]; rx_drop = $4 - b[2]
+            tx_err = $5 - b[3]; tx_drop = $6 - b[4]
+            if (rx_err + rx_drop + tx_err + tx_drop > 0) {
+                printf "  %s %-10s rx_err=%d rx_drop=%d tx_err=%d tx_drop=%d\n",
+                       $1, $2, rx_err, rx_drop, tx_err, tx_drop
+            }
+        }' "$before" "$after"
+}
+
 # utime + stime of one process, in ticks. The tokio runtime's threads are all
 # in this process, so one number covers the whole data path.
 cpu_ticks() {
@@ -789,6 +814,7 @@ PIDS+=("$LEND_CLI")
 # The busy claim's flow count is what makes it short of lanes, so the load runs
 # in the background while the allocator looks, and the change happens under it.
 LEND_RC=0
+drop_snapshot "$LOG/lend.drops.before"
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
     --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
     >"$LOG/lend-visitor.log" 2>&1 &
@@ -798,7 +824,10 @@ if wait_for "$LOG/lend-client.log" "lent lane"; then
     LEND_LENT=1
 fi
 wait "$LEND_VISITOR" || LEND_RC=$?
+drop_snapshot "$LOG/lend.drops.after"
 cat "$LOG/lend-visitor.log"
+echo "--- kernel drops across the lend (any interface that moved) ---"
+drop_delta "$LOG/lend.drops.before" "$LOG/lend.drops.after"
 echo "--- lending client log (the allocator's lines) ---"
 grep "Lane allocator" "$LOG/lend-client.log" || true
 
@@ -832,6 +861,7 @@ NOLEND_CLI=$!
 PIDS+=("$NOLEND_CLI")
 
 NOLEND_RC=0
+drop_snapshot "$LOG/nolend.drops.before"
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
     --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
     >"$LOG/nolend-visitor.log" 2>&1 &
@@ -839,8 +869,11 @@ NOLEND_VISITOR=$!
 # Long enough that the allocator's tick has run many times over the load: the
 # absence below is a measured absence, not a race with the first tick.
 wait "$NOLEND_VISITOR" || NOLEND_RC=$?
+drop_snapshot "$LOG/nolend.drops.after"
 sleep 2
 cat "$LOG/nolend-visitor.log"
+echo "--- kernel drops across the same load, no lend (any interface that moved) ---"
+drop_delta "$LOG/nolend.drops.before" "$LOG/nolend.drops.after"
 echo "--- lending-off client log (the allocator's lines, expected: none) ---"
 grep "Lane allocator" "$LOG/nolend-client.log" || echo "(none)"
 

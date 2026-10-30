@@ -962,6 +962,30 @@ suite's.
        either. The claim counters refuse almost nothing (seventeen `unclaimed`
        on the server, everything else zero), which is one fact against wholesale
        dropping and is not decisive.
+     - **The probe ran, and it closes the loss hypothesis (2026-10-30, load
+       0.6).** `drop_snapshot` now brackets both lending arms and `drop_delta`
+       reports what moved across them. Across the lend: **nothing**. Across the
+       same load with lending off: **nothing**. No interface in any of the three
+       namespaces dropped or errored a single packet, so the visitors' packets
+       were not being dropped before the TUN — they were not being *sent*,
+       because the flows were waiting for replies that took seconds to come.
+     - **What that leaves is latency, and it is bimodal.** The one sixteen-flow
+       arm that passed in that run did so at **21 332 round trips/s** through the
+       tunnel against **23 658** straight at the service — a tunnel that costs
+       ten percent when it works. The two that failed took **6.05 s** for the
+       same work, which at 16×200 round trips is a per-flow wait of seconds.
+       So the cell is not losing traffic and not short of window: it either runs
+       at within ten percent of a direct path or it stalls, and nothing in
+       between has been seen.
+     - **The trigger is still the second claim, and that is now the only
+       variable left.** One claim with two lanes passes (`16/16 in 0.106 s`,
+       above); two claims with four lanes stall — with lending on **and** with it
+       off, which is what makes "lending" the wrong name for this defect. Both
+       failing arms share exactly one thing the passing ones do not: an `idle`
+       claim holding two lanes that carry nothing, on the same TUN device and the
+       same runtime. The next probe is what those two silent lanes cost the busy
+       claim's flows — they share the hub's single routing lock and the device's
+       read loop, and nothing yet measures either.
      - **The probe that does choose between them, and it is cheap:** the TUN's own
        queue counters across *this* arm. `drop_snapshot` currently runs once,
        before the many-flows arm, so nothing reads `l3cli0`/`l3srv0` around the
