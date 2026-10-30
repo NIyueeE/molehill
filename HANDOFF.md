@@ -722,9 +722,19 @@ suite's.
        it — so the **tool's iperf listener is up whenever a sample runs**. The
        twenty-millisecond `Connection refused` is therefore *not* a missing
        listener on the tool's side: it is a refusal delivered back through the
-       tunnel, which means the backend was the side that refused (or the tool
-       closed the forwarded connection), and the sink's own single-test nature is
-       the first thing to look at rather than the carrier.
+       tunnel, so the backend refused, or the tool closed the forwarded
+       connection.
+     - **The single-test sink is not it either (2026-10-30, load 0.5).** Removing
+       `-1` from the sink so a stray connect could not consume it read
+       **6 of 7** on the arm and **7 of 7** on its A/A twin — **13 of 14**, with
+       the same one `unable to connect` shape. That is within noise of the
+       12 of 14 with `-1`, so the flag was reverted: it is a documented safety
+       property (a sink that exits on its own cannot linger across samples) and
+       nothing measured here argues against it.
+     - **What is left for that last sample:** the refusal arrives through the
+       tunnel in twenty milliseconds from a live tool listener to a live backend
+       listener, so the forward attempt itself is where to look — the server's
+       data-channel pairing for a visitor it has just accepted.
 
    - **The width change does not touch the transparent path.** `just l3-accept`
      (root, three namespaces, sixteen checks) reads the same at four workers as at
