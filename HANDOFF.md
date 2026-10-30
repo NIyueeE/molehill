@@ -954,7 +954,28 @@ suite's.
      on both benchmarks pages): three cost cells in a row were taken at loads of
      44, 57 and 49 and none of them was evidence, and a reader of a results file
      has no way to know that today.
-   - **The `MIN_RTO` trade is settled: 20 ms does not cost more, it fails
+   - **The per-datagram lock is not a lever, measured and reverted
+     (2026-10-30).** The phase table charges 0.352 µs of the 0.91 µs per-packet
+     turn to "lock + preamble", and the send path took the connection's mutex
+     **once per datagram** — up to 44 times per run. Building the whole run under
+     one guard was the obvious way to attack the largest item, so it was built
+     and A/B'd against its own parent with the A/A twin beside it, six rounds per
+     arm:
+
+     | arm | `cpu_s_per_gbit` |
+     |---|---|
+     | `l4`, lock per datagram (parent) | 0.6328 [0.6198..0.7172] |
+     | `l4~aa`, the same build again | 0.6482 [0.6244..0.7516] |
+     | `l4~b`, one lock per run | 0.6350 [0.6225..0.6472] |
+
+     **+0.35 % against a 9.81 % floor** — inside the noise, and slightly the
+     wrong side of it. The host was at load 13 (fifteen-minute), which is why the
+     floor is that wide, but the discipline is the same at any floor: a change
+     with no measured gain is not kept. Reverted. What survives is a negative
+     result worth having: either mutex acquisition is not what the 0.352 µs
+     measures, or the effect is below what this host can resolve, and the
+     architectural rewrite is still the only lever big enough to be seen.
+   - **The `MIN_RTO` trade is settled: 20 ms does not cost more, it fails   - **The `MIN_RTO` trade is settled: 20 ms does not cost more, it fails
      (2026-10-30).** Two builds differing only in that constant, six rounds per
      arm with the A/A twin beside them, on a host at load ~1.5:
 
