@@ -151,13 +151,25 @@ def one_flow(
             # only evidence either leaves behind. This is the line that tells
             # them apart.
             print(f"CONNECTED {index} {local[0]}:{local[1]}", flush=True)
+            # Read the banner by hand rather than through `recv_exactly`, so a
+            # timeout can say *how much* of it arrived. Zero and "four of five"
+            # are different defects: the first is a reply that never reached this
+            # socket, the second a reply the socket accepted and could not
+            # complete.
+            banner = bytearray()
             try:
-                banner = recv_exactly(sock, len(PREFIX))
+                while len(banner) < len(PREFIX):
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    banner += chunk
             except OSError as exc:
                 return (
-                    f"flow {index}: {exc} before the banner ({socket_state(sock)})"
+                    f"flow {index}: {exc} after {len(banner)}B of "
+                    f"{len(PREFIX)}B banner ({socket_state(sock)})"
                     f"{blind_write(sock, size)}"
                 )
+            banner = bytes(banner)
             if banner != PREFIX:
                 return f"flow {index}: expected {PREFIX!r}, got {banner!r}"
             # The flow's own five-tuple, so a failure can be followed past this

@@ -1190,6 +1190,25 @@ suite's.
        arrived — exactly like the banner before it. Placement, claims, lanes and
        the client's device-read are therefore all exercised successfully by the
        same flow that cannot hear a reply.
+     - **Three more exclusions, and one hard constraint (2026-10-30).**
+       - **Not a partial read.** The probe now reports how much of the banner
+         arrived before the timeout, and every stalled flow reads **`0B of 5B`** —
+         nothing at all, not a truncated reply.
+       - **Not memory pressure.** The container's cgroup has a **13 GiB** limit
+         with `oom_kill 20` recorded, so a failing acceptance run was checked
+         before and after: `20` before, `20` after. The stall is the product's.
+       - **And packet capture is impossible here.** `tcpdump` installs
+         (`apt-get` worked), but the container has **no `CAP_NET_RAW`** in its
+         effective, permitted or bounding set, so every capture attempt fails with
+         `You don't have permission to perform this capture on that device`. The
+         question this section reduces to — *who acknowledged the backend's
+         replies* — therefore cannot be answered by watching the wire in this
+         environment, and the instrument has to live in the product.
+     - **The next instrument is in-product:** count what `inject_wire` returns
+       for frames arriving on a lane (written / refused, with the errno), and
+       report the receiving socket's `TCP_INFO` from the daemon's own side. Those
+       two together say whether the frame reached the device and whether the
+       kernel's view of the connection matches the application's.
      - **The backend never retransmitted, so its replies were acknowledged
        (2026-10-30, load 0.95).** The echo service now reports its own kernel's
        `tcpi_total_retrans` on the connection's closing line, which is the one
