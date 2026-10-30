@@ -973,7 +973,45 @@ suite's.
        throughput and RSS numbers, for instance). They are not KCP claims — they
        are old-method numbers — and they need a sweep measured with the current
        model, which is a release-ritual job rather than a correction.
-   - **A correction first: the "24 µs receiver" number was a mis-assigned role
+   - **Item (1)'s gap is *all* user space, and that rules out a whole class of
+     fixes (2026-10-30).** `cpu_s_per_gbit` is `utime + stime`, and the sum cannot
+     say which half to attack — so the instruments now record the split
+     (`cpu_user_s` / `cpu_sys_s` in a sample's evidence, from
+     `/proc/<pid>/stat`). One `cost` cell per carrier, same host, back to back:
+
+     | carrier | role | user | kernel | kernel share | `cpu_s_per_gbit` |
+     |---|---|---|---|---|---|
+     | mhd | client | 67.37 s | 28.44 s | 29.7 % | 0.6541 |
+     | mhd | server | 80.00 s | 32.94 s | 29.2 % | |
+     | tcp | client | 79.79 s | 42.31 s | 34.7 % | 0.4666 |
+     | tcp | server | 65.05 s | 51.79 s | 44.3 % | |
+
+     Normalised by the bits each carrier moved in its own cell — mhd 319 Gbit,
+     TCP 512 — the two halves separate cleanly:
+
+     | half | mhd | tcp | ratio |
+     |---|---|---|---|
+     | **kernel** | **0.192 s/Gbit** | **0.184 s/Gbit** | **1.04×** |
+     | user | 0.462 s/Gbit | 0.283 s/Gbit | **1.63×** |
+
+     **mhd's kernel cost per bit is already the same as TCP's.** The entire 1.37×
+     is user-space work: the framing, the copies into and out of the stream
+     buffers, and the lock traffic around them.
+     - **What that rules out:** fewer or bigger syscalls — larger `SEND_RUN`,
+       `sendmmsg`, fewer boundaries crossed. The kernel half is equal, so no
+       amount of syscall batching moves the ratio. That was the cheapest
+       remaining hypothesis and it is now dead by measurement.
+     - **What it leaves:** the per-byte user-space work, which is the
+       architectural direction the budget has pointed at all along — one owner of
+       the socket and the stream buffers, so a byte is copied once instead of two
+       or three times. The new finding is that this is *quantified*: **0.18 s/Gbit
+       of user-space work to remove**, and the floor it must clear is 4.35 % of
+       0.64, i.e. 0.028 s/Gbit. Removing a third of one copy would do it.
+     - **Caveat stated:** one round per carrier, two separate runs, host at load
+       5–10. The absolute cost is therefore context, but the *ratio between the
+       halves* is what the claim rests on, and a 1.04× against a 1.63× is not a
+       noise artefact of that size.
+   - **A correction first: the "24 µs receiver" number was a mis-assigned role   - **A correction first: the "24 µs receiver" number was a mis-assigned role
      (2026-10-30).** Reading the same instrumented cell by *datagrams per run*
      rather than per run settles it, and the two sides swap places:
 

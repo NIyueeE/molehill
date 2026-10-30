@@ -362,6 +362,10 @@ def _evidence(ctx: Ctx, window: dict, extra: dict | None = None) -> dict:
         "window_s": sample.get("elapsed_s"),
         "cpu_s": sample.get("cpu_s"),
         "cpu_s_total": sample.get("cpu_s_total"),
+        # The split, because the sum cannot say what to fix: kernel time is
+        # syscalls and boundary copies, user time is copies and locks.
+        "cpu_user_s": sample.get("cpu_user_s"),
+        "cpu_sys_s": sample.get("cpu_sys_s"),
         "syscalls": sample.get("syscalls"),
         "wire": {
             key: wire.get(key)

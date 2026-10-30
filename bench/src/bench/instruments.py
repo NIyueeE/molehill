@@ -91,6 +91,24 @@ def cpu_ticks(pids: dict) -> dict:
     return out
 
 
+def cpu_split_ticks(pids: dict) -> dict:
+    """User and system ticks per role, from `/proc/<pid>/stat`.
+
+    Recorded beside the sum because the sum cannot say what to fix: work in the
+    kernel is syscalls and copies across the boundary, work in user space is the
+    copies and the locks. Two carriers with the same `cpu_s_per_gbit` can need
+    opposite fixes, and this is the one counter that tells them apart without a
+    profiler — the container has no `perf` and no `CAP_NET_RAW`, which is why it
+    is here.
+    """
+    out: dict = {}
+    for role, pid in pids.items():
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            fields = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()
+            out[role] = {"user": int(fields[11]), "sys": int(fields[12])}
+    return out
+
+
 def proc_io(pids: dict) -> dict:
     out: dict = {}
     for role, pid in pids.items():
@@ -126,6 +144,7 @@ def snapshot(topo: topology.Topology, pids: dict) -> dict:
     return {
         "t": time.time(),
         "cpu": cpu_ticks(pids),
+        "cpu_split": cpu_split_ticks(pids),
         "io": proc_io(pids),
         "dev": topo.dev(),
         "qdisc": topo.qdisc(),
@@ -139,6 +158,12 @@ def delta(before: dict, after: dict) -> dict:
         role: round((after["cpu"].get(role, 0) - ticks) / topology.CLK_TCK, 4)
         for role, ticks in before["cpu"].items()
     }
+    split: dict = {"user": {}, "sys": {}}
+    for role, was in before.get("cpu_split", {}).items():
+        now = after.get("cpu_split", {}).get(role, {})
+        for part in ("user", "sys"):
+            if part in was and part in now:
+                split[part][role] = round((now[part] - was[part]) / topology.CLK_TCK, 4)
     wire: dict = {}
     for key, a in after["dev"].items():
         b = before["dev"].get(key)
@@ -182,6 +207,8 @@ def delta(before: dict, after: dict) -> dict:
         "elapsed_s": round(after["t"] - before["t"], 4),
         "cpu_s": cpu,
         "cpu_s_total": round(sum(cpu.values()), 4),
+        "cpu_user_s": split["user"],
+        "cpu_sys_s": split["sys"],
         "io": io,
         "syscalls": sum(c["syscr"] + c["syscw"] for c in io.values()),
         "wire": wire,
