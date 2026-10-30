@@ -659,6 +659,11 @@ suite's.
        `ps -eo rss,comm --sort=-rss` before starting a long measurement — if a
        `rustc` for `thread-store`/`core-plugins` is running, that is not this
        repository's build and it is competing for the same 13 GiB.
+     - **Verified after the cleanup (2026-10-30):** a full `just check` with
+       `CARGO_INCREMENTAL=0` passed and left `oom_kill` at **20** — no new kills —
+       with `target/debug` growing by 1 GB instead of accumulating another
+       incremental session. Memory is what these runs have to be watched for, not
+       the load average.
      - **It also re-reads part of this file's history:** the `MIN_RTO` attempts
        that "died to host load" (47.9/97.5, 29–104, 3/32/77) were at least partly
        OOM kills of the run's own daemons, which is consistent with cells that
