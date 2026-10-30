@@ -225,6 +225,11 @@ def iperf_sink(ctx: Ctx, tag: str, port: int):
             ctx.topo.ns_argv(
                 topology.CLI_NS,
                 [
+                    # Line-buffered, or its banner and its errors stay in a
+                    # block buffer and the log is empty exactly when a failure
+                    # is being diagnosed.
+                    "stdbuf",
+                    "-oL",
                     "iperf3",
                     "-s",
                     "-1",
@@ -256,29 +261,27 @@ class Sink:
     port: int
 
     def ready(self, timeout: float = 15.0) -> bool:
-        """Is this sink serving — by its own log, and by the kernel's table?
+        """Is this sink both alive and listening?
 
-        Both halves are needed. `wait_listener` alone asks whether *something*
-        listens on the port; a sink that died at startup leaves it free, and a
-        sample taken against it reports `Connection refused` from the visitor,
-        which reads as a failure of the tool under test. That is not
-        hypothetical: one round of a seven-round bulk A/B had a **zero-byte**
-        sink log and was charged to the arm. The banner is the sink's own word
-        that it bound and is accepting, and the process still being alive is
-        the other half of the same fact.
+        `wait_listener` alone asks the kernel whether *something* listens on the
+        port; a sink that exited at startup leaves it free, and a sample taken
+        against it reports `Connection refused` from the visitor, which reads as
+        a failure of the tool under test. Asking whether our own process is
+        still running closes that hole.
+
+        The sink's *log* is deliberately not part of this: iperf3's stdout is
+        block-buffered when it is a file, so a healthy sink writes nothing until
+        enough output accumulates, and a zero-byte log says nothing about
+        whether it started. That misreading cost a whole A/B run — every sample
+        reported "never started" while the sinks were fine. The sink is started
+        under `stdbuf -oL` so its log *is* readable when a run is being diagnosed.
         """
         end = time.time() + timeout
-        announced = False
         while time.time() < end:
             if self.proc.poll() is not None:
                 return False
-            if not announced:
-                with contextlib.suppress(OSError):
-                    announced = "Server listening" in self.log.read_text(
-                        errors="replace"
-                    )
-            if announced:
-                return wait_listener(self.port)
+            if wait_listener(self.port, timeout=0.2):
+                return True
             time.sleep(0.02)
         return False
 

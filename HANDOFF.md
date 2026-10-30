@@ -655,18 +655,22 @@ suite's.
        The twin agrees with its own arm sample for sample, so the arms are not
        drifting, and the *result exchange* shape — the dominant one — is gone
        from the fixed arm entirely.
-     - **The seventh sample was not the carrier's, and the harness now refuses
-       that shape.** Its `stderr` said `Connection refused`, but the evidence
-       says otherwise: `meta.json` records `wall_s: 0.02` (not the 0.3–0.4 s
-       timer stall the older record blamed) with `connected: []`, and the sink's
-       own log is **zero bytes** — the iperf3 server for that sample never
-       started, so nothing was listening and the kernel answered with a reset in
-       twenty milliseconds. `wait_listener` only asked whether *something*
-       listened; `Sink::ready` now also requires the sink's own banner and the
-       process still being alive, so a sample taken against a backend that never
-       came up is a named harness fault (`the iperf3 sink never started`) instead
-       of a failure charged to the tool under test. Seven of seven fixed-arm
-       samples are therefore accounted for: **six measured, one void**.
+     - **The seventh sample is unexplained again, and one "harness fault"
+       reading was wrong.** Its `stderr` says `Connection refused` with
+       `wall_s: 0.02` and `connected: []` — an immediate reset, not the 0.3–0.4 s
+       timer stall an older entry blamed, and with no connection ever made. The
+       sink's log beside it was **zero bytes**, which looked like proof the
+       backend never started; it is not. iperf3's stdout is block-buffered into a
+       file, so a perfectly healthy sink writes nothing until its buffer fills.
+       A readiness check built on that text failed **every one** of the next
+       A/B's samples (`the iperf3 sink never started`, 24 of 24), which is what
+       exposed the misreading. `Sink::ready` now asks only the two things it can
+       know — our own process is alive, and the kernel reports the port
+       listening — and the sink runs under `stdbuf -oL` so its log is usable as
+       evidence the next time. Which leaves the seventh sample where it was:
+       twenty milliseconds with no connection made says the visitor's SYN met no
+       listener, and the probe that answers it is the *subject's* listener
+       lifecycle, not the carrier's.
      - **What the defect was.** The credit a peer is granted follows
        consumption, and `Conn::read` was the only place `read` advanced. Two
        sites discarded received bytes without counting them: a frame arriving
