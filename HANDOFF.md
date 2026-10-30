@@ -973,6 +973,31 @@ suite's.
        throughput and RSS numbers, for instance). They are not KCP claims — they
        are old-method numbers — and they need a sweep measured with the current
        model, which is a release-ritual job rather than a correction.
+   - **The biggest unexplained number left in item (1): the receiver's
+     `tx_build` (2026-10-30).** In the same instrumented cell, the side that only
+     sends acknowledgements spends **24.0 µs per run** in `tx_build` (583 562
+     runs, 14.0 s — **8.9 % of the run's 158 CPU-seconds**, more than any single
+     phase in the committed budget), while the side that actually posts bulk data
+     spends 0.97 µs per run there. That is backwards: building a run of *acks*
+     should be the cheapest work in the connection.
+
+     `poll_transmit` is not the answer on inspection — `AckSet::packet` copies
+     three fields, `next_stream_range` walks a two-entry map, and the credit frame
+     is eight bytes. What is left is **waiting**: the pump takes the connection's
+     mutex once per run, and the reader takes it once per datagram to copy up to
+     64 KiB out of the buffer. A run that queues behind a reader's copy is charged
+     the whole wait, and the average is dragged up by a minority of such runs —
+     the same contention the one-lock-per-run experiment would have *worsened*,
+     which is one reading of why that measured +0.35 % rather than a win.
+
+     **The measurement that would settle it**: charge the mutex wait separately —
+     time the acquisition, not the body, and report it as its own phase. If the
+     wait is the 24 µs, the fix is on the *reader* (copy outside the lock, or hand
+     the bytes over by ownership instead of by copy) and it is a real item-(1)
+     lever with a denominator this file has not yet used. If the wait is small,
+     the number is somewhere in the ack path and needs a profile. Not attempted at
+     this host's load (15–23 during the round), which is why it is written down
+     rather than measured.
    - **The phase split's shape is unchanged at HEAD (2026-10-30).** One
      instrumented `cost` cell (`target/evidence/phases-r25.*`, `work-r25/`) was
      taken with `MOLEHILL_MHD_STATS=1` to check that the split the item-(1)
