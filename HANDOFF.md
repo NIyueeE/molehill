@@ -634,6 +634,46 @@ suite's.
      so far is the visitor giving up, and nothing in the daemon's own logs says
      why.
 
+   - **Item (2) has a mechanism now, and it is the connection-wide credit
+     (2026-10-30, host load 2.6).** Six rounds of `bulk-n` at `loss1` with the
+     `--aa` twin landed **3 of 14** samples, and — the part that matters — the
+     twin failed the same way as the arm, so this is the carrier and not the
+     arm's configuration. Every failure is one shape: `stderr.txt` says
+     `warning: Failed to read JSON data size`, `exit 1`, and the transfer that
+     preceded it is healthy (**10.4 Gbit/s** aggregate on 8 streams in the
+     server's own log). So the data path works and the *result exchange* does
+     not: ~15 KB of JSON on iperf3's control connection, after the bulk streams
+     have finished.
+     - **What the instrument caught.** The server's `mhd stalled` line — built
+       for exactly this and never before seen firing in a failing cell — reports
+       **21 samples with `credit_blocked=true`**, `unsent_ms` **200 ms to
+       2 209 ms**, and the last of them at **04:00:27.334**, which is **19 ms
+       after** iperf3 gave up (`27.315`). The 13 `credit_blocked=false` samples
+       beside them are the ordinary flight-age kind. The bytes the results needed
+       were sitting in the send buffer, and the carrier was not allowed to put
+       them on the wire.
+     - **Why it is a design defect, not a tuning one.** `Conn::send_credit` is a
+       **connection-wide** byte window: `recv_credit = read + WINDOW`, where
+       `read` is everything consumed across every stream. One stream whose reader
+       is slow therefore pins the window for all of them, and a small message on
+       an idle stream queues behind up to 32 MiB of another stream's data. A
+       multiplexer with only a connection window has this by construction —
+       yamux and HTTP/2 both carry a per-stream window beside it for this reason.
+     - **The fix this points at** is per-stream flow control in the wire: a
+       credit per stream id, acknowledged by the reader, with the connection
+       window kept as the aggregate. Dialect 6.0 is still in development, so the
+       frame may be extended in place under the same number (§5). Not attempted
+       in this round — it is a wire change and wants its own measurement.
+     - **What it does not explain.** The first four stream opens cost **335 ms**
+       each (`INITIAL_RTO` plus a lost first packet at 1 % loss) against
+       **1.0–1.5 ms** for every open after them. That is a separate, much smaller
+       cost, and all 16 opens happen in the first two seconds — there is no
+       stream churn to blame.
+     - **The 74 057 `dropped data for a retired stream` lines are a symptom.**
+       That count was already learned the hard way (§ above, the revert): it goes
+       to zero without the failure rate moving, because a reset ahead of queued
+       data discards bytes the visitor still wanted.
+
    - **The width change does not touch the transparent path.** `just l3-accept`
      (root, three namespaces, fifteen checks) reads the same at four workers as at
      twenty: thirteen pass, and the two that fail are the known sixteen-flow
