@@ -973,6 +973,28 @@ suite's.
        throughput and RSS numbers, for instance). They are not KCP claims — they
        are old-method numbers — and they need a sweep measured with the current
        model, which is a release-ritual job rather than a correction.
+   - **The phase split's shape is unchanged at HEAD (2026-10-30).** One
+     instrumented `cost` cell (`target/evidence/phases-r25.*`, `work-r25/`) was
+     taken with `MOLEHILL_MHD_STATS=1` to check that the split the item-(1)
+     budget was built on still holds after the credit-leak fix and the traces.
+     The raw lines are per **event**, and an event is not a datagram for every
+     phase — a `seal` is a whole GSO run of ~23 datagrams, a `decode` is one
+     datagram — so the only honest reading without per-phase byte denominators
+     is the shape:
+
+     | side | phase | µs per event | events |
+     |---|---|---|---|
+     | receiver | `open` | 22.6 | 976 012 |
+     | sender | `seal` | 23.4 | 976 319 |
+     | sender | `tx_send` | 21.7 | 524 488 |
+     | receiver | `tx_build` | 24.0 | 583 562 |
+
+     Both record-layer phases are ~22 s of a run whose CPU total was ~158 s, so
+     the **26.9 % share the budget was built on still holds** — the split has not
+     moved. Turning these lines back into `s/Gbit` needs the bytes each phase
+     covers, which is the earlier table's method and not something to guess at;
+     the committed table (0.3855 s/Gbit measured of 0.6406, phases in the item-1
+     section) remains the reference.
    - **The per-datagram lock is not a lever, measured and reverted
      (2026-10-30).** The phase table charges 0.352 µs of the 0.91 µs per-packet
      turn to "lock + preamble", and the send path took the connection's mutex
