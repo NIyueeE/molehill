@@ -435,8 +435,41 @@ impl Conn {
             self.finishing.remove(&stream);
         }
         if done {
+            // The stream leaves with whatever its reader never took. Those
+            // bytes were spent from the peer's window when they were sent, so
+            // they have to be given back here: the window follows the reader,
+            // and nobody will ever read a stream that no longer exists.
+            self.release_unread(stream);
             self.streams.remove(&stream);
         }
+    }
+
+    /// Give back the window a stream will never consume.
+    ///
+    /// A stream can end holding bytes nobody read — its owner dropped the
+    /// handle, or it was retired while the peer still had frames on the wire.
+    /// Counting them as consumed is the only honest answer: the alternative is
+    /// that the peer's window never reopens, a little at a time, for every
+    /// short-lived stream a long-lived lane carries. A lane would then narrow
+    /// until it carried nothing, and the only symptom would be
+    /// `credit_blocked` on a connection whose readers are keeping up.
+    fn release_unread(&mut self, stream: u32) {
+        let held = self
+            .streams
+            .get_mut(&stream)
+            .map_or(0, |state| state.recv.discard());
+        self.advance_read(held);
+    }
+
+    /// Move this end's consumed position, and the window that follows it.
+    fn advance_read(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.read = self.read.saturating_add(bytes);
+        // The window follows the reader: credit is what has been consumed plus
+        // one window, so a peer that fills it meets a reader that drains it.
+        self.recv_credit = self.read.saturating_add(WINDOW);
     }
 
     /// Settle every finishing stream, after an acknowledgement moved a base.
@@ -476,10 +509,7 @@ impl Conn {
             return 0;
         };
         let taken = state.recv.read_into(out);
-        self.read += taken as u64;
-        // The window follows the reader: credit is what has been consumed plus
-        // one window, so a peer that fills it meets a reader that drains it.
-        self.recv_credit = self.read.saturating_add(WINDOW);
+        self.advance_read(taken as u64);
         taken
     }
 
@@ -955,6 +985,11 @@ impl Conn {
                 let retired = !known && id % 2 == u32::from(self.dialer);
                 if retired {
                     tracing::debug!(stream = id, "mhd dropped data for a retired stream");
+                    // The bytes are gone and nobody will read them, but the peer
+                    // spent its window on them: give that window back, or a lane
+                    // carrying many short streams narrows by one dead stream at a
+                    // time until it carries nothing.
+                    self.advance_read(data.len() as u64);
                 } else {
                     if !known {
                         // The peer opens a stream by naming it; the accept queue is
@@ -1220,6 +1255,37 @@ mod tests {
 
     fn payload(len: usize) -> Vec<u8> {
         (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
+    }
+
+    /// The window a stream's bytes were sent against comes back when the stream
+    /// ends without a reader.
+    ///
+    /// The window follows the reader, so bytes this end discards would be spent
+    /// for ever: the peer counts them against the window it was granted and the
+    /// window never reopens. That leaks one dead stream at a time, and the only
+    /// symptom is a long-lived lane that ends up `credit_blocked` with every
+    /// reader keeping up — which is the shape a lane carrying many short
+    /// visitors has.
+    #[test]
+    fn a_stream_retired_with_unread_bytes_returns_the_window() {
+        let mut conn = Conn::new(9, false);
+        let opening = conn.recv_credit;
+        let state = conn.streams.entry(2).or_default();
+        state.recv.insert(0, &payload(10));
+        assert_eq!(conn.backlog().total, 10, "ten bytes are held");
+
+        conn.release_unread(2);
+        assert_eq!(
+            conn.recv_credit,
+            opening + 10,
+            "the ten bytes come back as window"
+        );
+        assert_eq!(conn.backlog().total, 0, "and are no longer reported held");
+
+        // Idempotent: a stream released twice must not hand out the window
+        // twice, or the peer would be allowed twice what this end can hold.
+        conn.release_unread(2);
+        assert_eq!(conn.recv_credit, opening + 10);
     }
 
     /// Take the contiguous prefix of one stream, the way a caller with a large

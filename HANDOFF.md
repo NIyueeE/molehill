@@ -674,6 +674,26 @@ suite's.
        to zero without the failure rate moving, because a reset ahead of queued
        data discards bytes the visitor still wanted.
 
+     - **A second defect, found by that instrument and now fixed: the window
+       leaked one dead stream at a time (2026-10-30).** `recv_credit = read +
+       WINDOW`, and `read` was advanced in exactly one place — `Conn::read`, the
+       reader. A stream that ended holding unread bytes discarded them at two
+       sites (the retired-frame drop in `apply_datagram`, and `settle` removing
+       the stream) and **neither advanced `read`**. So every short-lived stream
+       narrowed the lane by its unread bytes, permanently: a lane carrying many
+       short connections with readers that are perfectly up to date reports
+       `credit_blocked`, the window never reopens, and the failure rate grows
+       through a run rather than appearing.
+       Fixed by `release_unread`/`advance_read`: the bytes a stream will never
+       deliver are counted as consumed, which is the only honest answer, since
+       the alternative is a window the peer was charged for and can never reuse.
+       A unit test asserts the window comes back and that releasing twice does
+       not hand it out twice.
+       **Not yet measured.** The cell is `bulk-n` at `loss1` (3 of 14 samples,
+       `credit_blocked` on 21 of 34 stall samples); it needs a calm host, and the
+       instrument that reports the backlog (`mhd stalled … backlog_streams=`)
+       now exists to say whether the leak was the whole of it.
+
    - **The width change does not touch the transparent path.** `just l3-accept`
      (root, three namespaces, fifteen checks) reads the same at four workers as at
      twenty: thirteen pass, and the two that fail are the known sixteen-flow

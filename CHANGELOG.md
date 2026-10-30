@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits, the second does not — and the line now fires on either, at most once a
   second.
 
+### Fixed
+
+- **A stream that ends without being read gives its window back.** The carrier
+  grants a peer credit by consumption, so bytes a stream held when it was
+  retired — its handle dropped, or the peer still sending into it — were counted
+  against the peer's window for ever. On a lane carrying many short
+  connections, such as the transparent path or a pool under churn, the window
+  narrowed one dead stream at a time until the lane carried nothing, with no
+  symptom beyond the sender reporting that the peer's credit was blocking it.
+
 ### Changed
 
 - **BREAKING: `mhd` is now a native multi-stream carrier, and the KCP engine

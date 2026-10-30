@@ -314,6 +314,18 @@ impl RecvBuf {
             .sum()
     }
 
+    /// Throw away everything that has not been read, answering how many bytes
+    /// that was.
+    ///
+    /// For a stream that is leaving the table with a reader that will never come
+    /// back: the bytes are unreachable, so holding them only misreports what
+    /// this end is behind on.
+    pub(crate) fn discard(&mut self) -> u64 {
+        let held = self.held();
+        self.pieces.clear();
+        held
+    }
+
     /// Move the contiguous prefix into `out`, answering how many bytes were
     /// written.
     ///
