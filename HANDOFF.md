@@ -1046,16 +1046,40 @@ suite's.
        1 882 ms and 4 442 ms depending on the run. A stall of that shape, on one
        end, in a run whose other end reports a one-second gap, is what the two
        daemons' read loops show — and nothing else in either log does.
-     - **The packet-count probe read wrong, and the cause was one field.**
-       `traffic_snapshot` printed `$10` of `/proc/net/dev` as tx **packets**; after
-       the interface name the fields are rx *bytes* `$2`, rx *packets* `$3`, …,
-       tx *bytes* `$10`, tx *packets* `$11`. So the first run's
-       `l3cli0 tx=281 728` was **bytes**, and at the workload's ~44-byte packets
-       that is the expected six thousand packets exactly — which is the useful
-       part: the traffic matches the workload, and the probe is trustworthy once
-       the offset is `$11`. Confirmed against `ip -s link show lo` rather than by
-       reading the header, because two successive values on `lo` are equal and the
-       header line is easy to mis-align.
+     - **The `unclaimed` counter names a real defect: the first SYN of every
+       flow is dropped at arm start (2026-10-30, load ~1).** Sixteen frames per
+       one-claim arm are counted `unclaimed` on the server, consistently
+       (16, 17, 16, 17 across runs), and the five-tuple says exactly what they
+       are:
+
+       ```
+       l3 device frame unclaimed proto=6 src=10.10.0.2:44672 dst=10.99.0.1:8443
+       ```
+
+       They are the **visitors' first SYNs**, one per flow, and they all land
+       inside **1.5 ms** at the start of the arm (`09:36:08.2617` to
+       `.2632`). The claim has no *live lane* yet at that instant — the client
+       registers the claim and then dials its lanes — so the server's routing
+       table has no entry for `10.99.0.1:8443` and the packets are dropped as
+       unclaimed rather than held. Each affected flow then waits for its kernel's
+       SYN retransmission, about **one second**, which is the slow half of the
+       bimodal shape this arm has shown all along.
+     - **What that does and does not explain.** It explains a one-second delay on
+       every flow that loses its first SYN and nothing more: the visitor's
+       timeout is five seconds, so a single SYN retransmission cannot by itself
+       produce the `timed out after 0/200` failures. The banner — the packet the
+       visitor actually waits for — is a separate loss, still unexplained, and
+       the flows that fail do *connect* (sixteen `CONNECTED` lines against ten
+       to thirteen `FLOW` lines, so the handshake always completes and the banner
+       is what goes missing).
+     - **What is now excluded, all by measurement, on this one cell:** the
+       carrier (frames cross with 0.5 ms hand-off and identical counts), flow
+       control (no credit, backlog or queue wait), kernel drops (`/proc/net/dev`
+       deltas empty), the kernel's own error accounting (`nstat` empty: routing,
+       discards, listen overflows, TCP errors and timeouts), the claim and lane
+       counts (the one-claim control fails too), lending, runtime width, and TUN
+       checksum/GSO offload (a build with plain-IP frames fails identically:
+       11/16, 13/16, 12/16).
 
        | what the visitor saw | how many | what the backend recorded |
        |---|---|---|

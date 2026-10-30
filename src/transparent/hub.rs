@@ -414,6 +414,13 @@ impl TunHub {
         };
         let Some((endpoint, slot)) = self.routes.pick(&info, self.direction) else {
             self.routes.stats.count_drop(DropReason::Unclaimed);
+            tracing::debug!(
+                target: "molehill::transparent",
+                "l3 device frame unclaimed proto={} src={} dst={}",
+                info.protocol,
+                place_text(info.src, info.src_port),
+                place_text(info.dst, info.dst_port),
+            );
             return;
         };
         let Some(wire) = self.routes.wire_format(&endpoint) else {
@@ -1645,6 +1652,20 @@ where
                     // virtio-net header first — so the parse starts past it.
                     let Some(info) = claimed_frame_info(&endpoint, frame, hub.direction(), wire) else {
                         stats.count_drop(DropReason::Unclaimed);
+                        // Named, because this counter reads one per flow: a
+                        // frame that parsed as IP and still did not match the
+                        // claim it arrived on is either the wrong packet on the
+                        // right lane or the right packet with the wrong
+                        // addresses, and only the five-tuple says which.
+                        if let Ok(info) = frame_info(frame, wire) {
+                            tracing::debug!(
+                                target: "molehill::transparent",
+                                "l3 frame unclaimed claim={endpoint} slot={slot} proto={} src={} dst={}",
+                                info.protocol,
+                                place_text(info.src, info.src_port),
+                                place_text(info.dst, info.dst_port),
+                            );
+                        }
                         continue;
                     };
                     hub.touch(&endpoint, &info);
