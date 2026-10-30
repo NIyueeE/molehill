@@ -1708,6 +1708,16 @@ impl TunnelPool {
     /// `from` from future placement. Its live streams stay on it; the repair
     /// dials its replacement on `target` once the entry drains to zero.
     fn begin_handover(&self, from: Carrier, target: Carrier) -> bool {
+        // The single choke point every move goes through, so the forced-carrier
+        // rule cannot be bypassed by a path added later: the environment pinned
+        // the carrier for a measurement, and moving a tunnel against it would
+        // poison the arm. The callers each kept their own guard and one of them
+        // was missing — measured as a *pinned* pool shrinking and dialing mhd
+        // with `MOLEHILL_DATA_CARRIER=tcp` set, which failed three integration
+        // tests that had never been run under a forced carrier.
+        if crate::transport::carrier::forced_carrier().is_some() {
+            return false;
+        }
         self.begin_handover_on(from, target, None).is_some()
     }
 

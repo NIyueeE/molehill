@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A forced carrier is honoured by the tunnel pool.** `MOLEHILL_DATA_CARRIER`
+  pins one carrier so a measurement can tell the two paths apart, and the pool's
+  rule already refused to move tunnels under it — but the entry point every move
+  goes through did not, so a pool pinned to TCP could still dial mhd and shrink
+  itself. The refusal now lives at that single point, which no path added later
+  can bypass. Found by running the whole suite with the carrier forced, which
+  three pool tests had never been run under.
 - **A cheap retransmission timer can no longer end a healthy path.** The carrier
   ends a path after ten unanswered retransmissions, and that count measures
   silence only *through the timer*: at the default floor ten backed-off retries

@@ -25,8 +25,8 @@
 //! unchanged, which is what keeps the feature gate from being a second data
 //! plane.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::logging::RepeatNotice;
@@ -302,21 +302,35 @@ impl CarrierChoice {
 /// and ignored rather than guessed at.
 #[must_use]
 pub fn forced_carrier() -> Option<Carrier> {
-    static FORCED: OnceLock<Option<Carrier>> = OnceLock::new();
-    *FORCED.get_or_init(|| {
-        let raw = std::env::var("MOLEHILL_DATA_CARRIER").ok()?;
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "tcp" => Some(Carrier::Tcp),
-            "mhd" => Some(Carrier::Mhd),
-            other => {
-                tracing::warn!(
-                    "MOLEHILL_DATA_CARRIER={other:?} is neither `tcp` nor `mhd`; ignoring it \
-                     (the data plane chooses its carrier at runtime)"
-                );
-                None
+    #[cfg(test)]
+    {
+        // Unit tests describe the runtime *rule*, not a measurement arm. The
+        // switch belongs to the integration path, which is a separate process and
+        // is run under it on purpose — `just check` with the carrier forced is how
+        // the whole suite is exercised through each one. Seven of these tests
+        // assert what an *unforced* choice does and failed under it before this
+        // block existed: a unit test reading the environment it inherited rather
+        // than the rule it is named for.
+        None
+    }
+    #[cfg(not(test))]
+    {
+        static FORCED: std::sync::OnceLock<Option<Carrier>> = std::sync::OnceLock::new();
+        *FORCED.get_or_init(|| {
+            let raw = std::env::var("MOLEHILL_DATA_CARRIER").ok()?;
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "tcp" => Some(Carrier::Tcp),
+                "mhd" => Some(Carrier::Mhd),
+                other => {
+                    tracing::warn!(
+                        "MOLEHILL_DATA_CARRIER={other:?} is neither `tcp` nor `mhd`; ignoring it \
+                         (the data plane chooses its carrier at runtime)"
+                    );
+                    None
+                }
             }
-        }
-    })
+        })
+    }
 }
 
 /// The carrier a fresh choice starts with: the forced one when the diagnostic

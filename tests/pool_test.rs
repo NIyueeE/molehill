@@ -1417,6 +1417,19 @@ async fn wait_for_cross_carrier(
 #[tokio::test]
 async fn a_live_pool_hands_a_tunnel_over_without_dropping_its_flows() -> Result<()> {
     init();
+    // This scenario moves a live tunnel from one carrier to the other, so it
+    // needs both. A forced carrier is the run's answer, not a preference, and the
+    // pool refuses every move under it by design — so the premise cannot hold and
+    // the scenario is skipped *out loud* rather than failing. It still runs in
+    // the default configuration, which is where the suite is normally used.
+    // The switch itself, because it is a process-level input rather than part of
+    // the API: `MOLEHILL_DATA_CARRIER` pinned to either value disables every move.
+    if std::env::var("MOLEHILL_DATA_CARRIER").is_ok() {
+        eprintln!(
+            "skipping the handover scenario: MOLEHILL_DATA_CARRIER pins the carrier it moves to"
+        );
+        return Ok(());
+    }
     spawn_tcp_backends();
 
     // The scenario owns its fixture: the idle-pool fixture is shared with two
