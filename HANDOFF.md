@@ -1046,11 +1046,17 @@ suite's.
        1 882 ms and 4 442 ms depending on the run. A stall of that shape, on one
        end, in a run whose other end reports a one-second gap, is what the two
        daemons' read loops show — and nothing else in either log does.
-     - **The next probe is packet counts, not drop counts.** `drop_snapshot`
-       records the four error/drop columns per interface; the question left is
-       whether the injected banner was *transmitted* on the server's `v-vis` at
-       all. Adding the rx/tx **packet** columns to the same delta answers it
-       without a product change.
+     - **A packet-count probe exists, and its first readings are not believable
+       yet.** `traffic_snapshot`/`traffic_delta` now print each interface's rx and
+       tx **packet** counts across the one-claim arm, which is the question left:
+       was the injected banner transmitted at all. Its first run read
+       `l3cli0 rx=2 480 tx=281 728`, `l3srv0 rx=2 460 tx=283 600` and
+       `v-srv tx=316 238` — for a workload of roughly six thousand packets. Those
+       numbers are either a field-offset mistake in the snapshot or a flood in the
+       namespaces that nothing else has reported, and **until one of those is
+       settled the readings are not evidence**. Do not quote them; re-run the
+       arm and check the totals against the visitor's own 16 × 200 round trips
+       first.
 
        | what the visitor saw | how many | what the backend recorded |
        |---|---|---|

@@ -288,6 +288,64 @@ drop_delta() {
         }' "$before" "$after"
 }
 
+# The one set of counters `/proc/net/dev` does not carry.
+#
+# A packet this daemon injects into its own device and the namespace then fails
+# to route is *not* an interface drop: it lands in the IP or TCP error counters,
+# or in the listen-queue overflow counters when the backend's accept queue is
+# full. `nstat -n` resets the kernel's baseline so the second call reports what
+# this arm did, and only the counters that can explain a lost flow are kept —
+# `nstat -az` prints several hundred.
+snmp_reset() {
+    local ns
+    for ns in "$NS_CLI" "$NS_SRV" "$NS_VIS"; do
+        ip netns exec "$ns" nstat -n >/dev/null 2>&1 || true
+    done
+}
+
+snmp_report() {
+    local out="$1" ns
+    : >"$out"
+    for ns in "$NS_CLI" "$NS_SRV" "$NS_VIS"; do
+        ip netns exec "$ns" nstat -az 2>/dev/null \
+            | awk -v ns="$ns" '
+                $2 + 0 == 0 { next }
+                $1 ~ /^(IpInHdrErrors|IpInAddrErrors|IpInDiscards|IpOutNoRoutes|IpInNoRoutes)$/ ||
+                $1 ~ /^(TcpInErrs|TcpInCsumErrors)$/ ||
+                $1 ~ /^(TcpExtListenOverflows|TcpExtListenDrops|TcpExtTCPBacklogDrop|TcpExtTCPReqQFullDrop|TcpExtTCPRcvQDrop|TcpExtTCPAbortOnMemory|TcpExtTCPTimeouts|TcpExtTCPAbortFailed)$/ {
+                    printf "  %s %-26s %s\n", ns, $1, $2
+                }' >>"$out"
+    done
+}
+
+# Whether an interface actually carried the packets it was given.
+#
+# The drop columns answer "was anything refused"; this answers "was it sent at
+# all", which is the question left when a packet the daemon wrote into its own
+# device reaches no counter and no visitor. Counts, so every interface is printed
+# and the reader compares the two ends of a lane.
+traffic_snapshot() {
+    local out="$1" ns
+    : >"$out"
+    for ns in "$NS_CLI" "$NS_SRV" "$NS_VIS"; do
+        ip netns exec "$ns" cat /proc/net/dev 2>/dev/null \
+            | awk -v ns="$ns" '/:/ { gsub(":", "", $1); print ns, $1, $3, $10 }' \
+            >>"$out"
+    done
+}
+
+traffic_delta() {
+    local before="$1" after="$2"
+    awk '
+        FILENAME == ARGV[1] { was[$1 " " $2] = $3 " " $4; next }
+        {
+            key = $1 " " $2
+            if (!(key in was)) next
+            split(was[key], b, " ")
+            printf "  %s %-10s rx_pkts=%d tx_pkts=%d\n", $1, $2, $3 - b[1], $4 - b[2]
+        }' "$before" "$after"
+}
+
 # utime + stime of one process, in ticks. The tokio runtime's threads are all
 # in this process, so one number covers the whole data path.
 cpu_ticks() {
@@ -815,6 +873,7 @@ PIDS+=("$LEND_CLI")
 # in the background while the allocator looks, and the change happens under it.
 LEND_RC=0
 drop_snapshot "$LOG/lend.drops.before"
+snmp_reset
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
     --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
     >"$LOG/lend-visitor.log" 2>&1 &
@@ -825,9 +884,12 @@ if wait_for "$LOG/lend-client.log" "lent lane"; then
 fi
 wait "$LEND_VISITOR" || LEND_RC=$?
 drop_snapshot "$LOG/lend.drops.after"
+snmp_report "$LOG/lend.snmp"
 cat "$LOG/lend-visitor.log"
 echo "--- kernel drops across the lend (any interface that moved) ---"
 drop_delta "$LOG/lend.drops.before" "$LOG/lend.drops.after"
+echo "--- and the counters /proc/net/dev does not carry ---"
+cat "$LOG/lend.snmp"
 echo "--- lending client log (the allocator's lines) ---"
 grep "Lane allocator" "$LOG/lend-client.log" || true
 
@@ -908,13 +970,21 @@ PIDS+=("$SOLO_CLI")
 
 SOLO_RC=0
 drop_snapshot "$LOG/solo.drops.before"
+traffic_snapshot "$LOG/solo.traffic.before"
+snmp_reset
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
     --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
     >"$LOG/solo-visitor.log" 2>&1 || SOLO_RC=$?
 drop_snapshot "$LOG/solo.drops.after"
+traffic_snapshot "$LOG/solo.traffic.after"
+snmp_report "$LOG/solo.snmp"
 cat "$LOG/solo-visitor.log"
 echo "--- kernel drops across it (any interface that moved) ---"
 drop_delta "$LOG/solo.drops.before" "$LOG/solo.drops.after"
+echo "--- and the counters /proc/net/dev does not carry ---"
+cat "$LOG/solo.snmp"
+echo "--- what each interface actually carried ---"
+traffic_delta "$LOG/solo.traffic.before" "$LOG/solo.traffic.after"
 
 echo
 echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
