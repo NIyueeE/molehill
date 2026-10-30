@@ -525,7 +525,11 @@ def git_revision(exclude: Path | None = None, here: Path | None = None) -> tuple
             ).stdout.strip()
             or here
         )
-        args = [_git(), "status", "--porcelain", "--", "."]
+        # `--no-optional-locks` keeps `git status` from refreshing the index.
+        # The bench runs under `sudo`, so that refresh would be written by root
+        # and every later `git` command as the normal user would fail with
+        # `.git/index: Permission denied`. Measured, after a run.
+        args = [_git(), "--no-optional-locks", "status", "--porcelain", "--", "."]
         # `:(exclude)` pathspec: everything except the run's own output, stated
         # relative to the repository root the status is run from. A path
         # *outside* the repository cannot be excluded — git exits 128 with
