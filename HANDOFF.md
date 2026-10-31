@@ -2130,6 +2130,28 @@ another copy to remove — and the target of 300 MiB should be re-costed before
 it is chased again, because 382 MiB bounded is now the number a release would
 publish.
 
+**The send buffer is where the manual pair's memory is, and the window frees it
+— but not on the cost cell (2026-10-31).** heaptrack on the *sending* daemon of
+the manual loopback pair puts its whole peak in one place: `StreamIo::poll_write`
+→ `Conn::write` → the send buffer, 121.76 MB of 125.53 MB, with 98.88 MB of that
+arriving through the Noise/stripe write path. Halving the credit window frees it
+there:
+
+| manual pair, `WINDOW` | server peak | client peak | throughput |
+|---|---|---|---|
+| 32 MiB (shipped) | 162.6 MB | 112.5 MB | 12.39 Gbit/s |
+| 16 MiB | **89-91 MB** | **71-73 MB** | 12.83-13.03 Gbit/s |
+
+and it does not carry that win to the model's cell. Interleaved A/B of the two
+builds on the `cost` cell (`--ab-arm`, two rounds each): `rss_peak_mib` 375.7 /
+386.5 for the 16 MiB window against 407.1 / 331.4 for the 32 MiB one — the arms
+overlap, and `cpu_s_per_gbit` (0.690 / 0.676 vs 0.691 / 0.746) and throughput
+(8.78 / 9.17 vs 8.78 / 7.38) are indistinguishable. So the cost cell's 380 MiB is
+**not** its send buffers; the manual pair's is. The next instrument is heaptrack
+on the bench's own daemons during a cell, not another constant: the two
+topologies disagree about where the bytes are, and only one of them is the
+published number.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
