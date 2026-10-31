@@ -42,7 +42,7 @@ from bench import instruments as inst
 from bench.targets import adapter_for, peer_version
 from bench.targets.peers import PEERS
 from bench.targets.peers import main as peers_main
-from bench.utils import interop, udp_stress
+from bench.utils import interop, observe, phases, udp_stress
 
 HERE = paths.PACKAGE_DIR
 
@@ -222,6 +222,14 @@ def cmd_mux(rest: list[str]) -> int:
     ).returncode
 
 
+def cmd_phases(rest: list[str]) -> int:
+    return phases.main(rest)
+
+
+def cmd_observe(rest: list[str]) -> int:
+    return observe.main(rest)
+
+
 #: Tools that keep their own command line. Dispatch happens before the model's
 #: parser, so their `--help` is the tool's, not the dispatcher's.
 UTILITY_COMMANDS = {
@@ -232,6 +240,8 @@ UTILITY_COMMANDS = {
     "l3": cmd_l3,
     "l3-census": cmd_l3_census,
     "mux": cmd_mux,
+    "phases": cmd_phases,
+    "observe": cmd_observe,
 }
 
 

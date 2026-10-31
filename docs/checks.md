@@ -261,7 +261,7 @@ One of its commands is in the check chain, and the rest are measurements:
 | `just bench report` / `just bench compare` / `just bench gate` | no | render a stored run; A/B two of them (or refuse); gate a release run |
 | `just bench plot` | no | the charts and markdown tables of a results file |
 | `just bench peers fetch` | no | fetch the peer tools' release binaries into `~/tmp/bench-peers` (override with `--peer-dir`) |
-| `just bench interop`, `just bench udp-stress`, `just bench l3`, `just bench l3-census`, `just bench mux` | no | the supporting instruments in `bench/src/bench/utils/` |
+| `just bench interop`, `just bench udp-stress`, `just bench l3`, `just bench l3-census`, `just bench mux`, `just bench phases`, `just bench observe` | no | the supporting instruments in `bench/src/bench/utils/`: `phases` turns the carrier's own meters into a per-phase budget, `observe` samples a process set's resident set over time |
 
 The model asserts nothing about the tool and gates nothing in CI: it produces
 numbers and verdicts, the gate decides whether a *release* run may be published,

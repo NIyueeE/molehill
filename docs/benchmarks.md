@@ -570,6 +570,15 @@ meta.
 - **`just bench plot` renders exactly the figures this page describes** from
   any results file: the timeline master, the small multiples, the capacity
   curve, the UDP ladder, the drift panels and the cost bars.
+- **A CPU number can be split into the carrier's own phases.** When the campaign
+  ran with `MOLEHILL_MHD_STATS=1`, `just bench phases <work directory or results
+  file>` reads the daemons' cumulative logs and prints seconds per carried Gbit
+  and nanoseconds per event for every phase the engine times: the record layer's
+  seal and open, the sender's run build and its syscall, the receiver's
+  per-datagram path, and the copies the two stream handles pay. Sampled phases
+  are scaled back to the round's real event count, because the meters time one
+  datagram in sixteen. It is an attribution, not a measurement — the claim is
+  still `cpu_s_per_gbit`, and this only says where that number went.
 
 ## The gate
 

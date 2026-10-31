@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reader owes the peer a megabyte both used to look like silence — the first
   waits, the second does not — and the line now fires on either, at most once a
   second.
+- **`just bench phases` and `just bench observe` carry the two instruments the
+  carrier's cost was argued with.** `phases` reads the cumulative logs
+  `MOLEHILL_MHD_STATS=1` writes and prints seconds per carried Gbit and
+  nanoseconds per event for every phase the engine times, with each sampled
+  phase scaled back to the round's real event count; `observe` samples a process
+  set's resident set, descriptors and threads over time and prints peak, mean and
+  last, so a plateau and a leak can be told apart. Both are contributor tools
+  outside the check chain; the model still owns every claim.
 
 ### Fixed
 

@@ -119,7 +119,7 @@ l3-accept-ipv6 *ARGS:
 #   sudo -n just bench --ab-arm l3 --binary-b /path/to/other/build
 #   just bench list | report FILE | gate FILE | compare A B | doctor
 #   just bench peers fetch                  # the reference-tool binaries
-#   just bench interop | udp-stress | l3 | l3-census | mux
+#   just bench interop | udp-stress | l3 | l3-census | mux | phases | observe
 #   just bench plot ~/tmp/bench-*.json --out-dir ~/tmp/charts
 bench *ARGS:
     #!/usr/bin/env bash
