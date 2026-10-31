@@ -1998,6 +1998,21 @@ reachable by moving the copy; it needs either a smaller credit window (a
 behaviour change, not a refactor) or a receive buffer that merges into a
 *pooled* run and returns it when read — which is where this stopped.
 
+**The window is not a cheap lever either (2026-10-31).** One constant, three
+campaigns, the same `cost` cell at four times the normal length:
+
+| `WINDOW` | `rss_peak_mib` | `cpu_s_per_gbit` | `throughput_gbps` |
+|---|---|---|---|
+| 32 MiB (shipped) | 628 | 0.647 | 9.70 |
+| 16 MiB | **521** | 0.705 | **7.26** |
+| 8 MiB | — (the cell failed on an iperf transport error, not on the carrier) | | |
+
+Halving the window buys 107 MiB for a quarter of the throughput. Extrapolating
+to 300 MiB would cost the carrier most of what `0eed55e` just won, so the answer
+to "is 300 MiB a constant away" is **no**. The remaining way to it is the pooled
+receive run, which is a design of its own; the alternative is to accept
+450-650 MiB, bounded and flat, as the carrier's documented cost.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
