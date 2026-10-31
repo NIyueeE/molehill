@@ -77,6 +77,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `tests/session_test.rs` | the session server contract driven by a hand-written client (one session, N services, per-service rejection, deregistration, the tunnel prologue) |
 | `tests/log_budget_test.rs` | drives the real binary and counts what an operator sees: a healthy run must emit no WARN/ERROR, bounded INFO, and no message shape more than three times |
 | `tests/interop_test.rs` | this build against the previous release's binary: each side refuses the other's dialect on that connection alone, an unknown dialect is refused the same way, and a refusing process keeps serving a peer of its own version (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |
+| `tests/primitives_test.rs` | the data path's primitive cost table, in the shape the engine uses them: a 1400-byte copy hot and through a 64 MiB ring, the allocation shapes, `Bytes` clone/slice/split, and the record layer's AEAD through `ring` (what `snow` uses, so what the profile shows). `#[ignore]`d — it asserts nothing; `just primitives` runs it in release |
 | `tests/hot_reload_test.rs` | the config watcher against a real binary: a changed file reaches the running service |
 | `tests/noise_keys_test.rs` | `--genkey` and the Noise key/PSK paths end to end, including the refusal when a key does not match |
 | `tests/startup_failure_test.rs` | a process that cannot serve its instance ends instead of running deaf |

@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set's resident set, descriptors and threads over time and prints peak, mean and
   last, so a plateau and a leak can be told apart. Both are contributor tools
   outside the check chain; the model still owns every claim.
+- **`just primitives` prices the data path's building blocks.** One table, in
+  the shapes the carrier uses them: a 1400-byte copy hot and through a 64 MiB
+  ring, the allocation shapes a receive piece can take, `Bytes` clone, slice and
+  split, and the record layer's AEAD through `ring` — the implementation `snow`
+  uses, which is the one the profile shows. It asserts nothing; it answers "is
+  this copy worth removing" with a number from this host.
 
 ### Fixed
 

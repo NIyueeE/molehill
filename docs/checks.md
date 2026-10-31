@@ -162,7 +162,9 @@ job), `just py-lint` (ruff check + format, also in the pre-commit gate),
 `just py-typecheck` (pyright, also in the pre-commit gate),
 `just py-fmt` (ruff's auto-fix), `just bench-selfcheck` (the performance model's
 own checks, also in the pre-commit gate), `just bench-deps` (iperf3 + iproute2
-on the benchmark host), `just container` (scratch image), and `just interop`
+on the benchmark host), `just primitives` (the data path's primitive cost
+table: copy, allocation, the record layer's AEAD — a table, not an assertion),
+`just container` (scratch image), and `just interop`
 (the interop matrix, below). The performance model's own commands are
 `just bench <verb>`, in the section below.
 

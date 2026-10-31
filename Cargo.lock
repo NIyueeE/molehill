@@ -1318,6 +1318,7 @@ dependencies = [
  "pin-project",
  "postcard",
  "rand",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.11.1",

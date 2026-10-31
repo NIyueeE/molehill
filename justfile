@@ -42,6 +42,12 @@ fmt:
 test:
     cargo test -- --test-threads=1
 
+# Price the primitives the data path is built from (copy, allocation, the
+# record layer's AEAD): a table, not an assertion. Release, because an
+# unoptimised copy says nothing about the one the product runs.
+primitives:
+    cargo test --release --test primitives_test -- --ignored --nocapture
+
 # Run the full check chain (identical to hooks + CI: fmt/secrets/machete/docs/ruff/clippy + audit/deny/outdated/test).
 check:
     #!/usr/bin/env bash

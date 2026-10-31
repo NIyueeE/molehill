@@ -157,4 +157,5 @@ libc = "0.2.189"
 nix = { version = "0.31.3", features = ["socket", "net", "feature", "uio"] }
 
 [dev-dependencies]
+ring = "0.17"
 tokio = { version = "1", features = ["test-util"] }
