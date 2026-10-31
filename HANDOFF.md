@@ -1877,6 +1877,22 @@ when the base passes it, so a packet finds its chunk without scanning. That is
 the next attempt, and it should be measured against the sender's `ack` phase
 (0.053 s/Gbit) rather than guessed at.
 
+**The cursor was built and the queue still loses (2026-10-31, third attempt).**
+With the cursor in place every unit test passed, and the first measurement was
+still catastrophic because `written()` summed the queue on every call — a second
+quadratic hidden in a helper. With that fixed to an incremental `tail`, `ack`
+fell to 4.82 µs per acknowledgement (the `Vec` build reads 19.89) and the cell
+still read `cpu_s_per_gbit` **4.38** and **1.35 Gbit/s** against 0.72 and 7.47.
+The reason is packetisation, not the queue: `range()` can only hand `wire` a slice
+of **one** chunk, so a packet never spans a record boundary, the writer is
+re-entered six times as often (52.9M `io_write` calls against 8.4M) with
+proportionally smaller writes, and the buffer grows because the producer is
+faster than the packetisation can drain it. Making the queue work therefore needs
+`wire::encode_stream` to take the payload as a list of slices (an iovec-sized
+change in the sender), which is a different project from "remove the compaction
+memmove". Reverted again; the `Vec` stays, with its 256 KiB idle shrink, until
+that is decided.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
