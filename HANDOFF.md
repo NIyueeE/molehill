@@ -1843,6 +1843,26 @@ and 8.97-9.16 for its twin. So the acknowledgement rework, the byte prefix and
 the buffer shrink did not move the loss recovery or the transparent path, which
 is what those gates exist to catch.
 
+**The receive-side zero copy was tried and rejected (2026-10-31).** The design
+was the one the plan named: `RecvBatch` hands each datagram on as a refcounted
+slice of a pooled 64 KiB region, and `RecvBuf` stores those slices instead of
+copying into a growable `Vec`. It works, and it made the copy cheaper — `append`
+fell from 0.40 to 0.26 µs per datagram (0.029 to 0.023 s/Gbit) — and it is still
+a loss: throughput **8.28 → 3.68 Gbit/s**, `cpu_s_per_gbit` **0.728 → 1.099**,
+resident set unchanged (633 against 652 MiB). The mechanism is the pinning: a
+piece keeps its whole region alive until the reader consumes it, and at a 32 MiB
+credit window one bulk stream spans about five hundred regions, so the eight
+region pool is always dry and every `recvmsg` allocates and zeroes a fresh 64 KiB
+region. Growing the pool does not help (the regions are pinned by the window
+itself), and refusing the wake instead — the first version — turns one stuck
+reader into a stalled connection, which `pool_test` caught twice
+(`a_pinned_pool_starts_at_its_count_and_stays_there`,
+`one_unanswerable_visitor_does_not_park_the_service`). Copying each datagram into
+a warm `Vec` is what keeps the region free, and that is the copy the plan wanted
+to remove. **So the receive path stays as it is**; the remaining 464 MiB is not
+this, and the next attempt should copy out of the region into a *right-sized*
+`Bytes` (one allocation, no pinning) rather than hand the region itself on.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
