@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lost packet's acknowledgement can no longer stall a stream's buffer.** The
+  carrier declares a packet lost on the evidence of later packets, and the
+  original may merely be reordered; its acknowledgement then arrives after the
+  retransmission was queued. The recovery table deleted the record at the moment
+  of the declaration, so that acknowledgement had nowhere to land, the stream's
+  send buffer never learned the range had arrived, and its frontier stopped at
+  the hole — the buffer then grew with everything written after it. The record
+  is now kept until some transmission of the range is acknowledged, a rewind
+  carries the lowest hole rather than the last one reported, overlapping
+  acknowledgements are merged instead of hiding bytes behind a key the frontier
+  never looks up, and the send buffers are capped at twice the credit window so
+  a frontier that does stall costs the writer a wait instead of memory.
 - **A forced carrier is honoured by the tunnel pool.** `MOLEHILL_DATA_CARRIER`
   pins one carrier so a measurement can tell the two paths apart, and the pool's
   rule already refused to move tunnels under it — but the entry point every move

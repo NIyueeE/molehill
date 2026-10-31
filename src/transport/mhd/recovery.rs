@@ -12,7 +12,7 @@
 //! is reported as the range it carried, and the stream that owns those bytes
 //! still has them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use super::wire::Ack;
@@ -86,6 +86,29 @@ const DEAD_LINK: u32 = 10;
 /// cheap timer can no longer end one by itself.
 const DEAD_FLOOR: Duration = Duration::from_secs(5);
 
+/// How long the record of a packet declared lost is kept, waiting for an
+/// acknowledgement that may still arrive.
+///
+/// A packet is declared lost on the evidence of *later* packets, not on
+/// evidence about itself: the original may merely be reordered, and its
+/// acknowledgement can arrive after the retransmission was already queued.
+/// Dropping the record when the loss is declared is what made that
+/// acknowledgement land nowhere: the stream's send buffer then never learned
+/// that the range had arrived, its acknowledgement frontier stopped at the
+/// hole, and everything written after it piled up behind a frontier that could
+/// not move — measured at 6.7 GiB resident in a 40-second cell before this
+/// existed. Three seconds is far past any reordering window this carrier
+/// tolerates (nine eighths of a round trip) and far below the point where
+/// holding the record costs anything worth measuring.
+const LOST_HOLD: Duration = Duration::from_secs(3);
+
+/// The most lost records kept at once, so a path that drops everything cannot
+/// grow the table without bound before the dead-link rule ends it.
+///
+/// Sixteen megabytes of flight is about twelve thousand packets; this is a
+/// third of that, which is the order a real path's loss burst reaches.
+const MAX_LOST: usize = 4096;
+
 /// The range of one stream a packet carried, kept so a loss can be re-sent
 /// without the stream having to say what it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +132,12 @@ pub(crate) struct Sent {
     pub(crate) time: Instant,
     /// What it carried, when that is something the stream can re-send.
     pub(crate) range: Option<SentRange>,
+    /// When it was declared lost, if it was.
+    ///
+    /// A lost packet has left the wire, but its record stays in the table until
+    /// an acknowledgement of it arrives (see [`LOST_HOLD`]). It is not in
+    /// flight: the byte total and the congestion window do not count it.
+    pub(crate) lost_at: Option<Instant>,
 }
 
 /// The round-trip estimate.
@@ -210,6 +239,14 @@ pub(crate) struct Recovery {
     /// The number the most recent tracked packet took.
     last: u32,
     in_flight: BTreeMap<u32, Sent>,
+    /// Packets that are off the wire but still remembered, keyed by when they
+    /// were declared lost, so the reaper is a prefix walk.
+    lost: BTreeSet<(Instant, u32)>,
+    /// Packets actually on the wire: `in_flight` minus the lost records.
+    ///
+    /// Kept as a counter rather than computed, because the timer arms on every
+    /// send and a scan of the table there would grow with the flight.
+    live: usize,
     /// Stream bytes the table holds, kept exact by [`Self::retire`].
     flight_bytes: u64,
     rtt: Rtt,
@@ -230,6 +267,8 @@ impl Recovery {
             next: 0,
             last: 0,
             in_flight: BTreeMap::new(),
+            lost: BTreeSet::new(),
+            live: 0,
             flight_bytes: 0,
             rtt: Rtt::default(),
             timer: None,
@@ -266,10 +305,64 @@ impl Recovery {
         self.flight_bytes
     }
 
-    /// Take one packet out of the flight, keeping the byte total exact.
+    /// Drop one packet's bytes from the flight total.
+    ///
+    /// Called exactly once for every packet that was on the wire, whichever
+    /// path removes it: an acknowledgement, a loss declaration, or a probe.
     fn retire(&mut self, sent: &Sent) {
         if let Some(range) = sent.range {
             self.flight_bytes = self.flight_bytes.saturating_sub(u64::from(range.len));
+        }
+    }
+
+    /// Remove one packet's record, keeping the counters exact.
+    fn take(&mut self, number: u32) -> Option<Sent> {
+        let sent = self.in_flight.remove(&number)?;
+        if let Some(at) = sent.lost_at {
+            self.lost.remove(&(at, number));
+        } else {
+            self.live = self.live.saturating_sub(1);
+            self.retire(&sent);
+        }
+        Some(sent)
+    }
+
+    /// Declare one packet lost: it leaves the wire, but its record stays.
+    ///
+    /// The record is what a late acknowledgement lands on. Answering `None`
+    /// for one already declared lost keeps the caller from re-sending the same
+    /// range twice for one report.
+    fn declare_lost(&mut self, now: Instant, number: u32) -> Option<Sent> {
+        if self.lost.len() >= MAX_LOST {
+            self.reap(now);
+        }
+        let entry = self.in_flight.get_mut(&number)?;
+        if entry.lost_at.is_some() {
+            return None;
+        }
+        entry.lost_at = Some(now);
+        let sent = *entry;
+        self.live = self.live.saturating_sub(1);
+        self.retire(&sent);
+        self.lost.insert((now, number));
+        Some(sent)
+    }
+
+    /// Forget the lost records nothing can still acknowledge.
+    ///
+    /// Two bounds: age (`LOST_HOLD`, past which no reordering this carrier
+    /// tolerates can still deliver the original) and count (`MAX_LOST`), so a
+    /// path that drops everything cannot grow the table before the dead-link
+    /// rule ends it.
+    fn reap(&mut self, now: Instant) {
+        let cutoff = now.checked_sub(LOST_HOLD);
+        while let Some(&(at, number)) = self.lost.first() {
+            let expired = cutoff.is_some_and(|cutoff| at < cutoff);
+            if !expired && self.lost.len() < MAX_LOST {
+                break;
+            }
+            self.lost.remove(&(at, number));
+            self.in_flight.remove(&number);
         }
     }
 
@@ -283,16 +376,18 @@ impl Recovery {
             number,
             time: now,
             range,
+            lost_at: None,
         };
         if let Some(range) = range {
             self.flight_bytes += u64::from(range.len);
             self.in_flight.insert(number, sent);
+            self.live += 1;
         }
         self.arm(now);
     }
 
     fn arm(&mut self, now: Instant) {
-        if self.in_flight.is_empty() {
+        if self.live == 0 {
             self.timer = None;
             return;
         }
@@ -304,6 +399,9 @@ impl Recovery {
     /// Fold one acknowledgement block in.
     pub(crate) fn on_ack(&mut self, now: Instant, ack: Ack) -> Acked {
         let mut result = Acked::default();
+        // Before anything is retired: a record whose hold has run out must not
+        // shadow the number this acknowledgement names.
+        self.reap(now);
         // The newest packet this block proves arrived, which is what a round-trip
         // sample is taken from. Both retirement paths feed it: the cumulative
         // one carries most of a healthy acknowledgement, so a sample taken only
@@ -324,8 +422,7 @@ impl Recovery {
             if number >= ack.below {
                 break;
             }
-            if let Some((_, sent)) = self.in_flight.pop_first() {
-                self.retire(&sent);
+            if let Some(sent) = self.take(number) {
                 note(&sent);
                 if let Some(range) = sent.range {
                     result.bytes += usize::from(range.len);
@@ -359,8 +456,7 @@ impl Recovery {
             .map(|(number, _)| *number)
             .collect();
         for number in acked {
-            if let Some(sent) = self.in_flight.remove(&number) {
-                self.retire(&sent);
+            if let Some(sent) = self.take(number) {
                 note(&sent);
                 if let Some(range) = sent.range {
                     result.bytes += usize::from(range.len);
@@ -383,8 +479,9 @@ impl Recovery {
         let lost: Vec<u32> = self
             .in_flight
             .range(oldest..=ack.largest)
-            .filter(|(number, _)| {
-                **number >= ack.below
+            .filter(|(number, sent)| {
+                sent.lost_at.is_none()
+                    && **number >= ack.below
                     && **number < ack.largest
                     && ack.largest.saturating_sub(**number) >= PACKET_THRESHOLD
                     && !ack.contains(**number)
@@ -392,8 +489,7 @@ impl Recovery {
             .map(|(number, _)| *number)
             .collect();
         for number in lost {
-            if let Some(sent) = self.in_flight.remove(&number) {
-                self.retire(&sent);
+            if let Some(sent) = self.declare_lost(now, number) {
                 result.lost.push(sent);
             }
         }
@@ -409,7 +505,8 @@ impl Recovery {
     /// The timer fired: answer why, and what to send again.
     pub(crate) fn on_timeout(&mut self, now: Instant) -> (Expiry, Vec<Sent>) {
         self.timer = None;
-        if self.in_flight.is_empty() {
+        self.reap(now);
+        if self.live == 0 {
             return (Expiry::Loss, Vec::new());
         }
         self.silent += 1;
@@ -417,6 +514,8 @@ impl Recovery {
         if self.silent >= DEAD_LINK && now.saturating_duration_since(since) >= DEAD_FLOOR {
             let all: Vec<Sent> = self.in_flight.values().copied().collect();
             self.in_flight.clear();
+            self.lost.clear();
+            self.live = 0;
             self.flight_bytes = 0;
             return (Expiry::Dead, all);
         }
@@ -424,7 +523,9 @@ impl Recovery {
         let stale: Vec<u32> = self
             .in_flight
             .iter()
-            .filter(|(_, sent)| now.saturating_duration_since(sent.time) > delay)
+            .filter(|(_, sent)| {
+                sent.lost_at.is_none() && now.saturating_duration_since(sent.time) > delay
+            })
             .map(|(number, _)| *number)
             .collect();
         if stale.is_empty() {
@@ -437,18 +538,25 @@ impl Recovery {
             // count the same bytes twice in the flight: the congestion window then
             // closes on a path that merely lost one packet, and every write stalls
             // until the retransmission timer drains the duplicate. That is a window
-            // that leaks on loss, not a probe.
+            // that leaks on loss, not a probe. A record already declared lost is
+            // not probed: its retransmission is already queued, and its record
+            // stays so a late acknowledgement of the original still lands.
             self.backoff = self.backoff.saturating_add(1);
-            let all: Vec<Sent> = self.in_flight.values().copied().collect();
-            self.in_flight.clear();
-            self.flight_bytes = 0;
+            let all: Vec<Sent> = self
+                .in_flight
+                .values()
+                .filter(|sent| sent.lost_at.is_none())
+                .copied()
+                .collect();
+            for sent in &all {
+                let _ = self.take(sent.number);
+            }
             self.arm(now);
             return (Expiry::Timeout, all);
         }
         let mut lost = Vec::new();
         for number in stale {
-            if let Some(sent) = self.in_flight.remove(&number) {
-                self.retire(&sent);
+            if let Some(sent) = self.declare_lost(now, number) {
                 lost.push(sent);
             }
         }
@@ -456,10 +564,17 @@ impl Recovery {
         (Expiry::Loss, lost)
     }
 
-    /// Whether anything is waiting for an acknowledgement.
+    /// Whether anything is waiting for an acknowledgement, lost records aside.
     #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
-        self.in_flight.len()
+        self.live
+    }
+
+    /// How many lost records the table is holding, which is what the reaper
+    /// exists to bound.
+    #[cfg(test)]
+    pub(crate) fn lost_records(&self) -> usize {
+        self.lost.len()
     }
 
     /// Something arrived from the peer: the run of silent timers is over.
@@ -475,7 +590,10 @@ impl Recovery {
     /// send: an age that keeps growing while nothing retires it is a stall with
     /// no loss to explain it, which is the shape both open defects have.
     pub(crate) fn oldest_flight_age(&self, now: Instant) -> Option<Duration> {
-        let (_, sent) = self.in_flight.iter().next()?;
+        let (_, sent) = self
+            .in_flight
+            .iter()
+            .find(|(_, sent)| sent.lost_at.is_none())?;
         Some(now.saturating_duration_since(sent.time))
     }
 
@@ -539,6 +657,116 @@ mod tests {
         let rtt = recovery.rtt();
         assert!(rtt.smoothed.unwrap() >= Duration::from_millis(30));
         assert!(first < second);
+    }
+
+    /// A packet declared lost keeps its record, so an acknowledgement that
+    /// arrives afterwards still retires it.
+    ///
+    /// This is the regression behind the 6.7 GiB resident growth: the record
+    /// was deleted at the moment of the loss declaration, the late
+    /// acknowledgement found no entry, the stream's send buffer never learned
+    /// that the range had arrived, and its frontier stopped at the hole for the
+    /// life of the stream.
+    #[test]
+    fn an_acknowledgement_after_the_loss_still_retires_the_record() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let first = send_one(&mut recovery, start, 0);
+        let _second = send_one(&mut recovery, start, 100);
+        let _third = send_one(&mut recovery, start, 200);
+        let fourth = send_one(&mut recovery, start, 300);
+
+        // The newest arrives, the two below it arrive, the first does not: with
+        // three later numbers seen it is a loss.
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(10),
+            Ack {
+                largest: fourth,
+                below: 0,
+                bits: 0b011, // third and second, not first
+            },
+        );
+        assert_eq!(acked.lost.len(), 1, "one packet is declared lost");
+        assert_eq!(acked.lost[0].number, first);
+        assert_eq!(recovery.in_flight(), 0, "it is off the wire");
+        assert_eq!(recovery.lost_records(), 1, "but its record is kept");
+        assert_eq!(recovery.flight_bytes(), 0, "and it costs no window");
+
+        // The original finally shows up, long after the retransmission was
+        // queued. The record is what lets this land.
+        let late = recovery.on_ack(
+            start + Duration::from_millis(20),
+            Ack {
+                largest: fourth,
+                below: fourth + 1,
+                bits: 0,
+            },
+        );
+        assert!(
+            late.newly.iter().any(|sent| sent.number == first),
+            "the late acknowledgement retires the lost packet"
+        );
+        assert_eq!(recovery.lost_records(), 0, "and the record is gone");
+        assert_eq!(
+            recovery.flight_bytes(),
+            0,
+            "no byte is left counted against the window"
+        );
+    }
+
+    /// A record nobody can still acknowledge is forgotten, so the table cannot
+    /// grow for the life of the connection.
+    #[test]
+    fn a_lost_record_is_forgotten_after_its_hold() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let first = send_one(&mut recovery, start, 0);
+        let _ = send_one(&mut recovery, start, 100);
+        let _ = send_one(&mut recovery, start, 200);
+        let fourth = send_one(&mut recovery, start, 300);
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(10),
+            Ack {
+                largest: fourth,
+                below: 0,
+                bits: 0b011, // third and second, not first
+            },
+        );
+        assert_eq!(acked.lost.len(), 1);
+        assert_eq!(acked.lost[0].number, first);
+        assert_eq!(recovery.lost_records(), 1);
+
+        // An acknowledgement that names nothing, a whole hold later: the reaper
+        // runs before the flight is read, and the record is gone.
+        let later = start + Duration::from_millis(10) + LOST_HOLD + Duration::from_millis(1);
+        let _ = recovery.on_ack(
+            later,
+            Ack {
+                largest: fourth,
+                below: 0,
+                bits: 0,
+            },
+        );
+        assert_eq!(recovery.lost_records(), 0, "the hold bounds the table");
+        assert_eq!(recovery.in_flight(), 0);
+        assert!(first < fourth);
+    }
+
+    /// However many packets a path drops, the lost table stays bounded.
+    #[test]
+    fn the_lost_table_is_capped() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        for i in 0..u32::try_from(MAX_LOST).unwrap() + 16 {
+            let number = recovery.next_number();
+            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)));
+            let _ = recovery.declare_lost(start, number);
+        }
+        assert!(
+            recovery.lost_records() <= MAX_LOST,
+            "{} records are more than the cap",
+            recovery.lost_records()
+        );
     }
 
     /// Three later acknowledgements are what turns a gap into a loss; two are

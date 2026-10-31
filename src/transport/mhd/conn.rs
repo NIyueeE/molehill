@@ -46,6 +46,19 @@ const DEAD_AFTER: Duration = Duration::from_secs(20);
 /// because it is a number, not a buffer.
 pub(crate) const WINDOW: u64 = 32 * 1024 * 1024;
 
+/// The most this end will hold in its send buffers, across every stream.
+///
+/// The credit window bounds what the *peer* can hold; this bounds what this end
+/// keeps for the re-send, and it exists because a byte's buffer is released only
+/// when an acknowledgement moves the stream's frontier past it. A frontier can
+/// stall — one range the peer received but never acknowledged, or acknowledged
+/// after its recovery record was forgotten — and without a ceiling the buffer
+/// grows with everything written after the hole. Measured: 6.7 GiB resident in a
+/// forty-second cell before this existed. At twice the window this refuses a
+/// write instead, which is backpressure the writer already understands; the
+/// connection's own stall line names the reason.
+const MAX_BUFFERED: u64 = 2 * WINDOW;
+
 /// How many bytes one stream may put in a row before the cursor moves on.
 ///
 /// Without it a bulk transfer takes every packet the credit allows and an
@@ -224,6 +237,11 @@ pub(crate) struct Conn {
     /// against the window from the moment it is queued until the peer's reader
     /// has taken it, which is what the peer's absolute credit describes.
     written: u64,
+    /// Bytes the send buffers still hold, across every stream.
+    ///
+    /// Kept rather than summed: it bounds a write on every call, and a sum over
+    /// the stream table there would grow with the connection's width.
+    buffered: u64,
     /// Bytes on the wire and not yet acknowledged.
     ///
     /// This is what the congestion window bounds. The peer's credit says how much
@@ -294,6 +312,7 @@ impl Conn {
             pending_fins: VecDeque::new(),
             finishing: BTreeSet::new(),
             written: 0,
+            buffered: 0,
             cwnd: INITIAL_CWND,
             slow_start: true,
             acked_since_growth: 0,
@@ -355,7 +374,11 @@ impl Conn {
         // and therefore the recovery table — is actually sized by.
         let credit = self.send_credit.saturating_sub(self.written);
         let window = self.cwnd.saturating_sub(self.recovery.flight_bytes());
-        let room = credit.min(window);
+        // The buffer ceiling is the third bound: a byte stays buffered until an
+        // acknowledgement moves its stream's frontier past it, and a frontier
+        // that stalls must cost the writer a wait rather than unbounded memory.
+        let held = MAX_BUFFERED.saturating_sub(self.buffered);
+        let room = credit.min(window).min(held);
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
@@ -382,6 +405,7 @@ impl Conn {
         }
         state.send.write(&bytes[..take]);
         self.written += take as u64;
+        self.buffered += take as u64;
         take
     }
 
@@ -440,7 +464,12 @@ impl Conn {
             // they have to be given back here: the window follows the reader,
             // and nobody will ever read a stream that no longer exists.
             self.release_unread(stream);
-            self.streams.remove(&stream);
+            if let Some(state) = self.streams.remove(&stream) {
+                // Its unacknowledged tail is no longer buffered by this end.
+                self.buffered = self
+                    .buffered
+                    .saturating_sub(u64::try_from(state.send.held()).unwrap_or(u64::MAX));
+            }
         }
     }
 
@@ -1055,11 +1084,14 @@ impl Conn {
         let ack_timing = stats::Timing::start(sampled);
         let acked = self.recovery.on_ack(now, ack);
         for sent in acked.newly {
-            if let Some(range) = sent.range
-                && let Some(state) = self.streams.get_mut(&range.stream)
-            {
-                state.send.ack(range.offset, usize::from(range.len));
-            }
+            let Some(range) = sent.range else {
+                continue;
+            };
+            let moved = match self.streams.get_mut(&range.stream) {
+                Some(state) => state.send.ack(range.offset, usize::from(range.len)),
+                None => 0,
+            };
+            self.buffered = self.buffered.saturating_sub(moved);
         }
         // A loss only rewinds the send point: the bytes are still in the
         // buffer, so the next pass carries them again from the same offset.
@@ -1356,6 +1388,94 @@ mod tests {
             }
         }
         assert_eq!(out, bytes, "the stream is whole after the retransmission");
+    }
+
+    /// The buffer a stream's bytes are held in empties once the peer has
+    /// acknowledged them — including a range it acknowledged only after
+    /// declaring it lost.
+    ///
+    /// The regression this pins is the resident growth: a lost packet's record
+    /// was deleted when the loss was declared, so the late acknowledgement had
+    /// nowhere to land and the stream's frontier stopped at that hole. Nothing
+    /// compacted the buffer again for the life of the connection, and it grew
+    /// with everything written.
+    #[test]
+    fn a_late_acknowledgement_still_frees_the_send_buffer() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let stream = link.a.open();
+        let bytes = payload(8000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        link.pump_dropping_one(now);
+        let Some(accepted) = link.b.accept() else {
+            unreachable!("the stream is named on arrival")
+        };
+        let mut out = take(&mut link.b, accepted.id);
+
+        let mut clock = now;
+        for _ in 0..8 {
+            clock += Duration::from_millis(10);
+            link.pump(clock);
+            out.extend_from_slice(&take(&mut link.b, accepted.id));
+            if out.len() == bytes.len() {
+                break;
+            }
+        }
+        assert_eq!(out, bytes, "the stream is whole");
+        let state = link.a.streams.get(&stream.id).unwrap();
+        assert_eq!(
+            state.send.held(),
+            0,
+            "every acknowledged byte left the buffer"
+        );
+    }
+
+    /// Two ranges dropped in one window are both retransmitted.
+    ///
+    /// The rewind used to assign each lost offset in turn, leaving the send
+    /// point at the highest one: every range below the last hole was never
+    /// re-sent, so the peer's frontier stopped there and the hole was permanent.
+    #[test]
+    fn two_dropped_datagrams_in_one_window_are_both_recovered() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let stream = link.a.open();
+        let bytes = payload(12_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        // The second and fourth datagrams of the transfer fall on the floor;
+        // the third and fifth put three later packets behind each of them, so a
+        // single acknowledgement declares both lost.
+        let mut buf = Vec::new();
+        let mut seen = 0usize;
+        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+            seen += 1;
+            if seen == 2 || seen == 4 {
+                continue;
+            }
+            link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+        }
+        for datagram in std::mem::take(&mut link.a_to_b) {
+            link.b.on_datagram(now, &datagram).unwrap();
+        }
+
+        let Some(accepted) = link.b.accept() else {
+            unreachable!("the stream is named on arrival")
+        };
+        let mut out = take(&mut link.b, accepted.id);
+        let mut clock = now;
+        for _ in 0..8 {
+            clock += Duration::from_millis(10);
+            link.pump(clock);
+            out.extend_from_slice(&take(&mut link.b, accepted.id));
+            if out.len() == bytes.len() {
+                break;
+            }
+        }
+        assert_eq!(out, bytes, "both holes are repaired");
     }
 
     /// Two streams share one connection, and a loss on one of them is not a

@@ -71,7 +71,7 @@ impl SendBuf {
             return 0;
         }
         let before = self.base;
-        self.acked.insert(start, end);
+        self.absorb(start, end);
         // Advance only over the run that starts at the base: a hole above it is
         // exactly what a retransmission is for, and stepping past it would drop
         // bytes the peer never acknowledged.
@@ -81,6 +81,43 @@ impl SendBuf {
         }
         self.compact();
         self.base - before
+    }
+
+    /// Add one acknowledged range, merging it into the ones it overlaps.
+    ///
+    /// A retransmission is acknowledged for a range that is already partly
+    /// acknowledged — that is the usual way two ranges overlap — and a plain
+    /// insert would leave the second copy at a key the frontier never looks up:
+    /// the bytes it covered were acknowledged but unreachable, the base stopped
+    /// in front of them, and everything written afterwards queued behind a hole
+    /// that no acknowledgement could fill. Merging keeps the set a partition of
+    /// the acknowledged bytes, which is what the frontier walk assumes.
+    fn absorb(&mut self, start: u64, end: u64) {
+        let mut start = start;
+        let mut end = end;
+        let preceding = self
+            .acked
+            .range(..=start)
+            .next_back()
+            .map(|(&at, &until)| (at, until));
+        if let Some((at, until)) = preceding
+            && until >= start
+        {
+            self.acked.remove(&at);
+            start = at;
+            end = end.max(until);
+        }
+        let touching: Vec<(u64, u64)> = self
+            .acked
+            .range(start..)
+            .take_while(|item| *item.0 <= end)
+            .map(|(&at, &until)| (at, until))
+            .collect();
+        for (at, until) in touching {
+            self.acked.remove(&at);
+            end = end.max(until);
+        }
+        self.acked.insert(start, end);
     }
 
     /// Drop the acknowledged prefix, but only once it pays for the move.
@@ -133,8 +170,15 @@ impl SendBuf {
 
     /// Rewind the send point to a range the peer never acknowledged, so the next
     /// pass carries it again.
+    ///
+    /// The send point only ever moves **back**: one acknowledgement can report
+    /// several losses, and assigning the offset of each in turn leaves the point
+    /// at the highest of them, so every range below it is never retransmitted
+    /// and the frontier stops at the first hole. Taking the minimum keeps the
+    /// lowest hole in front of the wire, which is the one that has to be filled
+    /// before anything above it can be acknowledged.
     pub(crate) fn rewind_to(&mut self, offset: u64) {
-        self.sent = offset.max(self.base);
+        self.sent = self.sent.min(offset.max(self.base));
     }
 
     /// Whether any queued byte has not been on the wire yet.
@@ -164,7 +208,6 @@ impl SendBuf {
 
     /// How many bytes the buffer still holds, the acknowledged prefix that
     /// compaction has not dropped included.
-    #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.data.len()
     }
@@ -535,6 +578,45 @@ mod tests {
         let (tail, fin) = send.range(3, 3).unwrap();
         assert_eq!(tail, b"def");
         assert!(fin);
+    }
+
+    /// A rewind carries the lowest hole, not the last one reported.
+    #[test]
+    fn a_rewind_never_advances_the_send_point() {
+        let mut send = SendBuf::default();
+        send.write(&[7u8; 3000]);
+        send.mark_sent(3000);
+        assert_eq!(send.next_offset(), 3000);
+
+        send.rewind_to(1400);
+        assert_eq!(send.next_offset(), 1400, "the lower hole is in front");
+
+        // A second loss in the same acknowledgement, further along. The send
+        // point must stay at the lower one: assigning it would skip everything
+        // between the two, and the stream's frontier would stop at the first
+        // hole for the rest of the connection.
+        send.rewind_to(2800);
+        assert_eq!(send.next_offset(), 1400, "a rewind never moves forward");
+    }
+
+    /// An acknowledgement that overlaps one already held extends it instead of
+    /// hiding the bytes it covers behind a key the frontier will never look up.
+    ///
+    /// A retransmission produces exactly this shape: the peer acknowledges a
+    /// range that is already partly acknowledged, and a plain insert leaves the
+    /// second copy keyed below the frontier.
+    #[test]
+    fn an_acknowledgement_that_overlaps_one_already_held_extends_it() {
+        let mut send = SendBuf::default();
+        send.write(&[1u8; 4000]);
+
+        assert_eq!(send.ack(2000, 1000), 0, "a range above the base waits");
+        assert_eq!(send.ack(1500, 1000), 0, "overlapping it waits too");
+
+        // The prefix arrives. The frontier must walk through the merged range
+        // (1500..3000), not stop at its own 1600.
+        assert_eq!(send.ack(0, 1600), 3000, "the whole run is acknowledged");
+        assert_eq!(send.unacked(), 1000, "only the tail is still owed");
     }
 
     /// The property the compaction rests on: acknowledging in any order still
