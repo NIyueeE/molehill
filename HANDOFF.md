@@ -1863,6 +1863,20 @@ to remove. **So the receive path stays as it is**; the remaining 464 MiB is not
 this, and the next attempt should copy out of the region into a *right-sized*
 `Bytes` (one allocation, no pinning) rather than hand the region itself on.
 
+**The chunked send buffer was tried and rejected too (2026-10-31).** Replacing
+the single growable `Vec` with a `VecDeque<Bytes>` (one chunk per written record)
+does remove the compaction memmove — `compact` became a `trim` that pops whole
+chunks — and every unit test passed. It is also **quadratic**: `range()` walks the
+queue from its front to find the offset a packet carries, and the send point is
+near the tail, so each packet walks the whole window. Measured: `cpu_s_per_gbit`
+**46.7** and **0.032 Gbit/s** (against 0.73 and 8.3). Reverted. The structure is
+still right — a chunk queue frees a record the moment it is acknowledged, which
+is what the `Vec` could not do — but it needs a **read cursor**: the queue index
+`next_offset()` currently points into, advanced as the send point moves and reset
+when the base passes it, so a packet finds its chunk without scanning. That is
+the next attempt, and it should be measured against the sender's `ack` phase
+(0.053 s/Gbit) rather than guessed at.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
