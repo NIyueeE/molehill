@@ -2041,7 +2041,9 @@ Two measurements made the mechanism explicit before the change:
 
 A per-datagram `to_vec` plus a doubling growth is what left that heap behind;
 blocks are exact (one per 16 KiB carried, the last one partial) and reused, so
-the allocator leaves the data path in steady state.
+the allocator leaves the data path in steady state. The same manual pair on this
+build peaks at **112 MiB** (client) and 137 (server) at 12.05 Gbit/s, against 423
+and 150 before it — with TCP's 12 MiB still the floor to beat.
 
 Measured with the model's `cost` cell, `screen` profile, `scale 2`, l4 arm, as
 an interleaved A/B against the previous build in one campaign (`--ab-arm`),
@@ -2069,6 +2071,13 @@ four rounds; its twin 12.29-12.85, with one cell lost to the host's
 `control socket has closed unexpectedly`). The `l3` arm times out in the same
 campaign on **both** builds, which is the host problem recorded below, not this
 change.
+
+`just l3-accept` on this build: the first run passed 13 of 16 and failed the
+three concurrent-claim arms, the second passed **16 of 16**. The failure set
+moved, and no L3 frame enters the receive buffer at all (`Frame::L3` is
+acknowledged and handed on, never stored in a stream), so the first run was the
+host's load — the same shape as the 14- and 15-of-16 runs recorded above for
+both other builds.
 
 **One gate is not green, and it is not this change.** `just check` passes under
 the default carrier and under `MOLEHILL_DATA_CARRIER=tcp`; under `=mhd` it fails
