@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::recovery::{Expiry, Recovery, SentRange};
-use super::stream::{RecvBuf, SendBuf};
+use super::stream::{Blocks, RecvBuf, SendBuf};
 use super::wire::{self, AckSet, Frame, MAX_STREAM_PAYLOAD, ResetCode};
 use crate::transport::health::SessionHealth;
 use crate::transport::stats;
@@ -203,6 +203,13 @@ pub(crate) struct Conn {
     /// Which bound refused the last partial write (see [`Conn::write`]).
     last_refusal: Option<Refusal>,
     recovery: Recovery,
+    /// The connection's receive blocks.
+    ///
+    /// Every stream takes from here and gives back as the reader passes what it
+    /// took, so the receive path's footprint is what the streams hold and a
+    /// burst reuses the blocks the last one released rather than asking the
+    /// allocator once per datagram.
+    blocks: Blocks,
     acks: AckSet,
     ack_pending: bool,
     /// Bytes the peer allows this end to have in flight, absolute.
@@ -309,6 +316,7 @@ impl Conn {
             stall_logged_at: None,
             last_refusal: None,
             recovery: Recovery::new(),
+            blocks: Blocks::default(),
             acks: AckSet::default(),
             ack_pending: false,
             send_credit: WINDOW / 2,
@@ -436,12 +444,14 @@ impl Conn {
     /// is queued at that point — a peer that never sees one keeps a dead stream
     /// for the connection's life.
     pub(crate) fn close_stream(&mut self, stream: u32) {
+        let blocks = &mut self.blocks;
         let Some(state) = self.streams.get_mut(&stream) else {
             return;
         };
         state.abandoned = true;
-        // Nothing will read this half again: release what arrived.
-        state.recv = RecvBuf::default();
+        // Nothing will read this half again: release what arrived, and with it
+        // the blocks a later stream on this connection can use.
+        state.recv.discard(blocks);
         state.send.finish();
         state.local_fin = true;
         self.settle(stream);
@@ -493,10 +503,11 @@ impl Conn {
     /// until it carried nothing, and the only symptom would be
     /// `credit_blocked` on a connection whose readers are keeping up.
     fn release_unread(&mut self, stream: u32) {
+        let blocks = &mut self.blocks;
         let held = self
             .streams
             .get_mut(&stream)
-            .map_or(0, |state| state.recv.discard());
+            .map_or(0, |state| state.recv.discard(blocks));
         self.advance_read(held);
     }
 
@@ -544,10 +555,11 @@ impl Conn {
     /// a time is a copy per byte that only exists to serve a shape no reader
     /// has.
     pub(crate) fn read(&mut self, stream: u32, out: &mut [u8]) -> usize {
+        let blocks = &mut self.blocks;
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
-        let taken = state.recv.read_into(out);
+        let taken = state.recv.read_into(blocks, out);
         self.advance_read(taken as u64);
         taken
     }
@@ -847,6 +859,10 @@ impl Conn {
         // One probe per due interval, however long the process was asleep: a
         // resumed laptop must not fire the whole missed schedule at once.
         self.keepalive_at = now + KEEPALIVE;
+        // A connection with nothing on loan keeps no receive blocks: the pool is
+        // what the streams took, and giving it back inside a keepalive interval
+        // is what makes a lane that carried a window's worth of data small again.
+        self.blocks.shrink();
         if now.saturating_duration_since(self.last_recv) > DEAD_AFTER {
             // One line, at the moment a lane decides its peer is gone: the age
             // is the evidence, and a lane that dies having heard nothing since it
@@ -1046,9 +1062,10 @@ impl Conn {
                         self.streams.insert(id, StreamState::default());
                         self.inbound.push_back(id);
                     }
+                    let blocks = &mut self.blocks;
                     let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
                     stats::around(sampled, &stats::PHASES.append, || {
-                        state.recv.insert(offset, data);
+                        state.recv.insert(blocks, offset, data);
                     });
                     if fin {
                         state.recv.finish(offset + data.len() as u64);
@@ -1340,8 +1357,9 @@ mod tests {
     fn a_stream_retired_with_unread_bytes_returns_the_window() {
         let mut conn = Conn::new(9, false);
         let opening = conn.recv_credit;
+        let blocks = &mut conn.blocks;
         let state = conn.streams.entry(2).or_default();
-        state.recv.insert(0, &payload(10));
+        state.recv.insert(blocks, 0, &payload(10));
         assert_eq!(conn.backlog().total, 10, "ten bytes are held");
 
         conn.release_unread(2);

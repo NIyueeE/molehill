@@ -268,6 +268,198 @@ impl SendBuf {
     }
 }
 
+/// Bytes in one receive block.
+///
+/// Arrived bytes are stored in blocks of this size instead of a growable vector
+/// per piece. A block is taken from the connection's [`Blocks`] as a run fills
+/// it and given back as the reader passes it, so the receive path's footprint is
+/// the bytes it holds rather than the peak a vector's doubling once reserved,
+/// and a datagram in the middle of a run takes no allocation at all. A datagram
+/// is smaller than a block, so one block carries several of them; only the last
+/// block of a run is partial.
+pub(crate) const BLOCK: usize = 16 * 1024;
+
+/// The connection's supply of receive blocks.
+///
+/// Every stream on the connection takes its blocks from here and returns them
+/// once the reader has passed them, so a burst reuses what the previous burst
+/// released. That reuse is the point: allocating a right-sized buffer per
+/// datagram is what fragmented the carrier's heap, and the fragments outlived
+/// the transfer that produced them.
+#[derive(Debug, Default)]
+pub(crate) struct Blocks {
+    /// The blocks themselves, addressed by index. Nothing reuses an index
+    /// before the stream that took it gives it back.
+    slabs: Vec<Box<[u8]>>,
+    /// Indices nobody holds.
+    free: Vec<u32>,
+    /// How many indices are out on loan.
+    live: usize,
+}
+
+impl Blocks {
+    /// One block, reused when the free list has one.
+    fn take(&mut self) -> u32 {
+        self.live += 1;
+        if let Some(at) = self.free.pop() {
+            return at;
+        }
+        let at = u32::try_from(self.slabs.len()).unwrap_or(u32::MAX);
+        self.slabs.push(vec![0u8; BLOCK].into_boxed_slice());
+        at
+    }
+
+    fn give(&mut self, at: u32) {
+        self.live = self.live.saturating_sub(1);
+        self.free.push(at);
+    }
+
+    /// Blocks this connection is holding on loan.
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.live
+    }
+
+    fn read(&self, at: u32, start: usize, len: usize) -> &[u8] {
+        &self.slabs[at as usize][start..start + len]
+    }
+
+    fn write(&mut self, at: u32, start: usize, bytes: &[u8]) {
+        self.slabs[at as usize][start..start + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Move bytes between two blocks, which is what folding a hole costs: the
+    /// run behind it is copied once, exactly as a growable piece copied it.
+    fn copy(&mut self, from: u32, from_start: usize, to: u32, to_start: usize, len: usize) {
+        let end = from_start + len;
+        if from == to {
+            self.slabs[to as usize].copy_within(from_start..end, to_start);
+            return;
+        }
+        let (low, high) = (from.min(to) as usize, from.max(to) as usize);
+        let (left, right) = self.slabs.split_at_mut(high);
+        let (src, dst) = if from < to {
+            (&left[low], &mut right[0])
+        } else {
+            (&right[0], &mut left[low])
+        };
+        dst[to_start..to_start + len].copy_from_slice(&src[from_start..end]);
+    }
+
+    /// Keep the blocks that are on loan and let the free ones go.
+    ///
+    /// A connection that has carried a window's worth of data holds thirty-two
+    /// megabytes of blocks afterwards; giving them back when nothing is on loan
+    /// is what keeps an idle lane small.
+    pub(crate) fn shrink(&mut self) {
+        if self.live == 0 {
+            self.slabs.clear();
+            self.free.clear();
+        }
+    }
+}
+
+/// Bytes `[start, start + len)` of one pooled block: the storage of a run.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    at: u32,
+    start: u16,
+    len: u16,
+}
+
+/// One contiguous run of a stream, in blocks taken from the pool.
+#[derive(Debug, Default)]
+struct Piece {
+    spans: VecDeque<Held>,
+    /// The run's whole length, delivered or not.
+    len: usize,
+    /// How much of it the reader has taken.
+    consumed: usize,
+}
+
+impl Piece {
+    /// Append a block's worth of bytes, filling the last block before taking
+    /// another one from the pool.
+    fn append_from(
+        &mut self,
+        blocks: &mut Blocks,
+        from: u32,
+        mut from_start: usize,
+        mut len: usize,
+    ) {
+        while len > 0 {
+            let Some(last) = self.spans.back_mut() else {
+                let at = blocks.take();
+                self.spans.push_back(Held {
+                    at,
+                    start: 0,
+                    len: 0,
+                });
+                continue;
+            };
+            // The span's first bytes may have been read already, so its room is
+            // what is left of the block, not of the datagrams.
+            let room = BLOCK.saturating_sub(usize::from(last.start) + usize::from(last.len));
+            if room == 0 {
+                let at = blocks.take();
+                self.spans.push_back(Held {
+                    at,
+                    start: 0,
+                    len: 0,
+                });
+                continue;
+            }
+            let take = room.min(len);
+            let (at, to_start) = (last.at, usize::from(last.start) + usize::from(last.len));
+            blocks.copy(from, from_start, at, to_start, take);
+            last.len += u16::try_from(take).unwrap_or(u16::MAX);
+            self.len += take;
+            len -= take;
+            from_start += take;
+        }
+    }
+
+    /// Append a caller's slice.
+    fn append(&mut self, blocks: &mut Blocks, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let Some(last) = self.spans.back_mut() else {
+                let at = blocks.take();
+                self.spans.push_back(Held {
+                    at,
+                    start: 0,
+                    len: 0,
+                });
+                continue;
+            };
+            // The span's first bytes may have been read already, so its room is
+            // what is left of the block, not of the datagrams.
+            let room = BLOCK.saturating_sub(usize::from(last.start) + usize::from(last.len));
+            if room == 0 {
+                let at = blocks.take();
+                self.spans.push_back(Held {
+                    at,
+                    start: 0,
+                    len: 0,
+                });
+                continue;
+            }
+            let take = room.min(bytes.len());
+            let (at, start) = (last.at, usize::from(last.start) + usize::from(last.len));
+            blocks.write(at, start, &bytes[..take]);
+            last.len += u16::try_from(take).unwrap_or(u16::MAX);
+            self.len += take;
+            bytes = &bytes[take..];
+        }
+    }
+
+    /// Give every block back to the pool.
+    fn release(&mut self, blocks: &mut Blocks) {
+        for span in self.spans.drain(..) {
+            blocks.give(span.at);
+        }
+    }
+}
+
 /// The bytes of a stream that have arrived, in and out of order.
 #[derive(Debug, Default)]
 pub(crate) struct RecvBuf {
@@ -279,7 +471,11 @@ pub(crate) struct RecvBuf {
     /// fit — an earlier version drained the whole buffer per caller chunk,
     /// which is a memmove of everything still held on every read and measured
     /// as a memmove per byte carried.
-    pieces: BTreeMap<u64, Vec<u8>>,
+    ///
+    /// The bytes themselves live in blocks from the connection's [`Blocks`], so
+    /// a piece's cost is what it holds; [`Self::discard`] and the read path
+    /// return the blocks, and nothing here allocates per datagram.
+    pieces: BTreeMap<u64, Piece>,
     /// Everything below this offset has been read out.
     read: u64,
     /// Where the peer said the stream ends, once it did.
@@ -304,8 +500,8 @@ impl RecvBuf {
     /// sender emits a stream in order, one packet after another — and a piece
     /// per packet would enter and leave the table once per packet, which is two
     /// tree operations and an allocation for every 1400 bytes carried. Appending
-    /// costs one copy into a warm buffer.
-    pub(crate) fn insert(&mut self, offset: u64, bytes: &[u8]) -> bool {
+    /// costs one copy into a block the pool already holds.
+    pub(crate) fn insert(&mut self, blocks: &mut Blocks, offset: u64, bytes: &[u8]) -> bool {
         let (mut offset, mut bytes) = (offset, bytes);
         if bytes.is_empty() {
             return false;
@@ -321,7 +517,7 @@ impl RecvBuf {
             bytes = &bytes[skip..];
         }
         if let Some((start, held)) = self.pieces.range(..offset).next_back() {
-            let piece_end = start + held.len() as u64;
+            let piece_end = start + held.len as u64;
             if piece_end > offset {
                 // The range starts inside a piece already held: skip the part
                 // that is there, and keep whatever extends past it.
@@ -347,21 +543,27 @@ impl RecvBuf {
             }
             bytes = &bytes[..keep];
         }
-        if let Some((start, held)) = self.pieces.range(..offset).next_back()
-            && start + held.len() as u64 == offset
-        {
+        let continues = self
+            .pieces
+            .range(..offset)
+            .next_back()
+            .map(|(start, piece)| *start + piece.len as u64)
+            .is_some_and(|end| end == offset);
+        if continues && let Some((start, _)) = self.pieces.range(..offset).next_back() {
             let start = *start;
-            if let Some(held) = self.pieces.get_mut(&start) {
-                held.extend_from_slice(bytes);
+            if let Some(piece) = self.pieces.get_mut(&start) {
+                piece.append(blocks, bytes);
             }
-            self.absorb_next(start);
+            self.absorb_next(blocks, start);
             return true;
         }
         if self.pieces.contains_key(&offset) {
             return false;
         }
-        self.pieces.insert(offset, bytes.to_vec());
-        self.absorb_next(offset);
+        let mut piece = Piece::default();
+        piece.append(blocks, bytes);
+        self.pieces.insert(offset, piece);
+        self.absorb_next(blocks, offset);
         true
     }
 
@@ -369,19 +571,29 @@ impl RecvBuf {
     ///
     /// Only a piece that arrives exactly where another ended can leave two
     /// adjacent entries; each fold removes one, so the table stays proportional
-    /// to the number of holes rather than to the bytes carried.
-    fn absorb_next(&mut self, start: u64) {
+    /// to the number of holes rather than to the bytes carried. The fold copies
+    /// the run it absorbs, which is what a growable piece did, and gives back
+    /// the blocks it leaves empty.
+    fn absorb_next(&mut self, blocks: &mut Blocks, start: u64) {
         loop {
             let Some(held) = self.pieces.get(&start) else {
                 return;
             };
-            let end = start + held.len() as u64;
-            let Some(following) = self.pieces.remove(&end) else {
+            let end = start + held.len as u64;
+            let Some(mut following) = self.pieces.remove(&end) else {
                 return;
             };
-            if let Some(held) = self.pieces.get_mut(&start) {
-                held.extend_from_slice(&following);
+            for span in following.spans.iter().copied() {
+                if let Some(piece) = self.pieces.get_mut(&start) {
+                    piece.append_from(
+                        blocks,
+                        span.at,
+                        usize::from(span.start),
+                        usize::from(span.len),
+                    );
+                }
             }
+            following.release(blocks);
         }
     }
 
@@ -407,25 +619,20 @@ impl RecvBuf {
             // between them and nothing past it can be reported.
             return self.read;
         }
-        (at + piece.len() as u64).max(self.read)
+        (at + piece.len as u64).max(self.read)
     }
 
     /// Bytes that have arrived and not yet been read out of this stream.
     ///
     /// The number a stalled reader is measured by: the connection's credit
     /// follows consumption, not arrival, so a stream whose reader has stopped
-    /// is invisible in every other counter while it holds the window back. This
-    /// is the per-stream half of that story, and the reason it is computed
-    /// rather than tracked: a piece may start below the read offset, so the
-    /// answer is the pieces' extents clipped to the reader's position.
+    /// is invisible in every other counter while it holds the window back. Each
+    /// piece counts what the reader has not taken from it, so a piece the reader
+    /// is part-way through contributes the rest of itself and nothing else.
     pub(crate) fn held(&self) -> u64 {
         self.pieces
-            .iter()
-            .map(|(&at, piece)| {
-                let len = piece.len() as u64;
-                let start = self.read.saturating_sub(at).min(len);
-                len - start
-            })
+            .values()
+            .map(|piece| u64::try_from(piece.len - piece.consumed).unwrap_or(0))
             .sum()
     }
 
@@ -434,10 +641,12 @@ impl RecvBuf {
     ///
     /// For a stream that is leaving the table with a reader that will never come
     /// back: the bytes are unreachable, so holding them only misreports what
-    /// this end is behind on.
-    pub(crate) fn discard(&mut self) -> u64 {
+    /// this end is behind on, and their blocks belong to the next stream.
+    pub(crate) fn discard(&mut self, blocks: &mut Blocks) -> u64 {
         let held = self.held();
-        self.pieces.clear();
+        for (_, mut piece) in std::mem::take(&mut self.pieces) {
+            piece.release(blocks);
+        }
         held
     }
 
@@ -450,34 +659,62 @@ impl RecvBuf {
     /// prefix in a buffer of this layer's own and then handing out a
     /// caller-sized slice of it is a second copy per byte, and the memmove that
     /// keeps the staged remainder in place made it worse than that.
-    pub(crate) fn read_into(&mut self, out: &mut [u8]) -> usize {
+    ///
+    /// A block the reader has passed goes back to the pool here, which is what
+    /// keeps a lane that has carried a window's worth of data from holding it.
+    pub(crate) fn read_into(&mut self, blocks: &mut Blocks, out: &mut [u8]) -> usize {
         let mut filled = 0;
         loop {
             let room = out.len().saturating_sub(filled);
             if room == 0 {
                 break;
             }
-            let Some((start, _)) = self.pieces.iter().next() else {
+            let Some((&start, _)) = self.pieces.iter().next() else {
                 break;
             };
-            let start = *start;
             if start > self.read {
                 break; // a hole: the prefix ends here
             }
-            let Some(held) = self.pieces.get(&start) else {
+            let Some(piece) = self.pieces.get_mut(&start) else {
                 break;
             };
-            let skip = usize::try_from(self.read - start).unwrap_or(held.len());
-            let take = room.min(held.len() - skip);
-            if take == 0 {
+            if usize::try_from(self.read - start).unwrap_or(usize::MAX) >= piece.len {
                 // Every byte of this piece has been handed out already.
                 self.pieces.remove(&start);
                 continue;
             }
-            out[filled..filled + take].copy_from_slice(&held[skip..skip + take]);
-            filled += take;
-            self.read += take as u64;
-            if skip + take == held.len() {
+            let mut taken = 0;
+            while taken < room {
+                let Some(front) = piece.spans.front_mut() else {
+                    break;
+                };
+                let take = room.saturating_sub(taken).min(usize::from(front.len));
+                if take == 0 {
+                    // A span with nothing left in it: give it back and look at
+                    // the next one rather than reading zero bytes forever.
+                    let at = front.at;
+                    piece.spans.pop_front();
+                    blocks.give(at);
+                    continue;
+                }
+                let bytes = blocks.read(front.at, usize::from(front.start), take);
+                out[filled + taken..filled + taken + take].copy_from_slice(bytes);
+                front.start += u16::try_from(take).unwrap_or(0);
+                front.len -= u16::try_from(take).unwrap_or(0);
+                piece.consumed += take;
+                taken += take;
+                self.read += take as u64;
+                if front.len == 0 {
+                    let at = front.at;
+                    piece.spans.pop_front();
+                    blocks.give(at);
+                }
+            }
+            filled += taken;
+            if taken == 0 {
+                break;
+            }
+            if piece.consumed >= piece.len {
                 self.pieces.remove(&start);
             }
         }
@@ -511,11 +748,11 @@ mod tests {
 
     /// Read everything the buffer holds into a fresh vector, the way a caller
     /// with an unbounded buffer would.
-    fn drain_all(recv: &mut RecvBuf) -> Vec<u8> {
+    fn drain_all(recv: &mut RecvBuf, blocks: &mut Blocks) -> Vec<u8> {
         let mut out = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
-            let n = recv.read_into(&mut chunk);
+            let n = recv.read_into(blocks, &mut chunk);
             if n == 0 {
                 return out;
             }
@@ -530,6 +767,7 @@ mod tests {
     fn a_stream_assembled_from_shuffled_pieces_is_the_original() {
         let original = stream_bytes(4096);
         let mut recv = RecvBuf::default();
+        let mut blocks = Blocks::default();
         // Twelve pieces, inserted in an order no sender would choose.
         let mut bounds: Vec<(usize, usize)> = Vec::new();
         let mut at = 0;
@@ -542,9 +780,9 @@ mod tests {
         assert_eq!(at, original.len());
         for index in [5usize, 0, 11, 3, 8, 1, 10, 4, 9, 2, 7, 6] {
             let (start, end) = bounds[index];
-            recv.insert(start as u64, &original[start..end]);
+            recv.insert(&mut blocks, start as u64, &original[start..end]);
         }
-        let out = drain_all(&mut recv);
+        let out = drain_all(&mut recv, &mut blocks);
         assert_eq!(out.len(), original.len(), "every byte must come out");
         assert_eq!(out, original, "the bytes must be the stream, in order");
     }
@@ -556,12 +794,13 @@ mod tests {
     fn held_counts_what_arrived_and_nobody_read() {
         let original = stream_bytes(600);
         let mut recv = RecvBuf::default();
-        recv.insert(0, &original[..300]);
-        recv.insert(300, &original[300..]);
+        let mut blocks = Blocks::default();
+        recv.insert(&mut blocks, 0, &original[..300]);
+        recv.insert(&mut blocks, 300, &original[300..]);
         assert_eq!(recv.held(), 600, "everything arrived and nothing was read");
 
         let mut chunk = [0u8; 128];
-        assert_eq!(recv.read_into(&mut chunk), 128);
+        assert_eq!(recv.read_into(&mut blocks, &mut chunk), 128);
         assert_eq!(
             recv.held(),
             600 - 128,
@@ -569,16 +808,64 @@ mod tests {
         );
 
         let mut rest = [0u8; 4096];
-        assert_eq!(recv.read_into(&mut rest), 600 - 128);
+        assert_eq!(recv.read_into(&mut blocks, &mut rest), 600 - 128);
         assert_eq!(recv.held(), 0, "a drained stream holds nothing");
 
         // A hole does not make the bytes behind it free: the peer sent them,
         // this end has them, and the credit the peer will be granted counts
         // them until they are read.
         let mut holed = RecvBuf::default();
-        holed.insert(0, &original[..100]);
-        holed.insert(200, &original[200..300]);
+        holed.insert(&mut blocks, 0, &original[..100]);
+        holed.insert(&mut blocks, 200, &original[200..300]);
         assert_eq!(holed.held(), 200, "a hole holds its own bytes as well");
+    }
+
+    /// The point of the pool: a stream's blocks are what it holds, not the peak
+    /// a growable piece once reached, and a reader that passes them gives them
+    /// back for the next stream on the connection instead of the allocator.
+    #[test]
+    fn a_drained_stream_gives_its_blocks_back_for_the_next_one() {
+        let original = stream_bytes(BLOCK * 4);
+        let mut recv = RecvBuf::default();
+        let mut blocks = Blocks::default();
+        for (index, chunk) in original.chunks(1400).enumerate() {
+            recv.insert(&mut blocks, (index * 1400) as u64, chunk);
+        }
+        assert_eq!(
+            blocks.live(),
+            original.len().div_ceil(BLOCK),
+            "one block per {BLOCK} bytes carried, with no doubling"
+        );
+        assert_eq!(
+            recv.held(),
+            u64::try_from(original.len()).unwrap(),
+            "a run holds exactly the bytes that arrived"
+        );
+
+        let mut chunk = [0u8; 1400];
+        let mut read = 0;
+        while read < original.len() {
+            let n = recv.read_into(&mut blocks, &mut chunk);
+            assert!(n > 0, "a full prefix must always make progress");
+            read += n;
+        }
+        assert_eq!(blocks.live(), 0, "a drained stream holds no blocks");
+
+        // The blocks came back to the pool rather than to the allocator: the
+        // next stream is carried by the same slabs.
+        let grown = blocks.slabs.len();
+        let mut next = RecvBuf::default();
+        for (index, chunk) in original.chunks(1400).enumerate() {
+            next.insert(&mut blocks, (index * 1400) as u64, chunk);
+        }
+        assert_eq!(
+            blocks.slabs.len(),
+            grown,
+            "the pool is reused, not regrown per stream"
+        );
+        assert_eq!(drain_all(&mut next, &mut blocks).len(), original.len());
+        blocks.shrink();
+        assert_eq!(blocks.slabs.len(), 0, "an idle connection holds no blocks");
     }
 
     /// A hole stops one stream at the hole and says where the next piece is; it
@@ -586,14 +873,18 @@ mod tests {
     #[test]
     fn a_hole_stops_the_prefix_and_reports_itself() {
         let mut recv = RecvBuf::default();
-        assert!(recv.insert(20, b"later"));
-        assert!(recv.insert(0, b"first"));
+        let mut blocks = Blocks::default();
+        assert!(recv.insert(&mut blocks, 20, b"later"));
+        assert!(recv.insert(&mut blocks, 0, b"first"));
         let mut out = [0u8; 32];
-        assert_eq!(recv.read_into(&mut out), 5);
+        assert_eq!(recv.read_into(&mut blocks, &mut out), 5);
         assert_eq!(&out[..5], b"first");
         assert_eq!(recv.hole(), Some((15, 20)), "the missing range is 5..20");
-        assert!(recv.insert(5, &[b'x'; 15]), "the hole can be filled");
-        assert_eq!(drain_all(&mut recv), b"xxxxxxxxxxxxxxxlater");
+        assert!(
+            recv.insert(&mut blocks, 5, &[b'x'; 15]),
+            "the hole can be filled"
+        );
+        assert_eq!(drain_all(&mut recv, &mut blocks), b"xxxxxxxxxxxxxxxlater");
     }
 
     /// A reader that takes the prefix in slices smaller than the pieces gets the
@@ -604,16 +895,17 @@ mod tests {
     fn a_reader_that_takes_small_slices_sees_each_byte_once() {
         let original = stream_bytes(4096);
         let mut recv = RecvBuf::default();
+        let mut blocks = Blocks::default();
         for (index, chunk) in original.chunks(331).enumerate() {
-            assert!(recv.insert((index * 331) as u64, chunk));
+            assert!(recv.insert(&mut blocks, (index * 331) as u64, chunk));
         }
         let mut got = Vec::new();
         let mut small = [0u8; 37];
         while got.len() < original.len() {
             // A retransmission of bytes already delivered in front of the read
             // offset must not duplicate them.
-            let _ = recv.insert(0, &original[..64]);
-            let n = recv.read_into(&mut small);
+            let _ = recv.insert(&mut blocks, 0, &original[..64]);
+            let n = recv.read_into(&mut blocks, &mut small);
             assert!(n > 0, "a full prefix must always make progress");
             got.extend_from_slice(&small[..n]);
         }
@@ -676,12 +968,13 @@ mod tests {
     #[test]
     fn the_arrived_prefix_stops_at_the_first_hole() {
         let mut recv = RecvBuf::default();
+        let mut blocks = Blocks::default();
         assert_eq!(recv.arrived(), 0);
-        recv.insert(0, &[1u8; 100]);
+        recv.insert(&mut blocks, 0, &[1u8; 100]);
         assert_eq!(recv.arrived(), 100);
-        recv.insert(300, &[2u8; 100]);
+        recv.insert(&mut blocks, 300, &[2u8; 100]);
         assert_eq!(recv.arrived(), 100, "a hole at 100 stops the prefix");
-        recv.insert(100, &[3u8; 200]);
+        recv.insert(&mut blocks, 100, &[3u8; 200]);
         assert_eq!(recv.arrived(), 400, "filling it moves the prefix on");
     }
 

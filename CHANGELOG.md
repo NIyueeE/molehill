@@ -100,6 +100,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The receive buffer keeps arrived bytes in pooled blocks, not one growing
+  vector per piece.** A piece used to be a `Vec` that doubled as data arrived and
+  was allocated afresh for every datagram that started one, so a lane's
+  footprint was the peak its receive buffer ever reached and the allocator kept
+  that heap afterwards. Received bytes now live in 16 KiB blocks taken from a
+  per-connection pool and given back the moment the reader passes them: a
+  drained lane holds none, and the only slack is the last block of a run.
+  Measured on the cost cell as an interleaved A/B against the build before it,
+  resident peak 663-694 → **373-436 MiB**, with CPU per carried Gbit and
+  throughput unmoved and the receiver's copy-in phase 0.023 → 0.0161 s/Gbit.
 - **The carrier's send buffer is a queue of the writer's records, not one
   growing vector.** Acknowledging a prefix used to memmove everything still
   owed down to the front — megabytes per acknowledgement at a 32 MiB window —
