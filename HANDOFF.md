@@ -2013,6 +2013,85 @@ to "is 300 MiB a constant away" is **no**. The remaining way to it is the pooled
 receive run, which is a design of its own; the alternative is to accept
 450-650 MiB, bounded and flat, as the carrier's documented cost.
 
+**The pooled receive run landed, and it is worth 240 MiB (2026-10-31).** The
+design the last paragraph named: a receive piece is no longer a growable `Vec`.
+It is a `VecDeque` of spans into 16 KiB blocks taken from a per-connection
+`Blocks` pool (`stream.rs`, `Blocks`/`Held`/`Piece`; the pool is a field of
+`Conn`), the front span is trimmed as the reader passes it, and a block goes
+back to the pool the moment the reader has consumed it. `discard` and the
+hole-folding `absorb_next` return blocks the same way, and the keepalive gives
+the whole pool back when nothing is on loan (`Blocks::shrink`), so an idle lane
+does not sit on a window's worth of blocks.
+
+One trade is worth stating: a piece costs at least one block, so a path that
+delivered many isolated fragments would spend 16 KiB where it used to spend the
+fragment's own bytes — the credit window bounds the bytes, not the number of
+fragments. The peer here is the other molehill daemon over an authenticated
+channel, so that shape is a badly reordering path and not an adversary; none of
+the measured paths came near it (the probe never saw more than one piece).
+
+Two measurements made the mechanism explicit before the change:
+
+| where the memory was | reading |
+|---|---|
+| heaptrack's top peak site | `RecvBuf::insert` → `RawVecInner::finish_grow`, i.e. the piece vector doubling |
+| live piece capacity at one probe | 86 MiB of capacity for 79 MiB held (the doubling's overshoot) |
+| RSS minutes after the transfer, capacity 1.3 MiB | 178 MiB — the heap never came back |
+| the same manual loopback pair on TCP | client peak **12 MiB** against mhd's **423** at the same 11.6 Gbit/s |
+
+A per-datagram `to_vec` plus a doubling growth is what left that heap behind;
+blocks are exact (one per 16 KiB carried, the last one partial) and reused, so
+the allocator leaves the data path in steady state.
+
+Measured with the model's `cost` cell, `screen` profile, `scale 2`, l4 arm, as
+an interleaved A/B against the previous build in one campaign (`--ab-arm`),
+so the host's own noise is shared by both arms:
+
+| arm | `cpu_s_per_gbit` | `throughput_gbps` | `rss_peak_mib` |
+|---|---|---|---|
+| previous (`b5cabf3`) | 0.6955 / 0.6931 | 8.24 / 8.89 | 663.0 / 694.5 |
+| pooled blocks | 0.6604 / 0.6941 | 8.90 / 8.74 | **382.4 / 435.5** |
+
+Two further samples of the same cell on the new build read 373.4 and 379.2 MiB
+(`cpu` 0.6774 / 0.7422, 8.72 / 7.98 Gbit/s). **The memory moves by a third; the
+CPU and the throughput do not move** — every difference there is inside the
+scatter this host shows between two runs of one build, which is why the A/B is
+interleaved rather than quoted across hours. The phase budget says the same
+from the other side: the receiver's `append` is now **0.0161 s/Gbit at 0.18 µs
+per datagram**, against 0.023 s/Gbit on the chunk build and 0.0273 in the
+rejected copy-out, and `io_read` is 0.75 µs per call — the merged run is still
+one walk per read.
+
+The gates: `append` 0.0161 ≤ 0.020, `rss_peak_mib` 373-436 < 452, throughput
+8.7-8.9 ≥ the `base7b` baseline (0.7229 s/Gbit, 7.47 Gbit/s). `bulk-n` under
+one percent loss with an A/A twin is green on the l4 arm (12.20-12.78 Gbit/s,
+four rounds; its twin 12.29-12.85, with one cell lost to the host's
+`control socket has closed unexpectedly`). The `l3` arm times out in the same
+campaign on **both** builds, which is the host problem recorded below, not this
+change.
+
+**One gate is not green, and it is not this change.** `just check` passes under
+the default carrier and under `MOLEHILL_DATA_CARRIER=tcp`; under `=mhd` it fails
+on `pool_test`'s `a_saturated_pool_still_serves_the_next_visitor` ("a fresh
+visitor must be served after the pool emptied"). It fails identically on the
+build *without* this change — the working tree stashed, rebuilt, same suite:
+10 passed, 1 failed, same message — and the same test passes three times out of
+three when run alone, so it is an order-dependent failure in the serial suite
+under a forced carrier. Worth opening on its own: the forced carrier is what the
+carrier measurements use, and a suite that only fails there is a gate nobody can
+trust. The pool snapshot at the failure is `size: 1, count: 2, streams back to
+zero, draining: false`, i.e. the capacity did return and the next visitor was not
+placed.
+
+**What is left is 80-130 MiB above the target, and it is not this buffer.** With
+the receive path exact, the carrier's own footprint per daemon is the send side
+(50-116 MB of `SendBuf` at a 32 MiB credit window) plus the process floor: the
+same loopback pair on TCP peaks at 12 MiB total, so almost all of it is the
+carrier's buffers. The next lever is the send buffer's window accounting, not
+another copy to remove — and the target of 300 MiB should be re-costed before
+it is chased again, because 382 MiB bounded is now the number a release would
+publish.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
