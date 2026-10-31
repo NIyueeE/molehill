@@ -2201,7 +2201,47 @@ nor a regression is shown, and the peak stayed where the send buffer puts it
 (124.6 MB against 128.6 MB on the manual pair). **Reverted**, with the numbers
 kept here: the deletion is real, but a change that adds a field and a second
 call shape has to earn its place with a measured effect, and this one is a
+
 precondition for the slab rather than a win of its own.
+
+**The window is where the cell's memory is, and sixteen megabytes puts it under
+the target (2026-10-31).** The attribution said the peak was neither the receive
+blocks nor the send-buffer *cap*: it moves with the **number of lanes**. One
+lane on the same cell reads **104.9 MiB** against 373-436 for four, and the
+client's own line says `tunnels=4 established=4`. A lane holds up to a window of
+receive blocks, and the send buffer's ceiling is written in terms of the same
+constant, so the credit window is the one number that sets the total. Halving it
+was measured twice, interleaved, on the model's own cell:
+
+| `cost` cell, `screen`, `scale 2`, l4, interleaved A/B | `cpu_s_per_gbit` | `throughput_gbps` | `rss_peak_mib` |
+|---|---|---|---|
+| 32 MiB (HEAD `4c04b7e`), 4 rounds | — | — | 349 / 497 / 428 / 449, median **438** |
+| 16 MiB, 4 rounds | 0.732 | 8.74 | 262 / 265 / 280, median **265** |
+| 32 MiB, 5 rounds | 0.763 | 7.62 | 296 / 482 / 331 / 370 / 416, median **370** |
+| 16 MiB, 5 rounds | 0.758 | 7.52 | 297 / 256 / 187 / 254 / 229, median **254** |
+
+The separate A/A twin (three rounds, the sixteen-megabyte build against itself)
+reads `rss_peak_mib` 237 / 278 / 285 for the arm and 282 / 377 / 449 for its
+twin, so this metric's noise on this host is wide — which is why the claim rests
+on two independent interleaved campaigns rather than one, and why the *bound* is
+the part that is argued: halving the window halves what a lane may hold. CPU and
+throughput do not move outside that scatter in either campaign (the largest
+difference is −8 % on one four-round arm, −1 % on the five-round one, against a
+15 % materiality floor).
+
+Two further confirmations, both from topologies with much less noise: the manual
+loopback pair's peak falls from 162.6 / 112.5 MB (server / client) to **100.6 /
+72.0 MB**, and the single-lane cell falls from 104.9 to 82.1 MiB. The gates that
+are not about memory: `bulk-n` under one percent loss reads 10.49 / 10.69 /
+10.91 / 11.03 Gbit/s on the l4 arm (one 5.06 outlier) with its A/A twin at
+10.68 / 10.98 / 9.45 / 11.58 and one host `control socket has closed` cell, and
+`just l3-accept` passes **16 of 16**.
+
+The trade is a wide-area one and it is arithmetic, not measured here: a lane
+stays full while its window covers `bandwidth × RTT`, so 16 MiB holds a lane at
+about 650 Mbit/s across a 200 ms path, where 32 MiB held 1.3 Gbit/s. A
+deployment that needs the long path's rate raises `[client.data].tunnels`, which
+the configuration page already prices at 0.5-0.8 MiB per lane per end.
 
 
 
