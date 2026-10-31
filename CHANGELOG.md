@@ -100,6 +100,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The carrier's credit window is sixteen megabytes, not thirty-two.** The
+  window is what a lane's buffers are made of on both ends — the receive blocks
+  a stream may hold, and the send buffer's ceiling, which is written in terms of
+  it — so the resident cost of a lane scales with this one number. On the
+  benchmark's four-lane cell the peak resident set falls from a median of
+  370-438 MiB to **254-265 MiB** across two interleaved A/Bs, with CPU per
+  carried Gbit and throughput inside the run's own scatter, and the gates that
+  are not about memory hold (`bulk-n` under one percent loss, 16 of 16 L3
+  acceptance checks). The trade is on a long path: a lane stays full while its
+  window covers `bandwidth × RTT`, so 16 MiB holds about 650 Mbit/s across
+  200 ms where 32 MiB held 1.3 Gbit/s — a deployment that needs that rate on a
+  long path raises `[client.data].tunnels`, which costs 0.5-0.8 MiB of resident
+  memory per lane per end.
 - **The receive buffer keeps arrived bytes in pooled blocks, not one growing
   vector per piece.** A piece used to be a `Vec` that doubled as data arrived and
   was allocated afresh for every datagram that started one, so a lane's

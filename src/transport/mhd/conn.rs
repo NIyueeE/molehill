@@ -41,10 +41,16 @@ const DEAD_AFTER: Duration = Duration::from_secs(20);
 
 /// The window this end advertises: how many bytes a peer may have in flight.
 ///
-/// Sized for a wide-area path: a lane carrying a gigabit at two hundred
-/// milliseconds needs tens of megabytes to stay full, and a window is cheap
-/// because it is a number, not a buffer.
-pub(crate) const WINDOW: u64 = 32 * 1024 * 1024;
+/// A lane stays full while its window covers `bandwidth × RTT`, so this number
+/// is the one lever on both throughput and resident memory: a lane holds up to
+/// a window of receive blocks, and the send-buffer cap below is expressed in
+/// terms of the same window. Sixteen megabytes keeps a lane at about
+/// 650 Mbit/s across a 200 ms path and fills a short one outright, and it is
+/// what puts the benchmark's four-lane cell under its memory target — the same
+/// cell reads 438 MiB at 32 MiB and **265 MiB at 16 MiB**, with CPU per carried
+/// Gbit and throughput inside the run's own scatter (`HANDOFF.md`, "the window
+/// is where the cell's memory is").
+pub(crate) const WINDOW: u64 = 16 * 1024 * 1024;
 
 /// The most this end will hold in its send buffers, across every stream.
 ///
