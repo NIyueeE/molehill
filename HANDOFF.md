@@ -2181,6 +2181,28 @@ what they cost is the rate. The next change is therefore a storage shape: a
 slab for the recovery table so a packet takes no allocation, which is the same
 direction the send buffer took when it became a chunk queue.
 
+**The acknowledgement's own vectors were the first slice of that, and they did
+not move the number (2026-10-31).** `on_ack` built an `Acked` of two `Vec<Sent>`
+plus two `Vec<u32>` number lists per acknowledgement — four allocations on a
+path that runs tens of thousands of times a second. The change was written and
+measured: `Acked` becomes a field of `Conn` that is cleared in place, and the
+number lists are taken out of `Recovery`, cleared, filled and put back. It does
+what it says — a manual loopback pair's sending daemon drops from **2 427 025
+allocation calls (148 269/s) to 2 056 274 (130 814/s)**, with temporary
+allocations 200 788 → 146 718 — and it changes nothing that is gated:
+
+| interleaved A/B on the cost cell | `cpu_s_per_gbit` | `throughput_gbps` | `rss_peak_mib` |
+|---|---|---|---|
+| with the reused outcome | 0.6774 / 0.6505 | 8.54 / 8.96 | 533.3 / 339.7 |
+| before it | 0.6344 / 0.6409 | 10.27 / 9.96 | 399.4 / 422.0 |
+
+Two samples an arm, no A/A twin, and every column overlaps — so neither a win
+nor a regression is shown, and the peak stayed where the send buffer puts it
+(124.6 MB against 128.6 MB on the manual pair). **Reverted**, with the numbers
+kept here: the deletion is real, but a change that adds a field and a second
+call shape has to earn its place with a measured effect, and this one is a
+precondition for the slab rather than a win of its own.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
