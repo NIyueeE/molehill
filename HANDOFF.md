@@ -1954,6 +1954,23 @@ explain the difference. **Next round re-applies the change, logs `buffered`,
 the two it is.** The change itself is not on the tree: it was reverted after the
 measurement, so a re-apply starts from this record.
 
+**It is in, and the L3 gate cannot be attributed to it (2026-10-31).** The
+sliced payload was re-applied and measured twice more before landing: sender
+`ack` 0.0287 s/Gbit (gate met), `cpu_s_per_gbit` 0.6418/0.6465 against 0.7229,
+throughput **9.65/9.70 Gbit/s** against 7.47, and `bulk-n` under one percent loss
+at **11.45-12.03 Gbit/s** in both arms against 8.60-8.99 before. Resident peak is
+628/774 MiB against 496, which the cell explains by carrying thirty percent more.
+Committed as `0eed55e` after a full serial suite and both clippy passes.
+
+`just l3-accept` did **not** reach sixteen: two runs on the chunk build gave
+14 PASS / 2 FAIL and 15 PASS / 1 FAIL, naming the lending arms. The same harness
+on the build **without** the chunk queue then gave 15 PASS / 1 FAIL, naming a
+different check ("lending-off either moved a lane or lost the workload"), so the
+failures are the host and the harness, not the change — the 16/16 passes were
+taken on a calmer machine. The honest state: the L3 gate is **unverified today on
+either build**, and the next attempt should run the two alternately on a quiet
+host rather than treat one red run as a verdict.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
