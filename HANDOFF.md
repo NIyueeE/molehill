@@ -2152,6 +2152,35 @@ on the bench's own daemons during a cell, not another constant: the two
 topologies disagree about where the bytes are, and only one of them is the
 published number.
 
+**The cell's peak is a fifth allocator retention, and the churn is per packet
+(2026-10-31).** Attaching heaptrack to a running daemon needs
+`/proc/sys/kernel/yama/ptrace_scope = 0`, which this container refuses even as
+root; the way in is a wrapper as `--binary` that execs the real binary under
+`heaptrack -o` (and passes `--version` straight through, or the model's
+provenance check reads heaptrack's version). Both daemons of one `cost` cell
+then profile as: **server peak heap 197.27 MB, client 66.39 MB**, and the
+server's share is the send path throughout — `NoiseStream::poll_write` called
+from `stripe::send_loop`, 127.64 MB plus 20.99 MB of one backtrace. That is the
+*slowed* regime, where the peer's reader cannot keep up and the credit window
+fills, so it prices the shape and not the native peak.
+
+The native peak is partly retained free memory, and trimming it prices that:
+
+| same cell, `screen`/`cost`/`scale 2`, l4 | `rss_peak_mib` | `cpu_s_per_gbit` | `throughput_gbps` |
+|---|---|---|---|
+| committed build | 373-436 | 0.68-0.74 | 8.7-8.9 |
+| `MALLOC_TRIM_THRESHOLD_=0` | **313.5** | 0.6648 | 8.70 |
+
+So roughly 60-120 MiB of the peak is free bytes glibc was holding rather than
+live data — and the churn that produces them is now visible by count: **9.25M
+allocations in one cell's two minutes (77k/s)**, with two sites at 2.18M calls
+each, both inside `Conn::on_datagram` on the dispatcher path — a `Vec` reserve
+and `Vec<recovery::Sent>::grow_one`, the recovery table's record growing once
+per packet. Their *live* contribution is kilobytes (89 KB and 3.15 MB at peak);
+what they cost is the rate. The next change is therefore a storage shape: a
+slab for the recovery table so a packet takes no allocation, which is the same
+direction the send buffer took when it became a chunk queue.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
