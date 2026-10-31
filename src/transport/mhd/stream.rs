@@ -14,6 +14,12 @@
 
 use std::collections::BTreeMap;
 
+/// What an emptied send buffer keeps, so the next request does not reallocate.
+///
+/// The peak a stream ever reached is otherwise its footprint until the stream
+/// is retired, and a lane holds every live stream's peak at once.
+const IDLE_CAPACITY: usize = 256 * 1024;
+
 /// The bytes a stream has written and the peer has not acknowledged.
 ///
 /// The bytes live in a `Vec` that starts at [`Self::drained`], not at the base:
@@ -164,6 +170,16 @@ impl SendBuf {
         let drop = usize::try_from(wasted).unwrap_or(self.data.len());
         self.data.drain(..drop.min(self.data.len()));
         self.drained = self.base;
+        // A stream that empties gives its capacity back. Without this the peak
+        // a stream ever reached is its footprint for the connection's life,
+        // and a lane carrying four bulk streams plus a few dozen short-lived
+        // ones holds every peak at once — measured as the plateau in
+        // `rss_peak_mib`. The reserve below the threshold keeps the common case
+        // (a request/response that continues) from reallocating.
+        let keep = IDLE_CAPACITY;
+        if self.data.is_empty() && self.data.capacity() > keep {
+            self.data.shrink_to(keep);
+        }
         // Ranges the base has passed can never match it again, and keeping them
         // would grow the table for the connection's whole life.
         self.acked = self.acked.split_off(&self.base);

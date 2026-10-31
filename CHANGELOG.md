@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number and the hole it left never fills. The wire is not compatible with a
   build from before this change; the dialect is 6.0 and unreleased, so both ends
   are this build.
+- **A stream that drains gives its send buffer's memory back.** The buffer kept
+  the peak it once reached for the stream's whole life, and a lane holds every
+  live stream's peak at once, so a busy lane's resident set was a third larger
+  than the work in it: an emptied buffer now shrinks to a small reserve. The
+  cost cell's peak fell from 652 to 465 MiB with no measurable cost in CPU or
+  throughput.
 - **A lost packet's acknowledgement can no longer stall a stream's buffer.** The
   carrier declares a packet lost on the evidence of later packets, and the
   original may merely be reordered; its acknowledgement then arrives after the

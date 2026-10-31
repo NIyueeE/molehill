@@ -1817,6 +1817,23 @@ storage), not a copy to remove, and it is what the next round has to price
 before the receive-side zero copy: the copy is 0.029 s/Gbit, the memory is
 650 MiB, and only one of them is a release blocker.
 
+**Correction (same day): it is a plateau, not a leak, and a third of it was the
+send buffer.** Two measurements settled it. A cell four times longer
+(`--scale 2`) reads 652.5 MiB against 650.4 for the normal one, so the peak is a
+bounded working set, and the `BTreeMap` churn above is not a leak. And a send
+buffer that empties now gives its capacity back (`IDLE_CAPACITY`, 256 KiB):
+**652.5 → 464.6 MiB**, with `cpu_s_per_gbit` 0.728 → 0.737 and throughput
+8.28 → 7.91 Gbit/s, both inside the run-to-run scatter of this host. The peak a
+stream once reached was otherwise its footprint until the stream retired, and a
+lane holds every live stream's peak at once — which is why halving
+`MAX_BUFFERED` did nothing: the cap was never what set the footprint.
+Shrinking on *every* compaction (to twice the live length) was measured and
+rejected: 497.7 MiB and 6.75 Gbit/s, worse on both, plus one cell that failed
+with `control socket has closed unexpectedly`. The residual 464 MiB is still
+above the 300 MiB target, and one cell in three fails on this host under load
+4-8 with the same iperf3 error, which is the measurement environment, not the
+carrier (it reproduces on a build with no change in it).
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
