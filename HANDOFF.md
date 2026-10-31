@@ -1971,6 +1971,33 @@ taken on a calmer machine. The honest state: the L3 gate is **unverified today o
 either build**, and the next attempt should run the two alternately on a quiet
 host rather than treat one red run as a verdict.
 
+**Receive-region ownership was built and rejected (2026-10-31).** The shape the
+plan named: the batch keeps its 64 KiB regions, and the connection copies each
+datagram out into a right-sized `Bytes` so the region is never pinned. It does
+what it says on memory — `rss_peak_mib` **376** against 628-774 for the chunk
+build — and it costs so much elsewhere that it cannot ship:
+
+| | chunk build (`0eed55e`) | copy-out |
+|---|---|---|
+| `rss_peak_mib` | 628-774 | **376** |
+| `cpu_s_per_gbit` | 0.642-0.647 | **1.597** |
+| `throughput_gbps` | 9.65-9.70 | **2.76** |
+| `append` | 0.023 | 0.0273 |
+| `io_read` per call | 1.15 µs | **5.15 µs** |
+
+Two of its three gates miss: `append` 0.027 > 0.020, and throughput is a third
+of the baseline. The mechanism is in `io_read`: a piece per datagram means the
+reader walks a table of thirteen hundred entries per megabyte instead of a few
+merged runs, so the copy out of the receive buffer — the one copy the design
+could not remove — got four times more expensive per call. Reverted.
+
+**What this leaves.** The two directions pull against each other: merging the
+receive buffer into runs is what makes reading cheap, and it is also what makes
+a stream's buffer hold its peak. The memory target of 300 MiB is therefore not
+reachable by moving the copy; it needs either a smaller credit window (a
+behaviour change, not a refactor) or a receive buffer that merges into a
+*pooled* run and returns it when read — which is where this stopped.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
