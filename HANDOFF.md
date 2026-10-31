@@ -1746,6 +1746,53 @@ losing the receive region on the first `EAGAIN` (a batch that can never receive
 again) and parking an oversize datagram instead of shrinking (a retry loop that
 never terminates).
 
+**Feasibility of the "one owner" rewrite, measured (2026-10-31).** The question
+was whether one task owning a connection's socket and its stream buffers — a
+byte crossing user space once instead of two or three times — closes the 1.39×
+`cpu_s_per_gbit` gap. It does not, and the study found a ship-blocking defect
+on the way. The budget (`MOLEHILL_MHD_STATS=1`, `screen`/`cost`, 272 Gbit per
+round, both daemons, per carried Gbit): record `seal` 0.0896 + `open` 0.0880,
+`tx_build` 0.0932, `tx_send` 0.0505, sender `rx_total` 0.0479, receiver
+`rx_total` 0.0670, `io_write` 0.0199, `io_read` 0.0164 — 0.4725 measured
+against the run's 0.728. The timers charge their own clock reads (about 0.1 µs
+per event) to the phase they time, so a copy phase is overstated by roughly a
+tenth. The copies come to 0.081 s/Gbit in total (`append` 0.029, `io_write`
+0.019, `tx_encode` 0.017, `io_read` 0.016), and the rewrite removes at most
+0.076 of them, because the iovec split that would save `tx_encode`'s copy
+costs 55 ns per datagram of kernel work back (494 against 439 ns for a
+44-datagram run, measured). **Projection: 1.39× → about 1.22×, not parity.**
+The rest is per-datagram bookkeeping (about 0.08: stream selection, the flight
+table, the lock, dispatch) and the syscall (about 0.05), and neither has a TCP
+counterpart to remove — TCP's kernel does the same per-segment work, which is
+why the two kernel halves already measure equal (0.192 against 0.184).
+**The defect**: the mhd sender's memory grows without bound under load.
+`rss_peak_mib` is 2 742–7 379 for mhd against 46–61 for TCP on the same cell —
+6.7 GiB inside one 40-second round. A probe build found a single stream holding
+up to 3.7 GB, with 987 000 acknowledged ranges queued behind a 31 KB hole at
+its base. Two defects produce it: `Recovery::on_ack` deletes a packet when it
+declares it lost, so the late acknowledgement of the original finds no entry
+and `SendBuf::ack` is never called for that range; and `apply_ack` rewinds the
+lost ranges in ascending order to `sent = offset.max(base)`, so only the
+highest one is retransmitted. `base` therefore never moves, `compact` never
+runs, and the buffer grows with everything written — in the later sample, 1.5
+GB of the 8.7 GB carried. Changing that
+one line to `sent = sent.min(offset.max(base))` took the cell from 2 742–7 379
+MiB to **768 MiB** with no CPU change (0.728 → 0.720, inside the cell's own
+7 % spread), but a hole still formed (17 KB, 31 000 ranges, 110 MB buffered),
+so that is a mitigation, not the fix. A carrier that grows 150 MB/s while
+carrying 8.5 Gbit/s cannot ship, whatever happens to the rest.
+**The plan this leaves**, in order: (0) fix the acknowledgement hole — keep a
+lost record until some transmission of that range is acknowledged, and never
+let a rewind advance the send point; ships whatever else happens; (1)
+receive-side zero copy (`append` into `Bytes` slices of a pooled region, then
+`io_read` through an owned-read seam), 0.03–0.05; (2) send-side owned writes
+behind an enum carrier rather than a boxed trait object, 0.015–0.02; (3)
+re-measure and stop at about 1.22×, where the remaining choice is batching the
+per-datagram bookkeeping (one lock, one timestamp, one table walk per run) or
+accepting the carrier's cost and documenting it. The full study, its commands
+and the raw logs are `target/evidence/feasibility-one-owner.md` and
+`target/evidence/work-{phases-mhd,phases-tcp,rss-cost,rewind}`.
+
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
   published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
