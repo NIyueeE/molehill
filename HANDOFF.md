@@ -2092,6 +2092,41 @@ trust. The pool snapshot at the failure is `size: 1, count: 2, streams back to
 zero, draining: false`, i.e. the capacity did return and the next visitor was not
 placed.
 
+**It is the burst's tail, and the test was measuring the queue (2026-10-31,
+third pass).** The failing assertion was asking one question with a ten-second
+budget: connect a fresh visitor, send four bytes, read four back. Timing the
+pieces showed where the time goes:
+
+| measurement (single test, `=mhd`) | reading |
+|---|---|
+| `TcpStream::connect` to the exposed port | **136-226 µs** — the kernel completes the handshake from the backlog |
+| the four bytes back, as the test was written | **3.13 / 3.13 / 3.13 s** |
+| the same, after five seconds of quiet before the visitor | **47.6 / 47.8 ms** |
+
+So the fresh visitor was not the slow part: it was arriving in the *tail* of the
+burst. The visitors are accepted asynchronously, and the ones the placement
+ceiling refuses each wait out the pool's capacity timeout, so the pool's stream
+count reaches zero while the server still has a queue of them — the test's "the
+pool emptied" fires inside that queue, and the visitor then waits behind it. On
+a loaded host the queue outlives the ten-second budget and the test fails; on an
+idle one it does not, which is the whole of the load correlation recorded above.
+The carrier's own opens in that window confirm the shape: they all complete at
+one instant, with durations descending in a regular step (458, 437, 417 … 143 ms)
+— a queue being released in a batch, not a path that is slow per open.
+
+The test now asks the question repeatedly instead of once: a fresh visitor every
+200 ms, two seconds of budget each, fifteen seconds in total, so it measures the
+property it owns (a saturated service *recovers*) rather than the length of the
+burst's tail. A service that never answers still fails, and fails on the total
+window. Verified with five single-test runs (all pass, 9.1-9.8 s) and six full
+serial runs of `pool_test` under a forced mhd carrier (all pass).
+
+**Open thread from that measurement: the burst's tail is a serial queue.** The
+refused visitors appear to be paired one at a time, each paying the pool's
+250 ms capacity wait — sixteen of them is the ~3 s tail, which matches to the
+order. Whether the pairing path can overlap them is a product question this test
+no longer sees; it is worth measuring on its own before deciding.
+
 **The failure needs host load, and nothing isolated reproduces it (2026-10-31,
 second pass).** Sixteen full-suite runs under `MOLEHILL_DATA_CARRIER=mhd` across
 the day split by host load and by nothing else: at load 4-6 it failed five times
