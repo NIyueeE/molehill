@@ -879,7 +879,16 @@ async fn a_saturated_pool_still_serves_the_next_visitor() -> Result<()> {
     let mut rd = [0u8; 4];
     time::timeout(Duration::from_secs(10), fresh.read_exact(&mut rd))
         .await
-        .map_err(|_| anyhow!("a fresh visitor must be served after the pool emptied"))??;
+        .map_err(|_| {
+            // The pool's own state at the moment the answer never came: a
+            // snapshot with streams back at zero says the capacity returned and
+            // the service still did not answer, which is a different defect from
+            // one still holding the burst.
+            anyhow!(
+                "a fresh visitor must be served after the pool emptied: {:?}",
+                molehill_rathole::live_pools()
+            )
+        })??;
     assert_eq!(
         &rd,
         PING.as_bytes(),
