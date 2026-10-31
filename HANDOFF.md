@@ -1793,6 +1793,31 @@ accepting the carrier's cost and documenting it. The full study, its commands
 and the raw logs are `target/evidence/feasibility-one-owner.md` and
 `target/evidence/work-{phases-mhd,phases-tcp,rss-cost,rewind}`.
 
+**Where the memory actually is, as of 2026-10-31.** The acknowledgement hole is
+fixed (the record survives until acked, `rewind_to` only moves back,
+overlapping ranges merge, and the ack block now carries the receiving stream's
+byte prefix), and the resident peak came down from 2 742-7 379 MiB to 650-730
+MiB. What is left is **not the send buffer**, and three measurements say so:
+
+| experiment | `rss_peak_mib` | reading |
+|---|---|---|
+| `MAX_BUFFERED` at 2 × WINDOW (64 MiB) | 650-730 | the committed build |
+| `MAX_BUFFERED` at 1 × WINDOW (32 MiB) | 571 | halving the cap does not halve the peak: the cap is not binding |
+| `MALLOC_ARENA_MAX=2` | 494 | the peak is allocator-sensitive |
+| `+ MALLOC_TRIM_THRESHOLD_=0` | 464 | but it is **not free space**: trimming what glibc can reach does not reclaim it |
+
+So the residual is a fragmented heap held by live allocations, about four to
+five times the live buffers the phase probe can see (send buffers ~50-116 MB per
+lane, receive backlog ~0 because the readers keep up), and it grows within a
+round with the bytes carried. The per-datagram allocator churn is the suspect —
+`Recovery::in_flight` and `SendBuf::acked` are `BTreeMap`s whose nodes are
+allocated and freed once per packet, roughly 700 000 times a second here, across
+fourteen threads and their arenas. That is a shape change (slab or vector
+storage), not a copy to remove, and it is what the next round has to price
+before the receive-side zero copy: the copy is 0.029 s/Gbit, the memory is
+650 MiB, and only one of them is a release blocker.
+
+
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
   published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
