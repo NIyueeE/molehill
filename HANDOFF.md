@@ -1834,6 +1834,15 @@ above the 300 MiB target, and one cell in three fails on this host under load
 4-8 with the same iperf3 error, which is the measurement environment, not the
 carrier (it reproduces on a build with no change in it).
 
+**The three carrier changes were re-verified against their gates (2026-10-31).**
+`just l3-accept` exits 0 with all sixteen checks passing, including the two
+lane-lending arms and the sixteen-flow arm. `bulk-n` under one percent loss with
+an A/A twin (`--profile dev --scenarios bulk-n --condition loss1 --rounds 4
+--aa`) records no failure in either arm: 8.60-8.99 Gbit/s for the measured arm
+and 8.97-9.16 for its twin. So the acknowledgement rework, the byte prefix and
+the buffer shrink did not move the loss recovery or the transparent path, which
+is what those gates exist to catch.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
