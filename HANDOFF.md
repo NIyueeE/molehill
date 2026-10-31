@@ -2092,6 +2092,29 @@ trust. The pool snapshot at the failure is `size: 1, count: 2, streams back to
 zero, draining: false`, i.e. the capacity did return and the next visitor was not
 placed.
 
+**The failure needs host load, and nothing isolated reproduces it (2026-10-31,
+second pass).** Sixteen full-suite runs under `MOLEHILL_DATA_CARRIER=mhd` across
+the day split by host load and by nothing else: at load 4-6 it failed five times
+in eight, at load 1.3 once in eight. The attempts that did *not* reproduce it,
+each of which rules out a hypothesis:
+
+| attempt | result | what it rules out |
+|---|---|---|
+| three suite runs with `MOLEHILL_MHD_STATS=1` | 3/3 pass | the stats reporter's overhead is not the trigger |
+| one suite run with twelve spinning CPUs | pass | contention *beside* the suite is not enough |
+| the burst-then-fresh scenario repeated 20× in one process | 20/20 served, 142 s | the scenario is sound: the pool, the valve and the backends recover round after round |
+| five more suite runs, idle host | 5/5 pass | — |
+
+The snapshots say the two outcomes are the same up to the last step: a passing
+run's pool at the drain reads `bytes: [(1197, 798)]`, `mhd_health: (467, 4)`,
+one tunnel, zero streams — the *same* byte counts the failing runs printed
+(`(463, 7)`), so the burst is carried and drained identically in both, and what
+differs is only how often the lane re-sent something. The next instrument is
+contention of the kind the failed runs had: pin the suite and a spinner to the
+same two CPUs (`taskset`), or catch a failing run with the pool snapshot printed
+*at* the failure — the test now does the latter, since its message names the
+pool.
+
 **That thread was opened, and it is a latency problem, not a harness one
 (2026-10-31).** Eight full serial runs of `pool_test` under `=mhd`: five failed,
 three passed; four runs of the single test passed, and the whole check is green
