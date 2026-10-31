@@ -1893,6 +1893,38 @@ change in the sender), which is a different project from "remove the compaction
 memmove". Reverted again; the `Vec` stays, with its 256 KiB idle shrink, until
 that is decided.
 
+**Where the carrier stands, measured at `cf0319d` (2026-10-31).** Two `screen`
+campaigns, one per carrier, same binary, same host, back to back:
+
+| arm | `cpu_s_per_gbit` | `rss_peak_mib` | `throughput_gbps` |
+|---|---|---|---|
+| `mhd` | 0.7246 [0.6653..0.7838] | 452 [385..520] | 7.20 |
+| `tcp` (`MOLEHILL_DATA_CARRIER=tcp`) | 0.5456 [0.5434..0.5478] | 50 | 12.48 |
+
+**1.33×**, and the honest bound is wider than the point: mhd's own two rounds
+span 0.665-0.784 while TCP's span 0.543-0.548, so the ratio this host can
+resolve is 1.22-1.44. The memory is **nine times TCP's** and, unlike the CPU,
+it is not in doubt: 452 MiB against 50, flat across a cell four times longer
+(652.5 against 650.4 before the idle-buffer shrink landed, and the shrink is
+what took it to the 450-500 band).
+
+**What that means for the remaining plan.** Step (1) is done: the byte prefix
+is in, the acknowledgement hole is closed, and the resident set went from
+2 742-7 379 MiB to 452-520. Steps (2) and (3) were each measured twice and each
+failed for a reason that is **not in the buffer structure**:
+
+- the receive side pins a 64 KiB region per datagram slice, and the credit
+  window spans about five hundred of them, so the pool is always dry;
+- the send side cannot hand `wire` more than one chunk, so a packet never spans
+  a record and the writer is re-entered six times as often.
+
+Both need a **layer interface** to change — the receive region's ownership, and
+`wire::encode_stream` taking a list of slices — which is a larger, separate
+project than "remove a copy". The decisions this leaves are therefore two, and
+they are the human's: accept 1.33× and 452 MiB as the carrier's documented
+cost, or commission the interface work (receive-region ownership + sliced send
+payload) as its own effort with its own gates.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
