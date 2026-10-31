@@ -2092,6 +2092,35 @@ trust. The pool snapshot at the failure is `size: 1, count: 2, streams back to
 zero, draining: false`, i.e. the capacity did return and the next visitor was not
 placed.
 
+**That thread was opened, and it is a latency problem, not a harness one
+(2026-10-31).** Eight full serial runs of `pool_test` under `=mhd`: five failed,
+three passed; four runs of the single test passed, and the whole check is green
+under the default carrier and under `=tcp`. Three things narrow it:
+
+- **Not the wrong pool.** A temporary probe printing every registered pool at
+  the failure showed exactly one, keyed `session:127.0.0.1:2370` (this test's
+  own), with `streams=0`. The wait watched the right pool and the pool was
+  empty.
+- **Not the standalone topology.** The same shape rebuilt outside the suite —
+  `tests/for_tcp/tunnel_valve.toml` (client asks for two tunnels, the server's
+  valve allows one), an echo backend, a scripted burst of 72 concurrent
+  visitors — serves 56 of 72 (the ceiling), opens in `p50` 23 ms / max 38 ms, and
+  answers a fresh visitor after the burst in **2-3 ms**. Idle first-byte latency
+  is 2.5 ms (`p50`); under four bulk streams, 54 ms.
+- **The suite's own opens are seconds long.** The carrier already logs its open
+  latency (`mhd stream opened and acknowledged`, `us=`). Across three *passing*
+  suite runs: n = 1210, min 41.8 ms, **`p50` 1.17 s, `p90` 2.31 s, max 3.68 s**.
+  That is the order the test's ten-second budget runs out on, and it is the same
+  order as the keepalive (2 s) that a write on an idle lane used to wait for.
+
+So the failing test is the suite's way of showing a real latency defect: under
+repeated churn a stream open costs seconds where an idle lane costs 2.5 ms. The
+next instrument is a **sustained** churn harness — repeated bursts on one lane,
+not one burst — or a dump of the server-side lane state at the moment the fresh
+visitor is not answered; the one-shot reproduction above is not enough, and the
+DEBUG logging that would carry the dump hides the failure (three runs, three
+passes, with `RUST_LOG` on).
+
 **What is left is 80-130 MiB above the target, and it is not this buffer.** With
 the receive path exact, the carrier's own footprint per daemon is the send side
 (50-116 MB of `SendBuf` at a 32 MiB credit window) plus the process floor: the
