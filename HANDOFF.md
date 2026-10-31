@@ -1925,6 +1925,35 @@ they are the human's: accept 1.33× and 452 MiB as the carrier's documented
 cost, or commission the interface work (receive-region ownership + sliced send
 payload) as its own effort with its own gates.
 
+**The human commissioned it, and the sliced payload works — the queue's memory
+does not (2026-10-31).** `wire::encode_stream` now writes only the header and the
+stream appends its payload straight into the staged GSO run through
+`SendBuf::append_to`, which walks the chunk queue from a cursor and **crosses
+chunk boundaries**. One contiguous run, no iovecs. Measured on the same cell as
+`base7b` (0.7229 s/Gbit, 7.47 Gbit/s, 496 MiB):
+
+| | `base7b` | sliced payload |
+|---|---|---|
+| sender `ack` | 0.0401 s/Gbit (19.89 µs/ack) | **0.0287 (13.08 µs)** |
+| `io_write` calls | 8.4M | 6.47M |
+| `cpu_s_per_gbit` | 0.7229 | 0.7748 |
+| `throughput_gbps` | 7.47 | 6.36 |
+| `rss_peak_mib` | 496 | **825** |
+
+So step (A)'s gate is met — the compaction memmove is gone and `ack` is 28 %
+lower — and the change is still net-negative: 15 % of throughput and two thirds
+more memory. The memory is the thing to understand before anything else: the
+queue's live bytes are `tail - head`, which is exactly what `buffered` counts and
+what `MAX_BUFFERED` caps at 2 × WINDOW per connection, so four lanes should not
+reach 825 MiB. Either a path adds to `buffered` without the queue growing, or a
+chunk is retained past its acknowledgement — `trim()` only pops chunks **wholly**
+below the base, so a 32 KiB record the peer acknowledged halfway keeps the whole
+chunk alive, and at a window of thousands of chunks that is the right order to
+explain the difference. **Next round re-applies the change, logs `buffered`,
+`tail - head` and the chunk count once a second beside RSS, and settles which of
+the two it is.** The change itself is not on the tree: it was reverted after the
+measurement, so a re-apply starts from this record.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
