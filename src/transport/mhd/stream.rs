@@ -120,6 +120,34 @@ impl SendBuf {
         self.acked.insert(start, end);
     }
 
+    /// Advance the frontier to a byte prefix the peer says it holds.
+    ///
+    /// This is the authoritative signal, and the reason it exists is that the
+    /// per-packet one can stop: a packet number that was lost is never
+    /// retransmitted under the same number, so the peer's cumulative number
+    /// frontier stays behind it for the connection's life, and every range
+    /// acknowledged after that hole queues behind a key the frontier walk never
+    /// reaches. A byte prefix has no such hole — the peer only ever reports
+    /// more bytes than before — so it moves the base on its own, and the range
+    /// map is left to the out-of-order acknowledgements it is good at.
+    ///
+    /// Answers how many bytes left the buffer, which is what the connection's
+    /// own total is kept by.
+    pub(crate) fn advance_to(&mut self, prefix: u64) -> u64 {
+        let target = prefix.min(self.written()).max(self.base);
+        let moved = target - self.base;
+        if moved == 0 {
+            return 0;
+        }
+        self.base = target;
+        self.sent = self.sent.max(self.base);
+        // Everything the prefix covers is acknowledged by definition, so the
+        // ranges under it can never match the base again.
+        self.acked = self.acked.split_off(&self.base);
+        self.compact();
+        moved
+    }
+
     /// Drop the acknowledged prefix, but only once it pays for the move.
     ///
     /// The buffer holds `[drained, written)`; the acknowledged part is
@@ -336,6 +364,23 @@ impl RecvBuf {
             Some(previous) => previous.min(at),
             None => at,
         });
+    }
+
+    /// How many of this stream's bytes have arrived with no hole.
+    ///
+    /// The receiver's half of [`SendBuf::advance_to`]: the number it puts in
+    /// every acknowledgement, so the peer's frontier moves on the bytes
+    /// themselves rather than on the packet records that carried them.
+    pub(crate) fn arrived(&self) -> u64 {
+        let Some((&at, piece)) = self.pieces.iter().next() else {
+            return self.read;
+        };
+        if at > self.read {
+            // The first piece starts beyond the read offset: a hole sits
+            // between them and nothing past it can be reported.
+            return self.read;
+        }
+        (at + piece.len() as u64).max(self.read)
     }
 
     /// Bytes that have arrived and not yet been read out of this stream.
@@ -578,6 +623,39 @@ mod tests {
         let (tail, fin) = send.range(3, 3).unwrap();
         assert_eq!(tail, b"def");
         assert!(fin);
+    }
+
+    /// A byte prefix moves the frontier on its own, which is the property the
+    /// packet-number acknowledgements cannot offer.
+    #[test]
+    fn a_byte_prefix_moves_the_frontier_without_a_range() {
+        let mut send = SendBuf::default();
+        send.write(&[3u8; 3000]);
+
+        assert_eq!(send.advance_to(1200), 1200, "the prefix frees its bytes");
+        assert_eq!(send.unacked(), 1800);
+        assert_eq!(send.advance_to(900), 0, "a stale prefix moves nothing");
+        assert_eq!(
+            send.advance_to(u64::MAX),
+            1800,
+            "a peer cannot acknowledge bytes nobody sent"
+        );
+        assert_eq!(send.unacked(), 0);
+        assert_eq!(send.held(), 0, "and the buffer is emptied");
+    }
+
+    /// The received prefix stops at the first hole and grows past it once the
+    /// hole is filled — that is what makes it safe to send as an acknowledgement.
+    #[test]
+    fn the_arrived_prefix_stops_at_the_first_hole() {
+        let mut recv = RecvBuf::default();
+        assert_eq!(recv.arrived(), 0);
+        recv.insert(0, &[1u8; 100]);
+        assert_eq!(recv.arrived(), 100);
+        recv.insert(300, &[2u8; 100]);
+        assert_eq!(recv.arrived(), 100, "a hole at 100 stops the prefix");
+        recv.insert(100, &[3u8; 200]);
+        assert_eq!(recv.arrived(), 400, "filling it moves the prefix on");
     }
 
     /// A rewind carries the lowest hole, not the last one reported.

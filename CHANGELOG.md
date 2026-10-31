@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stream's send buffer no longer depends on a packet number that may be
+  lost for good.** The acknowledgement block now carries the receiving stream
+  and how many of its bytes have arrived with no hole (twelve bytes on every
+  packet, and the dialect is still unreleased). The byte prefix is monotonic, so
+  a stream whose per-packet records are all gone can still be freed — which the
+  packet-number frontier cannot promise, because a retransmission takes a new
+  number and the hole it left never fills. The wire is not compatible with a
+  build from before this change; the dialect is 6.0 and unreleased, so both ends
+  are this build.
 - **A lost packet's acknowledgement can no longer stall a stream's buffer.** The
   carrier declares a packet lost on the evidence of later packets, and the
   original may merely be reordered; its acknowledgement then arrives after the

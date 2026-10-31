@@ -213,6 +213,14 @@ pub(crate) struct Conn {
     advertised: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
     read: u64,
+    /// The stream whose arrived prefix rides this end's acknowledgements.
+    ///
+    /// One stream's frontier, not every stream's: a packet acknowledges one
+    /// block, and the most recent one is enough because the value is monotonic
+    /// per stream and every packet carries a fresh copy (see `wire::ACK`).
+    arrived_stream: u32,
+    /// How many of that stream's bytes arrived with no hole.
+    arrived_prefix: u64,
     /// Streams the peer opened that nothing has taken yet.
     inbound: VecDeque<u32>,
     /// Aborts waiting for the next pass: a stream one end let go of.
@@ -307,6 +315,8 @@ impl Conn {
             recv_credit: WINDOW,
             advertised: 0,
             read: 0,
+            arrived_stream: 0,
+            arrived_prefix: 0,
             inbound: VecDeque::new(),
             resets: VecDeque::new(),
             pending_fins: VecDeque::new(),
@@ -640,7 +650,11 @@ impl Conn {
         if self.closed.is_some() {
             return None;
         }
-        let ack = self.acks.packet();
+        let ack = self.acks.packet().map(|block| wire::Ack {
+            stream: self.arrived_stream,
+            prefix: self.arrived_prefix,
+            ..block
+        });
         if self.credit_due() {
             return self.transmit_credit(now, out, ack);
         }
@@ -1034,6 +1048,12 @@ impl Conn {
                         state.recv.finish(offset + data.len() as u64);
                         state.peer_fin = true;
                     }
+                    // Remember this stream's arrived prefix, which every
+                    // acknowledgement from now on carries: it is what lets the
+                    // peer's send buffer move on the bytes rather than on the
+                    // packet records that carried them (see `wire::ACK`).
+                    self.arrived_stream = id;
+                    self.arrived_prefix = state.recv.arrived();
                 }
                 self.ack_pending = true;
             }
@@ -1091,6 +1111,18 @@ impl Conn {
                 Some(state) => state.send.ack(range.offset, usize::from(range.len)),
                 None => 0,
             };
+            self.buffered = self.buffered.saturating_sub(moved);
+        }
+        // The byte prefix is the authority on this stream's frontier, because
+        // it cannot stall the way the range acknowledgements can: a packet
+        // number lost for good stops the peer's cumulative frontier, and every
+        // range acknowledged behind that hole then waits on a key the frontier
+        // walk never reaches. The prefix only ever grows, so it frees those
+        // bytes without needing the hole to be filled.
+        if ack.prefix > 0
+            && let Some(state) = self.streams.get_mut(&ack.stream)
+        {
+            let moved = state.send.advance_to(ack.prefix);
             self.buffered = self.buffered.saturating_sub(moved);
         }
         // A loss only rewinds the send point: the bytes are still in the
@@ -1388,6 +1420,39 @@ mod tests {
             }
         }
         assert_eq!(out, bytes, "the stream is whole after the retransmission");
+    }
+
+    /// A byte prefix frees the buffer with no packet record at all.
+    ///
+    /// This is the property the whole block exists for: the peer's cumulative
+    /// *number* frontier can be stopped for good by one lost packet (a
+    /// retransmission takes a new number, so the hole never fills), but the
+    /// bytes it holds keep growing. A frontier keyed on bytes therefore frees a
+    /// stream whose packet records are all gone, which is exactly the state
+    /// that used to grow to gigabytes.
+    #[test]
+    fn a_byte_prefix_frees_the_buffer_without_any_packet_record() {
+        let now = Instant::now();
+        let mut conn = Conn::new(9, true);
+        let stream = conn.open();
+        let bytes = payload(4000);
+        assert_eq!(conn.write(stream.id, &bytes), bytes.len());
+        assert_eq!(usize::try_from(conn.buffered).unwrap(), bytes.len());
+
+        // Nothing was ever sent, so there is no flight entry to retire: only
+        // the prefix can move the frontier.
+        let block = wire::Ack {
+            largest: 0,
+            below: 0,
+            bits: 0,
+            stream: stream.id,
+            prefix: 4000,
+        };
+        conn.apply_ack(now, block, false);
+
+        let state = conn.streams.get(&stream.id).unwrap();
+        assert_eq!(state.send.held(), 0, "the buffer is empty");
+        assert_eq!(conn.buffered, 0, "and the connection's total agrees");
     }
 
     /// The buffer a stream's bytes are held in empties once the peer has

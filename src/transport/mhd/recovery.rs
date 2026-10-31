@@ -643,6 +643,7 @@ mod tests {
                 largest: second,
                 below: 0,
                 bits: 1, // first is one below largest
+                ..Ack::default()
             },
         );
         assert_eq!(acked.newly.len(), 2);
@@ -684,6 +685,7 @@ mod tests {
                 largest: fourth,
                 below: 0,
                 bits: 0b011, // third and second, not first
+                ..Ack::default()
             },
         );
         assert_eq!(acked.lost.len(), 1, "one packet is declared lost");
@@ -700,6 +702,7 @@ mod tests {
                 largest: fourth,
                 below: fourth + 1,
                 bits: 0,
+                ..Ack::default()
             },
         );
         assert!(
@@ -730,6 +733,7 @@ mod tests {
                 largest: fourth,
                 below: 0,
                 bits: 0b011, // third and second, not first
+                ..Ack::default()
             },
         );
         assert_eq!(acked.lost.len(), 1);
@@ -745,6 +749,7 @@ mod tests {
                 largest: fourth,
                 below: 0,
                 bits: 0,
+                ..Ack::default()
             },
         );
         assert_eq!(recovery.lost_records(), 0, "the hold bounds the table");
@@ -787,6 +792,7 @@ mod tests {
                 largest: later[1],
                 below: 0,
                 bits: 0b1,
+                ..Ack::default()
             },
         );
         assert!(acked.lost.is_empty(), "two behind is reordering");
@@ -799,6 +805,7 @@ mod tests {
                 largest: later[2],
                 below: 0,
                 bits: 0b11,
+                ..Ack::default()
             },
         );
         assert_eq!(acked.lost.len(), 1);

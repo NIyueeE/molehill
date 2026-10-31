@@ -47,8 +47,22 @@ const FLAG_UNNUMBERED: u8 = 0b0010_0000;
 
 /// flags + connection id + packet number.
 pub(crate) const HEAD: usize = 9;
-/// largest + frontier + bitmap.
-pub(crate) const ACK: usize = 16;
+/// largest + frontier + bitmap + the stream prefix block.
+///
+/// The last twelve bytes are the receiver's own stream frontier: which stream
+/// it last took bytes for, and how many of that stream's bytes it now holds
+/// without a hole. They exist because the packet-number frontier above cannot
+/// carry that fact. A number that was lost is never retransmitted under the
+/// same number, so a single real drop stops `below` for the life of the
+/// connection; everything that scrolls out of the 64-bit window is then
+/// declared lost, its recovery record is eventually forgotten, and the
+/// acknowledgement it would have carried lands nowhere. The stream's send
+/// buffer then waits on a frontier that can never move — measured at 6.7 GiB
+/// resident in a forty-second cell. A byte prefix is monotonic across losses,
+/// duplicates and reordering, so it is the one field a stalled number frontier
+/// cannot corrupt. It rides every packet, which costs twelve bytes: 0.86 % of a
+/// full datagram.
+pub(crate) const ACK: usize = 28;
 /// stream id + offset + length.
 pub(crate) const STREAM: usize = 14;
 /// stream id + length (an unreliable datagram frame carries no offset).
@@ -152,6 +166,17 @@ pub(crate) struct Ack {
     pub(crate) below: u32,
     /// Bit n set means largest - n - 1 arrived.
     pub(crate) bits: u64,
+    /// The stream whose frontier [`Self::prefix`] describes.
+    ///
+    /// Meaningless when `prefix` is zero, which is what a receiver that has
+    /// taken no stream bytes yet sends.
+    pub(crate) stream: u32,
+    /// How many of that stream's bytes the receiver holds with no hole.
+    ///
+    /// Monotonic: it can only grow for a given stream, so a lost or duplicated
+    /// acknowledgement costs nothing permanent — the next one carries a value
+    /// at least as large.
+    pub(crate) prefix: u64,
 }
 
 impl Ack {
@@ -242,6 +267,11 @@ impl AckSet {
                 largest,
                 below: self.below,
                 bits: self.bits,
+                // The stream frontier is not the acknowledgement set's
+                // business: the connection attaches it, because only the
+                // connection knows which stream it last took bytes for.
+                stream: 0,
+                prefix: 0,
             }),
             None => None,
         }
@@ -369,7 +399,9 @@ pub(crate) fn encode(
     if let Some(block) = ack {
         buf[at..at + 4].copy_from_slice(&block.largest.to_le_bytes());
         buf[at + 4..at + 8].copy_from_slice(&block.below.to_le_bytes());
-        buf[at + 8..at + ACK].copy_from_slice(&block.bits.to_le_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&block.bits.to_le_bytes());
+        buf[at + 16..at + 20].copy_from_slice(&block.stream.to_le_bytes());
+        buf[at + 20..at + ACK].copy_from_slice(&block.prefix.to_le_bytes());
         at += ACK;
     }
     match frame {
@@ -466,6 +498,8 @@ pub(crate) fn encode_stream(
         out.extend_from_slice(&block.largest.to_le_bytes());
         out.extend_from_slice(&block.below.to_le_bytes());
         out.extend_from_slice(&block.bits.to_le_bytes());
+        out.extend_from_slice(&block.stream.to_le_bytes());
+        out.extend_from_slice(&block.prefix.to_le_bytes());
     }
     out.extend_from_slice(&stream.to_le_bytes());
     out.extend_from_slice(&offset.to_le_bytes());
@@ -529,13 +563,19 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
     let ack = if flags & FLAG_ACK != 0 {
         let largest = bytes(at..at + 4)?;
         let below = bytes(at + 4..at + 8)?;
-        let slice = buf.get(at + 8..at + ACK).ok_or(Malformed)?;
+        let slice = buf.get(at + 8..at + 16).ok_or(Malformed)?;
+        let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
+        let bits = u64::from_le_bytes(array);
+        let stream = bytes(at + 16..at + 20)?;
+        let slice = buf.get(at + 20..at + ACK).ok_or(Malformed)?;
         let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
         at += ACK;
         Some(Ack {
             largest,
             below,
-            bits: u64::from_le_bytes(array),
+            bits,
+            stream,
+            prefix: u64::from_le_bytes(array),
         })
     } else {
         None
@@ -628,6 +668,10 @@ mod tests {
             largest: 7,
             below: 2,
             bits: 0b1010_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001,
+            // Non-zero on purpose: a decode that forgot the stream block would
+            // still pass every other test with it.
+            stream: 42,
+            prefix: 9_000_000_000,
         };
         let data = [1u8, 2, 3, 4, 5];
         let cases = [
