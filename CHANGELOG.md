@@ -100,6 +100,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The carrier's send buffer is a queue of the writer's records, not one
+  growing vector.** Acknowledging a prefix used to memmove everything still
+  owed down to the front — megabytes per acknowledgement at a 32 MiB window —
+  and a chunk is now dropped whole instead. A packet draws its payload from the
+  queue across record boundaries, straight into the run the socket is given, so
+  the packetisation does not fragment. Measured on the cost cell: the sender's
+  acknowledgement phase 0.0401 → 0.0287 s/Gbit, throughput 7.5 → 9.7 Gbit/s,
+  CPU per carried Gbit 0.723 → 0.645, resident peak 496 → 628-774 MiB (the cell
+  carries 30 % more, so more is in flight).
 - **BREAKING: `mhd` is now a native multi-stream carrier, and the KCP engine
   it was renamed from is deleted.** A lane — one UDP connection of the pool —
   carries its own reliable streams (TCP forwarding, the transparent path), its

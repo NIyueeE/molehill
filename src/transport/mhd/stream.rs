@@ -12,63 +12,67 @@
 //! hands out only the contiguous prefix, so a caller reads a stream and never a
 //! hole.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
-/// What an emptied send buffer keeps, so the next request does not reallocate.
-///
-/// The peak a stream ever reached is otherwise its footprint until the stream
-/// is retired, and a lane holds every live stream's peak at once.
-const IDLE_CAPACITY: usize = 256 * 1024;
+use bytes::Bytes;
 
 /// The bytes a stream has written and the peer has not acknowledged.
 ///
-/// The bytes live in a `Vec` that starts at [`Self::drained`], not at the base:
-/// acknowledging a prefix only moves `base`, and the prefix is dropped in one
-/// pass once it is as large as what is still owed. Draining on every
-/// acknowledgement instead would memmove the whole window each time — with a
-/// 32 MiB window that is tens of megabytes moved per packet, which measured as
-/// 143 CPU-seconds to carry 64 MiB on loopback.
+/// The bytes are a queue of chunks, one per record the writer handed over, and
+/// the head is dropped when the peer acknowledges past it. A single growable
+/// `Vec` could not do that: acknowledging a prefix meant memmoving everything
+/// still owed down to the front, megabytes per acknowledgement at a 32 MiB
+/// window.
+///
+/// A packet draws on the queue through [`Self::append_to`], which walks from a
+/// cursor and may cross chunk boundaries, so packetisation no longer depends on
+/// where a record happens to end.
 #[derive(Debug, Default)]
 pub(crate) struct SendBuf {
-    /// Bytes from `drained` up to what the writer has queued.
-    data: Vec<u8>,
-    /// The absolute offset of `data[0]`: everything below it is gone.
-    drained: u64,
-    /// The offset of data[0]: everything below it is acknowledged.
+    chunks: VecDeque<Bytes>,
+    /// The absolute offset of the first byte of `chunks.front()`.
+    head: u64,
+    /// The absolute offset just past the last byte the writer queued.
+    tail: u64,
+    /// The offset of the first byte the peer has not acknowledged.
     base: u64,
-    /// The offset the writer finished at, once it has.
+    /// The chunk the send point sits in, and that chunk's absolute offset.
+    cursor: usize,
+    cursor_at: u64,
     fin_at: Option<u64>,
-    /// How far the wire has already been given these bytes. Without it a sender
-    /// would re-send the first unacknowledged range on every pass, which is a
-    /// retransmission storm rather than a stream.
     sent: u64,
-    /// Ranges the peer acknowledged, keyed by their start offset.
-    ///
-    /// Acknowledgements arrive per packet and out of order, so the base may only
-    /// advance over the contiguous run that starts at it. Advancing to the
-    /// highest acknowledged offset instead walks the base over a hole and
-    /// destroys the bytes behind it.
     acked: BTreeMap<u64, u64>,
 }
 
 impl SendBuf {
     /// Append bytes, answering the offset they start at.
     pub(crate) fn write(&mut self, bytes: &[u8]) -> u64 {
-        let at = self.written();
-        self.data.extend_from_slice(bytes);
+        let at = self.tail;
+        if !bytes.is_empty() {
+            self.tail += bytes.len() as u64;
+            self.chunks.push_back(Bytes::copy_from_slice(bytes));
+        }
         at
     }
 
     /// One past the last byte the writer has queued.
     fn written(&self) -> u64 {
-        self.drained + self.data.len() as u64
+        self.tail
     }
 
-    /// Record that everything below upto arrived, answering how many bytes the
-    /// base moved.
-    ///
-    /// An acknowledgement past what was written is a peer mistake and is
-    /// clamped, never trusted: it would otherwise drop bytes nobody sent.
+    /// How many bytes a packet starting here may carry.
+    pub(crate) fn available(&self, offset: u64, max: usize) -> usize {
+        let room = self.written().saturating_sub(offset);
+        usize::try_from(room).map_or(0, |room| room.min(max))
+    }
+
+    /// Whether the range `offset..offset + len` ends the stream.
+    pub(crate) fn ends_at(&self, offset: u64, len: usize) -> bool {
+        self.fin_at == Some(offset + len as u64)
+    }
+
+    /// Record that everything below `offset + len` arrived, answering how far
+    /// the base moved.
     pub(crate) fn ack(&mut self, offset: u64, len: usize) -> u64 {
         let written = self.written();
         let start = offset.max(self.base).min(written);
@@ -78,26 +82,15 @@ impl SendBuf {
         }
         let before = self.base;
         self.absorb(start, end);
-        // Advance only over the run that starts at the base: a hole above it is
-        // exactly what a retransmission is for, and stepping past it would drop
-        // bytes the peer never acknowledged.
         while let Some(end) = self.acked.remove(&self.base) {
             self.base = end;
             self.sent = self.sent.max(self.base);
         }
-        self.compact();
+        self.trim();
         self.base - before
     }
 
     /// Add one acknowledged range, merging it into the ones it overlaps.
-    ///
-    /// A retransmission is acknowledged for a range that is already partly
-    /// acknowledged — that is the usual way two ranges overlap — and a plain
-    /// insert would leave the second copy at a key the frontier never looks up:
-    /// the bytes it covered were acknowledged but unreachable, the base stopped
-    /// in front of them, and everything written afterwards queued behind a hole
-    /// that no acknowledgement could fill. Merging keeps the set a partition of
-    /// the acknowledged bytes, which is what the frontier walk assumes.
     fn absorb(&mut self, start: u64, end: u64) {
         let mut start = start;
         let mut end = end;
@@ -127,18 +120,6 @@ impl SendBuf {
     }
 
     /// Advance the frontier to a byte prefix the peer says it holds.
-    ///
-    /// This is the authoritative signal, and the reason it exists is that the
-    /// per-packet one can stop: a packet number that was lost is never
-    /// retransmitted under the same number, so the peer's cumulative number
-    /// frontier stays behind it for the connection's life, and every range
-    /// acknowledged after that hole queues behind a key the frontier walk never
-    /// reaches. A byte prefix has no such hole — the peer only ever reports
-    /// more bytes than before — so it moves the base on its own, and the range
-    /// map is left to the out-of-order acknowledgements it is good at.
-    ///
-    /// Answers how many bytes left the buffer, which is what the connection's
-    /// own total is kept by.
     pub(crate) fn advance_to(&mut self, prefix: u64) -> u64 {
         let target = prefix.min(self.written()).max(self.base);
         let moved = target - self.base;
@@ -147,113 +128,143 @@ impl SendBuf {
         }
         self.base = target;
         self.sent = self.sent.max(self.base);
-        // Everything the prefix covers is acknowledged by definition, so the
-        // ranges under it can never match the base again.
-        self.acked = self.acked.split_off(&self.base);
-        self.compact();
+        self.trim();
+        self.follow();
         moved
     }
 
-    /// Drop the acknowledged prefix, but only once it pays for the move.
+    /// Drop the chunks the frontier has passed.
     ///
-    /// The buffer holds `[drained, written)`; the acknowledged part is
-    /// `[drained, base)`. Compacting moves the rest, so it is worth doing only
-    /// when the prefix is at least half of it — otherwise every acknowledgement
-    /// pays a memmove proportional to the window. At that threshold the bytes
-    /// moved never exceed the bytes reclaimed, so the amortised cost is one
-    /// copy per byte carried rather than one per packet.
-    fn compact(&mut self) {
-        let wasted = self.base.saturating_sub(self.drained);
-        if wasted == 0 || wasted * 2 < self.data.len() as u64 {
-            return;
+    /// A chunk whose start is below the base but whose end is above it stays,
+    /// because the bytes still owed inside it are read from it. That slack is
+    /// bounded by one record per live stream.
+    fn trim(&mut self) {
+        while let Some(chunk) = self.chunks.front() {
+            let end = self.head + chunk.len() as u64;
+            if end > self.base {
+                break;
+            }
+            self.head = end;
+            self.chunks.pop_front();
+            if self.cursor > 0 {
+                self.cursor -= 1;
+            } else {
+                self.cursor_at = self.head;
+            }
         }
-        let drop = usize::try_from(wasted).unwrap_or(self.data.len());
-        self.data.drain(..drop.min(self.data.len()));
-        self.drained = self.base;
-        // A stream that empties gives its capacity back. Without this the peak
-        // a stream ever reached is its footprint for the connection's life,
-        // and a lane carrying four bulk streams plus a few dozen short-lived
-        // ones holds every peak at once — measured as the plateau in
-        // `rss_peak_mib`. The reserve below the threshold keeps the common case
-        // (a request/response that continues) from reallocating.
-        let keep = IDLE_CAPACITY;
-        if self.data.is_empty() && self.data.capacity() > keep {
-            self.data.shrink_to(keep);
+        if let Some((&first, _)) = self.acked.first_key_value()
+            && first < self.base
+            && self.acked.len() > 64
+        {
+            self.acked = self.acked.split_off(&self.base);
         }
-        // Ranges the base has passed can never match it again, and keeping them
-        // would grow the table for the connection's whole life.
-        self.acked = self.acked.split_off(&self.base);
     }
 
-    /// Finish the stream: no byte past this offset will be written.
+    fn follow(&mut self) {
+        if self.cursor >= self.chunks.len() {
+            self.cursor = 0;
+            self.cursor_at = self.head;
+        }
+        while self.cursor < self.chunks.len() {
+            let end = self.cursor_at + self.chunks[self.cursor].len() as u64;
+            if self.sent < end {
+                return;
+            }
+            self.cursor_at = end;
+            self.cursor += 1;
+        }
+    }
+
+    /// Append `len` bytes starting at `offset` to `out`, walking the chunks.
+    pub(crate) fn append_to(&self, offset: u64, len: usize, out: &mut Vec<u8>) {
+        let from_cursor = offset >= self.cursor_at && self.cursor < self.chunks.len();
+        let (mut index, mut at) = if from_cursor {
+            (self.cursor, self.cursor_at)
+        } else {
+            (0, self.head)
+        };
+        let mut skip = usize::try_from(offset.saturating_sub(at)).unwrap_or(0);
+        let mut left = len;
+        while left > 0 {
+            let Some(chunk) = self.chunks.get(index) else {
+                break;
+            };
+            let end = at + chunk.len() as u64;
+            if offset >= end {
+                skip = skip.saturating_sub(chunk.len());
+            } else if skip < chunk.len() {
+                let take = left.min(chunk.len() - skip);
+                out.extend_from_slice(&chunk[skip..skip + take]);
+                left -= take;
+                skip = 0;
+            }
+            at = end;
+            index += 1;
+        }
+    }
+
     pub(crate) fn finish(&mut self) {
         self.fin_at = Some(self.written());
     }
 
-    /// Where the writer finished, once it has.
     pub(crate) fn finished_at(&self) -> Option<u64> {
         self.fin_at
     }
 
-    /// Whether the writer finished.
     #[cfg(test)]
     pub(crate) fn finished(&self) -> bool {
         self.fin_at.is_some()
     }
 
-    /// The offset the next packet should carry: the first byte neither
-    /// acknowledged nor already on the wire.
     pub(crate) fn next_offset(&self) -> u64 {
         self.sent.max(self.base)
     }
 
-    /// Record that a range starting here has been handed to the socket.
     pub(crate) fn mark_sent(&mut self, len: usize) {
         self.sent = self.next_offset().saturating_add(len as u64);
+        self.follow();
     }
 
-    /// Rewind the send point to a range the peer never acknowledged, so the next
-    /// pass carries it again.
-    ///
-    /// The send point only ever moves **back**: one acknowledgement can report
-    /// several losses, and assigning the offset of each in turn leaves the point
-    /// at the highest of them, so every range below it is never retransmitted
-    /// and the frontier stops at the first hole. Taking the minimum keeps the
-    /// lowest hole in front of the wire, which is the one that has to be filled
-    /// before anything above it can be acknowledged.
     pub(crate) fn rewind_to(&mut self, offset: u64) {
         self.sent = self.sent.min(offset.max(self.base));
+        self.cursor = 0;
+        self.cursor_at = self.head;
+        self.follow();
     }
 
-    /// Whether any queued byte has not been on the wire yet.
     pub(crate) fn has_unsent(&self) -> bool {
         self.next_offset() < self.written()
     }
 
-    /// Unacknowledged bytes, which is what a credit window is spent on.
     pub(crate) fn unacked(&self) -> u64 {
         self.written().saturating_sub(self.base)
     }
 
-    /// Up to max bytes starting at offset, and whether the range ends the stream.
+    /// Up to `max` bytes at `offset`, and whether the range ends the stream.
     ///
-    /// None when that offset is not held any more: the peer asked for bytes that
-    /// were already acknowledged and compacted away.
+    /// Tests only: the transmitter appends through [`Self::append_to`], which
+    /// may cross chunks.
+    #[cfg(test)]
     pub(crate) fn range(&self, offset: u64, max: usize) -> Option<(&[u8], bool)> {
-        if offset < self.drained {
+        if offset < self.head {
             return None;
         }
-        let start = usize::try_from(offset - self.drained).ok()?;
-        let end = (start + max).min(self.data.len());
-        let slice = self.data.get(start..end)?;
-        let fin = self.fin_at == Some(offset + slice.len() as u64);
-        Some((slice, fin))
+        let mut at = self.head;
+        for chunk in &self.chunks {
+            let end = at + chunk.len() as u64;
+            if offset < end {
+                let skip = usize::try_from(offset - at).ok()?;
+                let take = max.min(chunk.len() - skip);
+                let slice = chunk.get(skip..skip + take)?;
+                return Some((slice, self.fin_at == Some(offset + slice.len() as u64)));
+            }
+            at = end;
+        }
+        None
     }
 
-    /// How many bytes the buffer still holds, the acknowledged prefix that
-    /// compaction has not dropped included.
     pub(crate) fn held(&self) -> usize {
-        self.data.len()
+        usize::try_from(self.tail.saturating_sub(self.head)).unwrap_or(usize::MAX)
     }
 }
 

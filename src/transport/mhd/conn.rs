@@ -730,9 +730,12 @@ impl Conn {
         let (id, offset, want) = self.next_stream_range()?;
         let number = self.recovery.next_number();
         let state = self.streams.get(&id)?;
-        let (bytes, fin) = state.send.range(offset, want)?;
+        // How much the packet carries, and whether it ends the stream: the
+        // buffer answers both without being walked, because the payload is
+        // appended straight into the run afterwards.
+        let len = state.send.available(offset, want);
+        let fin = state.send.ends_at(offset, len);
         pick.stop(&stats::PHASES.tx_pick);
-        let len = bytes.len();
         let encode = stats::Timing::start(sampled);
         let packet_len = wire::encode_stream(
             out,
@@ -743,9 +746,12 @@ impl Conn {
                 id,
                 offset,
                 fin,
-                data: bytes,
+                len,
             },
         )?;
+        // The payload follows its header, drawn chunk by chunk: a packet is no
+        // longer capped by the chunk boundary the send point happens to sit in.
+        state.send.append_to(offset, len, out);
         encode.stop(&stats::PHASES.tx_encode);
         let book = stats::Timing::start(sampled);
         self.recovery.on_sent(
@@ -810,7 +816,7 @@ impl Conn {
                 id,
                 offset: at,
                 fin: true,
-                data: &[],
+                len: 0,
             },
         )?;
         self.recovery.on_sent(

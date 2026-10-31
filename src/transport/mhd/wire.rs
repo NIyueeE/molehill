@@ -446,15 +446,19 @@ pub(crate) fn encode(
 /// One reliable stream frame's identity: which stream, where in it, and
 /// whether the range ends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StreamRange<'a> {
+pub(crate) struct StreamRange {
     /// Which stream.
     pub(crate) id: u32,
     /// Where these bytes start in it.
     pub(crate) offset: u64,
     /// Whether this range ends the stream.
     pub(crate) fin: bool,
-    /// The bytes.
-    pub(crate) data: &'a [u8],
+    /// How many payload bytes the caller appends after this header.
+    ///
+    /// The payload is not carried here: the stream appends it straight into the
+    /// staged run out of its own buffer, which is what lets one packet draw on
+    /// more than one chunk of that buffer (see `SendBuf::append_to`).
+    pub(crate) len: usize,
 }
 
 /// Append one reliable-stream packet to `out`, answering its length.
@@ -468,16 +472,16 @@ pub(crate) fn encode_stream(
     id: u32,
     number: u32,
     ack: Option<Ack>,
-    range: StreamRange<'_>,
+    range: StreamRange,
 ) -> Option<usize> {
     let StreamRange {
         id: stream,
         offset,
         fin,
-        data,
+        len,
     } = range;
     let head = HEAD + ack.map_or(0, |_| ACK);
-    let total = head + STREAM + data.len();
+    let total = head + STREAM + len;
     if total > MAX_DATAGRAM {
         return None;
     }
@@ -503,9 +507,8 @@ pub(crate) fn encode_stream(
     }
     out.extend_from_slice(&stream.to_le_bytes());
     out.extend_from_slice(&offset.to_le_bytes());
-    let len = u16::try_from(data.len()).ok()?;
+    let len = u16::try_from(len).ok()?;
     out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(data);
     Some(total)
 }
 
