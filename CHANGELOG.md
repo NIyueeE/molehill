@@ -103,6 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the wide value. Measured on the model's `capacity` ramp: the dialer's
   open latency went from p90 **337 ms with 5 of 58 over 100 ms** to p90 **6.7 ms
   with 1 of 118 over 100 ms**.
+- **A control command can be timed from the queue to the socket, and a data
+  channel's open from the spawn to its first poll.** Every producer's send on the
+  session's writer queue succeeds by construction, so a command that reaches the
+  client late was either late in that queue or late on the wire; the frames now
+  carry their queueing instant and a hundred-millisecond wait reports itself. The
+  client's open task records the same for its own scheduling. Both are DEBUG and
+  both are silent on a healthy run.
 - **A visitor's wait for its data channel is now measured, not only its
   timeout.** The pairing logged a line when a whole budget expired, so a wait
   that came in under the budget — a hundred milliseconds, or three seconds — was

@@ -149,6 +149,27 @@ pub async fn run_server(
     Ok(())
 }
 
+/// One frame waiting for the session's writer, stamped when it was queued.
+///
+/// The stamp is what separates "the writer never ran" from "the command never
+/// went out": every producer's `send` on the unbounded queue succeeds, so a
+/// command that reaches the client late is late in this queue or late on the
+/// wire.
+#[derive(Debug)]
+struct QueuedFrame {
+    at: std::time::Instant,
+    frame: Vec<u8>,
+}
+
+impl QueuedFrame {
+    fn new(frame: Vec<u8>) -> Self {
+        Self {
+            at: std::time::Instant::now(),
+            frame,
+        }
+    }
+}
+
 /// One v4 control session: the services registered on it, beside the session's
 /// single writer and its shutdown signal.
 struct SessionHandle {
@@ -159,7 +180,7 @@ struct SessionHandle {
     /// The session's one and only writer: every service's commands are queued
     /// here as framed bytes, and a single task drains the queue into the
     /// socket. A session carries N services, so no service may write directly.
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    write_tx: mpsc::UnboundedSender<QueuedFrame>,
     /// Ends the session task. The registry entry holds the sender, so removing
     /// the entry (or dropping the session) stops the session.
     shutdown: broadcast::Sender<bool>,
@@ -169,7 +190,7 @@ impl SessionHandle {
     /// A session with no services yet: the v4 handshake publishes this before
     /// it serves anything, and the tests build the same shape.
     fn new(
-        write_tx: mpsc::UnboundedSender<Vec<u8>>,
+        write_tx: mpsc::UnboundedSender<QueuedFrame>,
         shutdown: broadcast::Sender<bool>,
     ) -> SessionHandle {
         SessionHandle {
@@ -1089,6 +1110,43 @@ async fn register_service(
     }
 }
 
+/// The session's single writer: one task drains the queue into the socket.
+///
+/// It is a task of its own because a session carries N services and no service
+/// may touch the socket. Each frame carries the instant it was queued, so a
+/// command that reaches the client late can be told apart from one that was late
+/// on the wire: every producer's `send` on the unbounded queue succeeds, so the
+/// only waits are this task not running and the wire itself.
+fn spawn_session_writer<W>(
+    wr: W,
+    mut write_rx: mpsc::UnboundedReceiver<QueuedFrame>,
+) -> tokio::task::JoinHandle<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(
+        async move {
+            let mut wr = wr;
+            while let Some(queued) = write_rx.recv().await {
+                let waited = queued.at.elapsed();
+                if waited >= std::time::Duration::from_millis(100) {
+                    debug!(
+                        queued_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                        behind = write_rx.len(),
+                        "control frame waited for the session writer"
+                    );
+                }
+                if let Err(e) = write_and_flush(&mut wr, &queued.frame).await {
+                    // The client is gone; the session's reader ends with it.
+                    debug!("Failed to write a session command: {e:#}");
+                    break;
+                }
+            }
+        }
+        .instrument(Span::current()),
+    )
+}
+
 /// The v4 control session: authenticate once for the endpoint, then serve N
 /// service registrations over the one connection.
 ///
@@ -1159,22 +1217,10 @@ async fn do_session_handshake(
     // Split *after* the socket options are set: these two halves are the
     // session's single reader (below) and its single writer (the task).
     let (mut rd, wr) = tokio::io::split(conn);
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<QueuedFrame>();
     let (shutdown_tx, _) = broadcast::channel::<bool>(1);
 
-    let mut writer = tokio::spawn(
-        async move {
-            let mut wr = wr;
-            while let Some(frame) = write_rx.recv().await {
-                if let Err(e) = write_and_flush(&mut wr, &frame).await {
-                    // The client is gone; the reader below ends with it.
-                    debug!("Failed to write a session command: {e:#}");
-                    break;
-                }
-            }
-        }
-        .instrument(Span::current()),
-    );
+    let mut writer = spawn_session_writer(wr, write_rx);
 
     // Publish the session before serving it: a data channel for one of its
     // services may arrive while this reader is still registering them. The
@@ -1205,7 +1251,7 @@ async fn do_session_handshake(
                 }
             }
             () = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
-                if heartbeat_tx.send(heartbeat.clone()).is_err() {
+                if heartbeat_tx.send(QueuedFrame::new(heartbeat.clone())).is_err() {
                     break anyhow!("The session writer is gone");
                 }
             }
@@ -1243,7 +1289,7 @@ async fn do_session_handshake(
 /// policy: what each command does, and which failure is the session's end.
 async fn handle_session_cmd(
     ctx: &SessionCtx,
-    writer: &mpsc::UnboundedSender<Vec<u8>>,
+    writer: &mpsc::UnboundedSender<QueuedFrame>,
     cmd: Result<SessionCmd>,
 ) -> Result<Option<anyhow::Error>> {
     match cmd {
@@ -1280,13 +1326,15 @@ async fn handle_session_cmd(
 /// lane.
 async fn answer_lane_drain(
     ctx: &SessionCtx,
-    writer: &mpsc::UnboundedSender<Vec<u8>>,
+    writer: &mpsc::UnboundedSender<QueuedFrame>,
     service_id: ServiceId,
     lane: [u8; 4],
     drain: bool,
 ) -> Result<bool> {
     let ack = ctx.lane_drain(service_id, lane, drain).await;
-    let sent = writer.send(postcard::to_stdvec(&ack)?).is_ok();
+    let sent = writer
+        .send(QueuedFrame::new(postcard::to_stdvec(&ack)?))
+        .is_ok();
     if sent {
         // A lane's retirement is a lifecycle event, not one connection's
         // business: the operator sees the same fact the client does (once per
@@ -1314,7 +1362,7 @@ struct SessionCtx {
 
 impl SessionCtx {
     /// The session's one writer, for as long as the session is registered.
-    async fn write_tx(&self) -> Result<mpsc::UnboundedSender<Vec<u8>>> {
+    async fn write_tx(&self) -> Result<mpsc::UnboundedSender<QueuedFrame>> {
         self.registry
             .sessions
             .read()
@@ -1410,7 +1458,7 @@ impl SessionCtx {
         write_register_result(&mut frame, ack).await?;
         self.write_tx()
             .await?
-            .send(frame)
+            .send(QueuedFrame::new(frame))
             .map_err(|_| anyhow!("The control session is gone"))
     }
 
@@ -2088,7 +2136,7 @@ fn spawn_tunnel_health_reporter(
                     "Reporting a tunnel's session health to its dialing end"
                 );
             }
-            if write_tx.send(frame).is_err() {
+            if write_tx.send(QueuedFrame::new(frame)).is_err() {
                 return;
             }
         }
@@ -2580,7 +2628,7 @@ enum DataChannelRequest {
 enum ControlSink {
     Session {
         service_id: ServiceId,
-        write_tx: mpsc::UnboundedSender<Vec<u8>>,
+        write_tx: mpsc::UnboundedSender<QueuedFrame>,
     },
 }
 
@@ -2590,7 +2638,7 @@ impl ControlSink {
     fn send(&self, data: &[u8]) -> Result<()> {
         match self {
             ControlSink::Session { write_tx, .. } => write_tx
-                .send(data.to_vec())
+                .send(QueuedFrame::new(data.to_vec()))
                 .map_err(|_| anyhow!("The control session is gone")),
         }
     }

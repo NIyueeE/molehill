@@ -2691,8 +2691,17 @@ fn spawn_data_channel(
 ) {
     #[cfg(feature = "multiplex")]
     let tunnel = tunnel.cloned();
+    // How long the task waited before its first poll. A spawned task that is
+    // not scheduled for a second is a runtime that is saturated, and the wait is
+    // otherwise attributed to the carrier — which is why it is measured here,
+    // where the spawn happens, and not inside the open.
+    let spawned = std::time::Instant::now();
     tokio::spawn(
         async move {
+            let started_us = u64::try_from(spawned.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if started_us >= 100_000 {
+                debug!(started_us, "data channel task waited to be scheduled");
+            }
             let res = {
                 #[cfg(feature = "multiplex")]
                 match tunnel {

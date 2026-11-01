@@ -2614,14 +2614,33 @@ worth fixing on its own account (and is fixed, with a test that reproduces it),
 but it was not "neither of two stalls" — it was not part of a single stall whose
 whole population is this one.
 
-What is now excluded about that wait, each by its own counter: the client's open
-is fast (p90 6.7 ms), the server's per-stream opening is fast (selector,
-handshake, hello all under 100 ms), the pool is not at its ceiling, the pairing
-queue does not stall, the carrier's blocking connection mutex is never held long,
-and more runtime workers make it worse rather than better. What is left is the
-interval between the server queuing the request (`send_us=0`) and the channel
-arriving in the queue — which is where the one bracketed incident showed a request
-that simply never reached the client's command loop.
+**Every stage of that wait is now instrumented, and every instrument is silent
+(2026-11-01).** Two more counters closed the remaining gaps — the delay between
+spawning the client's open task and its first poll, and the time a control frame
+spends in the session writer's queue (frames carry their queueing instant) — and
+then three runs of the cell read:
+
+| run | client's spawn waits | server's writer-queue waits | slowest pairings (µs) |
+|---|---|---|---|
+| 1 | none | none | 5 001 434, 3 249 175, 547 792 |
+| 2 | none | none | 5 002 054, 672 523, 491 149 |
+| 3 | none | none | 3 828 623, 2 866 764, 463 557 |
+
+So the writer picked every frame up immediately, the client's open task started
+immediately, and the visitor still waited seconds. Nine stages are excluded by
+their own numbers: the client's open (p90 6.7 ms), the server's per-stream opening
+(selector, handshake and hello all under 100 ms), the pool's ceiling, the pairing
+queue, the carrier's blocking connection mutex, runtime-worker count (more is
+worse), the control-read desync (fixed), the spawn delay, and now the writer's
+queue.
+
+That leaves one interval that **no** counter in the tree crosses: between the
+writer completing `write_and_flush` on the session socket and the client's command
+loop taking that frame. It is the last segment nobody has measured, and the one
+bracketed incident — a request that was queued with `send_us=0` and never entered
+the client's arm — says a frame can be written and not read. The next instrument
+belongs on the wire itself: a sequence number the server increments per command
+and the client echoes, so a gap is a lost frame rather than an inference.
 
 
 
