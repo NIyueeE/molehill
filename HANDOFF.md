@@ -3513,6 +3513,26 @@ hidden by a pool — it has to stop costing 2.65 ms.** That is the key-derivatio
 change above, which keeps every stream its own flow (so the mux experiment's
 failure does not repeat) and removes the two round trips a stream pays today.
 
+**And the arrival cost has two halves, which is what the next attempt has to
+respect.** A channel open is 2 648 µs: 1 818 µs of Noise handshake and 829 µs of
+hello-and-acknowledgement. Key derivation removes the first and leaves the
+second, so its ceiling is about **0.85 ms per arrival** — roughly a 3×
+improvement on 2.65 and still a round trip that TCP does not pay. The only shape
+that removes both is the one the mux experiment tried, and it *did* reach parity
+(3.77 ms against 3.46): its failure was not the shape but a data-path bug — a
+four-stripe transfer losing the last twelve frames while the carrier's own dwell
+line showed the streams sitting 20–87 ms in the send buffer. So the two
+candidates are now ordered by what is left, not by preference:
+
+1. **Diagnose the mux's lost frames.** One test reproduces it
+   (`striped_data_channels` on mhd, passes on TCP), and the candidate is the
+   stream-end path: what `finish` does to a stream whose send buffer still holds
+   bytes when the session above it is torn down. If that is a flush-ordering bug,
+   fixing it buys arrival parity *and* keeps the shape TCP has.
+2. **Key derivation**, if the mux path proves to be structurally lossy. It costs
+   one round trip instead of two and no shared window; it cannot reach parity on
+   its own.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —
