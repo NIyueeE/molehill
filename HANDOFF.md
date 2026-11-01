@@ -3437,6 +3437,50 @@ That is the next change (P2″), and it is a wire change inside the unreleased
 6.0 dialect: a stream's prologue names whether its keys are derived or
 handshaked, so a mixed pair still works while the work lands.
 
+**The multiplexer was tried first and reverted (2026-11-01), because it broke
+striping.** The simpler route to "no handshake on arrival" is the one TCP takes:
+put a multiplexer on the lane and let a visitor's channel be a stream of it —
+the engine, the pool and the ceiling all already exist. It was built and
+measured. A lane carried N long-lived Noise-wrapped streams, each hosting a yamux
+session, and a visitor's channel became a stream of one of them.
+
+| carriers per lane | `bulk-n` Gbit/s | `churn-16` p50 | `churn-16` p99 | rate/s |
+|---|---|---|---|---|
+| (before: one mhd stream per visitor) | 11.88 | 2.62 | 21.49 | 3328 |
+| 1 | 6.7–9.1 | 1.37–2.29 | 2.76–9.02 | ~4200 |
+| 4 | 9.88 | 1.38 | 3.73 | 4579 |
+| 8 | 10.31 | 1.37 | 3.77 | 4444 |
+| TCP, same profile | 10.90 | 2.82 | 3.46 | 5341 |
+
+The arrival axis is exactly what the plan wanted — p99 **21.49 → 3.77 ms**,
+level with TCP — and bulk's 13 % is inside the metric's materiality. What failed
+is not a number: `integration_test::striped_data_channels` **fails on mhd and
+passes on TCP** with the same tree. A four-stripe transfer ends at 5.9 MiB of
+8.4 with twelve frames parked behind sequence 187, and the carrier's own dwell
+instrument shows the stripes' streams sitting 20–87 ms in the send buffer before
+their bytes leave.
+
+The reason is structural and it is the thing to remember: **every carrier of one
+lane shares one `Conn` — one window, one pump.** Adding carriers therefore adds
+streams competing for the same budget instead of more budget, which is why bulk
+moved only 9.88 → 10.31 as the count doubled, and why a four-stripe group on a
+contended lane starves. Moving the handshake off the arrival path by sharing a
+connection moves the cost into the window those visitors share.
+
+So the change was reverted to `f0368ba`, with the striping suite green again on
+the same tree. What survives is the measurement and its consequence: the next
+attempt must make a stream cheaper **without** making many visitors share one
+flow — which is what the per-stream key derivation above does, keeping each
+stream its own mhd flow with its own offsets, credit and window. The other
+candidate this rules out is "widen the lane until mux works": that is a
+measurement of the carrier's window and pump, not of the arrival path, and it
+belongs in its own phase if it is attempted at all.
+
+One observation from the same runs, recorded because it is not caused by this
+change and not yet explained: one round in three of `churn-16` collapses to
+~190–270 visitors/s against ~4500 in the others, and runs from before this change
+show the same bimodality.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —
