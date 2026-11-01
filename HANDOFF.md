@@ -3194,6 +3194,33 @@ sent?** Its two ends are measured — the request crosses in 102 µs and the cli
 open completes in milliseconds — so the interval is inside the gather, and the next
 instrument belongs there rather than anywhere downstream.
 
+**And the gather has a suspect with the code in front of it: the queue's mutex is
+held across the wait (2026-11-01).** `take_channel` is
+
+```rust
+rx.lock().await.recv().await          // core/server.rs
+```
+
+with `SharedChannels<C> = Arc<tokio::sync::Mutex<mpsc::Receiver<C>>>`. A pairing
+therefore holds the mutex for as long as it waits, so **only one visitor can be
+waiting for a data channel at a time** — every other visitor queues on the mutex,
+not on the channel, and a visitor that finds the queue empty waits out its own
+`PAIR_WAIT_BUDGET` before the next one can even look. That is the serial queue this
+page has been describing since before the cycle started, and the type's own doc
+comment says the opposite of what the code does: "the mutex serializes only the
+*take*, never the wait". The comment is the intent; the code is the defect.
+
+The fix is a take-only lock plus a notification the producer raises after each
+push (`try_recv` under a short `std::sync::Mutex`, wait on `tokio::sync::Notify`,
+registering before the second look so a push between them cannot be lost). It was
+**started and reverted** in this round: the queue is shared by four consumer paths
+(the L4 pool, the UDP pool, the transparent service and the direct-channel route)
+and a partial conversion left the tree uncompilable. Recording the finding with the
+code that proves it is worth more than a rushed refactor at the end of a long
+session — the next attempt starts from the design above and converts all four
+callers in one commit, with `take_channel`'s signature unchanged so the call sites
+stay mechanical.
+
 **What is still not met**: the soak's four stage failures, the multi-second tail on
 a fresh connection (which is what the `capacity` cell and the soak's `clean` stage
 both read), and therefore every part of the objective that depends on them — the
