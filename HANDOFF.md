@@ -3246,6 +3246,87 @@ implemented for `StreamIo` by neither end, and the carrier's two-way quality rul
 is still off by default. Those are next, and the tail above stays open with this
 record.
 
+**The stripe width is the arrival tail, and it is now measured rather than
+argued (2026-11-01).** The plan's first phase was an instrument, and its gate was
+that the instrument must reproduce the symptom before any fix is written. It did
+not reproduce it — it *falsified the premise*, which is the more useful result.
+
+What the instrument showed. The probe's `setup_us` (now `setup_p50_ms` and
+nothing more) times the **visitor-to-server TCP handshake**, and the server
+accepts before it pairs, so that number never sees a tunnel: `churn-16` reads
+0.10 ms on mhd and 0.095 ms on TCP while the visitor actually waits tens of
+milliseconds. A metric named "the setup a visitor pays to arrive" that reads
+0.1 ms beside a real cost of 26 ms is worse than no metric, so the two
+percentiles added to it were withdrawn and the definition was corrected in place.
+
+Where the cost actually is, `dev` profile, both carriers, same host, 5 rounds
+with the run's own A/A twin:
+
+| cell | mhd | TCP |
+|---|---|---|
+| `churn-16` `rtt_p50_ms` | **34.66** | 2.815 |
+| `churn-16` `rtt_p99_ms` | **55.65** | 3.461 |
+| `churn-16` `rate_per_s` | **452.9** | 5341 |
+| `rr-16` `rtt_p50_ms` / `p99` | 0.695 / 2.19 | 0.578 / 1.80 |
+| `bulk-n` `throughput_gbps` | 8.155 | 10.901 |
+
+So mhd is at parity with TCP once a connection exists (`rr-16`), and 12–16×
+worse on a connection that has just arrived. That is the whole deficit, and it is
+in one place.
+
+Then three runs pinned the cause without touching the code:
+
+| run | `churn-16` `rtt_p50_ms` | `rtt_p99_ms` | `rate_per_s` |
+|---|---|---|---|
+| full `dev` profile (bulk ran first) | 34.66 | 55.65 | 453 |
+| `churn-16` alone, default target | **3.0–4.2** | 15–25 | 2081–3217 |
+| `churn-16` alone, `MOLEHILL_STRIPE_COUNT=4` | **25.3–32.2** | 49–73 | 214–566 |
+
+The same cell, the same binary, moves 8× when the stripe target is four instead
+of one — with no bulk traffic anywhere in the run. And running the cell alone
+(no bulk before it) recovers the target-1 behaviour, which is why the full-profile
+number was 34 ms: the `bulk-*` scenarios before it had grown the plan.
+
+The mechanism is therefore in two pieces of code, and both are load-bearing:
+
+- `StripePlan` is **global and monotone**: one target per server, grown by
+  `note_stall` on any group's backpressure, with no decay and no per-visitor say.
+  One bulk burst raises it, and every later visitor pays for it, whatever its own
+  traffic looks like. That is why the cell's numbers swing between rounds.
+- `stripe_gather` is a **global mutex held for a whole gather**: one visitor at a
+  time may collect K channels, each of which requires a control round trip and a
+  fresh stream open. Sixteen concurrent fresh connections therefore queue on the
+  lock, and the cost is `16 × K` serialized opens — 34 ms at K=4, which is the
+  measured p50.
+
+This is why the plan's phase order changes: **the gather goes first.** Prefill (the
+former P1) cannot help while the gather exists — a warm queue is drained by the
+first K-wide gather, and the lock still serializes the rest. mhd at K=1 is already
+at parity with TCP, so the fix is to stop making ordinary visitors into gathers,
+not to make gathers faster.
+
+The revised order, each phase still gated on its own measurement:
+
+| phase | what it changes | the cell that decides it |
+|---|---|---|
+| P1′ (was P3) | no global target and no gather lock: a visitor starts on one stripe immediately, and a *live* group is given more stripes only when its own sender parks | `churn-16` `rtt_p50_ms` back to the target-1 range (≈3 ms) with bulk before it; `bulk-n` within the 15 % floor |
+| P2′ (was P1) | the residual cold-path round trip: authenticated channels ready before demand | `churn-16` p50 under the parity line; `capacity_streams`; the soak's five stages |
+| P3′ (was P2) | the RTO as mhd's only repair path, using the SACK block it already carries | `loss1`: `rtt_p99_ms`; `bulk-n` within the floor |
+| P4′ | the dead wire (`Frame::Datagram`/`Frame::L3`, acknowledged and dropped) and the 25 s pairing patience | all checks; no metric regression |
+| P5′ | — | the release ritual: sweep, gate without a baseline, records, docs |
+
+What landed with this record: `FirstByte` in `server.rs` (stamp at `accept`, at
+pairing, at first byte, one line over 100 ms under `MOLEHILL_MHD_STATS=1`), the
+`churn-16` cell headlined on the metric that carries its cost, and the corrected
+`setup_p50_ms` definition on the benchmarks page in both languages. Nothing in the
+data path changed, so every number above measures the tree as it stood before the
+stripe work.
+
+The A/A reading also needs one correction to an earlier entry: a twin that
+reproduces a tail is evidence that the tail is *reproducible*, not that the cell
+cannot resolve a change. What the twin cannot do is price a change by itself —
+that is what `--ab-arm` with `--binary-b` is for.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The

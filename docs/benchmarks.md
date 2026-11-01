@@ -229,7 +229,7 @@ the definitions are what the report and the verdict render.
 | `udp_loss_pct` | % | lower is better | (datagrams sent - datagrams received) / datagrams sent | datagrams the probe sent |
 | `udp_gap_p99_ms` | ms | lower is better | 99th percentile of the gaps between replies the probe received | one received datagram |
 | `udp_rtt_p99_ms` | ms | lower is better | 99th percentile of the probe's datagram echo round trips | one echoed datagram |
-| `setup_p50_ms` | ms | lower is better | median time to establish one connection, when the workload opens a fresh one per request (the setup a visitor pays to arrive) | one connection |
+| `setup_p50_ms` | ms | lower is better | median time to establish one connection, when the workload opens a fresh one per request. It measures the visitor-to-server handshake only: the server accepts before it pairs the visitor with a channel, so the tunnel's arrival cost is in `rtt_*`, not here | one connection |
 | `cpu_s_per_gbit` | s/Gbit | lower is better | tool CPU-seconds (user+sys, both daemons) / Gbit the visitor offered | Gbit on the visitor's link egress |
 | `cpu_cores` | cores | lower is better | tool CPU-seconds / measured window | the workload's measured window |
 | `bytes_per_syscall` | B | higher is better | device I/O per call: the tool process's rchar+wchar / syscr+syscw. **L3 arms only** — see the note under the table | one read/write-family syscall |
@@ -268,7 +268,7 @@ Two conventions the table cannot state, because they belong to the workload:
 | `bulk-pair` | `bulk-pair` | whether two services (or two L3 claims) each carry a full stream, which separates a per-flow ceiling from a per-host one | `throughput_gbps` |
 | `rr-1` | `rr` | the round-trip rate and latency of one strict request/response flow | `rtt_p99_ms` |
 | `rr-16` | `rr` | the same, 16 flows at once: aggregate rate and tail latency | `rate_per_s` |
-| `churn-16` | `rr` | a fresh connection per request: the setup cost a visitor pays, and the per-visitor state the architecture keeps | `rate_per_s` |
+| `churn-16` | `rr` | a fresh connection per request: what a visitor pays to arrive, as the first request's round trip on each new connection | `rtt_p99_ms` |
 | `udp-pace` | `udp` | a paced UDP session: what fraction arrives, and how it is spaced | `udp_loss_pct` |
 | `udp-ladder` | `udp-ladder` | where a UDP path starts shedding, per offered rate | `udp_loss_pct` |
 | `timeline` | `staged` | how the tool behaves as the path degrades and recovers: one interactive stream, N bulk streams, a churn stream and a UDP session, over a scripted schedule of conditions, in place | `rtt_p99_ms` |

@@ -1343,8 +1343,10 @@ def scenario_catalog() -> list:
             id="churn-16",
             kind="rr",
             claim=(
-                "a fresh connection per request: the setup cost a visitor pays, "
-                "and the per-visitor state the architecture keeps"
+                "a fresh connection per request: what a visitor pays to arrive, "
+                "measured as the round trip of the first request on each new "
+                "connection (the connect itself is `setup_p50_ms`, and it cannot "
+                "see the tunnel: the server accepts before it pairs)"
             ),
             # Enough fresh connections to price them: measured at 0.1 s for a
             # single round of setups, the CPU counters (100 Hz) resolve nothing,
@@ -1356,7 +1358,7 @@ def scenario_catalog() -> list:
                 "fresh": True,
                 "max_s": 120,
             },
-            headline="rate_per_s",
+            headline="rtt_p99_ms",
         ),
         Scenario(
             id="udp-pace",

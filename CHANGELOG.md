@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   split, and the record layer's AEAD through `ring` — the implementation `snow`
   uses, which is the one the profile shows. It asserts nothing; it answers "is
   this copy worth removing" with a number from this host.
+- **A fresh connection's arrival is now the number the model headlines.** The
+  `churn-16` cell opens a new connection per request and reported its *rate*,
+  while the round trip of the first request on each connection — where a visitor
+  actually waits for a channel — sat in a column nobody read. The headline is
+  `rtt_p99_ms`, and `setup_p50_ms` keeps its number with a corrected definition:
+  it times the visitor-to-server handshake, and the server accepts before it
+  pairs, so it cannot see the tunnel. The in-process counterpart is one line at
+  `MOLEHILL_MHD_STATS=1`: a visitor whose first byte took longer than 100 ms
+  reports the two waits behind it — accept to channel pairing, and pairing to
+  the first byte.
 
 ### Fixed
 

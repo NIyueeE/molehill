@@ -3544,6 +3544,11 @@ where
                 }
                     Some(Ok((incoming, addr))) => {
                         listen_notice.clear();
+                        // The visitor's clock starts here, before anything this
+                        // end does: every later stamp is measured from the
+                        // kernel handing us the socket, which is the only
+                        // instant both ends agree on for "the visitor arrived".
+                        let accepted_at = std::time::Instant::now();
                         debug!("New visitor from {}", addr);
                         // The visitor socket gets the same latency-friendly
                         // defaults as the rest of the forwarding path.
@@ -3553,9 +3558,12 @@ where
                             serve_tcp_visitor(
                                 incoming,
                                 pool.clone(),
-                                shutdown_rx.resubscribe(),
-                                control_alive_rx.clone(),
+                                Stops {
+                                    shutdown: shutdown_rx.resubscribe(),
+                                    control: control_alive_rx.clone(),
+                                },
                                 permit,
+                                accepted_at,
                             )
                             .instrument(Span::current()),
                         );
@@ -3596,6 +3604,79 @@ impl<C> Clone for VisitorPool<C> {
     }
 }
 
+/// The visitor's read half, stamped so "its first byte was late" splits into
+/// the two waits behind it.
+///
+/// A visitor's arrival is stamped at `accept` and its channel pairing when the
+/// group starts; the third stamp is the first read that returns bytes. The
+/// three answer different questions: `accept → paired` is the pool having no
+/// channel ready, and `paired → first byte` is either a forwarding loop that
+/// did not get scheduled or a backend that did not answer. A single
+/// `setup_p99_ms` in a bench run says a visitor was slow; this says which of
+/// the three it was, on the same connection.
+///
+/// Off unless `MOLEHILL_MHD_STATS=1` (the carrier's own stats switch), so a
+/// healthy run never reads a clock for it.
+struct FirstByte<R> {
+    inner: R,
+    accepted_at: std::time::Instant,
+    paired_at: std::time::Instant,
+    logged: bool,
+}
+
+impl<R> FirstByte<R> {
+    const fn new(inner: R, accepted_at: std::time::Instant, paired_at: std::time::Instant) -> Self {
+        Self {
+            inner,
+            accepted_at,
+            paired_at,
+            logged: false,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByte<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if !self.logged
+            && matches!(poll, std::task::Poll::Ready(Ok(())))
+            && buf.filled().len() > before
+        {
+            self.logged = true;
+            if crate::transport::stats::enabled() {
+                let now = std::time::Instant::now();
+                let setup = now.duration_since(self.accepted_at);
+                if setup >= std::time::Duration::from_millis(100) {
+                    debug!(
+                        setup_us = u64::try_from(setup.as_micros()).unwrap_or(u64::MAX),
+                        paired_us = u64::try_from(now.duration_since(self.paired_at).as_micros())
+                            .unwrap_or(u64::MAX),
+                        "visitor's first byte was late: after pairing"
+                    );
+                }
+            }
+        }
+        poll
+    }
+}
+
+/// The two ways a pairing can stop before it forwards anything: the pool is
+/// shutting down, or the control session that owns its channels ended.
+///
+/// One value rather than two parameters because both are polled in the same
+/// `select!` and both end the visitor the same way — and because the pairing
+/// already carries the queue, the request sink, the plan and the visitor's own
+/// start stamp; a fourth handle would make the signature about bookkeeping.
+struct Stops {
+    shutdown: broadcast::Receiver<bool>,
+    control: tokio::sync::watch::Receiver<bool>,
+}
+
 /// Pair one accepted visitor with its data channels and start the forward.
 ///
 /// Everything that used to run inside the accept loop runs per visitor here, so
@@ -3607,9 +3688,9 @@ impl<C> Clone for VisitorPool<C> {
 async fn serve_tcp_visitor<C>(
     incoming: TcpStream,
     pool: VisitorPool<C>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
-    mut control_alive: tokio::sync::watch::Receiver<bool>,
+    mut stops: Stops,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    accepted_at: std::time::Instant,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -3634,8 +3715,8 @@ async fn serve_tcp_visitor<C>(
         &pool.data_ch_rx,
         &pool.data_ch_req_tx,
         Arc::clone(&pool.plan),
-        &mut shutdown_rx,
-        &mut control_alive,
+        &mut stops,
+        accepted_at,
     )
     .await
     {
@@ -3678,8 +3759,8 @@ async fn pair_striped_group<C>(
     data_ch_rx: &SharedChannels<C>,
     data_ch_req_tx: &mpsc::UnboundedSender<DataChannelRequest>,
     plan: Arc<crate::stripe::StripePlan>,
-    shutdown_rx: &mut broadcast::Receiver<bool>,
-    control_alive: &mut tokio::sync::watch::Receiver<bool>,
+    stops: &mut Stops,
+    accepted_at: std::time::Instant,
 ) -> Result<bool>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3721,8 +3802,8 @@ where
         let mut attempts = 0usize;
         loop {
             let next = tokio::select! {
-                _ = shutdown_rx.recv() => None,
-                _ = control_alive.changed() => None,
+                _ = stops.shutdown.recv() => None,
+                _ = stops.control.changed() => None,
                 ch = take_channel(data_ch_rx) => ch,
                 () = time::sleep(PAIR_WAIT_BUDGET) => {
                     // Nothing arrived inside the budget. Only the channels this
@@ -3793,17 +3874,25 @@ where
                 group,
                 stripes = stripe_count,
                 attempts,
+                accept_us = u64::try_from(pairing_started.duration_since(accepted_at).as_micros())
+                    .unwrap_or(u64::MAX),
                 paired_us = u64::try_from(paired.as_micros()).unwrap_or(u64::MAX),
                 "visitor waited for its data channels"
             );
         }
         debug!("Visitor paired with a {stripe_count}-stripe group {group}");
+        let paired_at = std::time::Instant::now();
         let (read, write) = incoming.into_split();
         // The group reports its own stalls to the plan: a frame that sat
         // parked on the path longer than `STRIPE_BACKPRESSURE` and then moved
         // is this group telling the server that one more stripe would have
         // helped.
-        crate::stripe::spawn_group(read, write, gathered, Some(Arc::clone(&plan)));
+        crate::stripe::spawn_group(
+            FirstByte::new(read, accepted_at, paired_at),
+            write,
+            gathered,
+            Some(Arc::clone(&plan)),
+        );
         return Ok(false);
     }
 }
@@ -5000,8 +5089,12 @@ mod tests {
         // its ceiling, where the client has no channel to give.
         let data_ch_rx: SharedChannels<tokio::io::DuplexStream> = ChannelQueue::pair(8);
         let (req_tx, mut req_rx) = mpsc::unbounded_channel();
-        let (_shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
-        let (_alive_tx, mut alive_rx) = tokio::sync::watch::channel(true);
+        let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (_alive_tx, alive_rx) = tokio::sync::watch::channel(true);
+        let mut stops = Stops {
+            shutdown: shutdown_rx.resubscribe(),
+            control: alive_rx,
+        };
 
         let session_over = pair_striped_group(
             incoming,
@@ -5009,8 +5102,8 @@ mod tests {
             &data_ch_rx,
             &req_tx,
             std::sync::Arc::new(crate::stripe::StripePlan::new(2)),
-            &mut shutdown_rx,
-            &mut alive_rx,
+            &mut stops,
+            std::time::Instant::now(),
         )
         .await
         .unwrap();

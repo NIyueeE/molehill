@@ -188,7 +188,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `udp_loss_pct` | % | 越低越好 | (发出的数据报 - 收到的数据报) / 发出的数据报 | 探针发出的数据报 |
 | `udp_gap_p99_ms` | ms | 越低越好 | 探针收到的各次应答之间间隔的第 99 百分位数 | 一个收到的数据报 |
 | `udp_rtt_p99_ms` | ms | 越低越好 | 探针数据报 echo 往返时间的第 99 百分位数 | 一个被 echo 的数据报 |
-| `setup_p50_ms` | ms | 越低越好 | 建立一条连接所需时间的中位数,前提是工作负载每次请求都新开一条连接(访客为抵达而付出的建连代价) | 一条连接 |
+| `setup_p50_ms` | ms | 越低越好 | 建立一条连接所需时间的中位数,前提是工作负载每次请求都新开一条连接。它只测访客到服务端的握手:服务端在接受之后才把访客与通道配对,所以隧道侧的抵达代价要看 `rtt_*`,不在这里 | 一条连接 |
 | `cpu_s_per_gbit` | s/Gbit | 越低越好 | 工具 CPU 秒数(user+sys,两个 daemon 合计) / 访客报价的 Gbit | 访客链路出方向上的 Gbit |
 | `cpu_cores` | cores | 越低越好 | 工具 CPU 秒数 / 测量窗口 | 工作负载的测量窗口 |
 | `bytes_per_syscall` | B | 越高越好 | 每次设备 I/O 的字节数:工具进程的 rchar+wchar / syscr+syscw。**仅 L3 臂**——见表格下方的说明 | 一次 read/write 族系统调用 |
@@ -224,7 +224,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `bulk-pair` | `bulk-pair` | 两个服务(或两条 L3 claim)是否各自承载一条完整的流,以此把每流上限与每主机上限分开 | `throughput_gbps` |
 | `rr-1` | `rr` | 一条严格请求/响应流的往返速率与延迟 | `rtt_p99_ms` |
 | `rr-16` | `rr` | 同上,但同时 16 条流:聚合速率与尾部延迟 | `rate_per_s` |
-| `churn-16` | `rr` | 每次请求新开一条连接:访客付出的建连代价,以及该架构为每个访客保留的状态 | `rate_per_s` |
+| `churn-16` | `rr` | 每次请求新开一条连接:访客为抵达付出的代价,取每条新连接上第一个请求的往返时间 | `rtt_p99_ms` |
 | `udp-pace` | `udp` | 一次限速的 UDP 会话:到达的比例是多少,间隔又如何 | `udp_loss_pct` |
 | `udp-ladder` | `udp-ladder` | 在每一个报价速率上,UDP 路径从何处开始丢弃 | `udp_loss_pct` |
 | `timeline` | `staged` | 路径劣化又恢复时工具如何表现:一条交互流、N 条 bulk 流、一条 churn 流与一次 UDP 会话,走一份脚本化的条件日程,原地切换 | `rtt_p99_ms` |
