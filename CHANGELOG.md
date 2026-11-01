@@ -21,11 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deriving each stream's record keys from the lane's own was built and measured
   three ways: it takes the p99 to **3.79 ms** and doubles the arrival rate, and
   every version costs the bulk cell (`bulk-n` throughput −15.67 %, a CLAIM past
-  its floor, and 0 of 4 samples where the shipped tree passes 4 of 4). The
-  mechanism, the numbers and the two remaining ways forward are in
-  `HANDOFF.md`, "key derivation delivered the arrival win and cost the bulk
-  cell". A deployment whose traffic is mostly short-lived connections should
-  measure its own path before choosing this carrier.
+  its floor, and 0 of 8 samples where the shipped tree passes 4 of 4), and the
+  one alternative that would remove the cost without the record layer — sealing
+  inside the carrier's own packet framing — has not been attempted. The
+  mechanism, the numbers and the state of each attempt are in `HANDOFF.md`,
+  "key derivation delivered the arrival win and cost the bulk cell".
+
+  This is not a latency footnote. The release sweep's staged schedule drives an
+  interactive probe that opens a **fresh connection per ping**, twenty times a
+  second beside four bulk streams and sixteen churn connections per second, so
+  a stage's p99 *is* the arrival cost under load. Measured on this host at
+  1.0.0: the clean stage reads **125 ms** where the v0.11.2 record read 30.8,
+  and **loss5, rate100, jitter and the clean repeat all failed** with `iperf3
+  error: control socket has closed unexpectedly` — the loss5 cell carried
+  **0.0 Gbit/s for all 118 of its seconds** — while the capacity ramp stopped
+  at **2 streams**. A deployment whose traffic is mostly short-lived
+  connections, or that is measured against the staged schedule, should treat
+  this carrier as unproven until the handshake is off the arrival path.
 
 ### Added
 
