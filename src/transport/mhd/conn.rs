@@ -156,6 +156,12 @@ struct StreamState {
     /// when there is one; otherwise it is the reset frame this flag records, so
     /// it is queued once and never lost.
     fin_sent: bool,
+    /// How many times this stream's bytes were declared lost and re-queued.
+    ///
+    /// Per stream, unlike the connection's own counter, because the question it
+    /// answers is about one stream: a Noise handshake that took five seconds is
+    /// either a queue or eight lost packets, and only this says which.
+    retransmits: u32,
 }
 
 /// One open stream the connection is holding.
@@ -1252,6 +1258,13 @@ impl Conn {
         self.id
     }
 
+    /// How many times that stream's ranges were declared lost.
+    pub(crate) fn stream_retransmits(&self, stream: u32) -> u32 {
+        self.streams
+            .get(&stream)
+            .map_or(0, |state| state.retransmits)
+    }
+
     /// What the connection's three write budgets have left, for the
     /// open-latency line: `(credit, window, buffer, streams with bytes queued)`.
     ///
@@ -1449,6 +1462,7 @@ impl Conn {
                 }
                 if let Some(state) = self.streams.get_mut(&range.stream) {
                     state.send.repair(range.offset, usize::from(range.len));
+                    state.retransmits = state.retransmits.saturating_add(1);
                 }
             }
         }
@@ -1510,6 +1524,7 @@ impl Conn {
                 }
                 if let Some(state) = self.streams.get_mut(&range.stream) {
                     state.send.repair(range.offset, usize::from(range.len));
+                    state.retransmits = state.retransmits.saturating_add(1);
                 }
             }
         }

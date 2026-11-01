@@ -622,6 +622,20 @@ impl MhdLane {
         &self,
     ) -> Result<crate::transport::multiplex::CarrierStream, crate::transport::multiplex::LaneError>
     {
+        Ok(self.open_channel_with_id().await?.1)
+    }
+
+    /// The same, answering the stream's id too.
+    ///
+    /// `open_stream` needs the id to read that stream's own retransmit count when
+    /// an open turns out slow (see `stream_retransmits`), and the id is minted
+    /// here.
+    async fn open_channel_with_id(
+        &self,
+    ) -> Result<
+        (u32, crate::transport::multiplex::CarrierStream),
+        crate::transport::multiplex::LaneError,
+    > {
         use tokio::io::AsyncWriteExt;
         if self.shared.is_closed() {
             return Err(crate::transport::multiplex::LaneError::Closed);
@@ -639,7 +653,7 @@ impl MhdLane {
                     .wrap_initiator(plain)
                     .await
                     .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-                Ok(Box::new(wrapped))
+                Ok((id, Box::new(wrapped)))
             }
             // Without the `noise` feature `noise` is always None, so this arm
             // is the only one the compiler needs there.
@@ -653,7 +667,7 @@ impl MhdLane {
                     .flush()
                     .await
                     .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-                Ok(plain)
+                Ok((id, plain))
             }
         }
     }
@@ -729,10 +743,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // The opening's own phases, because the whole of it says only "late":
         // a slow Noise handshake, a slow hello and a slow acknowledgement are
         // three different waits (see `MIN_RTO` for the timer one).
-        let mut stream = match self.open_channel().await {
-            Ok(stream) => stream,
-            Err(e) => return Err(e),
-        };
+        let (stream_id, mut stream) = self.open_channel_with_id().await?;
         let hs_at = Instant::now();
         let hello = crate::protocol::Hello::DataChannelTunnelHello(
             crate::protocol::CURRENT_PROTO_VERSION,
@@ -768,7 +779,16 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 // path here measures, so an open past it is a stall and worth the
                 // four numbers that tell its four causes apart (`Conn::budget`).
                 if us >= 100_000 {
-                    let (credit, window, buffer, queued) = self.shared.with(|conn| conn.budget());
+                    let (credit, window, buffer, queued, retransmits) = self.shared.with(|conn| {
+                        let (credit, window, buffer, queued) = conn.budget();
+                        (
+                            credit,
+                            window,
+                            buffer,
+                            queued,
+                            conn.stream_retransmits(stream_id),
+                        )
+                    });
                     tracing::debug!(
                         lane = self.id,
                         us,
@@ -776,6 +796,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                         window,
                         buffer,
                         queued_streams = queued,
+                        retransmits,
                         "mhd slow stream open: what the write budgets had left"
                     );
                 }

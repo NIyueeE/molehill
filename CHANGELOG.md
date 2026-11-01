@@ -90,6 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **A small flight's retransmission ladder stops at the wide timer.** The cheap
+  first step is what a stream open wants; an unbounded geometric climb is not.
+  Without the cap a sample-less lane walked 20, 40, … 2 560 ms — summing to more
+  than five seconds over nine timers, where the flat 333 ms it replaced summed to
+  three — so the floor that made the first retry cheap made the *ladder* longer.
+  Each step is now capped at the wide timer, and a test pins both the cheap first
+  step and the ceiling.
 - **A stream opening on a lane that has never carried a sample no longer waits
   the burst's timer.** The retransmission timer's starting value is the RFC 9002
   one (333 ms), which is right for a flight whose width is unknown: re-sending a

@@ -450,6 +450,14 @@ impl Recovery {
         // one datagram the peer drops by offset (see [`MIN_RTO_SMALL_FLIGHT`]).
         let small = self.live <= SMALL_FLIGHT_PACKETS;
         let rto = self.rtt.rto(small).saturating_mul(1u32 << backoff.min(10));
+        // A small flight's backoff stops at the wide timer. Without this a lane
+        // waiting for its first sample climbs 20, 40, ... 2 560 ms, and the SUM
+        // of those steps — 5.1 s — is what a stream open then waits, against the
+        // 2.7 s the old flat 333 ms produced over the same count. Measured: an
+        // open of 5 266 433 µs whose Noise handshake owned 5 265 951 of it, with
+        // exactly one retransmit recorded. The cheap floor is worth having for
+        // the first step; it must not extend the ladder.
+        let rto = if small { rto.min(INITIAL_RTO) } else { rto };
         self.timer = Some(now + rto);
     }
 
@@ -1050,6 +1058,44 @@ mod tests {
             SMALL_FLIGHT_INITIAL_RTO,
             "a lone packet on a sample-less lane is a handshake, and gets the \
              cheap timer"
+        );
+    }
+
+    /// A small flight's ladder stops at the wide timer, so one opening cannot
+    /// climb to seconds.
+    ///
+    /// The cheap first step is the point of [`MIN_RTO_SMALL_FLIGHT`]; an
+    /// unbounded geometric climb is not. Nine silent timers on a sample-less
+    /// lane must therefore never wait longer than nine wide intervals — the old
+    /// flat 333 ms behaviour — whatever the cheap base is.
+    #[test]
+    fn a_small_flights_ladder_stops_at_the_wide_timer() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        send_one(&mut recovery, start, 0);
+        let mut now = start;
+        let mut waits = Vec::new();
+        for _ in 0..9 {
+            let Some(deadline) = recovery.poll_timeout() else {
+                break;
+            };
+            waits.push(deadline.saturating_duration_since(now));
+            now = deadline.max(now);
+            let (_, resent) = recovery.on_timeout(now);
+            for sent in resent {
+                let number = recovery.next_number();
+                recovery.on_sent(now, number, sent.range);
+            }
+        }
+        assert_eq!(waits[0], MIN_RTO_SMALL_FLIGHT, "the first step is cheap");
+        assert!(
+            waits.iter().all(|wait| *wait <= INITIAL_RTO),
+            "no step may exceed the wide timer: {waits:?}"
+        );
+        let total: std::time::Duration = waits.iter().sum();
+        assert!(
+            total < std::time::Duration::from_secs(3),
+            "the whole ladder stays under three seconds, got {total:?}"
         );
     }
 
