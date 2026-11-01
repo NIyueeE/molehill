@@ -3761,6 +3761,43 @@ hand-offs rather than a starved runtime, and raising the worker count is not a
 fix. (One round in each run collapsed to ~180 arrivals/s — the bimodality noted
 earlier, still unexplained.) The numbers sit in `target/evidence/workers-*.json`.
 
+**And the record layer is measured at three sizes: it buys the arrival tail at
+every one of them and costs the bulk cell at every one of them (2026-11-01).**
+Each row is the derived-key tree over the same baseline build (`--ab-arm`,
+`--binary-b`, four rounds, mhd forced):
+
+| record size | `churn-16` p99 | `churn-16` rate | `bulk-n` throughput | `bulk-n` samples |
+|---|---|---|---|---|
+| none (the shipped tree) | 15.1–21.5 ms | 2 581–3 328/s | **12.29–12.32** | **5 of 5** |
+| 32 KiB | −74 % (3.79 ms) | +100 % | −19 % (9.96) | 2 of 5 |
+| 16 KiB | −78 % | — | 9.96 | 2 of 5 |
+| **1 348 B (one packet)** | **−72 % (4.21 ms)** | **+146 %** | **−53 % (5.75)** | 4 of 8 |
+| 1 348 B + per-stream credit | −72 % (4.21 ms) | +146 % | −53 % (5.75) | 4 of 8 |
+
+So the two effects are both structural properties of "put an AEAD record layer
+between the application and the carrier", and the record size only trades one
+against the other: a bigger record costs less throughput (fewer AEAD calls) and
+a smaller one fails less often (a shorter partial-record window), and neither
+direction reaches both goals. **The record layer is the wrong mechanism**, and
+this is the third granularity at which that has been measured.
+
+**A fifth thing was tried and it is also refuted: the per-stream credit.** The
+connection-wide `send_credit` is only refreshed by a dedicated `Frame::Credit`
+every `WINDOW / 4` of reader progress, while the peer's per-stream read frontier
+rides *every* acknowledgement block for free (`Ack::prefix`, already consumed by
+`SendBuf::advance_to` to free buffer). So `Conn::write`'s bound used a batched
+number where a current one was available — which looked exactly like the
+deadlock. Making the bound `base + WINDOW - written` for the stream being
+written changed **nothing measurable** (identical row above), so the credit path
+is not the bulk cell's failure either. Reverted; the finding is recorded because
+the reasoning was sound and the measurement is what rules it out.
+
+**What is left, in order of size:** the arrival tail is an await-count problem
+(measured above), the record layer cannot fix it without costing bulk, and the
+two mechanisms that reduce awaits without a record layer are session resumption
+(one round trip instead of two, with a ticket the lane issues at establishment)
+and collapsing the pairing path's hand-offs. Both are unattempted.
+
 **P4′ is half done, and the half that is left is left on purpose (2026-11-01).**
 The two frame classes nothing sent are gone: a datagram frame and a whole-IP-packet
 frame were declared, acknowledged and dropped by the connection, and no sender in
