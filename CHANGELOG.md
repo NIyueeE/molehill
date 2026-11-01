@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-01
+
 ### Added
 
 - **`MOLEHILL_MHD_STATS=1` reports the carrier's own cost.** One line per second
