@@ -2905,6 +2905,19 @@ park), or set the tail aside and spend the remaining effort on the work packages
 this defect has been crowding out. **The second is what this page recommends**, and
 the first is worth one round if the tail is the priority.
 
+**The transparent path is green after all of this (2026-11-01).** `just l3-accept`
+on the current tree: **16 of 16 PASS**, including the sixteen-concurrent-flow arm
+and both lane-lending arms — the two that have flaked on this host for the whole
+cycle. So the timer's small-flight floor, the per-stream repair queue, the
+backoff cap and the four instrumentation rounds did not disturb L3: byte-exact
+echo, the visitor's real address preserved, no server-side flow state, 200 KB
+streamed through a 65 KB device, 2000 small round trips exact, the policy refusal
+preceding any device access, and the valve naming its cap.
+
+This is the first evidence in the cycle that the carrier changes are safe *outside*
+the L4 cost cell, and it matters because the L3 path is the one the maintainer's
+own deployment waits on.
+
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
 the wire and **dropped** by the connection (`conn.rs`, `Frame::Datagram { .. } |
