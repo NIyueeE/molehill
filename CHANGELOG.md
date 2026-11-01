@@ -292,6 +292,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Two wire frame classes nothing sent are gone.** A v5 carrier declared an
+  unreliable datagram frame and an unreliable whole-IP-packet frame. No sender in
+  this dialect ever produced either — a UDP service and a transparent claim both
+  ride reliable streams — so the connection acknowledged them and dropped them.
+  The tags are removed rather than carried as dead numbers: the packet kinds are
+  now `Ack`, `Stream`, `Credit` and `Reset`, and the decoder refuses anything
+  else. Both ends ship together inside this dialect, so no compatibility question
+  arises; a peer that sends a retired tag is refused on the packet.
+
 - **The carrier's credit window is sixteen megabytes, not thirty-two.** The
   window is what a lane's buffers are made of on both ends — the receive blocks
   a stream may hold, and the send buffer's ceiling, which is written in terms of

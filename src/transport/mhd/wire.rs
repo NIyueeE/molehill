@@ -9,10 +9,13 @@
 //!   stream by bytes lets a loss hold up exactly one stream.
 //! - **A 64-bit acknowledgement bitmap** instead of a segment list: one
 //!   u32/u64 pair says what arrived below the largest packet seen.
-//! - **Three frame classes.** A reliable stream frame for what must arrive (TCP
-//!   forwarding, the control path), an unreliable datagram frame for what must
-//!   not wait (UDP forwarding), and an unreliable L3 frame for whole IP packets
-//!   (the transparent path, where the inner transport already recovers).
+//! - **One reliable frame class and two connection-level ones.** A stream frame
+//!   for what must arrive (every data channel and the control path), a credit
+//!   frame for the connection-wide send allowance, and a reset for a stream that
+//!   ends early. The two unreliable classes a v5 carrier declared for datagrams
+//!   and whole IP packets were never produced by any sender in this dialect; a
+//!   UDP service and a transparent claim both ride reliable streams, so the
+//!   classes were removed rather than carried as tags nothing sends.
 //!
 //! A frame never spans two packets. That is what makes a sent packet own a
 //! byte range of exactly one stream, so retransmission is "send these bytes at
@@ -65,10 +68,6 @@ pub(crate) const HEAD: usize = 9;
 pub(crate) const ACK: usize = 28;
 /// stream id + offset + length.
 pub(crate) const STREAM: usize = 14;
-/// stream id + length (an unreliable datagram frame carries no offset).
-pub(crate) const DATAGRAM: usize = 6;
-/// length only: an L3 frame is one whole IP packet.
-pub(crate) const L3: usize = 2;
 /// the connection-wide credit, absolute.
 pub(crate) const CREDIT: usize = 8;
 /// stream id + reason.
@@ -76,24 +75,15 @@ pub(crate) const RESET: usize = 5;
 
 /// The most stream bytes a reliable frame can carry.
 pub(crate) const MAX_STREAM_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - STREAM;
-/// The most bytes an unreliable datagram frame can carry.
-#[expect(
-    dead_code,
-    reason = "the unreliable frame classes are declared by the wire and wired \
-              into the UDP and L3 paths next; the format is one deliberate \
-              step, so its bounds live here with it"
-)]
-pub(crate) const MAX_DATAGRAM_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - DATAGRAM;
-/// The most bytes an L3 frame can carry (one inner IP packet, up to its MTU).
-#[expect(
-    dead_code,
-    reason = "the unreliable frame classes are declared by the wire and wired \
-              into the UDP and L3 paths next; the format is one deliberate \
-              step, so its bounds live here with it"
-)]
-pub(crate) const MAX_L3_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - L3;
 
 /// What a packet is for.
+///
+/// The discriminants are the wire contract and are deliberately compact: the
+/// two unreliable classes a v5 carrier declared — one message and one whole IP
+/// packet — were never produced by any sender in this dialect, so they are gone
+/// rather than carried as dead tags. A peer from another build of this dialect
+/// does not exist (both ends ship together), and an unknown tag is refused by
+/// `Kind::from_bits`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Kind {
@@ -101,14 +91,10 @@ pub(crate) enum Kind {
     Ack = 0,
     /// Reliable stream bytes at an offset.
     Stream = 1,
-    /// One unreliable message, delivered or not.
-    Datagram = 2,
-    /// One unreliable whole IP packet.
-    L3 = 3,
     /// The connection-wide credit this end may still send.
-    Credit = 4,
+    Credit = 2,
     /// One stream is finished early.
-    Reset = 5,
+    Reset = 3,
 }
 
 impl Kind {
@@ -116,10 +102,8 @@ impl Kind {
         match bits {
             0 => Some(Self::Ack),
             1 => Some(Self::Stream),
-            2 => Some(Self::Datagram),
-            3 => Some(Self::L3),
-            4 => Some(Self::Credit),
-            5 => Some(Self::Reset),
+            2 => Some(Self::Credit),
+            3 => Some(Self::Reset),
             _ => None,
         }
     }
@@ -300,18 +284,6 @@ pub(crate) enum Frame<'a> {
         /// The bytes.
         data: &'a [u8],
     },
-    /// One unreliable message on a stream, delivered or not.
-    Datagram {
-        /// Which stream.
-        id: u32,
-        /// The message.
-        data: &'a [u8],
-    },
-    /// One whole IP packet, delivered or not.
-    L3 {
-        /// The packet.
-        data: &'a [u8],
-    },
     /// The connection-wide credit this end still allows.
     Credit {
         /// Bytes the peer may still have in flight.
@@ -332,8 +304,6 @@ impl Frame<'_> {
         match self {
             Self::None => 0,
             Self::Stream { data, .. } => STREAM + data.len(),
-            Self::Datagram { data, .. } => DATAGRAM + data.len(),
-            Self::L3 { data } => L3 + data.len(),
             Self::Credit { .. } => CREDIT,
             Self::Reset { .. } => RESET,
         }
@@ -343,8 +313,6 @@ impl Frame<'_> {
         match self {
             Self::None => Kind::Ack,
             Self::Stream { .. } => Kind::Stream,
-            Self::Datagram { .. } => Kind::Datagram,
-            Self::L3 { .. } => Kind::L3,
             Self::Credit { .. } => Kind::Credit,
             Self::Reset { .. } => Kind::Reset,
         }
@@ -420,17 +388,6 @@ pub(crate) fn encode(
             let len = u16::try_from(data.len()).ok()?;
             buf[at + 12..at + 14].copy_from_slice(&len.to_le_bytes());
             buf[at + STREAM..at + STREAM + data.len()].copy_from_slice(data);
-        }
-        Frame::Datagram { id, data } => {
-            buf[at..at + 4].copy_from_slice(&id.to_le_bytes());
-            let len = u16::try_from(data.len()).ok()?;
-            buf[at + 4..at + 6].copy_from_slice(&len.to_le_bytes());
-            buf[at + DATAGRAM..at + DATAGRAM + data.len()].copy_from_slice(data);
-        }
-        Frame::L3 { data } => {
-            let len = u16::try_from(data.len()).ok()?;
-            buf[at..at + 2].copy_from_slice(&len.to_le_bytes());
-            buf[at + L3..at + L3 + data.len()].copy_from_slice(data);
         }
         Frame::Credit { connection } => {
             buf[at..at + 8].copy_from_slice(&connection.to_le_bytes());
@@ -607,20 +564,6 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
                 data: payload(at + STREAM, len)?,
             }
         }
-        Kind::Datagram => {
-            let stream = bytes(at..at + 4)?;
-            let len = usize::from(u16_at(at + 4)?);
-            Frame::Datagram {
-                id: stream,
-                data: payload(at + DATAGRAM, len)?,
-            }
-        }
-        Kind::L3 => {
-            let len = usize::from(u16_at(at)?);
-            Frame::L3 {
-                data: payload(at + L3, len)?,
-            }
-        }
         Kind::Credit => {
             let slice = buf.get(at..at + 8).ok_or(Malformed)?;
             let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
@@ -684,8 +627,6 @@ mod tests {
                 fin: true,
                 data: &data,
             },
-            Frame::Datagram { id: 9, data: &data },
-            Frame::L3 { data: &data },
             Frame::Credit {
                 connection: 1 << 40,
             },

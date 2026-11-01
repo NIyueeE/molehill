@@ -1468,12 +1468,6 @@ impl Conn {
             Frame::Credit { connection } => {
                 self.send_credit = connection;
             }
-            Frame::Datagram { .. } | Frame::L3 { .. } => {
-                // Delivered by the layer above; the connection acknowledges them
-                // so the sender's loss detection does not chase data nobody
-                // promised to deliver.
-                self.ack_pending = true;
-            }
             Frame::Reset { id, code } => {
                 // Only an abort ends a stream wherever it is. A clean finish
                 // rides a tracked frame with its offset (see `pending_fins`), so if
