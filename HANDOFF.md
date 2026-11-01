@@ -3672,6 +3672,13 @@ record.
   The bench fails cleanly — every test records `No such file or directory:
   'iperf3'` and the gate refuses the file — but it looks like a finished
   artifact until someone reads it.
+- **Never run two `just check`s at once.** The integration suites bind fixed
+  ports by design (`--test-threads=1`), so a second full chain running beside the
+  first makes them collide — measured this cycle as `status_api_test` failing
+  inside one chain while a fresh chain on the same tree passed, and the suite then
+  passing three times out of three standalone. A red gate on a tree that is green
+  when re-run alone is worth checking for a concurrent chain before it is blamed on
+  the code.
 - **`/tmp` is periodically wiped.** Keep `--out` and logs under `~/tmp` or the
   repo. The bench model's own work directories (`~/tmp/bench-*`) are normal
   residue and are never deleted by the harness.
