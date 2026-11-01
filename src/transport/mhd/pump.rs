@@ -1151,6 +1151,109 @@ mod lane_tests {
         assert!(PoolLane::is_alive(&*accepted));
     }
 
+    /// A yamux session over one mhd stream carries four independent streams and
+    /// loses no byte of them.
+    ///
+    /// This is the seam the multiplexed-lane experiment depended on: four data
+    /// channels, each a multiplexed stream over one carrier stream, a megabyte
+    /// each, and a count the peer has to confirm. It exists because that
+    /// experiment lost frames in the integration suite (four readers ending at
+    /// sequences 150, 176, 195 and 201 while 202 were sent), and the first
+    /// question is whether the loss is here or in the pool above it.
+    #[cfg(feature = "multiplex")]
+    #[tokio::test]
+    async fn a_multiplexed_stream_carries_four_streams_without_losing_bytes() {
+        use crate::transport::multiplex::{ClientTunnel, mux_config, run_server_tunnel};
+
+        const PAYLOAD: u64 = 1024 * 1024;
+        const STREAMS: usize = 4;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut listener = MhdListener::bind(addr).unwrap();
+        let bound = listener.local_addr();
+        let dialer = MhdLane::dial(
+            bound,
+            21,
+            None,
+            [11u8; crate::protocol::HASH_WIDTH_IN_BYTES],
+        )
+        .await
+        .unwrap();
+
+        // The server end: read the selector, hand the stream to a yamux session,
+        // and count what each inbound stream carried before answering with the
+        // count. Counting rather than echoing keeps the test one-directional, so a
+        // failure names the direction that lost bytes.
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await.unwrap();
+            let mut inbound = accepted.wait_stream().await.unwrap();
+            assert_eq!(
+                inbound.read_u8().await.unwrap(),
+                crate::protocol::PLAIN_SELECTOR
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(run_server_tunnel(inbound, mux_config(), tx));
+            while let Some(stream) = rx.recv().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(stream);
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let mut total: u64 = 0;
+                    loop {
+                        match r.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => total += n as u64,
+                            Err(e) => {
+                                // A reset loses the tail exactly the way a
+                                // truncation would; naming it is what tells the
+                                // two apart.
+                                eprintln!("server stream ended with {e:?} after {total} bytes");
+                                break;
+                            }
+                        }
+                    }
+                    let _ = w.write_all(&total.to_be_bytes()).await;
+                    let _ = w.flush().await;
+                });
+            }
+        });
+
+        let stream = dialer.open_channel().await.unwrap();
+        let (_shutdown, ended) = tokio::sync::watch::channel(false);
+        let tunnel = ClientTunnel::start(stream, mux_config(), ended);
+
+        let mut senders = Vec::with_capacity(STREAMS);
+        for index in 0..STREAMS {
+            let tunnel = tunnel.clone();
+            senders.push(tokio::spawn(async move {
+                let mut stream = tunnel.open_stream().await.unwrap();
+                let chunk = vec![u8::try_from(index).unwrap_or(0); 16 * 1024];
+                let mut sent = 0u64;
+                while sent < PAYLOAD {
+                    let take = usize::try_from((PAYLOAD - sent).min(chunk.len() as u64)).unwrap();
+                    stream.write_all(&chunk[..take]).await.unwrap();
+                    sent += take as u64;
+                }
+                stream.flush().await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut answer = [0u8; 8];
+                stream.read_exact(&mut answer).await.unwrap();
+                u64::from_be_bytes(answer)
+            }));
+        }
+        for (index, sender) in senders.into_iter().enumerate() {
+            // The module opts into `panic` for exactly this: a stalled stream is
+            // the failure this test exists to catch, and the panic names which
+            // one.
+            let Ok(joined) = tokio::time::timeout(Duration::from_secs(20), sender).await else {
+                panic!("stream {index} stalled")
+            };
+            let counted = joined.unwrap();
+            assert_eq!(counted, PAYLOAD, "stream {index} lost bytes");
+        }
+        drop(tunnel);
+        server.abort();
+    }
+
     /// A stream carries a real conversation: many round trips, each one a
     /// request the peer answers. This is the shape every forwarded TCP channel
     /// has, and it is where a lost wake-up or a stalled credit shows up.

@@ -65,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stream's close can no longer overtake its own data.** A multiplexed
+  stream's FIN went out on a bookkeeping queue that leaves before any payload —
+  right for a window update, wrong for a close whose frames were still queued:
+  the peer read the FIN as the end of the stream and dropped what followed.
+  Measured at the carrier seam: a stream that wrote 1 048 576 bytes delivered
+  **950 272** and then a clean EOF, and the same shape truncated striped forwards
+  under load. A close now follows its own stream's data and still overtakes other
+  streams'. TCP hid this behind its socket buffer; a carrier that backpressures
+  the multiplexer exposes it, which is how it was found.
+
 - **A visitor no longer pays for another visitor's striping.** The server kept
   one striping width for the whole process and grew it whenever *any* group's
   send direction parked; a group already forwarding kept the width it started

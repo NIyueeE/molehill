@@ -3556,6 +3556,37 @@ dedicated round: what mhd's stream does with queued bytes when its own buffer is
 near `MAX_BUFFERED` and the peer's window is closed, and whether a `MuxStream`
 reset can discard frames the yamux session had already queued.
 
+**And it was none of those: a stream's FIN was overtaking its own data
+(2026-11-01, fixed).** The bug reproduces in **60 ms** without any of the server
+or pool machinery — `a_multiplexed_stream_carries_four_streams_without_losing_bytes`
+in `src/transport/mhd/pump.rs` opens one carrier stream, runs a yamux session over
+it, and has four streams write a megabyte each. Before the fix, a stream that
+wrote **1 048 576** bytes delivered **950 272** and then a *clean EOF* — six
+16 KiB frames lost, and the EOF is what named the culprit: a clean end means the
+peer received a FIN, so nothing below had errored.
+
+The FIN came from `Connection`'s `control_frames`, a bookkeeping queue that is
+drained **before** `pending_frames` so a window update never waits behind
+megabytes of payload — a reasonable rule for a bodyless control frame whose
+stream has nothing queued, and a data-losing one for a **close**: the FIN arrived
+at the peer before the frames still sitting in `pending_frames`, the peer ended
+the stream, and those frames were discarded. TCP hid this for two years because
+the socket accepts data fast enough that `pending_frames` is nearly always empty
+when a close is queued; a carrier that *backpressures* the mux keeps it full, and
+the hazard becomes routine.
+
+The fix is exactly that distinction: a close whose stream still has queued body
+bytes goes to `pending_frames` (so it follows its own stream's data) and it still
+jumps the bookkeeping queue when nothing of that stream is queued. The connection
+keeps `queued_body: IntMap<StreamId, usize>` for the question — decremented where
+a frame leaves the data queue, removed at zero.
+
+That closes the last known blocker on the multiplexed lane: the arrival path it
+measured (p99 21.49 → 3.77 ms, level with TCP's 3.46) can now be re-applied on a
+carrier that no longer loses bytes, which is the next round's work. It also
+stands on its own as a fix to the shipped TCP carrier: the same ordering hazard
+existed there, just rarely enough that the suite never caught it.
+
 **And P3′ was built and measured out (2026-11-01).** The rule was the one TCP
 cannot implement: a packet is declared lost the moment the peer's *per-stream
 cumulative byte prefix* passes its range, instead of waiting for three later

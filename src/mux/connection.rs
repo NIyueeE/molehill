@@ -224,11 +224,24 @@ struct Active<T> {
     /// connection sleeping with no registered waker for later sends.
     pending_frames: VecDeque<Frame<()>>,
     /// The part of the queue that is connection bookkeeping rather than
-    /// payload: a window update (the peer's send credit) or a stream close.
-    /// Both are bodyless, and either one stuck behind megabytes of bulk data
-    /// costs the peer progress it cannot recover from the payload side, so
-    /// they leave before any data frame. Data frames keep their own FIFO.
+    /// payload: a window update (the peer's send credit) or a stream close for
+    /// a stream with **nothing queued**. Both are bodyless, and either one stuck
+    /// behind megabytes of bulk data costs the peer progress it cannot recover
+    /// from the payload side, so they leave before any data frame. Data frames
+    /// keep their own FIFO.
+    ///
+    /// A close for a stream whose data is still queued does **not** belong here.
+    /// Ordering inside a stream is the whole of its reliability: a FIN that
+    /// overtakes its own stream's frames tells the peer the stream ended early,
+    /// and the frames behind it are discarded — measured as a stream carrying
+    /// 950 272 of 1 048 576 bytes and then reporting a clean EOF
+    /// (`src/transport/mhd/pump.rs`, the multiplexed-stream test). Such a close
+    /// goes to `pending_frames` instead, so it follows its own stream's data.
     control_frames: VecDeque<Frame<()>>,
+    /// Body bytes queued in `pending_frames`, per stream. It exists for the one
+    /// question `control_frames` cannot answer alone: whether a close may
+    /// overtake (nothing of that stream is queued) or must follow.
+    queued_body: IntMap<StreamId, usize>,
     /// Body bytes currently queued in `pending_frames` (control frames are
     /// bodyless, so they are free). This is what bounds how much one tunnel
     /// can hold in userspace — see `Active::max_pending_bytes`.
@@ -338,6 +351,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             pending_read_frame: None,
             pending_frames: VecDeque::new(),
             control_frames: VecDeque::new(),
+            queued_body: IntMap::default(),
             pending_bytes: 0,
             max_pending_bytes,
             recv_cursor: 0,
@@ -470,6 +484,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                         if is_bookkeeping(&frame) {
                             self.control_frames.push_back(frame);
                         } else {
+                            *self.queued_body.entry(id).or_default() += frame.body_size();
                             self.pending_frames.push_back(frame);
                         }
                         self.recv_cursor = (i + 1) % receivers;
@@ -479,10 +494,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                     }
                     Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
                         tracing::trace!("{}/{}: sending close", self.id, id);
-                        // A close carries no payload and ends a
-                        // stream: it takes the priority queue.
-                        self.control_frames
-                            .push_back(Frame::close_stream(id, ack).into());
+                        // A close is bodyless, so it takes the priority queue —
+                        // unless this stream still has data queued, in which case
+                        // it must follow that data or the peer ends the stream
+                        // early and drops it (see `control_frames`).
+                        let close: Frame<()> = Frame::close_stream(id, ack).into();
+                        if self.queued_body.get(&id).is_some_and(|bytes| *bytes > 0) {
+                            self.pending_frames.push_back(close);
+                        } else {
+                            self.control_frames.push_back(close);
+                        }
                         self.recv_cursor = (i + 1) % receivers;
                         self.wake_stream_writer(id);
                         took_command = true;
@@ -1023,6 +1044,14 @@ impl<T> Active<T> {
         }
         let frame = self.pending_frames.pop_front()?;
         self.pending_bytes = self.pending_bytes.saturating_sub(frame.body_size());
+        if frame.body_size() > 0
+            && let Some(queued) = self.queued_body.get_mut(&frame.header().stream_id())
+        {
+            *queued = queued.saturating_sub(frame.body_size());
+            if *queued == 0 {
+                self.queued_body.remove(&frame.header().stream_id());
+            }
+        }
         Some(frame)
     }
 
