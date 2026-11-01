@@ -53,14 +53,15 @@
 //! `tests/session_test.rs::a_striped_gather_names_its_group_on_every_request`
 //! instead.
 //!
-//! The configs are written in each side's own schema. v0.11.2 moved the wire
-//! tables (`[server.transport]` to `[server.noise]`, and the L3 client's), so
-//! one file can no longer drive both binaries; a released-side config written
-//! with a current key would fail to start, and the test would report a config
-//! error as an interop failure. The released side is also configured with the
-//! KK pattern — a supported v0.11.1 setting — so its Noise handshake completes
-//! and the hello's version check is the layer that refuses. A default v0.11.1
-//! peer (NK) is refused at the Noise layer instead.
+//! The configs are written in each side's own schema, because a release may
+//! move a table between two tags and a released-side config written with the
+//! other side's key fails to start — which the test would then report as an
+//! interop failure instead of the config error it is. v0.11.2 moved the wire
+//! tables (`[server.transport]` to `[server.noise]`, and the L3 client's), and
+//! this build inherits them, so for the 1.0.0 matrix the two schemas agree on
+//! every table these cases write. The branch is kept rather than collapsed:
+//! the next release that moves a table edits one arm, and a schema that has
+//! drifted is visible in the diff instead of implied by a shared string.
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
@@ -189,81 +190,49 @@ fn spawn_echo_backend(port: u16) {
     });
 }
 
-/// Which configuration schema to write: the released binary's, or this build's.
-#[derive(Clone, Copy)]
-enum Schema {
-    Released,
-    Current,
+/// The server's config, in the schema both binaries read.
+///
+/// One string, not two: v0.11.2 moved the wire tables to the flat
+/// `[server.noise]` and this build inherited them, so the released side and
+/// this side read the same file. That has been true exactly once before — the
+/// 0.11.2 matrix needed `[server.transport.noise]` with `local_private_key`,
+/// `remote_public_key` and a `pattern` for the released side, and a config
+/// error read as an interop failure. A release that moves a table again
+/// reintroduces the split here, and the split is the signal that it has.
+fn server_config(control: u16, exposed: u16) -> String {
+    format!(
+        "[server]\n\
+         default_token = \"{TOKEN}\"\n\
+         allow_ports = [\"{exposed}\"]\n\
+         \n\
+         [server.control]\n\
+         bind_addr = \"127.0.0.1:{control}\"\n\
+         \n\
+         [server.noise]\n\
+         private_key = \"{NOISE_SERVER_PRIVATE}\"\n\
+         public_key = \"{NOISE_CLIENT_PUBLIC}\"\n"
+    )
 }
 
-fn server_config(schema: Schema, control: u16, exposed: u16) -> String {
-    match schema {
-        Schema::Released => format!(
-            "[server]\n\
-             default_token = \"{TOKEN}\"\n\
-             allow_ports = [\"{exposed}\"]\n\
-             \n\
-             [server.control]\n\
-             bind_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [server.transport.noise]\n\
-             pattern = \"Noise_KK_25519_ChaChaPoly_BLAKE2s\"\n\
-             local_private_key = \"{NOISE_SERVER_PRIVATE}\"\n\
-             remote_public_key = \"{NOISE_CLIENT_PUBLIC}\"\n"
-        ),
-        Schema::Current => format!(
-            "[server]\n\
-             default_token = \"{TOKEN}\"\n\
-             allow_ports = [\"{exposed}\"]\n\
-             \n\
-             [server.control]\n\
-             bind_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [server.noise]\n\
-             private_key = \"{NOISE_SERVER_PRIVATE}\"\n\
-             public_key = \"{NOISE_CLIENT_PUBLIC}\"\n"
-        ),
-    }
-}
-
-fn client_config(schema: Schema, control: u16, exposed: u16, backend: u16) -> String {
-    match schema {
-        Schema::Released => format!(
-            "[client]\n\
-             default_token = \"{TOKEN}\"\n\
-             \n\
-             [client.control]\n\
-             default_remote_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [client.transport]\n\
-             type = \"noise\"\n\
-             \n\
-             [client.transport.noise]\n\
-             pattern = \"Noise_KK_25519_ChaChaPoly_BLAKE2s\"\n\
-             local_private_key = \"{NOISE_CLIENT_PRIVATE}\"\n\
-             remote_public_key = \"{NOISE_SERVER_PUBLIC}\"\n\
-             \n\
-             [client.services.echo]\n\
-             local_addr = \"127.0.0.1:{backend}\"\n\
-             remote_bind_addr = \"127.0.0.1:{exposed}\"\n"
-        ),
-        Schema::Current => format!(
-            "[client]\n\
-             default_token = \"{TOKEN}\"\n\
-             \n\
-             [client.control]\n\
-             default_remote_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [client.noise]\n\
-             public_key = \"{NOISE_SERVER_PUBLIC}\"\n\
-             private_key = \"{NOISE_CLIENT_PRIVATE}\"\n\
-             data_enable = true\n\
-             \n\
-             [client.services.echo]\n\
-             local_addr = \"127.0.0.1:{backend}\"\n\
-             remote_bind_addr = \"127.0.0.1:{exposed}\"\n"
-        ),
-    }
+/// The client's config, in the schema both binaries read (see
+/// [`server_config`] for why that is one string).
+fn client_config(control: u16, exposed: u16, backend: u16) -> String {
+    format!(
+        "[client]\n\
+         default_token = \"{TOKEN}\"\n\
+         \n\
+         [client.control]\n\
+         default_remote_addr = \"127.0.0.1:{control}\"\n\
+         \n\
+         [client.noise]\n\
+         public_key = \"{NOISE_SERVER_PUBLIC}\"\n\
+         private_key = \"{NOISE_CLIENT_PRIVATE}\"\n\
+         data_enable = true\n\
+         \n\
+         [client.services.echo]\n\
+         local_addr = \"127.0.0.1:{backend}\"\n\
+         remote_bind_addr = \"127.0.0.1:{exposed}\"\n"
+    )
 }
 
 /// One launched process, with its output on disk: a pipe nobody drains (or
@@ -477,17 +446,14 @@ fn old_server_refuses_new_client_and_says_so() {
     let backend = free_port();
     spawn_echo_backend(backend);
 
-    let server_cfg = case.write(
-        "server-old.toml",
-        &server_config(Schema::Released, control, case.exposed),
-    );
+    let server_cfg = case.write("server-old.toml", &server_config(control, case.exposed));
     let old_client_cfg = case.write(
         "client-old.toml",
-        &client_config(Schema::Released, control, case.exposed, backend),
+        &client_config(control, case.exposed, backend),
     );
     let new_client_cfg = case.write(
         "client-new.toml",
-        &client_config(Schema::Current, control, case.exposed, backend),
+        &client_config(control, case.exposed, backend),
     );
     case.spawn("server", &old, "--server", &server_cfg);
     case.spawn("client", Path::new(NEW_BIN), "--client", &new_client_cfg);
@@ -550,13 +516,10 @@ fn new_server_refuses_old_client_and_keeps_serving() {
     let backend = free_port();
     spawn_echo_backend(backend);
 
-    let server_cfg = case.write(
-        "server-new.toml",
-        &server_config(Schema::Current, control, case.exposed),
-    );
+    let server_cfg = case.write("server-new.toml", &server_config(control, case.exposed));
     let client_cfg = case.write(
         "client-new.toml",
-        &client_config(Schema::Current, control, case.exposed, backend),
+        &client_config(control, case.exposed, backend),
     );
     // The new server first.
     case.spawn("server", Path::new(NEW_BIN), "--server", &server_cfg);
@@ -652,13 +615,10 @@ fn old_server_rejects_unknown_dialect_and_survives() {
     let backend = free_port();
     spawn_echo_backend(backend);
 
-    let server_cfg = case.write(
-        "server-old.toml",
-        &server_config(Schema::Released, control, case.exposed),
-    );
+    let server_cfg = case.write("server-old.toml", &server_config(control, case.exposed));
     let client_cfg = case.write(
         "client-old.toml",
-        &client_config(Schema::Released, control, case.exposed, backend),
+        &client_config(control, case.exposed, backend),
     );
     case.spawn("server", &old, "--server", &server_cfg);
 
