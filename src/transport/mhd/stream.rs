@@ -317,6 +317,11 @@ impl SendBuf {
         self.next_offset() < self.written() || self.has_repair()
     }
 
+    /// The acknowledged frontier: bytes below it are gone.
+    pub(crate) fn base(&self) -> u64 {
+        self.base
+    }
+
     pub(crate) fn unacked(&self) -> u64 {
         self.written().saturating_sub(self.base)
     }

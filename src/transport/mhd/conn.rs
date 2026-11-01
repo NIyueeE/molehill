@@ -228,6 +228,14 @@ pub(crate) struct NoneSnapshot {
     pub(crate) buffer: u64,
     /// Where the round-robin cursor was.
     pub(crate) cursor: u32,
+    /// The first stream the walk should have found, with the facts that decide
+    /// it: `(id, open, has_unsent, next_offset, written, base)`.
+    ///
+    /// The summary above said `queued=1 … reason="no eligible stream"` — a
+    /// stream the scheduler may serve, holding bytes, and a walk that found
+    /// nothing — and no amount of aggregation resolves a contradiction like
+    /// that. These are the numbers themselves.
+    pub(crate) witness: Option<(u32, bool, bool, u64, u64, u64)>,
 }
 
 /// What this end is holding that its own readers have not taken.
@@ -1138,10 +1146,18 @@ impl Conn {
                 .values()
                 .filter(|state| state.reset.is_none_or(|code| code == ResetCode::Finished))
                 .count(),
+            // The **same** test the scheduler applies, or the count contradicts
+            // the walk: a stream the peer reset keeps its queued bytes and is
+            // never served, so counting it produced lines that read
+            // `queued=1 … why="no eligible stream"` and sent three rounds of
+            // investigation after an artifact of this counter.
             queued: self
                 .streams
                 .values()
-                .filter(|state| state.send.has_unsent())
+                .filter(|state| {
+                    state.reset.is_none_or(|code| code == ResetCode::Finished)
+                        && state.send.has_unsent()
+                })
                 .count(),
             fins: self.pending_fins.len(),
             resets: self.resets.len(),
@@ -1150,6 +1166,17 @@ impl Conn {
             window: self.cwnd.saturating_sub(self.recovery.flight_bytes()),
             buffer: MAX_BUFFERED.saturating_sub(self.buffered),
             cursor: self.cursor,
+            witness: self.streams.iter().next().map(|(&id, state)| {
+                let open = state.reset.is_none_or(|code| code == ResetCode::Finished);
+                (
+                    id,
+                    open,
+                    state.send.has_unsent(),
+                    state.send.next_offset(),
+                    state.send.written(),
+                    state.send.base(),
+                )
+            }),
         });
     }
 
@@ -1245,11 +1272,14 @@ impl Conn {
     /// described a connection with nothing queued — which is exactly the wrong
     /// conclusion to draw from it.
     pub(crate) fn refusal_now(&mut self) -> Option<NoneSnapshot> {
-        if !self.has_queued_transmit() {
-            return None;
-        }
-        let reason = self.none_snapshot.map_or("idle", |snap| snap.reason);
-        self.snapshot_none(reason);
+        // Only the snapshot taken **at the refusal**, inside the same critical
+        // section as the walk that produced it. Re-sampling here was the bug that
+        // made this counter lie for three rounds: the pump calls it after `flush`
+        // has already returned, so a writer landing in between made the counts
+        // describe a later instant than the reason — which is how a line came to
+        // read `queued=1 … reason="no eligible stream"` while the walk had run on
+        // an empty queue. A reason and its counts must come from one instant or
+        // the alarm is worse than no alarm.
         self.none_snapshot
     }
 
@@ -1897,6 +1927,43 @@ mod tests {
         assert!(
             accepted.contains(&interactive.id),
             "the interactive stream must be there too"
+        );
+    }
+
+    /// A stream with bytes to send is found by the walk **whatever the cursor
+    /// says**.
+    ///
+    /// The bench produced a refusal line that contradicted itself — `visited=2
+    /// open=2 queued=1 … reason="no eligible stream"` with a witness of
+    /// `(5, open=true, has_unsent=true, next=934 070 444, written=934 095 627)`
+    /// and a cursor of 11, i.e. an id no longer in the table. This pins the
+    /// invariant the scheduler is supposed to have: a cursor past every live id
+    /// wraps, and a stream owing bytes is never skipped.
+    #[test]
+    fn a_stream_owing_bytes_is_found_whatever_the_cursor_says() {
+        let mut conn = Conn::new(9, false);
+        let older = conn.open();
+        let younger = conn.open();
+        // Retire the older one, so the surviving id is not where the cursor sits.
+        conn.streams.remove(&older.id);
+        assert_eq!(conn.write(younger.id, b"payload"), 7);
+
+        // The cursor is advanced the way a served packet does it, landing past
+        // every live id — the state the bench logged.
+        conn.cursor = younger.id + 2;
+        let Some(pick) = conn.next_stream_range() else {
+            unreachable!("a stream owing bytes must be found")
+        };
+        assert_eq!(pick.id, younger.id, "the walk wrapped to the only stream");
+        assert_eq!(pick.offset, 0);
+        assert_eq!(pick.len, 7);
+
+        // And the same after the cursor has been moved by a real serve.
+        conn.advance_cursor();
+        assert!(
+            conn.next_stream_range().is_some(),
+            "still found after the cursor moved: cursor={}",
+            conn.cursor
         );
     }
 

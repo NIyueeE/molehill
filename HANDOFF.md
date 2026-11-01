@@ -2796,6 +2796,42 @@ seconds for a pass. That is where the next instrument goes, and it is the same
 `wake_pump`/`wait` pair on the accepted-lane path (`spawn_sender`) rather than the
 dialed one.
 
+**Three of my own instruments were wrong, and they are corrected
+(2026-11-01).** Working the server's send path turned up errors in the tools
+rather than in the carrier, and each is worth recording because each cost rounds:
+
+1. **Half the instruments are gated on `MOLEHILL_MHD_STATS`, and several
+   measurements were taken without it.** The "first stream byte waited for the
+   socket", "pump built nothing", "pump waited on the socket" and every `tx_*`
+   phase line are silent unless the switch is on. Re-running the same cells with
+   it set is what made the third item below visible at all. Any negative that
+   names one of those lines has to say the switch was on.
+2. **"pump built nothing while bytes were queued" counted streams the scheduler
+   may never serve.** A stream the peer reset keeps its queued bytes and is
+   skipped by design, so the count included it and produced
+   `queued=1 … reason="no eligible stream"` — a line that contradicts itself and
+   sent three rounds after an artifact. The count now applies the scheduler's own
+   eligibility test.
+3. **And the alarm still lied, for a different reason: its counts were sampled
+   after the fact.** The pump asked for the snapshot *after* `flush` returned,
+   which is a second lock acquisition — so a writer landing in between made the
+   counts describe a later instant than the reason sitting beside them. The
+   reporter now logs only the snapshot taken **at the refusal**, in the same
+   critical section as the walk that produced it. With that, the alarm is silent
+   on a cell whose slow opens still read 4 219 347 and 1 830 857 µs: the alarm was
+   never the defect.
+
+A stream owing bytes is found by the walk whatever the cursor says — that
+invariant is now pinned by a unit test (`a_stream_owing_bytes_is_found_whatever_the_cursor_says`),
+including the state the bench logged: a cursor past every live id, which is what
+a retired stream leaves behind.
+
+So the sender-side seven seconds is still unexplained, and the next instrument is
+the one the third item implies: a **dwell** counter for bytes already in a stream's
+send buffer — stamped when a write makes a stream non-empty and charged when a
+packet for it is built. That is the only interval between "`Conn::write` accepted
+it" and "the pump put it on the wire", and nothing measures it yet.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The

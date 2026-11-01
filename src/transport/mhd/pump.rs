@@ -221,6 +221,7 @@ async fn flush(
                     window = snap.window,
                     buffer = snap.buffer,
                     cursor = snap.cursor,
+                    witness = ?snap.witness,
                     "mhd pump built nothing while bytes were queued"
                 );
             }
