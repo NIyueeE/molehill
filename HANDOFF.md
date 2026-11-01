@@ -2569,15 +2569,31 @@ Two candidate causes are already excluded by measurement:
 | the client's spawned open was starved of a worker | expired budgets at `TOKIO_WORKER_THREADS=4` vs `16`, three runs each | **1 vs 4** — more threads make it *worse*, which is contention, not starvation |
 | the carrier's blocking connection mutex (`parking_lot`, so a waiter parks an OS thread) | acquisition wait, same runs | **0 waits over 100 ms** in every run, including the one that expired |
 
-What is left is the control reader itself, and it has a defect worth fixing on
-its own account: `read_control_cmd` reads the tag byte into a **local** array and
-then the body with a second `read_exact`. The client's command loop creates that
-future fresh inside `tokio::select!`, so whenever the other branch
-(`req_rx.recv()`) wins, the future is dropped **between the two reads** and the
-tag byte it already consumed is gone. That is not a delay, it is a desync — and
-the reason it has not been seen as one may be that the load that provokes it also
-ends the session. Making the read hold its partial frame across polls is the next
-change, and it is a correctness fix whether or not it turns out to be this stall.
+The control reader had a defect worth fixing on its own account, and it is now
+fixed: `read_control_cmd` read the tag byte into a **local** array and then the
+body with a second `read_exact`, while the client's command loop creates that
+future fresh inside `tokio::select!` — so whenever the other branch won, the
+future was dropped between the two reads and the tag byte it had already consumed
+was gone. The frame now lives in the caller's state (`ControlFrame`) and a dropped
+future resumes it. **The test reproduces the desync exactly**: with the old
+shape, a frame read across a cancellation comes back as `CreateDataChannel`
+because the body's first byte (0) was read as a tag.
+
+**And it is not this stall.** Five runs of the same cell with the fix in place
+still expire the budget 0-2 times each, with the same 5 002/5 003 ms samples:
+
+| run | expired budgets | p99 |
+|---|---|---|
+| 1 | 2 | 5 002, 5 003 |
+| 2 | 1 | 9, 5 003 |
+| 3 | 1 | 5 003, 11, 2 230 |
+| 4 | **0** | 3 023, 20, 507 |
+| 5 | 1 | 18, 2 947 |
+
+Run 4 is the one to keep in mind: **no expired budget and still 3 s**, which is
+the second term this page already noted. So there are at least two stalls under
+the `capacity` cell, the control-read desync was neither of them, and the next
+instrument has to separate them rather than explain one with the other.
 
 
 

@@ -103,6 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the wide value. Measured on the model's `capacity` ramp: the dialer's
   open latency went from p90 **337 ms with 5 of 58 over 100 ms** to p90 **6.7 ms
   with 1 of 118 over 100 ms**.
+- **A cancelled control-channel read no longer desynchronises the session.** A
+  command frame is a tag byte plus a body whose width the tag decides, and the
+  reader took them in two reads. The client's command loop reads inside a
+  `tokio::select!`, so a read that had already consumed the tag and then lost the
+  race was dropped — and the next read, starting over, took the body's first byte
+  for a tag, after which every later frame was one byte out of phase. The bytes
+  now live in the caller's state and a dropped future resumes the same frame; the
+  reader also uses `read` rather than `read_exact`, because a cancelled `read`
+  leaves the socket untouched while a cancelled `read_exact` has already consumed
+  what it copied. Two tests pin it: a frame read across a cancellation, and one
+  byte per write.
 - **A data-channel request can be followed from the server's queue to the
   client's command loop.** Both ends log the request and its receipt, which is
   what showed a request leaving the server in zero microseconds and never

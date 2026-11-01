@@ -463,7 +463,7 @@ impl std::fmt::Display for Ack {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub enum ControlChannelCmd {
     /// The v3 command a server used to send; no v4 build constructs it, and
     /// the client refuses it if a peer in that dialect sends one.
@@ -1305,38 +1305,122 @@ pub async fn write_register_result<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ac
     Ok(())
 }
 
+/// The body width a control command's tag selects.
+///
+/// One table, read by the reader and by [`ControlFrame::complete`] alike, so a
+/// frame cannot be considered whole by one and unfinished by the other. Every
+/// width is fixed because the command's *shape* is fixed: a varint field would
+/// move the frame's length with its value and the reader could not know how much
+/// to wait for.
+#[cfg(feature = "client")]
+fn cmd_suffix(tag: u8) -> Result<usize> {
+    Ok(match tag {
+        // The two tag-only commands.
+        0 | 1 => 0,
+        // A service id.
+        2 | 3 => 4,
+        // The stripe request: service, group, index, count.
+        4 => 10,
+        // The lane report: service, lane, offered, refused, sequence.
+        5 => 17,
+        // The drain answer: service, lane, state.
+        6 => 9,
+        // The tunnel health report: service, tunnel, emitted, re-sent, handed,
+        // sequence.
+        7 => 21,
+        // The group release: service and group.
+        8 => 8,
+        tag => bail!("Unknown control channel command tag {tag:#x}"),
+    })
+}
+
+/// One control-channel command frame under construction.
+///
+/// A frame is a tag byte plus a body whose width the tag decides, so reading one
+/// takes two reads — and a caller that drops the future between them loses a byte
+/// the socket has already handed up, after which every later frame is read one
+/// byte out of phase. A `tokio::select!` does exactly that whenever its other
+/// branch wins, and the client's command loop is one.
+///
+/// So the bytes live in the caller's own state and a dropped future resumes the
+/// same frame. Two details make that true: [`AsyncReadExt::read`] is used rather
+/// than `read_exact` (a cancelled `read` leaves the socket untouched, a cancelled
+/// `read_exact` has already consumed whatever it copied), and the tag's width is
+/// resolved the moment the tag lands.
+#[cfg(feature = "client")]
+#[derive(Debug, Default)]
+pub struct ControlFrame {
+    /// A tag byte plus the widest body any command has.
+    buf: [u8; 22],
+    /// How many bytes of the frame in flight are already in `buf`.
+    filled: usize,
+    /// The frame's whole width, once its tag is in.
+    width: Option<usize>,
+}
+
+#[cfg(feature = "client")]
+impl ControlFrame {
+    /// No frame in flight: the state before the first one, and after each
+    /// delivery.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; 22],
+            filled: 0,
+            width: None,
+        }
+    }
+
+    /// Read until the frame in flight is whole.
+    async fn complete<T: AsyncRead + Unpin>(&mut self, conn: &mut T) -> Result<()> {
+        loop {
+            // The width is resolved on every pass, because a pass may have been
+            // the one that landed the tag.
+            if self.width.is_none() && self.filled >= 1 {
+                self.width = Some(1 + cmd_suffix(self.buf[0])?);
+            }
+            let want = self.width.unwrap_or(1);
+            if self.filled >= want {
+                return Ok(());
+            }
+            let read = conn
+                .read(&mut self.buf[self.filled..want])
+                .await
+                .with_context(|| "Failed to read cmd")?;
+            if read == 0 {
+                bail!("Failed to read cmd: the control channel ended mid-frame");
+            }
+            self.filled += read;
+        }
+    }
+
+    /// Drop the frame just delivered, so the next read starts a fresh one.
+    const fn reset(&mut self) {
+        self.filled = 0;
+        self.width = None;
+    }
+}
+
 /// Read one control-channel command.
 ///
 /// Tag-dispatched: the tag alone decides how many bytes follow, which is what
 /// keeps every session command value-independent in length. Read-only for the
-/// same reason as [`read_register_result`].
+/// same reason as [`read_register_result`], and cancellation-safe through
+/// [`ControlFrame`] — see its own note for why that matters.
 #[cfg(feature = "client")]
-pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<ControlChannelCmd> {
-    // 1 tag byte + the largest suffix below (the tunnel health report's 21
-    // bytes: service, tunnel, emitted, re-sent, handed over, sequence).
-    let mut buf = [0u8; 22];
-    conn.read_exact(&mut buf[..1])
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    let suffix = match buf[0] {
-        0 => return Ok(ControlChannelCmd::CreateDataChannel),
-        1 => return Ok(ControlChannelCmd::HeartBeat),
-        2 | 3 => 4,
-        4 => 10,
-        // The lane report is 17 bytes (service + four fields + sequence); the
-        // tunnel report is 21 (the same, plus the bytes handed over).
-        5 => 17,
-        7 => 21,
-        6 => 9,
-        // The group release: service and group, the same fixed-width pair the
-        // stripe request carries.
-        8 => 8,
-        tag => bail!("Unknown control channel command tag {tag:#x}"),
-    };
-    conn.read_exact(&mut buf[1..=suffix])
-        .await
-        .with_context(|| "Failed to read cmd")?;
+pub async fn read_control_cmd<T: AsyncRead + Unpin>(
+    conn: &mut T,
+    frame: &mut ControlFrame,
+) -> Result<ControlChannelCmd> {
+    frame.complete(conn).await?;
+    frame.reset();
+    let buf = &frame.buf;
+    let suffix = cmd_suffix(buf[0])?;
+    let buf = &buf[..=suffix];
     Ok(match buf[0] {
+        // The two tag-only commands never reach a body arm.
+        0 => ControlChannelCmd::CreateDataChannel,
+        1 => ControlChannelCmd::HeartBeat,
         2 | 3 => {
             let service_id: ServiceId = postcard::from_bytes(&buf[1..=suffix])
                 .with_context(|| "Failed to deserialize cmd")?;
@@ -1409,7 +1493,7 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
                 postcard::from_bytes(&buf[1..11]).with_context(|| "Failed to deserialize cmd")?;
             ControlChannelCmd::CreateDataChannelForStripe(service_id, group, index, count)
         }
-        // The suffix table above already refused every other tag.
+        // `cmd_suffix` above already refused every other tag.
         tag => bail!("Unknown control channel command tag {tag:#x}"),
     })
 }
@@ -1923,6 +2007,69 @@ mod tests {
         );
     }
 
+    /// A frame whose read is dropped between the tag and its body resumes the
+    /// same frame instead of eating the tag.
+    ///
+    /// This is the defect `ControlFrame` exists for: the client's command loop
+    /// reads inside a `tokio::select!`, so a read that has consumed the tag and
+    /// then loses the race is dropped — and the next read, starting over, would
+    /// take the body's first byte for a tag, after which every later frame is one
+    /// byte out of phase. The test drives exactly that: the tag arrives, the read
+    /// is cancelled, then the body arrives.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn a_control_command_survives_a_cancelled_read() {
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let service = ServiceId::new(7);
+        let framed =
+            postcard::to_stdvec(&ControlChannelCmd::CreateDataChannelFor(service)).unwrap();
+        // The tag alone: enough to land the frame's width, not its body.
+        tx.write_all(&framed[..1]).await.unwrap();
+
+        let mut frame = ControlFrame::new();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            read_control_cmd(&mut rx, &mut frame),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the body has not arrived yet");
+
+        tx.write_all(&framed[1..]).await.unwrap();
+        assert_eq!(
+            read_control_cmd(&mut rx, &mut frame).await.unwrap(),
+            ControlChannelCmd::CreateDataChannelFor(service),
+            "the frame resumes: the tag read before the cancellation is not lost"
+        );
+
+        // And the stream is still in phase.
+        let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat).unwrap();
+        tx.write_all(&heartbeat).await.unwrap();
+        assert_eq!(
+            read_control_cmd(&mut rx, &mut frame).await.unwrap(),
+            ControlChannelCmd::HeartBeat
+        );
+    }
+
+    /// A peer that dribbles a frame out one byte at a time still produces it
+    /// whole.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn a_control_command_arrives_one_byte_at_a_time() {
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let service = ServiceId::new(0x0102_0304);
+        let framed = postcard::to_stdvec(&ControlChannelCmd::ServiceDropped(service)).unwrap();
+        for byte in &framed {
+            tx.write_all(std::slice::from_ref(byte)).await.unwrap();
+        }
+        let mut frame = ControlFrame::new();
+        assert_eq!(
+            read_control_cmd(&mut rx, &mut frame).await.unwrap(),
+            ControlChannelCmd::ServiceDropped(service)
+        );
+    }
+
     #[cfg(feature = "client")]
     #[tokio::test]
     async fn read_control_cmd_dispatches_every_variant() {
@@ -1948,7 +2095,9 @@ mod tests {
             tx.write_all(&postcard::to_stdvec(&cmd).unwrap())
                 .await
                 .unwrap();
-            let back = read_control_cmd(&mut rx).await.unwrap();
+            let back = read_control_cmd(&mut rx, &mut ControlFrame::new())
+                .await
+                .unwrap();
             assert_eq!(
                 format!("{back:?}"),
                 format!("{cmd:?}"),
@@ -1966,7 +2115,9 @@ mod tests {
 
         let (mut tx, mut rx) = duplex(64);
         tx.write_all(&[0x7f]).await.unwrap();
-        let err = read_control_cmd(&mut rx).await.unwrap_err();
+        let err = read_control_cmd(&mut rx, &mut ControlFrame::new())
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("Unknown control channel command tag"));
     }
 
@@ -2485,7 +2636,9 @@ mod tests {
         ])
         .await
         .unwrap();
-        let back = read_control_cmd(&mut rx).await.unwrap();
+        let back = read_control_cmd(&mut rx, &mut ControlFrame::new())
+            .await
+            .unwrap();
         assert!(matches!(
             back,
             ControlChannelCmd::LaneDrainAck(id, lane, state)
@@ -2498,9 +2651,13 @@ mod tests {
         tx.write_all(&[6, 0, 0, 0, 7, 1, 2, 3, 4, 0, 1])
             .await
             .unwrap();
-        let first = read_control_cmd(&mut rx).await.unwrap();
+        let first = read_control_cmd(&mut rx, &mut ControlFrame::new())
+            .await
+            .unwrap();
         assert!(matches!(first, ControlChannelCmd::LaneDrainAck(..)));
-        let second = read_control_cmd(&mut rx).await.unwrap();
+        let second = read_control_cmd(&mut rx, &mut ControlFrame::new())
+            .await
+            .unwrap();
         assert!(matches!(second, ControlChannelCmd::HeartBeat));
     }
 

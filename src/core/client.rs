@@ -3781,6 +3781,11 @@ impl ClientSession {
         // sibling's command (`await_verdict`). The inner buffer is empty once
         // the handshake has read its frame, so nothing is copied twice.
         let mut rd = BufReader::new(rd);
+        // The frame in flight, held across the loop's iterations: `select!`
+        // recreates the read each time its other branch wins, and a read that
+        // starts over would lose the tag byte it had already consumed (see
+        // `ControlFrame`).
+        let mut frame = crate::protocol::ControlFrame::new();
 
         info!("Control session established, remote {}", self.remote_addr);
 
@@ -3795,7 +3800,7 @@ impl ClientSession {
 
         loop {
             tokio::select! {
-                cmd = read_control_cmd(&mut rd) => match cmd? {
+                cmd = read_control_cmd(&mut rd, &mut frame) => match cmd? {
                     // A visitor needs a channel for that service.
                     ControlChannelCmd::CreateDataChannelFor(id) => {
                         debug!(%id, "client asked for a data channel");
@@ -4222,6 +4227,10 @@ impl ClientSession {
     /// A `ServiceDropped` is queued rather than served here: re-registering
     /// from inside a registration would nest one verdict wait in another.
     async fn await_verdict<R: AsyncBufRead + Unpin>(&mut self, rd: &mut R) -> Result<Ack> {
+        // This loop is not a `select!`, so nothing cancels the read mid-frame;
+        // the frame is still the reader's state rather than a local buffer, so
+        // the one reader serves both callers.
+        let mut frame = crate::protocol::ControlFrame::new();
         loop {
             let framed = {
                 let peek = rd
@@ -4239,7 +4248,7 @@ impl ClientSession {
             if framed {
                 return read_register_result(rd).await;
             }
-            match read_control_cmd(rd).await? {
+            match read_control_cmd(rd, &mut frame).await? {
                 ControlChannelCmd::CreateDataChannelFor(id) => self.open_channel(id),
                 ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
                     self.open_stripe_channel(id, group, index, count);
