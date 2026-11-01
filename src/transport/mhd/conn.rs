@@ -196,6 +196,34 @@ struct Pick {
     repair: bool,
 }
 
+/// One coherent picture of why a pass built nothing.
+///
+/// Taken **inside** the connection lock, at the instant the pass gave up, and
+/// read later by the pump. Reading the connection afterwards would race the
+/// dispatcher: `ack_pending` or a stream's queue can change between the refusal
+/// and the log, and the two numbers then describe different moments — which cost
+/// this investigation two runs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NoneSnapshot {
+    /// Which branch refused.
+    pub(crate) reason: &'static str,
+    /// Streams in the table, and how many the scheduler may serve.
+    pub(crate) visited: usize,
+    pub(crate) open: usize,
+    /// Streams holding bytes the scheduler could not pick.
+    pub(crate) queued: usize,
+    /// Control work waiting: finishes, resets, and an acknowledgement.
+    pub(crate) fins: usize,
+    pub(crate) resets: usize,
+    pub(crate) ack: bool,
+    /// The three write budgets, as they stood.
+    pub(crate) credit: u64,
+    pub(crate) window: u64,
+    pub(crate) buffer: u64,
+    /// Where the round-robin cursor was.
+    pub(crate) cursor: u32,
+}
+
 /// What this end is holding that its own readers have not taken.
 ///
 /// The receive-side mirror of [`Conn::waiting`]. The credit this end advertises
@@ -250,6 +278,15 @@ pub(crate) struct Conn {
     stall_logged_at: Option<Instant>,
     /// Which bound refused the last partial write (see [`Conn::write`]).
     last_refusal: Option<Refusal>,
+    /// Why the last [`Self::poll_transmit`] answered `None`, when it did.
+    ///
+    /// The pump's "built nothing while bytes were queued" line reads this: a
+    /// refusal has several sources that look identical from outside (no eligible
+    /// stream, a stream the peer reset, a zero-length range, a frame that would
+    /// not fit, or simply nothing left to say), and each is fixed somewhere else.
+    none_reason: Option<&'static str>,
+    /// The coherent picture behind that reason (see [`NoneSnapshot`]).
+    none_snapshot: Option<NoneSnapshot>,
     recovery: Recovery,
     /// The connection's receive blocks.
     ///
@@ -278,6 +315,21 @@ pub(crate) struct Conn {
     arrived_prefix: u64,
     /// Streams the peer opened that nothing has taken yet.
     inbound: VecDeque<u32>,
+    /// When each of those was opened by the peer's first datagram.
+    ///
+    /// The accept path reads it to say how long a stream waited between its
+    /// first datagram and the task that takes it — the number that separates "the
+    /// carrier delivered it late" from "the task was not scheduled" (see
+    /// `MhdLane::accept_stream`).
+    inbound_at: BTreeMap<u32, Instant>,
+    /// When each live stream was created, whichever end created it.
+    ///
+    /// One clock read per stream, and the number that separates the two halves
+    /// of a slow open: the age at the moment a packet carrying the stream's first
+    /// byte is *handed to the socket* is the time the carrier held it, while the
+    /// rest of the opening's duration is the wire. Without the split a "the open
+    /// took 750 ms" reading cannot say which side to fix (see `transmit_stream`).
+    stream_opened: BTreeMap<u32, Instant>,
     /// Aborts waiting for the next pass: a stream one end let go of.
     resets: VecDeque<(u32, ResetCode)>,
     /// Finishes waiting for a packet of their own: (stream, end offset).
@@ -363,6 +415,8 @@ impl Conn {
             unsent_at: None,
             stall_logged_at: None,
             last_refusal: None,
+            none_reason: None,
+            none_snapshot: None,
             recovery: Recovery::new(),
             blocks: Blocks::default(),
             acks: AckSet::default(),
@@ -374,6 +428,8 @@ impl Conn {
             arrived_stream: 0,
             arrived_prefix: 0,
             inbound: VecDeque::new(),
+            inbound_at: BTreeMap::new(),
+            stream_opened: BTreeMap::new(),
             resets: VecDeque::new(),
             pending_fins: VecDeque::new(),
             finishing: BTreeSet::new(),
@@ -409,16 +465,39 @@ impl Conn {
 
     /// Open a stream, answering its id.
     pub(crate) fn open(&mut self) -> StreamHandle {
+        self.open_at(Instant::now())
+    }
+
+    /// Open a stream, recording when it was created.
+    fn open_at(&mut self, now: Instant) -> StreamHandle {
         let id = self.next_stream;
         self.next_stream = self.next_stream.wrapping_add(2);
         self.streams.insert(id, StreamState::default());
+        self.stream_opened.insert(id, now);
         StreamHandle { id }
     }
 
     /// Take a stream the peer opened, if one is waiting.
+    ///
+    /// Tests only: every real caller wants the age, which is what separates a
+    /// late delivery from a late accept (see [`Self::accept_aged`]).
+    #[cfg(test)]
     pub(crate) fn accept(&mut self) -> Option<StreamHandle> {
+        self.accept_aged(Instant::now()).map(|(handle, _)| handle)
+    }
+
+    /// Take a stream the peer opened, with how long it waited for this call.
+    ///
+    /// The age is measured from the datagram that named the stream, so it is the
+    /// wait the *accept path* added — the carrier's delivery time is inside it
+    /// only as far as the datagram itself was late.
+    pub(crate) fn accept_aged(&mut self, now: Instant) -> Option<(StreamHandle, Duration)> {
         let id = self.inbound.pop_front()?;
-        Some(StreamHandle { id })
+        let age = self
+            .inbound_at
+            .remove(&id)
+            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        Some((StreamHandle { id }, age))
     }
 
     /// Queue bytes on a stream, answering how many the credit let through.
@@ -539,6 +618,7 @@ impl Conn {
             // they have to be given back here: the window follows the reader,
             // and nobody will ever read a stream that no longer exists.
             self.release_unread(stream);
+            self.stream_opened.remove(&stream);
             if let Some(state) = self.streams.remove(&stream) {
                 // Its unacknowledged tail is no longer buffered by this end.
                 self.buffered = self
@@ -668,7 +748,7 @@ impl Conn {
     }
 
     /// Whether anything is still waiting for the wire.
-    fn has_queued_transmit(&self) -> bool {
+    pub(crate) fn has_queued_transmit(&self) -> bool {
         self.ack_pending
             || !self.resets.is_empty()
             || !self.pending_fins.is_empty()
@@ -714,7 +794,10 @@ impl Conn {
     /// `out` is the run the pump is staging, so a stream frame's payload is
     /// appended from the stream's own buffer and never staged twice.
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
+        self.none_reason = None;
         if self.closed.is_some() {
+            self.none_reason = Some("connection closed");
+            self.snapshot_none("connection closed");
             return None;
         }
         let ack = self.acks.packet().map(|block| wire::Ack {
@@ -741,14 +824,20 @@ impl Conn {
         if let Some(len) = self.transmit_fin(now, out, ack) {
             return Some(len);
         }
-        if self.ack_pending {
-            let packet_len =
-                wire::encode_control(out, self.id, self.recovery.last_number(), ack, Frame::None)?;
+        if self.ack_pending
+            && let Some(packet_len) =
+                wire::encode_control(out, self.id, self.recovery.last_number(), ack, Frame::None)
+        {
             self.ack_pending = false;
             self.keepalive_at = now + KEEPALIVE;
             return Some(packet_len);
         }
-        self.transmit_keepalive(now, out, ack)
+        let packet = self.transmit_keepalive(now, out, ack);
+        if packet.is_none() {
+            let reason = self.none_reason.unwrap_or("nothing to say");
+            self.snapshot_none(reason);
+        }
+        packet
     }
 
     /// A credit update: where this end's reader has got to.
@@ -794,14 +883,21 @@ impl Conn {
         // more than the work it measures at this size (see `stats`).
         let sampled = stats::enabled() && stats::PHASES.timing();
         let pick = stats::Timing::start(sampled);
-        let Pick {
+        let Some(Pick {
             id,
             offset,
             len: want,
             repair,
-        } = self.next_stream_range()?;
+        }) = self.next_stream_range()
+        else {
+            self.none_reason = Some("no eligible stream");
+            return None;
+        };
         let number = self.recovery.next_number();
-        let state = self.streams.get(&id)?;
+        let Some(state) = self.streams.get(&id) else {
+            self.none_reason = Some("stream retired mid-pick");
+            return None;
+        };
         // How much the packet carries, and whether it ends the stream: the
         // buffer answers both without being walked, because the payload is
         // appended straight into the run afterwards. A repair already came back
@@ -812,12 +908,30 @@ impl Conn {
             state.send.available(offset, want)
         };
         if len == 0 {
+            self.none_reason = Some("range is empty");
             return None;
+        }
+        // A stream's very first byte, handed to the socket: its age is the part
+        // of a slow open the carrier owned (see `stream_opened`).
+        if offset == 0
+            && !repair
+            && stats::enabled()
+            && let Some(at) = self.stream_opened.get(&id)
+        {
+            let waited = now.saturating_duration_since(*at);
+            if waited >= Duration::from_millis(50) {
+                tracing::debug!(
+                    stream = id,
+                    waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                    "mhd first stream byte waited for the socket"
+                );
+                self.stream_opened.remove(&id);
+            }
         }
         let fin = state.send.ends_at(offset, len);
         pick.stop(&stats::PHASES.tx_pick);
         let encode = stats::Timing::start(sampled);
-        let packet_len = wire::encode_stream(
+        let Some(packet_len) = wire::encode_stream(
             out,
             self.id,
             number,
@@ -828,7 +942,10 @@ impl Conn {
                 fin,
                 len,
             },
-        )?;
+        ) else {
+            self.none_reason = Some("frame does not fit");
+            return None;
+        };
         // The payload follows its header, drawn chunk by chunk: a packet is no
         // longer capped by the chunk boundary the send point happens to sit in.
         state.send.append_to(offset, len, out);
@@ -1005,6 +1122,31 @@ impl Conn {
             .or_else(|| self.streams.range(..cursor).find_map(eligible))
     }
 
+    /// Capture why this pass built nothing, while the lock is still held.
+    fn snapshot_none(&mut self, reason: &'static str) {
+        self.none_snapshot = Some(NoneSnapshot {
+            reason,
+            visited: self.streams.len(),
+            open: self
+                .streams
+                .values()
+                .filter(|state| state.reset.is_none_or(|code| code == ResetCode::Finished))
+                .count(),
+            queued: self
+                .streams
+                .values()
+                .filter(|state| state.send.has_unsent())
+                .count(),
+            fins: self.pending_fins.len(),
+            resets: self.resets.len(),
+            ack: self.ack_pending,
+            credit: self.send_credit.saturating_sub(self.written),
+            window: self.cwnd.saturating_sub(self.recovery.flight_bytes()),
+            buffer: MAX_BUFFERED.saturating_sub(self.buffered),
+            cursor: self.cursor,
+        });
+    }
+
     /// Move the cursor past the stream that was just served, wrapping to the
     /// smallest id so the walk starts again where it began.
     fn advance_cursor(&mut self) {
@@ -1087,6 +1229,27 @@ impl Conn {
     /// Whether the last refusal was the peer's credit (see [`Conn::write`]).
     pub(crate) fn credit_blocked(&self) -> bool {
         matches!(self.last_refusal, Some(Refusal::Credit))
+    }
+
+    /// A coherent picture of the state *now*, when bytes are queued but a pass
+    /// built nothing.
+    ///
+    /// Read under the same lock as the queue test: sampling the two separately
+    /// let a writer's `Conn::write` land between them, and the resulting line
+    /// described a connection with nothing queued — which is exactly the wrong
+    /// conclusion to draw from it.
+    pub(crate) fn refusal_now(&mut self) -> Option<NoneSnapshot> {
+        if !self.has_queued_transmit() {
+            return None;
+        }
+        let reason = self.none_snapshot.map_or("idle", |snap| snap.reason);
+        self.snapshot_none(reason);
+        self.none_snapshot
+    }
+
+    /// The connection id, so a diagnostic can be matched with the peer's line.
+    pub(crate) fn connection_id(&self) -> u32 {
+        self.id
     }
 
     /// What the connection's three write budgets have left, for the
@@ -1174,6 +1337,8 @@ impl Conn {
                         // what tells its owner.
                         self.streams.insert(id, StreamState::default());
                         self.inbound.push_back(id);
+                        self.inbound_at.insert(id, now);
+                        self.stream_opened.insert(id, now);
                     }
                     let blocks = &mut self.blocks;
                     let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;

@@ -2476,6 +2476,45 @@ thing to measure, and the fix it points at is structural: hand the stream to its
 task from inside the critical section the dispatcher already holds, instead of
 making the accept task contend for it.
 
+**Two defects were then separated, and only one of them is the timer
+(2026-11-01).** The dialer's opening was split into its own phases
+(`hs_us` the Noise handshake, `ack_us` hello-plus-acknowledgement), and the
+split immediately named a cluster: **335-337 ms**, which is `INITIAL_RTO` to the
+millisecond, on lanes that had never carried a round-trip sample. The server's
+counterpart — the wait for a stream's first byte, captured inside
+`transmit_stream` — read **752 ms**, i.e. that timer twice.
+
+That is a different defect from the one the earlier entry named, and it has a
+different fix: `INITIAL_RTO` protects a *wide* flight (re-sending a thousand
+packets costs a thousand duplicates), and a stream opening puts one or two packets
+in the air, where a duplicate is one datagram the peer drops by offset. So a
+sample-less small flight now arms **20 ms** instead, with the exponential backoff
+bounding duplicates on a long path. Measured on the dialer:
+
+| | opens over 100 ms | p90 | max |
+|---|---|---|---|
+| `SMALL_FLIGHT_INITIAL_RTO` 333 ms | 5 of 58 | 337 543 µs | 5 645 589 µs |
+| 20 ms | **1 of 118** | **6 664 µs** | 2 788 322 µs |
+
+An interleaved A/B of two builds differing only in that constant, three rounds
+with the A/A twin (`target/evidence/bench-fastopen.json`), reads p99 **-99.28 %**
+for the fast build — but the verdict engine refuses it as a claim (n=[2,2], p 1.0,
+and the ramp's own `capacity_streams` difference is flagged fragile), which is the
+honest reading of a cell this noisy.
+
+**The `capacity` ramp's p99 is still pinned by a wall neither build moves, and it
+is the next target.** In that A/B, `l4` (20 ms) read 21.3, 22.5, 25.8 and 10.4 ms
+at L1 while **`l4~aa` — a second copy of the same build — read 5 004 and 5 002**,
+and `l4~b` (333 ms) read 4 860 and 5 003. So the 5-second term is arm-independent
+and it dominates the percentile; the timer work is real and invisible to that
+metric until the wall is gone. Exactly 5 000 ms is `PAIR_WAIT_BUDGET`
+(`core/server.rs`), so the first hypothesis is a visitor's channel request that
+goes unanswered for one budget and is then served by the retry — a defect with no
+log line until now, which this round added (`pairing budget expired with no data
+channel`). The run that followed it counted **0** expiries and produced no 5 000 ms
+sample, so the wall is intermittent and the count has to be taken on a run that
+hits it; that is the next measurement, and it is instrumentation the tree now has.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The

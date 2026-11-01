@@ -90,6 +90,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **A stream opening on a lane that has never carried a sample no longer waits
+  the burst's timer.** The retransmission timer's starting value is the RFC 9002
+  one (333 ms), which is right for a flight whose width is unknown: re-sending a
+  thousand packets costs a thousand duplicates, so erring late is cheap. It is
+  the wrong value for the one or two packets a stream opening puts in the air —
+  and that case was measured to the millisecond: the dialer's own phase split
+  showed a cluster of opens at **335–337 ms**, and the server's wait for that
+  stream's first byte read 752 ms. A flight of one or two packets on a
+  sample-less lane now arms a 20 ms timer; the exponential backoff bounds the
+  duplicates on a genuinely long path (20, 40, 80, 160 ms), and a wider flight
+  keeps the wide value. Measured on the model's `capacity` ramp: the dialer's
+  open latency went from p90 **337 ms with 5 of 58 over 100 ms** to p90 **6.7 ms
+  with 1 of 118 over 100 ms**.
+- **A pairing budget that expires is now visible.** A visitor whose channel
+  request is answered a budget late pays the whole wait and then succeeds on the
+  retry, so its only symptom was a latency the operator could see and the log
+  could not. One DEBUG line records each expired budget with its attempt number
+  and how many stripes had arrived.
 - **A stream that opens behind a bulk transfer always finds room to say so.** The
   three budgets a write draws on — the peer's credit, the congestion window, the
   send-buffer ceiling — belong to the connection, so a bulk stream took them in

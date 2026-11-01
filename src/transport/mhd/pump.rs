@@ -193,6 +193,38 @@ async fn flush(
     }
     build.stop(&crate::transport::stats::PHASES.tx_build);
     if spans.is_empty() {
+        // Nothing was built. Two causes look identical from outside and are
+        // fixed in different places: the state machine refused every packet (a
+        // budget), or the pump never ran (a lost wake-up or a starved task).
+        // This line is the discriminator, and it is gated on the switch.
+        if crate::transport::stats::enabled() {
+            let refused =
+                shared.with(|conn| conn.refusal_now().map(|snap| (conn.connection_id(), snap)));
+            // Only the real alarm: a pass that ran and *refused to send bytes it
+            // was holding*. A snapshot taken after the pass raced a writer
+            // landing immediately behind it, and that case is not a defect —
+            // which is why the condition is on the queued count taken with the
+            // same lock, not on "something was queued a moment ago".
+            if let Some((id, snap)) = refused
+                && snap.queued > 0
+            {
+                tracing::debug!(
+                    id,
+                    reason = snap.reason,
+                    visited = snap.visited,
+                    open = snap.open,
+                    queued = snap.queued,
+                    pending_fins = snap.fins,
+                    pending_resets = snap.resets,
+                    ack_pending = snap.ack,
+                    credit = snap.credit,
+                    window = snap.window,
+                    buffer = snap.buffer,
+                    cursor = snap.cursor,
+                    "mhd pump built nothing while bytes were queued"
+                );
+            }
+        }
         return Ok(0);
     }
     let sent = spans.len();
@@ -644,10 +676,25 @@ impl MhdLane {
     }
 
     /// Take a stream the peer opened, if one is waiting.
+    ///
+    /// A hundred milliseconds is fifty times the round trip a healthy path here
+    /// measures, so a stream that waited longer than that for its own accept is a
+    /// stall, and the number says whether it is the carrier's delivery or this
+    /// task's scheduling: the age is measured from the datagram that named the
+    /// stream.
     pub(crate) fn accept_stream(&self) -> Option<StreamIo> {
-        let id = self
-            .shared
-            .with(|conn| conn.accept().map(|handle| handle.id))?;
+        let (id, age) = self.shared.with(|conn| {
+            let now = Instant::now();
+            conn.accept_aged(now).map(|(handle, age)| (handle.id, age))
+        })?;
+        if age >= std::time::Duration::from_millis(100) {
+            tracing::debug!(
+                lane = self.id,
+                stream = id,
+                accepted_us = u64::try_from(age.as_micros()).unwrap_or(u64::MAX),
+                "mhd stream waited for its accept"
+            );
+        }
         Some(StreamIo::new(Arc::clone(&self.shared), id))
     }
 }
@@ -679,7 +726,14 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // a visitor's first byte waited on this carrier: `open_channel` is the
         // Noise handshake, and the hello and its acknowledgement follow it.
         let opening = Instant::now();
-        let mut stream = self.open_channel().await?;
+        // The opening's own phases, because the whole of it says only "late":
+        // a slow Noise handshake, a slow hello and a slow acknowledgement are
+        // three different waits (see `MIN_RTO` for the timer one).
+        let mut stream = match self.open_channel().await {
+            Ok(stream) => stream,
+            Err(e) => return Err(e),
+        };
+        let hs_at = Instant::now();
         let hello = crate::protocol::Hello::DataChannelTunnelHello(
             crate::protocol::CURRENT_PROTO_VERSION,
             self.nonce,
@@ -698,10 +752,18 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         let ack = crate::protocol::read_ack(&mut stream)
             .await
             .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+        let ack_us = u64::try_from(hs_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         match ack {
             crate::protocol::Ack::Ok => {
                 let us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
-                tracing::debug!(lane = self.id, us, "mhd stream opened and acknowledged");
+                tracing::debug!(
+                    lane = self.id,
+                    us,
+                    hs_us = u64::try_from(hs_at.duration_since(opening).as_micros())
+                        .unwrap_or(u64::MAX),
+                    ack_us,
+                    "mhd stream opened and acknowledged"
+                );
                 // A hundred milliseconds is fifty times the round trip a healthy
                 // path here measures, so an open past it is a stall and worth the
                 // four numbers that tell its four causes apart (`Conn::budget`).

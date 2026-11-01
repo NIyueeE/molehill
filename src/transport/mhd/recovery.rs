@@ -82,6 +82,23 @@ pub(crate) const MIN_RTO_SMALL_FLIGHT: Duration = Duration::from_millis(20);
 /// and its answer) with no room for a bulk run to qualify.
 const SMALL_FLIGHT_PACKETS: usize = 2;
 
+/// The timer a **small flight** arms when the lane has no round-trip sample yet.
+///
+/// [`INITIAL_RTO`] is the right timer for a flight whose width is unknown: at
+/// 333 ms a re-send of a thousand packets costs a thousand duplicates, so erring
+/// late is cheap. It is the wrong timer for a stream opening on a lane that has
+/// never carried a sample, and that case is measured: the dialer's own phase
+/// split puts a cluster of opens at **335-337 ms**, which is `INITIAL_RTO` to the
+/// millisecond, and the server's corresponding wait for the first stream byte
+/// reads 752 ms — a lost handshake packet, twice.
+///
+/// A flight of one or two packets cannot pay that: a duplicate is one datagram
+/// the peer drops by offset. So an unmeasured small flight arms this instead, and
+/// the exponential backoff bounds the duplicates on a genuinely long path (20,
+/// 40, 80, 160 ms — four re-sends before a 200 ms round trip has even answered
+/// once), while [`DEAD_FLOOR`] keeps a busy host from being read as a dead path.
+const SMALL_FLIGHT_INITIAL_RTO: Duration = Duration::from_millis(20);
+
 /// The retransmission timer's ceiling, which is also the idle limit of a silent
 /// peer.
 const MAX_RTO: Duration = Duration::from_secs(30);
@@ -228,6 +245,9 @@ impl Rtt {
     fn rto(&self, small_flight: bool) -> Duration {
         let base = match self.smoothed {
             Some(smoothed) => smoothed + self.variance.saturating_mul(4),
+            // A lane that has carried nothing yet: the wide value unless the
+            // flight is too small to storm (see `SMALL_FLIGHT_INITIAL_RTO`).
+            None if small_flight => SMALL_FLIGHT_INITIAL_RTO,
             None => INITIAL_RTO,
         };
         let floor = if small_flight {
@@ -896,8 +916,14 @@ mod tests {
         assert!(!resent.is_empty(), "a dead path reports what it held");
     }
 
-    /// Silence backs the timer off and, after the limit, calls the path dead
-    /// rather than holding a lane that will never carry anything.
+    /// Silence backs the timer off and, once the count AND the silence floor are
+    /// both met, calls the path dead rather than holding a lane that will never
+    /// carry anything.
+    ///
+    /// The two conditions are the point of [`DEAD_FLOOR`]: a cheap timer reaches
+    /// `DEAD_LINK` retries in a fraction of a second, so the count alone would
+    /// end a lane that a busy host merely delayed. The loop below therefore runs
+    /// until the path dies rather than assuming it dies at the tenth retry.
     #[test]
     fn silence_backs_off_and_then_kills_the_path() {
         let start = Instant::now();
@@ -905,7 +931,10 @@ mod tests {
         send_one(&mut recovery, start, 0);
         let mut now = start;
         let mut expiries = Vec::new();
-        for _ in 0..DEAD_LINK {
+        // A bounded run: the timer backs off towards `MAX_RTO`, so the silence
+        // floor is reached in a handful of ticks. The bound is what keeps a
+        // broken rule from looping here for ever.
+        for _ in 0..64 {
             let Some(deadline) = recovery.poll_timeout() else {
                 break;
             };
@@ -927,7 +956,12 @@ mod tests {
         assert_eq!(
             expiries.last(),
             Some(&Expiry::Dead),
-            "ten silent retransmissions must end the path"
+            "the count and the silence floor together must end the path"
+        );
+        assert!(
+            now.saturating_duration_since(start) >= DEAD_FLOOR,
+            "it may only die once the floor is met, died after {:?}",
+            now.saturating_duration_since(start)
         );
         assert_eq!(recovery.in_flight(), 0);
     }
@@ -1013,8 +1047,26 @@ mod tests {
         let deadline = recovery.poll_timeout().unwrap();
         assert_eq!(
             deadline.saturating_duration_since(start),
+            SMALL_FLIGHT_INITIAL_RTO,
+            "a lone packet on a sample-less lane is a handshake, and gets the \
+             cheap timer"
+        );
+    }
+
+    /// A **wide** flight on a sample-less lane still arms the wide timer: that
+    /// is the case every `MIN_RTO` A/B priced, and it must not change.
+    #[test]
+    fn an_unmeasured_burst_keeps_the_initial_timer() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        for offset in 0..=SMALL_FLIGHT_PACKETS {
+            send_one(&mut recovery, start, offset as u64 * 100);
+        }
+        let deadline = recovery.poll_timeout().unwrap();
+        assert_eq!(
+            deadline.saturating_duration_since(start),
             INITIAL_RTO,
-            "no round trip has been measured, so the initial timer stands"
+            "an unmeasured burst errs late, because re-sending it costs its width"
         );
     }
 }

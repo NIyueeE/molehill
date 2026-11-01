@@ -3571,6 +3571,16 @@ where
                     // arrived are paired already, and re-asking for those would
                     // open channels no visitor needs.
                     attempts += 1;
+                    // One line per budget that expired. A visitor whose first
+                    // request is answered a budget late pays this whole wait and
+                    // then succeeds on the retry, so the only symptom is a
+                    // latency the operator sees and the log, until this, did not.
+                    debug!(
+                        attempts,
+                        stripes = stripe_count,
+                        gathered = gathered.len(),
+                        "pairing budget expired with no data channel"
+                    );
                     if attempts >= PAIR_ATTEMPTS {
                         debug!("No data channel after {attempts} requests; dropping the visitor");
                         // The stripes that did arrive are parked on the client.
