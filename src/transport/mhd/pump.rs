@@ -266,12 +266,26 @@ async fn flush(
             backlog_worst_stream = stall.backlog.worst.map_or(0, |(id, _)| id),
             backlog_worst_bytes = stall.backlog.worst.map_or(0, |(_, held)| held),
             backlog_bytes = stall.backlog.total,
+            worst_stream = stall.worst.map_or(0, |(id, ..)| id),
+            worst_stream_unsent = stall.worst.map_or(0, |(_, unsent, ..)| unsent),
+            worst_stream_retransmits = stall.worst.map_or(0, |(_, _, retransmits, ..)| retransmits),
+            worst_stream_next = stall.worst.map_or(0, |(_, _, _, next, _)| next),
+            worst_stream_written = stall.worst.map_or(0, |(_, _, _, _, written)| written),
             "mhd stalled: bytes waiting"
         );
     }
     for _ in 0..sent {
         shared.note_sent();
     }
+    // Wake the readers on every pass, not only when a receive batch lands.
+    // A reader that missed its wake-up is otherwise parked until the pump's own
+    // timer — and the chain measured on the soak is exactly that: a client
+    // reader holding a megabyte unread, its advertised credit therefore frozen,
+    // the server blocked on `credit_blocked` with sixteen megabytes queued, the
+    // forwarding connections never finishing, and the pool filling to its
+    // ceiling until it refuses a visitor. `wake_readers` on an empty list is a
+    // `mem::take` of nothing, so a pass that has nothing to wake costs a branch.
+    shared.wake_readers();
     Ok(sent)
 }
 

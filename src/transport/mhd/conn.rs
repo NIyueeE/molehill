@@ -275,6 +275,13 @@ pub(crate) struct Stall {
     pub(crate) unacked_ms: u128,
     /// What this end's own readers owe the peer.
     pub(crate) backlog: Backlog,
+    /// The stream that is holding the wire back, with the facts that decide why:
+    /// `(id, unsent bytes, retransmits, next offset, written, its credit room)`.
+    ///
+    /// The ages say *that* a stream stalled; these say *which* and whether it is
+    /// bytes nobody could send (no room), bytes that were lost and are owed again
+    /// (retransmits), or bytes the writer never produced.
+    pub(crate) worst: Option<(u32, u64, u32, u64, u64)>,
 }
 
 /// A connection between two of this carrier's endpoints.
@@ -1242,6 +1249,23 @@ impl Conn {
     /// here at all — it stops the *peer*, through the credit — so a connection
     /// blocked on the far end's credit and a connection whose own reader owes
     /// the peer a megabyte were, until this, the same absence of log lines.
+    /// The stream with the most bytes the wire has not taken, and its own facts.
+    fn worst_stream(&self) -> Option<(u32, u64, u32, u64, u64)> {
+        self.streams
+            .iter()
+            .filter(|(_, state)| state.send.has_unsent())
+            .max_by_key(|(_, state)| state.send.unacked())
+            .map(|(&id, state)| {
+                (
+                    id,
+                    state.send.unacked(),
+                    state.retransmits,
+                    state.send.next_offset(),
+                    state.send.written(),
+                )
+            })
+    }
+
     pub(crate) fn stall_report(&mut self, now: Instant) -> Option<Stall> {
         const FLOOR: Duration = Duration::from_millis(200);
         /// A reader that is a second behind keeps kilobytes here, never this.
@@ -1265,6 +1289,7 @@ impl Conn {
             unsent_ms: unsent.map_or(0, |d| d.as_millis()),
             unacked_ms: unacked.map_or(0, |d| d.as_millis()),
             backlog,
+            worst: self.worst_stream(),
         })
     }
 

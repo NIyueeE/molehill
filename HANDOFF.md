@@ -3038,10 +3038,37 @@ family as the seven-second open, and it now explains the soak failure, the
 > needed it — `iperf3`'s control connection — dies.
 
 That is a single mechanism spanning three separate cell families, and it is worth
-more than any width or any per-stage timer. It also says where the next look
-belongs: not at a *new* stream's open, but at an **existing** stream that has
-stopped moving — `Conn::backlog`, `waiting` and the per-stream `retransmits` are
-all already computed there, and none of them has ever been read on a stall.
+more than any width or any per-stage timer.
+
+**Reading those three on a stall named the chain, and one link is now fixed
+(2026-11-01).** The stall line gained the stream that is holding the wire back and
+its own facts, and the soak then reads, on the same instant:
+
+```
+server  unsent_ms=208 credit_blocked=true  worst_stream=5  unsent=16 073 916  retransmits=0
+client  unsent_ms=0   credit_blocked=false backlog_worst_stream=17 backlog_bytes=1 060 839
+```
+
+So the server cannot send because **its peer's credit is spent**, and the client is
+holding **a megabyte unread** on one stream with nothing of its own queued. Nothing
+is lost (`retransmits=0` on both), nothing is over the wire — the client's reader
+simply is not consuming, so its advertised credit never moves.
+
+The pump woke readers only when a receive batch landed, so a reader whose wake-up
+arrived while it was between polls waited for the pump's timer. Readers are now
+woken on every pass — a `mem::take` of an empty list when there is nothing to
+wake — and the effect on that profile is categorical:
+
+| | before | after |
+|---|---|---|
+| peak live streams | **224** (its ceiling) | **17** |
+| ceiling refusals | **2** | **0** |
+
+**What it does not fix**: the four stage failures are still there, and the `clean`
+stage still reads p99 1 801 ms (from 3 892 ms, so it moved, but a tail of seconds
+remains). So the pool-filling mechanism is closed and the latency that fed it is
+not. That is a real narrowing and it is the first change in this cycle that made a
+measured failure category disappear.
 
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by

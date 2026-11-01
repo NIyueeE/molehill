@@ -102,6 +102,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both directions and reports a park past twenty milliseconds, which is what
   showed the wait is a parked *reader* of about seven seconds while the writer
   never parks at all.
+- **A reader that missed its wake-up no longer waits for the pump's timer.** The
+  pump woke readers only when a receive batch arrived, so a reader whose wake-up
+  landed while it was between polls stayed parked until the pump's own timer. The
+  chain that produced was measured on the soak profile: a reader holding a
+  megabyte unread, its advertised credit therefore frozen, the peer blocked on
+  `credit_blocked` with sixteen megabytes queued, the forwarding connections never
+  finishing, and the pool filling to its ceiling until it refused a visitor — which
+  killed `iperf3`'s control connection. Readers are now woken on every pass, which
+  costs a branch when the list is empty. Measured on that profile: the pool's peak
+  live streams fell from 224 (its ceiling) to **17**, and the ceiling refusals from
+  2 to **0**.
 - **The pool reports how long a stream slot was actually held.** Its telemetry
   carried a count and nothing else, which cannot separate "the workload is wide"
   from "slots are taken and not returned": the soak reached the pool's ceiling at
