@@ -3561,6 +3561,7 @@ where
         // pre-open nothing, so the gather hung until the visitor's own
         // read timed out). A request the client refuses is answered with
         // nothing at all, which is why the wait below re-asks.
+        let asked = std::time::Instant::now();
         for index in 0..stripes {
             if data_ch_req_tx
                 .send(stripe_request(group_bytes, index, stripes))
@@ -3569,6 +3570,12 @@ where
                 return Ok(true);
             }
         }
+        debug!(
+            group,
+            stripes,
+            send_us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "asking the client for data channels"
+        );
         let mut gathered: Vec<C> = Vec::with_capacity(stripe_count);
         let mut attempts = 0usize;
         loop {

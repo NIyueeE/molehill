@@ -3797,10 +3797,14 @@ impl ClientSession {
             tokio::select! {
                 cmd = read_control_cmd(&mut rd) => match cmd? {
                     // A visitor needs a channel for that service.
-                    ControlChannelCmd::CreateDataChannelFor(id) => self.open_channel(id),
+                    ControlChannelCmd::CreateDataChannelFor(id) => {
+                        debug!(%id, "client asked for a data channel");
+                        self.open_channel(id);
+                    }
                     // A visitor's stripe group: the group is known, so the
                     // channel can be placed on a tunnel of its own (D24).
                     ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
+                        debug!(%id, group = %hex::encode(group), index, count, "client asked for a stripe");
                         self.open_stripe_channel(id, group, index, count);
                     }
                     // The server will never forward that group: the stripes

@@ -2544,6 +2544,41 @@ Note what the last column also says: with the wall gone the cell still reads
 1.4-2.2 s, so there is a second term under it. It is not the same defect and it is
 not yet named.
 
+**Bracketed: the command leaves the server and never reaches the client's loop
+(2026-11-01).** Both ends now log the request and its receipt, so one losing
+incident is a two-line comparison:
+
+```
+server  asking the client for data channels group=46 stripes=1 send_us=0
+client  (nothing for 46)
+server  asking the client for data channels group=47 ...   [50 ms later]
+client  client asked for a stripe group=0000002f ...       [102 us after ITS ask]
+```
+
+Group 46's request was queued by the server with **`send_us=0`** — the unbounded
+`sink.send` neither blocks nor drops — and the client's command loop never entered
+that arm for it, while the very next request crossed in **102 µs**. No
+`Unknown control channel command tag` and no `Failed to read cmd` appear in
+either log, so the frame was not misparsed into a different command: it was not
+read at all.
+
+Two candidate causes are already excluded by measurement:
+
+| hypothesis | instrument | reading |
+|---|---|---|
+| the client's spawned open was starved of a worker | expired budgets at `TOKIO_WORKER_THREADS=4` vs `16`, three runs each | **1 vs 4** — more threads make it *worse*, which is contention, not starvation |
+| the carrier's blocking connection mutex (`parking_lot`, so a waiter parks an OS thread) | acquisition wait, same runs | **0 waits over 100 ms** in every run, including the one that expired |
+
+What is left is the control reader itself, and it has a defect worth fixing on
+its own account: `read_control_cmd` reads the tag byte into a **local** array and
+then the body with a second `read_exact`. The client's command loop creates that
+future fresh inside `tokio::select!`, so whenever the other branch
+(`req_rx.recv()`) wins, the future is dropped **between the two reads** and the
+tag byte it already consumed is gone. That is not a delay, it is a desync — and
+the reason it has not been seen as one may be that the load that provokes it also
+ends the session. Making the read hold its partial frame across polls is the next
+change, and it is a correctness fix whether or not it turns out to be this stall.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The

@@ -67,8 +67,28 @@ impl Shared {
     }
 
     /// Run a closure with the connection held.
+    ///
+    /// The mutex is **blocking** (`parking_lot`), so a caller that waits for it
+    /// parks an OS thread — and every other task that thread was running. That is
+    /// the property behind the measurement this method now reports: with sixteen
+    /// runtime workers the pairing budget expired **four** times against **once**
+    /// with four, which is contention getting worse with more threads, not
+    /// starvation getting better. A hundred milliseconds of waiting is fifty times
+    /// a healthy acquisition, so anything past it is worth one line.
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Conn) -> R) -> R {
+        if !crate::transport::stats::enabled() {
+            let mut conn = self.conn.lock();
+            return f(&mut conn);
+        }
+        let asked = std::time::Instant::now();
         let mut conn = self.conn.lock();
+        let waited = asked.elapsed();
+        if waited >= std::time::Duration::from_millis(100) {
+            tracing::debug!(
+                waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                "mhd connection lock waited"
+            );
+        }
         f(&mut conn)
     }
 

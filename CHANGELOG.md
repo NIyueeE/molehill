@@ -103,6 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the wide value. Measured on the model's `capacity` ramp: the dialer's
   open latency went from p90 **337 ms with 5 of 58 over 100 ms** to p90 **6.7 ms
   with 1 of 118 over 100 ms**.
+- **A data-channel request can be followed from the server's queue to the
+  client's command loop.** Both ends log the request and its receipt, which is
+  what showed a request leaving the server in zero microseconds and never
+  reaching the client — the stall behind the `capacity` cell's five-second tail.
+  The carrier's blocking connection mutex and runtime-worker starvation are both
+  excluded by their own counters, and a hundred-millisecond acquisition of that
+  mutex now reports itself.
 - **A data channel that stalls on its last leg is now visible.** A channel that
   is opened and then waits for the pairing queue it belongs in is a visitor
   waiting for a channel that already exists, and no counter said so. One DEBUG
