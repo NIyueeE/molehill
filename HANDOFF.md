@@ -2999,12 +2999,28 @@ workload. **Tuning the profile until it passes would hide the second question**,
 the repository's measurement rules forbid that — a gate is not made green by
 changing the thing it measures.
 
-The next measurement is the count's *composition*: how many of those 224 streams
-are forwarding channels that have finished their byte work but not yet been
-retired, versus live visitors. `mhd` retires a stream only when it is abandoned,
-its finish has been sent and everything is acknowledged — three conditions a
-`yamux` stream does not have — and that is the most likely reason the same workload
-sits higher on `mhd` than on TCP.
+**And widening the pool does not help, which changes the diagnosis again
+(2026-11-01).** The same soak at `pool_cap = 8` — 448 slots instead of 224 —
+fails exactly the same four stages with the same reason, and **still logs two
+"pool at its stream ceiling" refusals**:
+
+| `tunnels` | slots | ceiling refusals | stages failed |
+|---|---|---|---|
+| 4 | 224 | 2 | 4 of 5 |
+| 8 | 448 | **2** | **4 of 5** |
+
+A workload that is merely *wide* would have fitted in 448. A count that reaches
+224 and then 448 is a count that grows with the space given to it, so the ceiling
+is what stops it rather than the workload — the signature of **leases held rather
+than released**. The dip to 23 in the earlier table shows release happens *in
+bulk* when a stage boundary closes everything, which is what a leak looks like
+when a burst ends: it falls back only when something shuts the doors.
+
+So the previous two rounds are both superseded: it is not "not a leak", and it is
+not "the workload is wide". What is needed now is not another width but the **age
+of the live leases** — a histogram of how long each held stream slot has been
+held. The pool's counters carry a count and nothing else, so that has to be added,
+and it is the first instrument in this cycle aimed at capacity rather than latency.
 
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
