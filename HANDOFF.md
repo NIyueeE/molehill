@@ -3085,6 +3085,36 @@ one the chain implies — a timestamped waker, so that "woken at T, polled at T+
 is measurable at all, because after this fix the only place left for a parked
 reader to lose time is between the wake and the poll.
 
+**Where the cycle stands after these fixes, measured rather than asserted.** Three
+changes are in the tree and each was verified against the thing it targeted:
+
+| change | committed | evidence |
+|---|---|---|
+| a lost range is re-sent as itself, not as the rest of the stream | `b728cac` | the harness: 12 000 bytes re-sent before, 1 349 after |
+| the retransmission floor is scoped to the flight, and a small one's ladder stops at the wide timer | `c22c504`, `4988786` | the dialer: opens over 100 ms fell from 5 of 58 to 1 of 118, p90 337 ms → 6.7 ms |
+| readers are woken on every pump pass | `c04e939` | the soak: peak live streams 224 → 17, ceiling refusals 2 → 0 |
+
+And the cell those first two were aimed at, re-taken today on this host
+(`bulk-n`, `loss1`, three rounds with the A/A twin,
+`target/evidence/loss1-after-fixes.json`):
+
+| arm | `throughput_gbps` | `cpu_s_per_gbit` | failures |
+|---|---|---|---|
+| `l4` | **11.780** [10.644..12.081] | 0.5890 [0.5766..0.5924] | **0 of 8** |
+| `l4~aa` | 12.003 [11.958..12.251] | 0.5752 | 0 of 8 |
+
+So that cell now carries about twelve gigabits per second under one percent loss
+with **no failed sample**; the October record's "mhd 9.3-10.4 Gbit/s, 2-4 of 8-12
+samples passing" was a different method and is not a comparison. The claim this
+supports is narrow and it is the honest one: the loss cell is not the failure it
+was, and the two carrier fixes above are not regressions.
+
+**What is still not met**: the soak's four stage failures, the multi-second tail on
+a fresh connection (which is what the `capacity` cell and the soak's `clean` stage
+both read), and therefore every part of the objective that depends on them — the
+drift axis, the release sweep, and any statement that this carrier is preferable
+to TCP on a latency-sensitive path.
+
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
 the wire and **dropped** by the connection (`conn.rs`, `Frame::Datagram { .. } |
