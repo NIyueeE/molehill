@@ -3587,6 +3587,38 @@ carrier that no longer loses bytes, which is the next round's work. It also
 stands on its own as a fix to the shipped TCP carrier: the same ordering hazard
 existed there, just rarely enough that the suite never caught it.
 
+**The lane was re-applied on the fixed carrier, and it is a trade the gate
+refuses (2026-11-01).** With the close-ordering fix in, `striped_data_channels`
+passes on `mhd` for the first time and the arrival numbers are the best this cycle
+has produced — but the second axis pays for them. Same build, four rounds,
+medians:
+
+| cell | direct mhd streams (today) | multiplexed lane | TCP |
+|---|---|---|---|
+| `churn-16` `rtt_p50_ms` | 2.62 | **1.51** | 2.82 |
+| `churn-16` `rtt_p99_ms` | 21.49 | **5.17** | 3.46 |
+| `churn-16` `rate_per_s` | 3328 | **4335** | 5341 |
+| `rr-16` `rtt_p50` / `p99` | 0.695 / 2.19 | **0.474 / 1.21** | 0.578 / 1.80 |
+| `bulk-n` `throughput_gbps` | 11.49 | **8.76** | 10.90 |
+| `bulk-n` `cpu_s_per_gbit` | 0.587 | **0.759** | — |
+
+The bulk row is a same-day A/B (`--ab-arm id=l4 --binary-b` against a binary of
+this commit without the lane, four rounds): the lane carries **−23.75 %**
+throughput and **+29.37 %** CPU per bit, both past their floors. The cause is
+structural and not a tuning problem — a multiplexer over a byte stream makes one
+more copy of every byte, and `mhd`'s direct stream had none. So the lane buys the
+arrival tail with the two axes the objective ranks *after* it but the release
+still has to respect: `bulk-n` is the product's primary workload, and a 29 % CPU
+regression contradicts the carrier's whole case.
+
+Reverted again, and this time the conclusion is a decision rather than a
+suspicion: **the arrival cost has to be removed inside the carrier's own stream,
+not by putting a multiplexer over it.** That is key derivation — one lane-level
+handshake, per-stream keys from it, every stream still its own flow. Its ceiling
+is the 0.83 ms of hello-and-acknowledgement that remains after the 1.82 ms
+handshake goes: arrival p99 should land near 5 ms with `bulk-n` untouched,
+because nothing about the data path changes.
+
 **And P3′ was built and measured out (2026-11-01).** The rule was the one TCP
 cannot implement: a packet is declared lost the moment the peer's *per-stream
 cumulative byte prefix* passes its range, instead of waiting for three later
