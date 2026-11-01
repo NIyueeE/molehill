@@ -2301,6 +2301,33 @@ about 650 Mbit/s across a 200 ms path, where 32 MiB held 1.3 Gbit/s. A
 deployment that needs the long path's rate raises `[client.data].tunnels`, which
 the configuration page already prices at 0.5-0.8 MiB per lane per end.
 
+**The timer's floor is scoped to the flight, not to the connection
+(2026-11-01).** The carrier had one retransmission floor serving two situations
+that are not alike, and the record above says what each of them measured:
+
+| situation | what a lost packet costs | what a re-send costs |
+|---|---|---|
+| a stream opening: one packet of the Noise handshake | the floor, `200 ms` — measured as `open_channel` **502.3-503.9 ms** against a 4 µs hello and a 0.2-1.7 ms ack on the same lane | one datagram the peer drops by offset |
+| a burst: thousands of packets in flight | the floor, correctly | the whole flight, as new numbers, on every fire |
+
+Lowering the floor *globally* was measured twice and fails both times (six of
+six bulk cells, then every sample again with `DEAD_FLOOR` in place), and the
+mechanism it failed through is the second row: a cheap timer on a wide flight
+re-sends the flight on scheduling noise. So the floor is now chosen by what is
+actually in flight — at most two packets arms the 20 ms floor
+(`MIN_RTO_SMALL_FLIGHT`), anything wider keeps the 200 ms one — and it is a
+clamp *under* `smoothed + 4 × variance`, so it only binds on a path whose
+estimate is already milliseconds.
+
+Three tests pin the scope rather than the number: a small flight arms 20 ms, one
+packet past the limit arms 200 ms, and a path with no sample at all still arms
+`INITIAL_RTO` (333 ms), which is what an opening on a fresh lane pays. **The
+measurement is not taken yet**: the instrument is the `us=` field on
+`mhd stream opened and acknowledged` (p50 1.17 s, p90 2.31 s, max 3.68 s across
+three passing suite runs at `=mhd`), and the run that would show the floor moving
+it is the saturated-pool scenario with the open latency read from the log, plus a
+`cost` cell for the invariant that the wide path is unchanged.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The

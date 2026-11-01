@@ -1604,4 +1604,85 @@ mod tests {
             "the interactive stream must be there too"
         );
     }
+
+    /// A lost opening packet costs the cheap timer, not the burst's, and the
+    /// simulated clock says exactly how long the peer waits.
+    ///
+    /// This is the latency the carrier was losing to one constant: an opening is
+    /// a *small flight* (one handshake packet in the air), so a lost one is
+    /// re-sent after `MIN_RTO_SMALL_FLIGHT` rather than after the wide floor.
+    /// The state machine owns no clock, which is what makes the assertion exact:
+    /// the loop below advances a simulated millisecond at a time and stops at the
+    /// first one where the peer can read the bytes.
+    #[test]
+    fn a_lost_opening_packet_is_re_sent_within_the_cheap_timer() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        // A lane that has carried something: the opening below then has a
+        // round-trip sample, which is the case a stream opened on a live lane
+        // hits (a fresh lane pays `INITIAL_RTO` instead; see the unit test).
+        let warm = link.a.open();
+        assert_eq!(link.a.write(warm.id, b"warm"), 4);
+        link.pump(start);
+        let warmed = link.b.accept().unwrap();
+        assert_eq!(take(&mut link.b, warmed.id), b"warm", "the warm-up lands");
+
+        let opening = link.a.open();
+        assert_eq!(link.a.write(opening.id, b"ping"), 4);
+        let mut buf = Vec::new();
+        let mut dropped = false;
+        while let Some(len) = link.a.poll_transmit(start, &mut buf) {
+            if !dropped {
+                dropped = true; // the opening packet, on the floor
+                continue;
+            }
+            link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+        }
+        assert!(dropped, "the opening packet must have been sent");
+
+        let deadline = link.a.poll_timeout().unwrap();
+        assert_eq!(
+            deadline.saturating_duration_since(start),
+            crate::transport::mhd::recovery::MIN_RTO_SMALL_FLIGHT,
+            "one packet in flight is a handshake, not a burst"
+        );
+
+        let mut waited = Duration::ZERO;
+        let mut answered = false;
+        let mut peer = None;
+        while waited <= Duration::from_millis(250) {
+            let now = start + waited;
+            if link.a.poll_timeout().is_some_and(|at| at <= now) {
+                let (expiry, _) = link.a.on_timeout(now);
+                assert_eq!(
+                    expiry,
+                    Expiry::Loss,
+                    "a stale packet is a loss, not a probe"
+                );
+                while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+                    link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+                }
+                for datagram in std::mem::take(&mut link.a_to_b) {
+                    link.b.on_datagram(now, &datagram).unwrap();
+                }
+            }
+            // The stream is accepted once and read from then on: `accept` pops
+            // it from the queue, so it will not be handed out twice.
+            if peer.is_none() {
+                peer = link.b.accept().map(|handle| handle.id);
+            }
+            if let Some(id) = peer
+                && !take(&mut link.b, id).is_empty()
+            {
+                answered = true;
+                break;
+            }
+            waited += Duration::from_millis(1);
+        }
+        assert!(answered, "the opening must arrive after its re-send");
+        assert!(
+            waited <= Duration::from_millis(30),
+            "a lost opening waits the cheap timer, took {waited:?}"
+        );
+    }
 }

@@ -39,25 +39,48 @@ const TIME_THRESHOLD_DEN: u32 = 8;
 /// a genuinely slow path still gets its second, fourth and eighth chance.
 const INITIAL_RTO: Duration = Duration::from_millis(333);
 
-/// The retransmission timer's floor: below this the timer fires on scheduling
-/// noise rather than on a lost packet.
+/// The retransmission timer's floor for a **wide** flight: below this the timer
+/// fires on scheduling noise rather than on a lost packet.
 ///
 /// Measured, not chosen: on a calm host the transparent path's sixteen-flow arm
 /// runs 16/16 in **1.517 s** with this floor and in **0.344 s** with 20 ms, so
 /// the floor dominates that workload's latency — a lost packet on a
 /// request/response flow costs the floor, and a two-lane claim loses a few.
 ///
-/// It is kept at 200 because 20 ms does not merely cost more, it **fails**:
-/// an interleaved A/B of two builds differing only in this constant, six rounds
-/// per arm with the A/A twin beside them, had the 20 ms build fail **six of six**
-/// bulk cells with `control socket has closed unexpectedly` against **one of
-/// six** at 200 ms. The mechanism is [`DEAD_LINK`], which counts retransmissions
-/// rather than seconds: ten retries at 20 ms is a fraction of a second of
-/// silence, which a busy host produces routinely, so lanes were being declared
-/// dead. [`DEAD_FLOOR`] now puts a five-second floor under that rule, which is a
-/// no-op at this setting and the thing that would have to exist before the floor
-/// could be lowered — and lowering it is worth measuring again once it does.
+/// Lowering it *globally* is refuted twice over: an interleaved A/B of two
+/// builds differing only in this constant failed **six of six** bulk cells with
+/// `control socket has closed unexpectedly` against **one of six** here, and a
+/// second A/B with [`DEAD_FLOOR`] in place failed every sample again. So this is
+/// the floor for a flight worth protecting — which is why the cheap floor below
+/// is scoped to a flight too small to storm (see [`MIN_RTO_SMALL_FLIGHT`]).
 const MIN_RTO: Duration = Duration::from_millis(200);
+
+/// The floor for a flight of one or two packets: the opening handshake's cost.
+///
+/// The measured defect this exists for is the *open*: `open_channel` (the Noise
+/// KK handshake) cost **502.3-503.9 ms** under load against a 4 µs hello and a
+/// 0.2-1.7 ms acknowledgement on the same lane — exactly `INITIAL_RTO`, because
+/// the handshake's first packet is lost or late and a small flight has no
+/// round-trip sample to base a timer on yet.
+///
+/// A global 20 ms floor is refuted (see [`MIN_RTO`]): it made a *wide* flight
+/// re-send itself on scheduling noise, and a whole-flight re-send is a storm.
+/// A flight of one or two packets cannot storm — a duplicate of a single
+/// handshake packet is dropped by its offset and costs one datagram — so the
+/// cheap floor is applied **only** while the connection has at most
+/// [`SMALL_FLIGHT_PACKETS`] packets outstanding. Once the burst starts, the
+/// timer is the wide one again.
+///
+/// It also only binds on a fast path: the floor is a *clamp* under
+/// `smoothed + 4 x variance`, so a 200 ms path's estimate already sits above it
+/// and nothing changes there.
+pub(crate) const MIN_RTO_SMALL_FLIGHT: Duration = Duration::from_millis(20);
+
+/// How many packets in flight still count as "the handshake", not "the burst".
+///
+/// Two covers the request/response pair a stream open is (the handshake message
+/// and its answer) with no room for a bulk run to qualify.
+const SMALL_FLIGHT_PACKETS: usize = 2;
 
 /// The retransmission timer's ceiling, which is also the idle limit of a silent
 /// peer.
@@ -197,12 +220,22 @@ impl Rtt {
     }
 
     /// The retransmission timer for the current estimate.
-    fn rto(&self) -> Duration {
+    ///
+    /// `small_flight` selects the cheap floor: a connection with one or two
+    /// packets outstanding is opening a stream — a lost handshake packet there
+    /// costs the floor and nothing else can be re-sent by mistake — while a
+    /// wider flight keeps the floor that survived every bulk A/B.
+    fn rto(&self, small_flight: bool) -> Duration {
         let base = match self.smoothed {
             Some(smoothed) => smoothed + self.variance.saturating_mul(4),
             None => INITIAL_RTO,
         };
-        base.clamp(MIN_RTO, MAX_RTO)
+        let floor = if small_flight {
+            MIN_RTO_SMALL_FLIGHT
+        } else {
+            MIN_RTO
+        };
+        base.clamp(floor, MAX_RTO)
     }
 }
 
@@ -392,7 +425,11 @@ impl Recovery {
             return;
         }
         let backoff = self.backoff.min(16);
-        let rto = self.rtt.rto().saturating_mul(1u32 << backoff.min(10));
+        // A flight of one or two packets is a stream opening, not a burst: it
+        // gets the cheap floor, because a duplicate of a handshake packet is
+        // one datagram the peer drops by offset (see [`MIN_RTO_SMALL_FLIGHT`]).
+        let small = self.live <= SMALL_FLIGHT_PACKETS;
+        let rto = self.rtt.rto(small).saturating_mul(1u32 << backoff.min(10));
         self.timer = Some(now + rto);
     }
 
@@ -442,7 +479,6 @@ impl Recovery {
                 let sample = now.saturating_duration_since(time);
                 result.progress = true;
                 self.rtt.sample(sample);
-                self.timer = Some(now + self.rtt.rto());
                 self.heard();
             }
             self.arm(now);
@@ -468,7 +504,6 @@ impl Recovery {
             let sample = now.saturating_duration_since(time);
             result.progress = true;
             self.rtt.sample(sample);
-            self.timer = Some(now + self.rtt.rto());
             self.heard();
         }
         // Lost: three behind the largest, and not named by the bitmap.
@@ -895,5 +930,91 @@ mod tests {
             "ten silent retransmissions must end the path"
         );
         assert_eq!(recovery.in_flight(), 0);
+    }
+
+    /// One packet in flight gets the cheap floor: a stream opening on a lane
+    /// that has already measured its round trip must not wait 200 ms for a lost
+    /// handshake packet.
+    ///
+    /// This is the measured defect the floor exists for: `open_channel` cost
+    /// 502 ms against a 4 µs hello and a 0.2-1.7 ms acknowledgement on the same
+    /// lane. A lane carrying bulk has samples, so its estimate is milliseconds —
+    /// and the wide floor turned that into the whole timer.
+    #[test]
+    fn a_small_flight_retransmits_in_twenty_milliseconds() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        // One round trip, so the estimate is a real one: two milliseconds.
+        let first = send_one(&mut recovery, start, 0);
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(2),
+            Ack {
+                largest: first,
+                below: first + 1,
+                bits: 0,
+                ..Ack::default()
+            },
+        );
+        assert!(acked.progress, "the acknowledgement samples the trip");
+        assert_eq!(
+            recovery.poll_timeout(),
+            None,
+            "an empty flight has no timer"
+        );
+
+        // The opening packet of the next stream: one packet, estimate 2 ms.
+        let sent_at = start + Duration::from_millis(3);
+        send_one(&mut recovery, sent_at, 100);
+        let deadline = recovery.poll_timeout().unwrap();
+        assert_eq!(
+            deadline.saturating_duration_since(sent_at),
+            MIN_RTO_SMALL_FLIGHT,
+            "a single handshake packet waits the cheap floor, not the wide one"
+        );
+    }
+
+    /// A burst keeps the wide floor: that is the case every `MIN_RTO` A/B
+    /// measured, and the reason the cheap floor is scoped to a small flight
+    /// rather than applied to the connection.
+    #[test]
+    fn a_wide_flight_keeps_the_two_hundred_millisecond_floor() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let first = send_one(&mut recovery, start, 0);
+        let _ = recovery.on_ack(
+            start + Duration::from_millis(2),
+            Ack {
+                largest: first,
+                below: first + 1,
+                bits: 0,
+                ..Ack::default()
+            },
+        );
+
+        let sent_at = start + Duration::from_millis(3);
+        for offset in 0..=SMALL_FLIGHT_PACKETS {
+            send_one(&mut recovery, sent_at, 100 + offset as u64 * 100);
+        }
+        let deadline = recovery.poll_timeout().unwrap();
+        assert_eq!(
+            deadline.saturating_duration_since(sent_at),
+            MIN_RTO,
+            "one packet past the small-flight limit is a burst, and keeps the wide floor"
+        );
+    }
+
+    /// Before any sample there is nothing to be cheap about: the initial timer
+    /// is still the RFC 9002 value, whatever the flight size.
+    #[test]
+    fn an_unmeasured_path_keeps_the_initial_timer() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        send_one(&mut recovery, start, 0);
+        let deadline = recovery.poll_timeout().unwrap();
+        assert_eq!(
+            deadline.saturating_duration_since(start),
+            INITIAL_RTO,
+            "no round trip has been measured, so the initial timer stands"
+        );
     }
 }

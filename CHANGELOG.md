@@ -90,6 +90,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **A stream's opening packet no longer waits the burst's timer.** The
+  retransmission timer's floor is what a lost packet costs, and one floor was
+  serving two different situations: a handshake's single outstanding packet,
+  where a duplicate costs one datagram the peer drops by offset, and a burst of
+  thousands, where re-sending the flight is a storm. A connection with one or
+  two packets in flight now uses a 20 ms floor and everything wider keeps the
+  200 ms one that survived every bulk A/B — the case the two earlier attempts at
+  a global 20 ms floor were measuring, and failing. The cheap floor only binds
+  where the round-trip estimate is already small, so a long path is unchanged.
 - **A stream that ends without being read gives its window back.** The carrier
   grants a peer credit by consumption, so bytes a stream held when it was
   retired — its handle dropped, or the peer still sending into it — were counted
