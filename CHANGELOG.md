@@ -90,6 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **A parked stream reports how long it waited, in both directions.** Every
+  per-stage timer in the carrier measures work *inside* a stage, so nine of them
+  read "fast" while a stream open took seconds: the time was in the intervals
+  between stages, where a task waits to be polled again. `StreamIo` now stamps
+  both directions and reports a park past twenty milliseconds, which is what
+  showed the wait is a parked *reader* of about seven seconds while the writer
+  never parks at all.
 - **The carrier's read of a slow stream now includes that stream's own
   retransmits.** A stream that opens in seconds and a stream that opens in
   milliseconds look identical in every connection-wide counter; the per-stream

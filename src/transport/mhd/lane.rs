@@ -212,12 +212,34 @@ impl Shared {
 pub(crate) struct StreamIo {
     shared: Arc<Shared>,
     id: u32,
+    /// When this handle's writer last found nothing to write.
+    ///
+    /// The one wait no per-stage timer can see: every stage of a slow stream
+    /// open measured fast (nine of them, in turn), because each measures work
+    /// *inside* a stage, while the seconds sit in the interval between stages —
+    /// how long a parked task takes to be polled again. This is that interval,
+    /// measured where it happens: set when a write returns `Pending`, and
+    /// charged to a meter on the poll that resumes it.
+    parked_at: Option<std::time::Instant>,
+    /// The same for the read direction: set when a read finds nothing, charged
+    /// on the poll that finds bytes.
+    ///
+    /// The write side turned out never to park on a slow open, so the wait is on
+    /// this side — either for data that has not arrived, or for a wake-up that
+    /// arrived late, and the two are told apart by comparing this number with the
+    /// peer's own send time.
+    read_parked_at: Option<std::time::Instant>,
 }
 
 impl StreamIo {
     /// Wrap one stream of a connection.
     pub(crate) fn new(shared: Arc<Shared>, id: u32) -> Self {
-        Self { shared, id }
+        Self {
+            shared,
+            id,
+            parked_at: None,
+            read_parked_at: None,
+        }
     }
 }
 
@@ -260,12 +282,24 @@ impl AsyncRead for StreamIo {
             this.shared.wake_pump();
         }
         if taken > 0 {
+            if let Some(at) = this.read_parked_at.take() {
+                let waited = at.elapsed();
+                if waited >= std::time::Duration::from_millis(20) {
+                    tracing::debug!(
+                        stream = this.id,
+                        parked_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                        "mhd stream reader was parked"
+                    );
+                }
+            }
             buf.advance(taken);
             return Poll::Ready(Ok(()));
         }
         if ended || !open {
             return Poll::Ready(Ok(()));
         }
+        this.read_parked_at
+            .get_or_insert_with(std::time::Instant::now);
         Poll::Pending
     }
 }
@@ -297,9 +331,23 @@ impl AsyncWrite for StreamIo {
             )
         });
         if written > 0 {
+            // The park, if there was one, ends here: that interval is what a
+            // slow open is actually made of (see `parked_at`).
+            if let Some(at) = this.parked_at.take() {
+                let waited = at.elapsed();
+                if waited >= std::time::Duration::from_millis(20) {
+                    crate::transport::stats::PHASES.write_park.record(waited);
+                    tracing::debug!(
+                        stream = this.id,
+                        parked_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                        "mhd stream writer was parked"
+                    );
+                }
+            }
             this.shared.wake_pump();
             return Poll::Ready(Ok(written));
         }
+        this.parked_at.get_or_insert_with(std::time::Instant::now);
         Poll::Pending
     }
 

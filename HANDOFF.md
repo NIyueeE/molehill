@@ -2745,10 +2745,36 @@ The interval that is left is between stages — the time between a stream's
 `poll_write` returning `Pending` and that task being polled again — and no
 per-stage timer can see it, which is why nine of them in a row have read "fast".
 
-The instrument that would see it is a task-level one: record both sides of each
-`sleep`/park in `StreamIo`, or count how long a parked writer stays parked. That
-is the next thing to build, and it is a different kind of counter from everything
-above.
+**Built, and it names the wait: a read park of seven seconds (2026-11-01).**
+`StreamIo` now stamps both directions — the instant a `poll_write` or `poll_read`
+answers `Pending`, and the interval charged on the poll that resumes it. Two runs
+of the cell:
+
+| run | write parks ≥ 20 ms | read parks ≥ 20 ms | longest read parks (µs) | slowest opens (µs) |
+|---|---|---|---|---|
+| 1 | **0** | 66 | **7 004 863**, 7 004 604, 7 003 393, 7 001 846 | 3 451 921, 1 361 265 |
+| 2 | **0** | 82 | **7 006 343**, 7 005 816, 7 004 043, 7 003 488 | 5 367 516, 1 489 641 |
+
+So the wait that nine per-stage timers could not see is a **parked reader**, and
+the writer never parks at all. Two things follow from the shape of those numbers.
+
+- The clusters are at **7.0 seconds to within a few milliseconds**, across runs
+  *and* across streams. A queue produces a spread; a single value repeated to four
+  digits is a **cadence** — a wake-up that arrives on somebody else's timer rather
+  than when the data did.
+- Nothing in the carrier has a 7-second period. What it does have is a 2-second
+  keepalive, so 7 s is the shape of "woken by the pump three or four times before
+  the bytes it is waiting for are found" — which is the signature of `wake_readers`
+  firing before there is data to read, with the reader's waker already taken by
+  that wake (`Wakers::readers` is emptied by `mem::take` on every wake, so a second
+  wake with nothing new to read leaves the reader parked with no waker at all).
+
+That last sentence is the hypothesis to test next, and it is a **lost wake-up**
+rather than a slow path: the fix would be to wake again whenever the reader's
+`poll_read` finds nothing but the connection has moved on since the waker was
+registered — or, simpler and standard, to register a *fresh* waker on every park
+(the code does that) **and** to have the pump re-check readers after every pass,
+not only after a batch. It is one more round of measurement, not a guess.
 
 
 

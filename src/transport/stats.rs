@@ -111,6 +111,12 @@ pub(crate) struct Phases {
     /// A stream handle's write: the copy from the caller's slice into the send
     /// buffer.
     pub(crate) io_write: Meter,
+    /// How long a stream's writer stayed parked before its bytes went in.
+    ///
+    /// Not a copy and not a stage: the time between a `poll_write` answering
+    /// `Pending` and the poll that resumes it. Nine per-stage timers all read
+    /// "fast" while a stream open took seconds, because the seconds are here.
+    pub(crate) write_park: Meter,
     /// Sealing one record (the Noise write path), copied and encrypted.
     pub(crate) seal: Meter,
     /// Opening one record (the Noise read path), verified and decrypted.
@@ -146,6 +152,7 @@ impl Phases {
             tx_call: Meter::new(),
             io_read: Meter::new(),
             io_write: Meter::new(),
+            write_park: Meter::new(),
             seal: Meter::new(),
             open: Meter::new(),
             rx_runs: Meter::new(),
