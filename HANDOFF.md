@@ -2872,14 +2872,38 @@ contention, scheduling order, lane sharing (measured as a 4-7x factor), the pool
 ceiling, the pairing queue, qdisc depth, and drops on every device and qdisc the
 model counts.
 
-**That is twelve rounds on one defect, and it stops here by the repository's own
+**And the kernel's socket queues are empty too (2026-11-01).** The first reading
+from outside the process: `/proc/net/udp` in both bench namespaces, sampled every
+100 ms through a whole cell — 984 samples — for `tx_queue` (bytes the sender holds
+unsent) and `rx_queue` (bytes the receiver holds unread):
+
+| reading | deepest seen |
+|---|---|
+| `tx_queue`, server namespace | **960 bytes** (one datagram) |
+| `rx_queue`, server namespace | **2 880 bytes** (two datagrams) |
+
+So a saturating UDP sender never has more than one datagram waiting in its socket,
+and the receiver never holds more than two. There is no socket backlog anywhere,
+which is the same conclusion the qdisc gave (`dropped_packets` 0 at both queue
+depths) from a different direction.
+
+That is twelve rounds on one defect, and it stops here by the repository's own
 rule** (AGENTS.md §9: three failed attempts, then write the findings down and ask).
-What is left needs a decision rather than another counter: the interval is between
-two sockets with nothing dropped, which points at path-level behaviour no
-userspace instrument can reach — the tier of `ss -n -u -m` socket-queue readings,
-`tc -s qdisc` backlogs and per-namespace UDP MIB counters taken *during* a
-reproducing cell. That is a different instrument family, and it is worth doing —
-but it should be a decision, not a fourteenth guess.
+The socket-queue reading above was the first of the outside-the-process family, and
+it closes that family too: one datagram in flight at the sender, two at the
+receiver, nothing dropped, no qdisc backlog. **Every stage, every buffer and every
+kernel queue this host exposes is measured and clear, and the wait is still seven
+seconds** — which no longer points at a place to instrument next; it points at the
+measurement itself. The one thing not yet questioned is whether the seven seconds
+belongs to the visitor whose open is slow at all: the park is per stream, the
+`paired_us` is per visitor, and the two were correlated by magnitude rather than by
+identity.
+
+That is the decision this needs: either correlate one slow open end-to-end by
+identity (a correlation id through the request, the open, the handshake and the
+park), or set the tail aside and spend the remaining effort on the work packages
+this defect has been crowding out. **The second is what this page recommends**, and
+the first is worth one round if the tail is the priority.
 
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
