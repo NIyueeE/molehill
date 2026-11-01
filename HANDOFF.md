@@ -2710,6 +2710,28 @@ the write budgets are not binding at all (`window` reads one initial cwnd,
 budget but the *turn* — the pump's run, the socket's queue, and the sender's
 starvation, none of which a per-write reservation touches.
 
+**And the first attempt at that fix is refuted (2026-11-01).** The reading was that
+a small stream's packet must enter the socket *before* a bulk stream's, since a
+shared lane means one shared socket; so `next_stream_range` served an opening
+stream ahead of the round-robin walk, tracked by a `BTreeSet` of streams that had
+written less than `OPEN_RESERVE` (a set rather than a scan, because this is read
+once per packet). Two rounds per lane count, against the same cell:
+
+| `tunnels` | slowest opens (µs) | p99 |
+|---|---|---|
+| 4 | 6 259 040, 6 056 186 | 5 003, 11, 185, 5 003 |
+| 1 | 5 014 086, 5 002 959 | 15, 28, 2 276 |
+
+That is not a win: the four-lane tail is worse than the 885 ms it started from,
+and the one-lane p99 moved the right way only inside this host's scatter for a
+cell this short. Reverted, not landed — the run is `target/evidence/prio{4,1}.json`.
+
+So the "turn" is not the round-robin order either, and the cost a shared lane
+imposes is somewhere in the pump's own loop rather than in the choice of which
+stream to build a packet for. The next thing to measure is `flush`: how long
+`send_run` blocks on `socket.writable()` per pass, which is the one wait in the
+pump that no counter covers.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
