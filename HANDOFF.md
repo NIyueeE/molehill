@@ -3619,6 +3619,61 @@ is the 0.83 ms of hello-and-acknowledgement that remains after the 1.82 ms
 handshake goes: arrival p99 should land near 5 ms with `bulk-n` untouched,
 because nothing about the data path changes.
 
+**Key derivation was built, it delivered the arrival win, and it was reverted
+because it costs the bulk cell (2026-11-01).** Three attempts, all measured the
+same way (`--ab-arm id=l4 --binary-b` against a build of `891129d`, four rounds,
+mhd forced, `bulk-n` + `churn-16`):
+
+| attempt | `churn-16` p99 | `bulk-n` throughput | `bulk-n` samples |
+|---|---|---|---|
+| baseline (`891129d`) | 21.5 ms | **11.69 Gbit/s** | **4 of 4** |
+| record layer, 32 KiB, framed in a second buffer | −74 % (3.79 ms) | −15.67 % (CLAIM) | 2 of 5 |
+| record layer, 16 KiB records | −78 % | 9.96 Gbit/s | 2 of 5 |
+| record layer, one copy, prefix written apart | −78 % | — | **0 of 10** |
+| two-copy version re-measured against the same baseline | — | — | **0 of 4** |
+
+So the arrival half is real and large: p99 **21.5 → 3.79 ms** (TCP's is 3.46),
+rate **+100 %**, CPU per bit **−52 %**. And the bulk half is not a tuning
+problem — the last row re-measured the *first* attempt against the same baseline
+and it failed 0 of 4, so the record size and the copy count were never the cause.
+The tree is back at `891129d`, where `bulk-n` passes 4 of 4.
+
+**What the failure looks like, for whoever picks this up.** The transfer runs at
+full rate for most of the cell — the pump fills 42-datagram runs and 8.1 GB
+crosses — and then degrades: the server's pump drops to a handful of datagrams
+per second with **10 MB still queued on one stream**, the client's readers park
+with **empty** receive buffers (`read == arrived`, `pieces == 0` — no hole, no
+backlog), and `iperf3` times out at 25 s. Nothing in the carrier's own
+instruments is alarmed: no socket wait, no reset, no `built nothing while bytes
+were queued`, no repair owed, and the scheduler's walk never refuses while bytes
+are queued. What is left after all of that is the **credit path**: the server is
+`credit_blocked` with 10 MB queued, and the credit is advertised only when the
+reader has consumed `WINDOW / 4` (4 MB) past the last advertisement. A record
+layer that will not hand out a *partial* record makes the reader's consumption
+lag the sender's by up to one record — and with a 16 MB window against a 4 MB
+advertisement threshold, the sender can park mid-record with less than 4 MB of
+reader progress since the last advertisement, which is exactly the state the logs
+show. The Noise path had the same shape but its records were small enough that
+the sender almost never parked mid-record, so the suite never caught it.
+
+**The two ways forward, both worth the round:**
+
+1. **Make the credit follow the reader, not a threshold.** `credit_due()` is a
+   4 MB batching rule that exists to keep ack traffic down; on a carrier whose
+   reader can stall behind an incomplete record it is a liveness rule. Advertising
+   on every read that moves the frontier (or on a much smaller threshold, e.g.
+   `WINDOW / 64`) would remove the deadlock window without touching the record
+   layer. This is the cheaper fix and it is testable in isolation.
+2. **Derive the keys without adding a record layer** — seal inside the carrier's
+   own packet framing, so there is no second length prefix and no partial-record
+   wait. That is a wire change inside the unreleased 6.0 dialect and a bigger
+   piece of work than (1).
+
+Both are gated on the same cell: `bulk-n` must pass 4 of 4 *and* `churn-16` p99
+must stay near 4 ms. Until one of them lands, the tree carries the per-stream
+handshake and the arrival tail, and this entry is the record of what the
+alternative costs.
+
 **P4′ is half done, and the half that is left is left on purpose (2026-11-01).**
 The two frame classes nothing sent are gone: a datagram frame and a whole-IP-packet
 frame were declared, acknowledged and dropped by the connection, and no sender in
