@@ -3549,6 +3549,11 @@ where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let stripes = u8::try_from(stripe_count).with_context(|| "stripe count exceeds u8")?;
+    // How long the visitor waited for its channels, whatever the outcome. The
+    // probe's p99 says a visitor was slow; this says whether the wait was here —
+    // and unlike the expiry line below it fires on the successful-but-slow case
+    // too, which is the one no counter saw.
+    let pairing_started = std::time::Instant::now();
     // Each iteration is one gather attempt under a fresh group id.
     'gather: loop {
         let group = GROUP_IDS.fetch_add(1, Ordering::Relaxed);
@@ -3645,6 +3650,16 @@ where
                 drop(gathered);
                 continue 'gather;
             }
+        }
+        let paired = pairing_started.elapsed();
+        if paired >= std::time::Duration::from_millis(100) {
+            debug!(
+                group,
+                stripes = stripe_count,
+                attempts,
+                paired_us = u64::try_from(paired.as_micros()).unwrap_or(u64::MAX),
+                "visitor waited for its data channels"
+            );
         }
         debug!("Visitor paired with a {stripe_count}-stripe group {group}");
         let (read, write) = incoming.into_split();

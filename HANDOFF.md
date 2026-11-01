@@ -2591,9 +2591,37 @@ still expire the budget 0-2 times each, with the same 5 002/5 003 ms samples:
 | 5 | 1 | 18, 2 947 |
 
 Run 4 is the one to keep in mind: **no expired budget and still 3 s**, which is
-the second term this page already noted. So there are at least two stalls under
-the `capacity` cell, the control-read desync was neither of them, and the next
-instrument has to separate them rather than explain one with the other.
+the second term this page already noted.
+
+**The two terms are one defect, and it is the pairing wait (2026-11-01).** The
+missing instrument was the *successful but slow* pairing: the expiry line above
+only fires when a whole budget is spent, so every wait that came in under it
+was invisible. Logging the measured duration instead:
+
+| run | expired budgets | slowest pairings (µs) | p99 |
+|---|---|---|---|
+| 1 | 2 | 5 001 910, 5 001 689, 559 982 | 5 003, 5 003 |
+| 2 | **0** | 967 552, 819 933, 293 140 | 1 657, 23, 294 |
+| 3 | **0** | 3 512 305, 1 363 876, 928 606 | 1 365, 3 513 |
+
+So the 5-second term is a pairing that spent one or more budgets, and the
+1-3 second term is the *same* wait arriving under one. There is one continuous
+distribution from tens of milliseconds to five seconds, not two defects, and the
+`capacity` cell's entire p99 is the time a visitor waits for its data channel.
+
+That also revises the previous entry's conclusion: the control-read desync was
+worth fixing on its own account (and is fixed, with a test that reproduces it),
+but it was not "neither of two stalls" — it was not part of a single stall whose
+whole population is this one.
+
+What is now excluded about that wait, each by its own counter: the client's open
+is fast (p90 6.7 ms), the server's per-stream opening is fast (selector,
+handshake, hello all under 100 ms), the pool is not at its ceiling, the pairing
+queue does not stall, the carrier's blocking connection mutex is never held long,
+and more runtime workers make it worse rather than better. What is left is the
+interval between the server queuing the request (`send_us=0`) and the channel
+arriving in the queue — which is where the one bracketed incident showed a request
+that simply never reached the client's command loop.
 
 
 

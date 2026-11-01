@@ -103,6 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the wide value. Measured on the model's `capacity` ramp: the dialer's
   open latency went from p90 **337 ms with 5 of 58 over 100 ms** to p90 **6.7 ms
   with 1 of 118 over 100 ms**.
+- **A visitor's wait for its data channel is now measured, not only its
+  timeout.** The pairing logged a line when a whole budget expired, so a wait
+  that came in under the budget — a hundred milliseconds, or three seconds — was
+  invisible, and the `capacity` cell's latency looked like two unrelated defects.
+  It is one: the same wait, arriving under the budget instead of past it. One
+  DEBUG line per slow pairing records the measured duration.
 - **A cancelled control-channel read no longer desynchronises the session.** A
   command frame is a tag byte plus a body whose width the tag decides, and the
   reader took them in two reads. The client's command loop reads inside a
