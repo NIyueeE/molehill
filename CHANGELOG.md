@@ -102,6 +102,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both directions and reports a park past twenty milliseconds, which is what
   showed the wait is a parked *reader* of about seven seconds while the writer
   never parks at all.
+- **The pool reports how long a stream slot was actually held.** Its telemetry
+  carried a count and nothing else, which cannot separate "the workload is wide"
+  from "slots are taken and not returned": the soak reached the pool's ceiling at
+  224 slots and again at 448, a count that grows with the space given to it. Each
+  slot's whole life is now recorded, and the line gained the number returned since
+  the last window with their mean and worst lifetime.
 - **The carrier's read of a slow stream now includes that stream's own
   retransmits.** A stream that opens in seconds and a stream that opens in
   milliseconds look identical in every connection-wide counter; the per-stream

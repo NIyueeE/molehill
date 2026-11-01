@@ -244,6 +244,17 @@ pub(crate) struct TunnelCounters {
     streams: std::sync::atomic::AtomicUsize,
     /// Opens requested but not yet completed on this tunnel.
     pending: std::sync::atomic::AtomicUsize,
+    /// Stream slots returned since the last telemetry window, and how long they
+    /// were held in total, and the longest single hold.
+    ///
+    /// A count alone cannot tell "the workload is wide" from "slots are held and
+    /// never returned": the soak hit the ceiling at 224 slots and again at 448,
+    /// which is a count that grows with the space given to it. These three say
+    /// whether the slots that *do* come back were held for milliseconds or for
+    /// minutes.
+    held_count: std::sync::atomic::AtomicU64,
+    held_nanos: std::sync::atomic::AtomicU64,
+    held_max_nanos: std::sync::atomic::AtomicU64,
     /// Bytes delivered from this tunnel's streams to the forwarding code.
     ///
     /// Counted per IO poll by [`crate::core::client::ClientDataChannel::Mux`]
@@ -292,6 +303,9 @@ impl TunnelCounters {
         std::sync::Arc::new(Self {
             streams: std::sync::atomic::AtomicUsize::new(0),
             pending: std::sync::atomic::AtomicUsize::new(0),
+            held_count: std::sync::atomic::AtomicU64::new(0),
+            held_nanos: std::sync::atomic::AtomicU64::new(0),
+            held_max_nanos: std::sync::atomic::AtomicU64::new(0),
             delivered: std::sync::atomic::AtomicU64::new(0),
             written: std::sync::atomic::AtomicU64::new(0),
             health,
@@ -382,6 +396,39 @@ impl TunnelCounters {
         self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Record one slot's whole life, from the open that charged it to the drop
+    /// that returned it.
+    fn note_held(&self, held: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let nanos = u64::try_from(held.as_nanos()).unwrap_or(u64::MAX);
+        self.held_count.fetch_add(1, Ordering::Relaxed);
+        self.held_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.held_max_nanos.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// Take the window's held-time readings: `(count, mean ms, max ms)`.
+    fn take_held(&self) -> (u64, f64, f64) {
+        use std::sync::atomic::Ordering;
+        let count = self.held_count.swap(0, Ordering::Relaxed);
+        let nanos = self.held_nanos.swap(0, Ordering::Relaxed);
+        let max = self.held_max_nanos.swap(0, Ordering::Relaxed);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "nanosecond counts over a second of window are far below 2^53"
+        )]
+        let mean_ms = if count == 0 {
+            0.0
+        } else {
+            (nanos as f64 / count as f64) / 1e6
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the same bound applies: a hold of hours is still below 2^53 nanoseconds"
+        )]
+        let max_ms = max as f64 / 1e6;
+        (count, mean_ms, max_ms)
+    }
+
     /// The open completed: the reservation becomes a live stream.
     fn charge(&self) {
         use std::sync::atomic::Ordering;
@@ -420,6 +467,8 @@ impl TunnelCounters {
 /// channel does.
 pub(crate) struct StreamLease {
     stream: CarrierStream,
+    /// When the slot was charged, so its whole life can be recorded on drop.
+    charged_at: std::time::Instant,
     /// The id of the tunnel this stream is charged to (unique per process).
     tunnel_id: usize,
     counters: std::sync::Arc<TunnelCounters>,
@@ -449,6 +498,7 @@ impl Drop for StreamLease {
         self.counters
             .streams
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.counters.note_held(self.charged_at.elapsed());
         if let Some(pool) = self.pool.upgrade() {
             // One stream of capacity came back. `notify_waiters` (not
             // `notify_one`) because every waiter re-reads the whole pool: the
@@ -514,6 +564,14 @@ struct PoolEvent {
 pub struct PoolSnapshot {
     /// The pool's key in its session: `session:<data endpoint>`.
     pub key: String,
+    /// Stream slots returned since the last read, their mean and worst lifetime
+    /// in milliseconds.
+    ///
+    /// The count alone cannot separate "the workload is wide" from "slots are
+    /// held and not returned" — the soak hit its ceiling at 224 slots and again
+    /// at 448, which is a count that grows with the space given to it. These say
+    /// how long the slots that *do* come back were held.
+    pub held: (u64, f64, f64),
     /// `Carrier::as_str`.
     pub carrier: &'static str,
     /// The number of live tunnels.
@@ -1894,6 +1952,7 @@ impl TunnelPool {
     #[must_use]
     pub fn snapshot(&self) -> PoolSnapshot {
         self.try_snapshot().unwrap_or_else(|| PoolSnapshot {
+            held: (0, 0.0, 0.0),
             key: self.inner.shared.key.clone(),
             carrier: self.inner.shared.carrier.as_str(),
             size: 0,
@@ -1913,7 +1972,17 @@ impl TunnelPool {
     fn try_snapshot(&self) -> Option<PoolSnapshot> {
         use std::sync::atomic::Ordering;
         let state = self.inner.state.try_lock()?;
+        // Summed across the pool's tunnels: one figure for the whole pool, which
+        // is the unit a reader compares against `streams`.
+        let mut held = (0u64, 0.0f64, 0.0f64);
+        for entry in &state.entries {
+            let (count, mean, max) = entry.tunnel.counters().take_held();
+            held.0 += count;
+            held.1 = held.1.max(mean);
+            held.2 = held.2.max(max);
+        }
         Some(PoolSnapshot {
+            held,
             key: self.inner.shared.key.clone(),
             carrier: self.inner.shared.carrier.as_str(),
             size: state.entries.len(),
@@ -2313,6 +2382,7 @@ impl TunnelPool {
                 placement.chosen_load = counters.load();
                 PlacementStats::record(placement, started.elapsed(), None);
                 Ok(StreamLease {
+                    charged_at: started,
                     stream,
                     tunnel_id: tunnel.id(),
                     counters,
@@ -2363,6 +2433,7 @@ impl TunnelPool {
                                 Some("fallback"),
                             );
                             return Ok(StreamLease {
+                                charged_at: started,
                                 stream,
                                 tunnel_id: next.tunnel.id(),
                                 counters,
@@ -3306,6 +3377,9 @@ impl TunnelPool {
             shrinks = snapshot.shrinks,
             handover = %handover,
             mhd_health = %health.join(","),
+            returned = snapshot.held.0,
+            held_mean_ms = format!("{:.1}", snapshot.held.1),
+            held_max_ms = format!("{:.1}", snapshot.held.2),
             "pool-stats: tunnel pool timeline"
         );
     }
