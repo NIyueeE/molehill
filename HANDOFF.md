@@ -2769,12 +2769,32 @@ the writer never parks at all. Two things follow from the shape of those numbers
   that wake (`Wakers::readers` is emptied by `mem::take` on every wake, so a second
   wake with nothing new to read leaves the reader parked with no waker at all).
 
-That last sentence is the hypothesis to test next, and it is a **lost wake-up**
-rather than a slow path: the fix would be to wake again whenever the reader's
-`poll_read` finds nothing but the connection has moved on since the waker was
-registered — or, simpler and standard, to register a *fresh* waker on every park
-(the code does that) **and** to have the pump re-check readers after every pass,
-not only after a batch. It is one more round of measurement, not a guess.
+**The lost-wake-up reading is refuted, and the fault is on the sending side
+(2026-11-01).** The discriminator is the age of the *data* rather than of the
+wake-up: the receive buffer stamps the instant bytes first became readable at the
+read offset, and the resumed poll reports that stamp beside the park. Two runs:
+
+| run | parked (µs) | bytes had been ready for |
+|---|---|---|
+| 1 | 7 003 911 / 7 003 708 / 7 001 715 / 7 001 549 | **16 / 20 / 6 / 5 µs** |
+| 2 | 7 003 801 / 7 003 454 / 7 001 574 / 7 001 431 | **14 / 27 / 9 / 8 µs** |
+
+Seven seconds of waiting for data that had existed for **sixteen microseconds**.
+So the wake-up was not late — it fired when the bytes arrived — and the bytes
+themselves arrived seven seconds after the reader began waiting. The first
+instrument got this wrong in a way worth recording: it read the stamp *after*
+`read_into` had already cleared it, so every sample said `u64::MAX`; the stamp is
+now read inside the same critical section, before the read.
+
+Since the parked reader is the *client* and the bytes it waits for are the
+server's, the fault is in the server's send path — and 7.0 s repeated to four
+digits across runs and streams is still a cadence, not a distribution. The
+server's own opening instrument brackets its work (it wrote the acknowledgement
+inside 100 ms in the samples it caught), so what is left is the server's *pump*:
+a stream write that succeeds and calls `wake_pump`, whose bytes then wait seven
+seconds for a pass. That is where the next instrument goes, and it is the same
+`wake_pump`/`wait` pair on the accepted-lane path (`spawn_sender`) rather than the
+dialed one.
 
 
 

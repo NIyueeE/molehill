@@ -262,7 +262,9 @@ impl AsyncRead for StreamIo {
         // would be one copy per byte into it and another out, and the second
         // copy only exists to keep a shape the reader does not have.
         let dst = buf.initialize_unfilled();
-        let (taken, ended, open, credit_due) = this.shared.with(|conn| {
+        let (taken, ready_before, ended, open, credit_due) = this.shared.with(|conn| {
+            // Read *before* the read: taking the bytes clears the stamp.
+            let ready_before = conn.ready_for(stream, std::time::Instant::now());
             let taken = crate::transport::stats::around(
                 crate::transport::stats::enabled(),
                 &crate::transport::stats::PHASES.io_read,
@@ -270,6 +272,7 @@ impl AsyncRead for StreamIo {
             );
             (
                 taken,
+                ready_before,
                 conn.peer_finished(stream) || conn.reset_reason(stream).is_some(),
                 conn.stream_open(stream),
                 conn.credit_due(),
@@ -285,9 +288,15 @@ impl AsyncRead for StreamIo {
             if let Some(at) = this.read_parked_at.take() {
                 let waited = at.elapsed();
                 if waited >= std::time::Duration::from_millis(20) {
+                    // The discriminator: how long the bytes had been *ready* at
+                    // the instant they were finally taken. Equal to the park
+                    // means the data itself was late; a small number means the
+                    // data was waiting and the wake-up was.
                     tracing::debug!(
                         stream = this.id,
                         parked_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                        ready_us = ready_before.map_or(u64::MAX, |d| u64::try_from(d.as_micros())
+                            .unwrap_or(u64::MAX)),
                         "mhd stream reader was parked"
                     );
                 }

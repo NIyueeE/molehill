@@ -1258,6 +1258,13 @@ impl Conn {
         self.id
     }
 
+    /// How long that stream has had bytes its reader has not taken.
+    pub(crate) fn ready_for(&self, stream: u32, now: Instant) -> Option<Duration> {
+        self.streams
+            .get(&stream)
+            .and_then(|s| s.recv.ready_for(now))
+    }
+
     /// How many times that stream's ranges were declared lost.
     pub(crate) fn stream_retransmits(&self, stream: u32) -> u32 {
         self.streams
@@ -1358,6 +1365,7 @@ impl Conn {
                     stats::around(sampled, &stats::PHASES.append, || {
                         state.recv.insert(blocks, offset, data);
                     });
+                    state.recv.note_ready(Some(now));
                     if fin {
                         state.recv.finish(offset + data.len() as u64);
                         state.peer_fin = true;

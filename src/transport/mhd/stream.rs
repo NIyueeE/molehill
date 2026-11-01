@@ -559,6 +559,13 @@ pub(crate) struct RecvBuf {
     pieces: BTreeMap<u64, Piece>,
     /// Everything below this offset has been read out.
     read: u64,
+    /// When bytes first became readable at the read offset and nothing took them.
+    ///
+    /// The discriminator for a parked reader: if this instant is long before the
+    /// poll that finally got the bytes, the data was there and the wake-up was
+    /// late; if it is at the same moment, the data itself arrived late and the
+    /// fault is upstream of this end.
+    ready_at: Option<std::time::Instant>,
     /// Where the peer said the stream ends, once it did.
     ///
     /// A finish may arrive on a range whose predecessors are still missing (the
@@ -582,6 +589,21 @@ impl RecvBuf {
     /// per packet would enter and leave the table once per packet, which is two
     /// tree operations and an allocation for every 1400 bytes carried. Appending
     /// costs one copy into a block the pool already holds.
+    /// Whether the reader is owed bytes right now, stamped the first time it is.
+    pub(crate) fn note_ready(&mut self, now: Option<std::time::Instant>) {
+        if let Some(now) = now
+            && self.ready_at.is_none()
+            && self.arrived() > self.read
+        {
+            self.ready_at = Some(now);
+        }
+    }
+
+    /// How long bytes have been waiting for a reader, if they are.
+    pub(crate) fn ready_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.ready_at.map(|at| now.saturating_duration_since(at))
+    }
+
     pub(crate) fn insert(&mut self, blocks: &mut Blocks, offset: u64, bytes: &[u8]) -> bool {
         let (mut offset, mut bytes) = (offset, bytes);
         if bytes.is_empty() {
@@ -744,6 +766,17 @@ impl RecvBuf {
     /// A block the reader has passed goes back to the pool here, which is what
     /// keeps a lane that has carried a window's worth of data from holding it.
     pub(crate) fn read_into(&mut self, blocks: &mut Blocks, out: &mut [u8]) -> usize {
+        let read = self.read_into_inner(blocks, out);
+        if read > 0 {
+            // Everything owed at the old offset has been taken; whatever is
+            // still owed becomes ready now.
+            self.ready_at = None;
+            self.note_ready(None);
+        }
+        read
+    }
+
+    fn read_into_inner(&mut self, blocks: &mut Blocks, out: &mut [u8]) -> usize {
         let mut filled = 0;
         loop {
             let room = out.len().saturating_sub(filled);
