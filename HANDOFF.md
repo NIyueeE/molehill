@@ -3746,6 +3746,21 @@ the handshake (session resumption, which `src/protocol.rs`'s selector doc names
 a `0x02` for and no module implements), and fewer pump hand-offs per arrival.
 Both are un-attempted, and both are smaller than the record layer.
 
+**And the tail is not worker starvation — measured, three settings (2026-11-01).**
+The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
+`churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
+
+| workers | `rtt_p50_ms` | `rtt_p99_ms` | `rate_per_s` |
+|---|---|---|---|
+| 4 (the default) | **3.25** | **16.15** | **2 630** |
+| 8 | 3.69 | 18.60 | 2 349 |
+| 16 | 4.03 | 18.88 | 2 169 |
+
+Monotone in the wrong direction on all three, so the tail is a fixed chain of
+hand-offs rather than a starved runtime, and raising the worker count is not a
+fix. (One round in each run collapsed to ~180 arrivals/s — the bimodality noted
+earlier, still unexplained.) The numbers sit in `target/evidence/workers-*.json`.
+
 **P4′ is half done, and the half that is left is left on purpose (2026-11-01).**
 The two frame classes nothing sent are gone: a datagram frame and a whole-IP-packet
 frame were declared, acknowledged and dropped by the connection, and no sender in
