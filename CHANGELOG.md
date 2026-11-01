@@ -103,6 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the wide value. Measured on the model's `capacity` ramp: the dialer's
   open latency went from p90 **337 ms with 5 of 58 over 100 ms** to p90 **6.7 ms
   with 1 of 118 over 100 ms**.
+- **A data channel that stalls on its last leg is now visible.** A channel that
+  is opened and then waits for the pairing queue it belongs in is a visitor
+  waiting for a channel that already exists, and no counter said so. One DEBUG
+  line records any wait past a hundred milliseconds.
 - **A pairing budget that expires is now visible.** A visitor whose channel
   request is answered a budget late pays the whole wait and then succeeds on the
   retry, so its only symptom was a latency the operator could see and the log

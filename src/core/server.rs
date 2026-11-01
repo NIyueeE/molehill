@@ -2389,10 +2389,21 @@ async fn route_mhd_stream(
         report_tunnel_violation(service_id, "no such service on this session");
         return Ok(());
     };
-    queue
-        .send(DataChannel::RawMhd(io))
-        .await
-        .map_err(|_| anyhow!("Data channel for a stale control session"))
+    // The last leg of a visitor's wait, and the one no other instrument sees: a
+    // channel that is opened and then sits in a full queue is a visitor waiting
+    // for a channel that already exists. A hundred milliseconds is fifty times a
+    // healthy pairing, so anything past it is worth one line.
+    let queued = std::time::Instant::now();
+    let sent = queue.send(DataChannel::RawMhd(io)).await;
+    let waited = queued.elapsed();
+    if waited >= std::time::Duration::from_millis(100) {
+        debug!(
+            service = %service_id,
+            waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+            "mhd data channel waited for the pairing queue"
+        );
+    }
+    sent.map_err(|_| anyhow!("Data channel for a stale control session"))
 }
 
 /// A live control channel, kept alive by holding the three channel

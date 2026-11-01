@@ -2515,6 +2515,35 @@ channel`). The run that followed it counted **0** expiries and produced no 5 000
 sample, so the wall is intermittent and the count has to be taken on a run that
 hits it; that is the next measurement, and it is instrumentation the tree now has.
 
+**Confirmed: the 5-second wall is exactly one expired pairing budget
+(2026-11-01).** Four consecutive runs of the same cell with the counter in place:
+
+| run | expired budgets | p99 at L1 and L2 |
+|---|---|---|
+| 1 | **0** | 776, 1 815 ms |
+| 2 | **1** | 4 173, **5 002** |
+| 3 | **1** | **5 003**, 240 ms |
+| 4 | **1** | **5 003**, 22, 642 ms |
+
+One expiry, one five-second sample, in every run — and the run without an expiry
+has no wall at all. So a visitor's `CreateDataChannelFor` goes unanswered for a
+whole `PAIR_WAIT_BUDGET` and the retry is served at once. That is the defect the
+`capacity` cell is mostly measuring, and it is a *product* lock-up, not a
+statistical tail.
+
+What is excluded about it: the client's own open is fast (p90 6.7 ms after the
+timer fix), the server's per-stream opening is fast (selector, handshake and hello
+sum to under 100 ms in every sample), the pool is not at its ceiling (0 saturation
+lines, at most 5 streams of a 56 ceiling), and the pairing queue does not stall (0
+`waited for the pairing queue` lines in three further runs, which also produced no
+wall and p99 1.4-2.2 s). So the missing link is between "the server asked" and
+"the client's stream arrived at the pairing queue", and the instrument for that
+leg now exists.
+
+Note what the last column also says: with the wall gone the cell still reads
+1.4-2.2 s, so there is a second term under it. It is not the same defect and it is
+not yet named.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
