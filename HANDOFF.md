@@ -3016,11 +3016,32 @@ than released**. The dip to 23 in the earlier table shows release happens *in
 bulk* when a stage boundary closes everything, which is what a leak looks like
 when a burst ends: it falls back only when something shuts the doors.
 
-So the previous two rounds are both superseded: it is not "not a leak", and it is
-not "the workload is wide". What is needed now is not another width but the **age
-of the live leases** — a histogram of how long each held stream slot has been
-held. The pool's counters carry a count and nothing else, so that has to be added,
-and it is the first instrument in this cycle aimed at capacity rather than latency.
+**The held-time instrument answers it, and it reunifies the defect (2026-11-01).**
+Each lease now records its whole life, and the pool's line reports what came back
+since the last window with its mean and worst hold. Through one soak:
+
+| phase | `streams` | returned in window | mean hold | worst hold |
+|---|---|---|---|---|
+| early | 18 → 49 → 67 | 41 → 330 → 572 | 200-430 ms | 425-755 ms |
+| at the ceiling | **224** | **0, 0, 0, 0, 0 …** | — | — |
+| after it broke | 174 | 192 | **2 094 ms** | **5 024 ms** |
+
+So the slots are not leaked and the workload is not merely wide: at the ceiling
+**nothing is returned for tens of seconds at all**, and when the pool finally
+breaks free the returned slots had been held for **two seconds on average and five
+at worst**. Existing forwarding channels stopped finishing — that is the same
+family as the seven-second open, and it now explains the soak failure, the
+`capacity` cell's tail and the earlier loss-cell failure as one thing:
+
+> some `mhd` streams stop making progress for seconds and nothing recovers them;
+> the pool fills with them, refuses the next data channel, and the visitor that
+> needed it — `iperf3`'s control connection — dies.
+
+That is a single mechanism spanning three separate cell families, and it is worth
+more than any width or any per-stage timer. It also says where the next look
+belongs: not at a *new* stream's open, but at an **existing** stream that has
+stopped moving — `Conn::backlog`, `waiting` and the per-stream `retransmits` are
+all already computed there, and none of them has ever been read on a stall.
 
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
