@@ -2336,14 +2336,34 @@ event. The repair is now a range beside the cursor — merged with the ranges it
 touches, trimmed as it goes out, dropped when the peer's byte prefix passes it —
 and the send point only ever moves forward.
 
-The harness measures what that cost, and it is the reason this is the first item
-after the timer: one lost 1 349-byte datagram re-sent **12 000 bytes** before the
-change and **1 349** after, which is the difference between a loss costing one
-datagram and a loss costing the stream's whole buffered remainder. The same
-number is what the two `loss1` cells were showing from the other side — mhd
-carrying 9.5-9.9 Gbit/s against TCP's 15.9-16.1 under one percent loss — and
-**that comparison has not been re-run**, so it is the next measurement and not a
-claim.
+The harness measures what that cost: one lost 1 349-byte datagram re-sent
+**12 000 bytes** before the change and **1 349** after, which is the difference
+between a loss costing one datagram and a loss costing the stream's whole
+buffered remainder.
+
+**And it does not move the cell it was aimed at, which is the finding.** An
+interleaved A/B of the two builds on `bulk-n` under one percent loss (`dev`
+profile, four measured rounds, `--aa`, the carrier forced to mhd, host load 1.54,
+`target/evidence/bench-repair-loss1.json`):
+
+| arm | build | `throughput_gbps` | `cpu_s_per_gbit` |
+|---|---|---|---|
+| `l4` | this change (`b728cac`) | 12.082 [11.908..12.422] | 0.5771 [0.5696..0.5905] |
+| `l4~aa` | the same build again | 11.726 [11.309..12.191] | 0.5893 [0.5694..0.5976] |
+| `l4~b` | before it (`af839e2`) | 12.064 [11.929..12.314] | 0.5806 [0.5770..0.5845] |
+
+The run's own floor is **3.76 %** on throughput and 2.39 % on CPU, and both arms
+sit inside it: **no claim**, and the one directional reading (`retrans_segments`,
+the new build re-sending more) is flagged fragile — dropping a single round flips
+it. So the rewind amplification was real and is gone, but it was **not what
+limited that cell**, and the October record's 9.5-9.9 Gbit/s is not comparable
+with these 12.0 (different host, different method run). What the change is kept
+for is what it removes: a loss now costs its own range, and the send point is
+monotonic, which is the precondition for a scheduler that can bound what a stream
+has outstanding. The next suspect for the loss gap is therefore *not* the
+re-send volume; the two candidates left are the shared flight/credit accounting
+(one cwnd for every stream of a lane) and the absence of pacing, and both need
+the phase budget on this cell rather than another guess.
 
 Two properties the change keeps, because they were the rewind's excuse: a repair
 is *ordered* only by offset in the buffer, never against fresh data (the receiver
