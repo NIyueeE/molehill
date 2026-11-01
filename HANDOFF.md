@@ -3070,6 +3070,21 @@ remains). So the pool-filling mechanism is closed and the latency that fed it is
 not. That is a real narrowing and it is the first change in this cycle that made a
 measured failure category disappear.
 
+Confirmed on the headline cell, with a control binary differing only in that one
+line (`--ab-arm`, `--aa`, three rounds, `target/evidence/bench-wake.json`): the
+per-cell p99 readings at L1 are `18, 24, 5 003, 23` for the fixed build, `16,
+5 002, 994, 5 002` for the control — and **`4 632, 15, 2 771, 2 279` for the A/A
+twin**, which is the same build measured twice. So the tail is in both arms and in
+the twin, the run makes no claim, and `capacity_streams` reads 1 [0..1] against the
+control's 0 [0..0] as a fragile directional reading only.
+
+Two things are therefore settled and they should not be conflated again: the pump's
+wake-up **was** delaying readers (224 → 17 peak streams is categorical), and the
+multi-second tail on an open **is not** that wake-up. The next instrument is the
+one the chain implies — a timestamped waker, so that "woken at T, polled at T+Δ"
+is measurable at all, because after this fix the only place left for a parked
+reader to lose time is between the wake and the poll.
+
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
 the wire and **dropped** by the connection (`conn.rs`, `Frame::Datagram { .. } |
