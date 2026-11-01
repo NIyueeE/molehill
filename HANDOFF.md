@@ -3619,6 +3619,23 @@ is the 0.83 ms of hello-and-acknowledgement that remains after the 1.82 ms
 handshake goes: arrival p99 should land near 5 ms with `bulk-n` untouched,
 because nothing about the data path changes.
 
+**P4′ is half done, and the half that is left is left on purpose (2026-11-01).**
+The two frame classes nothing sent are gone: a datagram frame and a whole-IP-packet
+frame were declared, acknowledged and dropped by the connection, and no sender in
+this dialect ever produced one — a UDP service and a transparent claim both ride
+reliable streams. The kinds are now `Ack`, `Stream`, `Credit` and `Reset`, the
+decoder refuses anything else, and the reader's size constants and round-trip case
+list went with them.
+
+The other half — tightening the pairing patience — is **not** done, because no
+measurement says it should be. `PAIR_WAIT_BUDGET` (5 s) × `PAIR_ATTEMPTS` (5) is a
+25 s ceiling on one visitor's wait, and the number that matters is not the ceiling
+but that a *legitimate* cold open can take most of one budget: the client's own
+dial has a 15 s budget, and the first visitor after a registration waits for a
+lane that does not exist yet. Shortening it without a cell that measures the cold
+path would trade a rare long wait for a rare truncated visitor. It stays, with the
+reason written here rather than a number changed to look tidy.
+
 **And P3′ was built and measured out (2026-11-01).** The rule was the one TCP
 cannot implement: a packet is declared lost the moment the peer's *per-stream
 cumulative byte prefix* passes its range, instead of waiting for three later
