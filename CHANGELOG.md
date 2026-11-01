@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-11-01
 
+### Known gaps
+
+- **A fresh connection's arrival is slower than TCP's, and the reason is one
+  handshake.** Every visitor channel opens its own Noise handshake before its
+  first byte can move: measured on the `churn-16` cell (a fresh connection per
+  request, sixteen at once), `accept → paired` p50 2 603 µs and p99 14 127 µs,
+  of which a channel open is 2 648 µs and **1 818 µs of that is the handshake**.
+  The whole cell reads round-trip p99 **21.49 ms** against TCP's **3.46 ms**,
+  with the median at parity (2.62 ms against 2.82). Removing the handshake by
+  deriving each stream's record keys from the lane's own was built and measured
+  three ways: it takes the p99 to **3.79 ms** and doubles the arrival rate, and
+  every version costs the bulk cell (`bulk-n` throughput −15.67 %, a CLAIM past
+  its floor, and 0 of 4 samples where the shipped tree passes 4 of 4). The
+  mechanism, the numbers and the two remaining ways forward are in
+  `HANDOFF.md`, "key derivation delivered the arrival win and cost the bulk
+  cell". A deployment whose traffic is mostly short-lived connections should
+  measure its own path before choosing this carrier.
+
 ### Added
 
 - **`MOLEHILL_MHD_STATS=1` reports the carrier's own cost.** One line per second
