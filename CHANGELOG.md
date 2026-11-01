@@ -355,15 +355,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries 30 % more, so more is in flight).
 - **BREAKING: `mhd` is now a native multi-stream carrier, and the KCP engine
   it was renamed from is deleted.** A lane — one UDP connection of the pool —
-  carries its own reliable streams (TCP forwarding, the transparent path), its
-  own unreliable datagrams and, from the same engine, unreliable L3 frames:
-  each stream is addressed by a byte offset, so a lost datagram costs one
-  stream a round trip and never stalls the connection, and the connection
-  acknowledges with a 64-bit bitmap. There is no yamux above an `mhd` lane and
-  no KCP segment queue below it; yamux remains the TCP carrier's multiplexer.
-  Noise is per stream, so every data channel is still encrypted exactly when
-  `data_enable` says so. **No configuration key changes**: the data plane's
-  keys were already carrier-neutral.
+  carries its own reliable streams: TCP forwarding, the transparent path and
+  UDP services all ride one. Each stream is addressed by a byte offset, so a
+  lost datagram costs one stream a round trip and never stalls the connection,
+  and the connection acknowledges with a 64-bit bitmap. There is no yamux above
+  an `mhd` lane and no KCP segment queue below it; yamux remains the TCP
+  carrier's multiplexer. Noise is per stream, so every data channel is still
+  encrypted exactly when `data_enable` says so. **No configuration key
+  changes**: the data plane's keys were already carrier-neutral.
 - **The process sizes its runtime instead of taking one thread per core.** A
   molehill process now starts `min(4, available cores)` worker threads, and
   `TOKIO_WORKER_THREADS` overrides it. The data plane is a few tasks that never
