@@ -3322,6 +3322,35 @@ pairing, at first byte, one line over 100 ms under `MOLEHILL_MHD_STATS=1`), the
 data path changed, so every number above measures the tree as it stood before the
 stripe work.
 
+**What P1′ has to preserve, measured before it is written.** Striping is worth
+something real: one bulk visitor (`bulk-1`, isolated run, three rounds each)
+carries **5.35–5.64 Gbit/s** at width 1 and **6.62–7.10** at width 4 — +23 %, for
+`cpu_s_per_gbit` 0.62–0.66 → 0.77–0.81. So the fix cannot be "stop striping"; it
+has to be "stripe only the visitor that needs it, and only after it starts".
+
+The design that follows from the two measurements, decided here so the next round
+does not re-derive it:
+
+1. **A visitor always starts on one stripe.** No global target is read on the
+   arrival path, and `stripe_gather` is deleted with the atomic-gather invariant
+   it existed for.
+2. **The stripe's group is named on the data channel itself.** A growth stripe is
+   requested for one group, so the client writes that group id in the tunnel
+   prologue (four bytes, `None` for the first stripe, which is opened before a
+   group exists). The server then delivers the channel to that group's own waiter
+   instead of a shared queue — which is what makes concurrent gathers impossible
+   to interleave without a mutex, and it retires `StripeGroups`' parked-group
+   table, its TTL, its tombstones and `ReleaseStripedGroup` with it.
+3. **Growth follows the group's own sender.** `StripeSender` already measures a
+   contiguous park (`STRIPE_BACKPRESSURE`, `STRIPE_GROWTH_DWELL` exist); when a
+   live group parks, the server asks for one more stripe for *that* group and the
+   running group attaches it — one more write half for the sender's rotation, one
+   more reader into the same reorder channel. A request that never parks stays at
+   one stripe for its whole life.
+4. **The width is bounded by the visitor's own behaviour, not by history.** A
+   group that stops parking stops growing; nothing raises a target another
+   visitor will pay for.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —
