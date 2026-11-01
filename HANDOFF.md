@@ -3142,6 +3142,34 @@ drops on every device. What produces the bytes — the forwarding loop above the
 tunnel stream and the backend behind it — has never been instrumented at all, and
 that is now the only place this symptom can live.
 
+**And it is not a hole either (2026-11-01).** The obvious remaining explanation was
+that bytes had arrived but could not be handed out — `arrived()` only advances over
+a contiguous prefix, so a missing range would make a reader wake hundreds of times
+and read nothing. So the park line now carries the buffer's own state:
+`(read, arrived, piece count, first piece)`.
+
+| parked (µs) | ready for | wakes | hole |
+|---|---|---|---|
+| 7 003 659 | 23 µs | 137 | `(343, 343, **0**, None)` |
+| 7 003 114 | 9 µs | 244 | `(371, 371, **0**, None)` |
+| 5 457 832 | 5 µs | 126 108 | `(104, 104, **0**, None)` |
+
+`read == arrived` and **zero pieces**: the buffer is empty and the reader sits
+exactly at its frontier. Nothing has arrived beyond what has already been read, so
+there is no hole and nothing to hand out — the peer sent nothing at all during
+those seven seconds.
+
+Put together with the wake count, that closes the receive side completely: the
+client's reader is woken hundreds of times, is polled, calls `poll_read`, and the
+stream it reads from has received nothing. **Every instrument that has been
+pointing at the client has therefore been measuring a symptom on the wrong end.**
+
+The producer is the server: its forwarding loop reads the visitor's bytes off the
+visitor socket and writes them into the tunnel stream, and neither that loop nor the
+accept-and-pair path ahead of it has ever been instrumented. That is where the next
+look belongs, and it is the first time in this cycle that the suspect is a component
+the carrier does not own.
+
 **What is still not met**: the soak's four stage failures, the multi-second tail on
 a fresh connection (which is what the `capacity` cell and the soak's `clean` stage
 both read), and therefore every part of the objective that depends on them — the

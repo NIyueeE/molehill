@@ -604,6 +604,21 @@ impl RecvBuf {
         }
     }
 
+    /// The hole the reader is stuck behind, if it is stuck: `(read, arrived,
+    /// pieces, first piece start)`.
+    ///
+    /// `arrived()` only advances over a contiguous prefix, so bytes can be
+    /// present and unreadable at the same time — which is exactly what a reader
+    /// that is woken hundreds of times and reads nothing looks like from outside.
+    pub(crate) fn prefix_state(&self) -> (u64, u64, usize, Option<u64>) {
+        (
+            self.read,
+            self.arrived(),
+            self.pieces.len(),
+            self.pieces.keys().next().copied(),
+        )
+    }
+
     /// How long bytes have been waiting for a reader, if they are.
     pub(crate) fn ready_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
         self.ready_at.map(|at| now.saturating_duration_since(at))

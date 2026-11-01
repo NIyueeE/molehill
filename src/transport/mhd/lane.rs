@@ -311,6 +311,7 @@ impl AsyncRead for StreamIo {
                         parked_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
                         ready_us = ready_before.map_or(u64::MAX, |d| u64::try_from(d.as_micros())
                             .unwrap_or(u64::MAX)),
+                        hole = ?this.shared.with(|conn| conn.hole(this.id)),
                         wakes_while_parked = this
                             .shared
                             .wakes

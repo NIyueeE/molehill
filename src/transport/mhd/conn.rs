@@ -1339,6 +1339,11 @@ impl Conn {
         self.id
     }
 
+    /// The hole that stream's reader is stuck behind, if any.
+    pub(crate) fn hole(&self, stream: u32) -> Option<(u64, u64, usize, Option<u64>)> {
+        self.streams.get(&stream).map(|s| s.recv.prefix_state())
+    }
+
     /// How long that stream has had bytes its reader has not taken.
     pub(crate) fn ready_for(&self, stream: u32, now: Instant) -> Option<Duration> {
         self.streams
