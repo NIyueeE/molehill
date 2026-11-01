@@ -3395,6 +3395,48 @@ parity in the median and 6× in the tail. That tail — 21.5 ms against TCP's
 absence: sixteen concurrent pairings each need a control round trip and a stream
 open, and none of them is slow by itself.
 
+**The tail is the per-stream Noise handshake, and it is measured (2026-11-01).**
+The arrival instrument (`MOLEHILL_MHD_STATS=1`) prints both halves of an arrival
+every ten seconds; one window of `churn-16` (2 627 visitors) reads:
+
+| half | p50 | p99 | max |
+|---|---|---|---|
+| `accept → paired` | **2 603 µs** | **14 127 µs** | 28 513 µs |
+| `paired → first byte` | **12 µs** | 48 µs | 125 µs |
+
+So the whole arrival cost is the pairing wait and none of it is the forwarding
+loop. Lowering the mhd slow-opening bar to 5 ms (the same switch) then splits the
+openings that matter: of 213 openings over 5 ms, the mean split was selector
+**5 µs**, Noise handshake **1 168 µs**, hello-and-acknowledgement **4 538 µs**.
+And the client's own line, at `debug` for every open (25 628 samples in one
+round), gives the shape without any queueing in it: a channel open costs
+**2 648 µs**, of which **1 818 µs (69 %) is the Noise handshake** and 829 µs is
+the hello and its acknowledgement.
+
+So a visitor's arrival pays a full Noise handshake — two round trips and two key
+setups — once per connection, and sixteen concurrent visitors queue behind that
+work. That is exactly what TCP does not pay: a yamux stream open carries no
+handshake, which is why the same cell reads 3.46 ms there.
+
+Three consequences, and they close the phase as it was written:
+
+- **Prefill cannot fix it.** A warm channel costs the same open to produce; a
+  spare pool moves the handshake off the visitor's path only until the visitors
+  arrive faster than the pool is refilled, which is the case that is failing
+  (3 300/s).
+- **Growth cannot fix it.** Striping is a bulk concern; this is the arrival path.
+- **The fix is to stop paying a handshake per visitor.** The lane already runs a
+  Noise handshake once, when it is established (the validation stream). Deriving
+  each stream's keys from that lane secret — `HKDF(lane handshake hash, stream
+  id)`, a per-direction counter as the AEAD nonce — keeps every stream's crypto
+  independent while making an opening a selector byte, a hello and an
+  acknowledgement. Expected: an open of ~0.85 ms instead of 2.65, so a pairing
+  p99 near 5 ms instead of 14.
+
+That is the next change (P2″), and it is a wire change inside the unreleased
+6.0 dialect: a stream's prologue names whether its keys are derived or
+handshaked, so a mixed pair still works while the work lands.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —

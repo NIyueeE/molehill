@@ -54,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MOLEHILL_MHD_STATS=1`: a visitor whose first byte took longer than 100 ms
   reports the two waits behind it — accept to channel pairing, and pairing to
   the first byte.
+- **`MOLEHILL_MHD_STATS=1` reads a visitor's arrival as a distribution, not as a
+  threshold.** Every ten seconds each forwarding service prints p50, p99 and max
+  of both halves of an arrival — accept to channel pairing, and pairing to the
+  first byte — so a window of thousands of connections can be read without a log
+  line per connection. The same switch lowers the mhd slow-opening bar from
+  100 ms to 5 ms and prints that line at `info`: an opening is the arrival path's
+  whole cost, and a measured pairing p99 of fourteen milliseconds is invisible to
+  a hundred-millisecond threshold.
 
 ### Fixed
 

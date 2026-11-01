@@ -2392,18 +2392,7 @@ async fn serve_mhd_stream(
             // The client's open waits for this before it names its service.
             write_and_flush(&mut io, &postcard::to_stdvec(&Ack::Ok)?).await?;
             let total_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
-            // A hundred milliseconds is fifty times the round trip a healthy path
-            // here measures: past it the opening is a stall, and the split says
-            // which of its three waits owns it.
-            if total_us >= 100_000 {
-                debug!(
-                    sel_us,
-                    hs_us,
-                    hello_us = total_us.saturating_sub(sel_us).saturating_sub(hs_us),
-                    total_us,
-                    "mhd slow stream opening on the server: selector, handshake and hello"
-                );
-            }
+            note_slow_opening(total_us, sel_us, hs_us);
             let (service_id, _tunnel) = read_tunnel_prologue(&mut io).await?;
             debug!(%service_id, "mhd tunnel stream routed");
             route_mhd_stream(io, &registry, &nonce, service_id).await
@@ -2411,6 +2400,37 @@ async fn serve_mhd_stream(
         other @ Hello::ControlChannelHello(..) => {
             bail!("Expected a data-plane hello on the mhd stream, got {other:?}")
         }
+    }
+}
+
+/// Report one mhd stream opening when it was slow, split into its three waits.
+///
+/// A hundred milliseconds is fifty times the round trip a healthy path here
+/// measures: past it the opening is a stall. With the carrier's stats switch on,
+/// the bar drops to five milliseconds and the line is an `info`: a stream
+/// opening on the session's own read loop is the arrival path's whole cost, and
+/// a measured pairing p99 of fourteen milliseconds is invisible to a 100 ms bar.
+/// Five milliseconds still leaves most opens unlogged, which is what keeps the
+/// line readable.
+#[cfg(feature = "mhd")]
+fn note_slow_opening(total_us: u64, sel_us: u64, hs_us: u64) {
+    let hello_us = total_us.saturating_sub(sel_us).saturating_sub(hs_us);
+    if crate::transport::stats::enabled() && total_us >= 5_000 {
+        info!(
+            sel_us,
+            hs_us,
+            hello_us,
+            total_us,
+            "mhd slow stream opening on the server: selector, handshake and hello"
+        );
+    } else if total_us >= 100_000 {
+        debug!(
+            sel_us,
+            hs_us,
+            hello_us,
+            total_us,
+            "mhd slow stream opening on the server: selector, handshake and hello"
+        );
     }
 }
 
@@ -3468,12 +3488,33 @@ where
     let listen_notice = RepeatNotice::new();
 
     let stripe_gather = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let arrival = std::sync::Arc::new(ArrivalStats::default());
     let pool = VisitorPool {
         data_ch_rx,
         data_ch_req_tx: data_ch_req_tx.clone(),
         stripe_gather,
         plan,
+        arrival: std::sync::Arc::clone(&arrival),
     };
+    // One line every ten seconds while the switch is on: a bench round is tens
+    // of seconds, and a window shorter than that would print hundreds of lines
+    // for a handful of arrivals. The task ends with the pool.
+    {
+        let arrival = std::sync::Arc::clone(&arrival);
+        let mut shutdown = shutdown_rx.resubscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.recv() => return,
+                    () = time::sleep(Duration::from_secs(10)) => {
+                        if crate::transport::stats::enabled() {
+                            report_arrivals(&arrival);
+                        }
+                    }
+                }
+            }
+        });
+    }
     let visitor_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VISITORS));
     // The control task's liveness as a shareable signal. A `JoinHandle` cannot
     // be cloned and polling one from several tasks is not allowed, so one
@@ -3543,7 +3584,10 @@ where
                         // end does: every later stamp is measured from the
                         // kernel handing us the socket, which is the only
                         // instant both ends agree on for "the visitor arrived".
-                        let accepted_at = std::time::Instant::now();
+                        let arrival = Arrival {
+                            accepted_at: std::time::Instant::now(),
+                            stats: std::sync::Arc::clone(&arrival),
+                        };
                         debug!("New visitor from {}", addr);
                         // The visitor socket gets the same latency-friendly
                         // defaults as the rest of the forwarding path.
@@ -3558,7 +3602,7 @@ where
                                     control: control_alive_rx.clone(),
                                 },
                                 permit,
-                                accepted_at,
+                                arrival,
                             )
                             .instrument(Span::current()),
                         );
@@ -3588,6 +3632,8 @@ struct VisitorPool<C> {
     /// constants; a visitor's width no longer comes from it (see
     /// `serve_tcp_visitor`).
     plan: Arc<crate::stripe::StripePlan>,
+    /// Each visitor's arrival split, for the periodic summary.
+    arrival: std::sync::Arc<ArrivalStats>,
 }
 
 impl<C> Clone for VisitorPool<C> {
@@ -3597,6 +3643,7 @@ impl<C> Clone for VisitorPool<C> {
             data_ch_req_tx: self.data_ch_req_tx.clone(),
             stripe_gather: std::sync::Arc::clone(&self.stripe_gather),
             plan: Arc::clone(&self.plan),
+            arrival: std::sync::Arc::clone(&self.arrival),
         }
     }
 }
@@ -3616,16 +3663,16 @@ impl<C> Clone for VisitorPool<C> {
 /// healthy run never reads a clock for it.
 struct FirstByte<R> {
     inner: R,
-    accepted_at: std::time::Instant,
+    arrival: Arrival,
     paired_at: std::time::Instant,
     logged: bool,
 }
 
 impl<R> FirstByte<R> {
-    const fn new(inner: R, accepted_at: std::time::Instant, paired_at: std::time::Instant) -> Self {
+    const fn new(inner: R, arrival: Arrival, paired_at: std::time::Instant) -> Self {
         Self {
             inner,
-            accepted_at,
+            arrival,
             paired_at,
             logged: false,
         }
@@ -3647,12 +3694,19 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByte<R> {
             self.logged = true;
             if crate::transport::stats::enabled() {
                 let now = std::time::Instant::now();
-                let setup = now.duration_since(self.accepted_at);
-                if setup >= std::time::Duration::from_millis(100) {
+                let setup = now.duration_since(self.arrival.accepted_at);
+                let after_pairing = now.duration_since(self.paired_at);
+                let paired = setup.saturating_sub(after_pairing);
+                self.arrival.stats.note(
+                    u32::try_from(paired.as_micros()).unwrap_or(u32::MAX),
+                    u32::try_from(after_pairing.as_micros()).unwrap_or(u32::MAX),
+                );
+                if after_pairing >= std::time::Duration::from_millis(100) {
                     debug!(
                         setup_us = u64::try_from(setup.as_micros()).unwrap_or(u64::MAX),
-                        paired_us = u64::try_from(now.duration_since(self.paired_at).as_micros())
-                            .unwrap_or(u64::MAX),
+                        paired_us = u64::try_from(paired.as_micros()).unwrap_or(u64::MAX),
+                        after_pairing_us =
+                            u64::try_from(after_pairing.as_micros()).unwrap_or(u64::MAX),
                         "visitor's first byte was late: after pairing"
                     );
                 }
@@ -3660,6 +3714,97 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByte<R> {
         }
         poll
     }
+}
+
+/// What a visitor's arrival cost, split at its pairing, for the periodic line.
+///
+/// A single sample says only that one visitor was slow, and a threshold line
+/// cannot say where the mass is: the tail this exists to explain is twenty
+/// milliseconds, which no 100 ms threshold would ever print. So each visitor
+/// records two numbers — `accept → paired` (the pool had no channel) and
+/// `paired → first byte` (the forwarding loop or the backend did not answer) —
+/// and the pool prints their percentiles every ten seconds.
+///
+/// Only fed while `MOLEHILL_MHD_STATS=1` is set, so a default run pays nothing.
+/// The vector is bounded: a window that fills it drops the rest rather than
+/// growing without limit, and the count beside the percentiles says so.
+#[derive(Default)]
+struct ArrivalStats {
+    samples: std::sync::Mutex<Vec<(u32, u32)>>,
+}
+
+/// The most arrivals one reporting window keeps.
+const ARRIVAL_WINDOW_MAX: usize = 65_536;
+
+impl ArrivalStats {
+    fn note(&self, paired_us: u32, first_us: u32) {
+        let mut samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if samples.len() < ARRIVAL_WINDOW_MAX {
+            samples.push((paired_us, first_us));
+        }
+    }
+
+    /// Take the window's samples and leave it empty.
+    fn drain(&self) -> Vec<(u32, u32)> {
+        let mut samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *samples)
+    }
+}
+
+/// Nearest-rank percentile of an ascending slice, in whole microseconds.
+///
+/// Taken as `numerator/denominator` rather than a float so the rank is integer
+/// arithmetic: a percentile that is off by a rounding error is a percentile
+/// nobody can reproduce.
+fn pct_us(sorted: &[u32], numerator: usize, denominator: usize) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (numerator * sorted.len()).div_ceil(denominator);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+/// Print one window of arrival splits: both halves, three points each.
+///
+/// `p50` and `p99` rather than a mean on purpose: the question is whether the
+/// mass or the tail moved, and a mean answers neither.
+fn report_arrivals(stats: &ArrivalStats) {
+    let samples = stats.drain();
+    if samples.is_empty() {
+        return;
+    }
+    let mut paired: Vec<u32> = samples.iter().map(|(p, _)| *p).collect();
+    let mut first: Vec<u32> = samples.iter().map(|(_, f)| *f).collect();
+    paired.sort_unstable();
+    first.sort_unstable();
+    info!(
+        n = samples.len(),
+        paired_p50_us = pct_us(&paired, 50, 100),
+        paired_p99_us = pct_us(&paired, 99, 100),
+        paired_max_us = paired.last().copied().unwrap_or(0),
+        first_p50_us = pct_us(&first, 50, 100),
+        first_p99_us = pct_us(&first, 99, 100),
+        first_max_us = first.last().copied().unwrap_or(0),
+        "visitor arrival, split at the pairing"
+    );
+}
+
+/// One visitor's arrival: when the kernel handed over the socket, and where its
+/// split is recorded.
+///
+/// One value rather than two parameters because the pair travels together from
+/// the accept loop to the forwarding loop, and every hop in between already
+/// carries enough to be readable.
+#[derive(Clone)]
+struct Arrival {
+    accepted_at: std::time::Instant,
+    stats: std::sync::Arc<ArrivalStats>,
 }
 
 /// The two ways a pairing can stop before it forwards anything: the pool is
@@ -3687,7 +3832,7 @@ async fn serve_tcp_visitor<C>(
     pool: VisitorPool<C>,
     mut stops: Stops,
     _permit: tokio::sync::OwnedSemaphorePermit,
-    accepted_at: std::time::Instant,
+    arrival: Arrival,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -3720,7 +3865,7 @@ async fn serve_tcp_visitor<C>(
         &pool.data_ch_req_tx,
         Arc::clone(&pool.plan),
         &mut stops,
-        accepted_at,
+        arrival,
     )
     .await
     {
@@ -3760,7 +3905,7 @@ async fn pair_striped_group<C>(
     data_ch_req_tx: &mpsc::UnboundedSender<DataChannelRequest>,
     plan: Arc<crate::stripe::StripePlan>,
     stops: &mut Stops,
-    accepted_at: std::time::Instant,
+    arrival: Arrival,
 ) -> Result<bool>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3833,16 +3978,8 @@ where
                     // The stripes still missing are the slots from the next
                     // arrival on: the channels already gathered took the slots
                     // before them.
-                    let next = u8::try_from(gathered.len())
-                        .with_context(|| "stripe index exceeds u8")?
-                        .min(stripes);
-                    for index in next..stripes {
-                        if data_ch_req_tx
-                            .send(stripe_request(group_bytes, index, stripes))
-                            .is_err()
-                        {
-                            return Ok(true);
-                        }
+                    if ask_missing(data_ch_req_tx, group_bytes, stripes, gathered.len())? {
+                        return Ok(true);
                     }
                     continue;
                 }
@@ -3874,8 +4011,12 @@ where
                 group,
                 stripes = stripe_count,
                 attempts,
-                accept_us = u64::try_from(pairing_started.duration_since(accepted_at).as_micros())
-                    .unwrap_or(u64::MAX),
+                accept_us = u64::try_from(
+                    pairing_started
+                        .duration_since(arrival.accepted_at)
+                        .as_micros()
+                )
+                .unwrap_or(u64::MAX),
                 paired_us = u64::try_from(paired.as_micros()).unwrap_or(u64::MAX),
                 "visitor waited for its data channels"
             );
@@ -3888,7 +4029,7 @@ where
         // is this group telling the server that one more stripe would have
         // helped.
         crate::stripe::spawn_group(
-            FirstByte::new(read, accepted_at, paired_at),
+            FirstByte::new(read, arrival, paired_at),
             write,
             gathered,
             Some(Arc::clone(&plan)),
@@ -3913,6 +4054,30 @@ fn stripe_request(group: [u8; 4], index: u8, count: u8) -> DataChannelRequest {
         index,
         count,
     }
+}
+
+/// Ask for the stripes a gather still lacks, from its next arrival on.
+///
+/// `Ok(true)` means the request sink is gone — the service's control channel
+/// ended — which the caller reports the same way a missing channel is reported.
+fn ask_missing(
+    data_ch_req_tx: &mpsc::UnboundedSender<DataChannelRequest>,
+    group: [u8; 4],
+    stripes: u8,
+    gathered: usize,
+) -> Result<bool> {
+    let next = u8::try_from(gathered)
+        .with_context(|| "stripe index exceeds u8")?
+        .min(stripes);
+    for index in next..stripes {
+        if data_ch_req_tx
+            .send(stripe_request(group, index, stripes))
+            .is_err()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The per-stripe `StartForwardStripedTcp` commands of one gather attempt,
@@ -5103,7 +5268,10 @@ mod tests {
             &req_tx,
             std::sync::Arc::new(crate::stripe::StripePlan::new(2)),
             &mut stops,
-            std::time::Instant::now(),
+            Arrival {
+                accepted_at: std::time::Instant::now(),
+                stats: std::sync::Arc::new(ArrivalStats::default()),
+            },
         )
         .await
         .unwrap();
