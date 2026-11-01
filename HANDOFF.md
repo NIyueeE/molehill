@@ -2726,11 +2726,29 @@ That is not a win: the four-lane tail is worse than the 885 ms it started from,
 and the one-lane p99 moved the right way only inside this host's scatter for a
 cell this short. Reverted, not landed — the run is `target/evidence/prio{4,1}.json`.
 
-So the "turn" is not the round-robin order either, and the cost a shared lane
-imposes is somewhere in the pump's own loop rather than in the choice of which
-stream to build a packet for. The next thing to measure is `flush`: how long
-`send_run` blocks on `socket.writable()` per pass, which is the one wait in the
-pump that no counter covers.
+So the "turn" is not the round-robin order either.
+
+**And it is not the socket (2026-11-01).** The pump's `send_run` waits on
+`socket.writable()` before each chunk it posts, which was the last uncovered wait
+in that loop; instrumented (gated on the phase switch, because the probe costs a
+`try_io`), two runs read:
+
+| run | socket waits ≥ 100 ms | slowest opens (µs) |
+|---|---|---|
+| 1 | **0** | 3 996 381, 701 095 |
+| 2 | **0** | 2 096 250, 1 896 885 |
+
+Four seconds of open with the pump never blocked on the socket. Which is the
+conclusion worth writing down plainly: **every instrumented stage of this open is
+fast while the open is slow**, and each of them measures work *inside* a stage.
+The interval that is left is between stages — the time between a stream's
+`poll_write` returning `Pending` and that task being polled again — and no
+per-stage timer can see it, which is why nine of them in a row have read "fast".
+
+The instrument that would see it is a task-level one: record both sides of each
+`sleep`/park in `StreamIo`, or count how long a parked writer stays parked. That
+is the next thing to build, and it is a different kind of counter from everything
+above.
 
 
 

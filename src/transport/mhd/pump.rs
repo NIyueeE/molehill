@@ -229,7 +229,30 @@ async fn flush(
     }
     let sent = spans.len();
     let posting = crate::transport::stats::Timing::start(crate::transport::stats::enabled());
+    // `send_run` waits on `socket.writable()` before each chunk it posts, and
+    // that wait is the one place a pass can block for an unbounded time: a lane
+    // whose bulk stream has filled the socket's send buffer makes every later
+    // packet — an opening stream's handshake included — queue behind it. Nothing
+    // else in the pump charges that time, so it is measured here.
+    let sampled = crate::transport::stats::enabled();
+    let before_wait = Instant::now();
     send_run(socket, peer, run, spans).await?;
+    // Gated: the extra `try_io` is a syscall the hot path must not pay, so the
+    // probe exists only while the phase switch is on.
+    if sampled {
+        let posted = before_wait.elapsed();
+        if posted >= std::time::Duration::from_millis(100) {
+            let blocked = socket
+                .try_io(tokio::io::Interest::WRITABLE, || Ok(()))
+                .is_err();
+            tracing::debug!(
+                posted_us = u64::try_from(posted.as_micros()).unwrap_or(u64::MAX),
+                datagrams = sent,
+                still_blocked = blocked,
+                "mhd pump waited on the socket"
+            );
+        }
+    }
     posting.stop(&crate::transport::stats::PHASES.tx_send);
     crate::transport::stats::sent_run(sent, run.len());
     if let Some(stall) = shared.with(|conn| conn.stall_report(Instant::now())) {
