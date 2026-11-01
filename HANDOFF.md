@@ -2634,13 +2634,50 @@ queue, the carrier's blocking connection mutex, runtime-worker count (more is
 worse), the control-read desync (fixed), the spawn delay, and now the writer's
 queue.
 
-That leaves one interval that **no** counter in the tree crosses: between the
-writer completing `write_and_flush` on the session socket and the client's command
-loop taking that frame. It is the last segment nobody has measured, and the one
-bracketed incident — a request that was queued with `send_us=0` and never entered
-the client's arm — says a frame can be written and not read. The next instrument
-belongs on the wire itself: a sequence number the server increments per command
-and the client echoes, so a gap is a lost frame rather than an inference.
+**Correction: no frame is lost, and the wait is the client's own open
+(2026-11-01).** The group id rides the wire, so the two logs answer the question
+without a new instrument: in six arm-rounds the server's `asking the client for
+data channels` and the client's `client asked for a stripe` counted **54/54,
+51/52, 86/86, 56/56, 217/419, 51/51**. Every request that was asked for was
+received, so the earlier "written and not read" reading was wrong — the two lines
+it compared were 50 ms apart in a stream of one request per visitor, and one lost
+line was a coincidence of that cadence.
+
+Timing the client from the start of its open to the prologue settles where the
+wait is, because it matches the server's pairing wait to within 120-600 µs:
+
+| run | client open→prologue (µs) | server pairing wait (µs) |
+|---|---|---|
+| 1 | 3 212 752 / 162 869 | 3 212 872 / 163 091 |
+| 2 | 3 641 981 / 2 283 435 | 3 642 105 / 2 284 062 |
+| 3 | 6 643 947 / 2 224 649 | 5 001 552 (budget) / 2 225 049 |
+
+So the visitor's entire wait — and therefore the whole `capacity` cell — is the
+client's *stream open*, and the wire plus the server's routing add a few hundred
+microseconds on top. The pool's own placement timer agrees: its `max_us` reads
+1.8-2.6 ms normally and **3 918 256 µs** in the interval that had one slow open,
+matching the client's 3 918 263 µs to seven digits.
+
+**And the open's slow half is the Noise handshake, not the acknowledgement.**
+Splitting the slowest opens:
+
+```
+us=5 266 433   lane=1   hs_us=5 265 951   ack_us=481
+us=   23 531   lane=0   hs_us=   23 433   ack_us= 98
+```
+
+The handshake is three round trips over one mhd stream, so a 5.27-second value is
+not a queue: it is **20 + 40 + 80 + 160 + 320 + 640 + 1 280 + 2 560 = 5 100 ms**,
+the exponential backoff after eight unanswered timers, which is what
+`MIN_RTO_SMALL_FLIGHT` climbs through since this round's earlier change. The
+hypothesis that follows is therefore specific and testable: the handshake's
+packets are being **lost** on a lane that is carrying bulk in the same direction,
+or its write is being refused while the flight is full, and the timer is what
+turns one loss into seconds. The next instrument is the retransmit counter for
+that specific stream, not another timer study — and the fix, if the hypothesis
+holds, is the one the plan already names: a small stream's bytes must not queue
+behind a bulk stream's, which is a scheduler and budget question rather than a
+recovery one.
 
 
 

@@ -103,6 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the wide value. Measured on the model's `capacity` ramp: the dialer's
   open latency went from p90 **337 ms with 5 of 58 over 100 ms** to p90 **6.7 ms
   with 1 of 118 over 100 ms**.
+- **A data channel's open is now timed from its start to the prologue that makes
+  the server see it.** The visitor's wait for a channel had been chased through
+  nine stages of the machine; this counter showed it is the client's own stream
+  open, matching the server's pairing wait to within a few hundred microseconds,
+  and that the slow half of that open is the Noise handshake rather than the
+  acknowledgement. DEBUG, and silent unless the open passes a hundred
+  milliseconds.
 - **A control command can be timed from the queue to the socket, and a data
   channel's open from the spawn to its first poll.** Every producer's send on the
   session's writer queue succeeds by construction, so a command that reaches the

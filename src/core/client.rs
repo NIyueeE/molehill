@@ -1465,6 +1465,11 @@ async fn run_mux_data_channel(
     tunnel: &Tunnels,
     stripe: Option<StripeOpen>,
 ) -> Result<()> {
+    // When the open itself began, so the wait can be split: the client's own open
+    // and its write of the prologue happen before the server can see the channel,
+    // and a visitor's wait that is spent here is a different fix from one spent
+    // after the prologue.
+    let opening = std::time::Instant::now();
     let mut stream = match stripe {
         Some(request) => open_stripe_stream(args, tunnel, request).await?,
         None => tunnel.open_stream().await?,
@@ -1479,6 +1484,10 @@ async fn run_mux_data_channel(
     let tunnel =
         crate::protocol::TunnelId::new(u32::try_from(stream.tunnel_id()).unwrap_or(u32::MAX));
     write_tunnel_prologue(&mut stream, args.service_id, tunnel).await?;
+    let ready_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if ready_us >= 100_000 {
+        debug!(ready_us, "data channel was slow from open to prologue");
+    }
     // The channel belongs to one tunnel now: the client's UDP pin accounting
     // keys on the channel, so a peer's route can move a tunnel's pinned count.
     let channel = args
