@@ -3375,6 +3375,26 @@ the growth half repays, and it is confined to one visitor moving bulk alone.
 control round trip and one stream open before the visitor's first byte): that is
 P2′'s target, and the `FirstByte` line says which half of it is which.
 
+The full `dev` profile (every scenario, five rounds, its own A/A twin) confirms it
+in context — and this is the run that also says where the remaining tail is:
+
+| cell (full profile) | mhd before | mhd after | TCP |
+|---|---|---|---|
+| `churn-16` `rtt_p50_ms` | 34.66 | **2.62** | 2.815 |
+| `churn-16` `rtt_p99_ms` | 55.65 | **21.49** | 3.461 |
+| `churn-16` `rate_per_s` | 453 | **3328** | 5341 |
+| `bulk-n` `throughput_gbps` | 8.155 | **11.88** | 10.901 |
+| `bulk-1` `throughput_gbps` | 3.8–4.1 | 5.63 | — |
+| `rr-1` `rtt_p50` / `p99` | 0.14 / 0.19 | **0.098 / 0.130** | — |
+| `rr-16` `rtt_p50` / `p99` | 0.695 / 2.19 | **0.463 / 1.347** | 0.578 / 1.80 |
+
+So on a path where connections already exist, mhd now **beats** TCP (`rr-1`,
+`rr-16`) and carries more bulk (`bulk-n` 11.88 against 10.90). Arrival cost is at
+parity in the median and 6× in the tail. That tail — 21.5 ms against TCP's
+3.46 — is the next measurement, and the mechanism to look for is *queueing*, not
+absence: sixteen concurrent pairings each need a control round trip and a stream
+open, and none of them is slow by itself.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —
