@@ -42,6 +42,16 @@ pub(crate) struct SendBuf {
     fin_at: Option<u64>,
     sent: u64,
     acked: BTreeMap<u64, u64>,
+    /// Ranges the recovery has declared lost and this end still owes the peer,
+    /// keyed by their start offset.
+    ///
+    /// They are *extra* to the send point, not a rewind of it: a lost range is
+    /// one more range to put on the wire, and everything the send point has
+    /// already covered stays covered. That is the whole difference from the
+    /// single `sent` cursor this replaces — a rewind re-sent every byte after
+    /// the hole on every loss (the bandwidth-delay product of duplicates per
+    /// loss event), while a repair re-sends the hole.
+    repairs: BTreeMap<u64, u64>,
 }
 
 impl SendBuf {
@@ -158,6 +168,19 @@ impl SendBuf {
         {
             self.acked = self.acked.split_off(&self.base);
         }
+        // A repair the peer has already acknowledged is not owed any more; one
+        // that straddles the new frontier keeps only its unacknowledged tail.
+        while let Some((&start, &until)) = self.repairs.first_key_value() {
+            if until <= self.base {
+                self.repairs.remove(&start);
+                continue;
+            }
+            if start < self.base {
+                self.repairs.remove(&start);
+                self.repairs.insert(self.base, until);
+            }
+            break;
+        }
     }
 
     fn follow(&mut self) {
@@ -225,15 +248,73 @@ impl SendBuf {
         self.follow();
     }
 
-    pub(crate) fn rewind_to(&mut self, offset: u64) {
-        self.sent = self.sent.min(offset.max(self.base));
-        self.cursor = 0;
-        self.cursor_at = self.head;
-        self.follow();
+    /// Mark one range lost: the recovery wants these bytes again.
+    ///
+    /// The range is kept by offset and merged with the ones it touches, so a
+    /// loss burst costs one entry per hole rather than one per packet. It does
+    /// **not** move the send point: fresh data keeps flowing while the repair is
+    /// owed, because the two are independent ranges of the same stream and the
+    /// receiver reassembles by offset.
+    pub(crate) fn repair(&mut self, offset: u64, len: usize) {
+        let mut start = offset.max(self.base);
+        let mut end = offset.saturating_add(len as u64).min(self.tail);
+        if end <= start {
+            return; // already acknowledged, or past what was written
+        }
+        if let Some((&at, &until)) = self.repairs.range(..=start).next_back()
+            && until >= start
+        {
+            self.repairs.remove(&at);
+            start = at;
+            end = end.max(until);
+        }
+        let touching: Vec<(u64, u64)> = self
+            .repairs
+            .range(start..)
+            .take_while(|(at, _)| **at <= end)
+            .map(|(&at, &until)| (at, until))
+            .collect();
+        for (at, until) in touching {
+            self.repairs.remove(&at);
+            end = end.max(until);
+        }
+        self.repairs.insert(start, end);
+    }
+
+    /// The next repair to put on the wire, and how much of it one packet may
+    /// carry.
+    pub(crate) fn next_repair(&self, max: usize) -> Option<(u64, usize)> {
+        let (&start, &end) = self.repairs.iter().next()?;
+        let start = start.max(self.base);
+        if end <= start {
+            return None;
+        }
+        let len = usize::try_from(end - start).map_or(0, |len| len.min(max));
+        (len > 0).then_some((start, len))
+    }
+
+    /// Record that a repair range went out, trimming what is still owed.
+    pub(crate) fn repair_sent(&mut self, offset: u64, len: usize) {
+        let end = offset.saturating_add(len as u64);
+        let Some((&start, &until)) = self.repairs.range(..=offset).next_back() else {
+            return;
+        };
+        if until <= offset {
+            return;
+        }
+        self.repairs.remove(&start);
+        if until > end {
+            self.repairs.insert(end, until);
+        }
+    }
+
+    /// Whether a declared loss is still owed to the peer.
+    pub(crate) fn has_repair(&self) -> bool {
+        self.next_repair(1).is_some()
     }
 
     pub(crate) fn has_unsent(&self) -> bool {
-        self.next_offset() < self.written()
+        self.next_offset() < self.written() || self.has_repair()
     }
 
     pub(crate) fn unacked(&self) -> u64 {
@@ -978,23 +1059,64 @@ mod tests {
         assert_eq!(recv.arrived(), 400, "filling it moves the prefix on");
     }
 
-    /// A rewind carries the lowest hole, not the last one reported.
+    /// A declared loss is one owed range, and it does not move the send point.
+    ///
+    /// The rewind this replaces re-sent every byte after the hole on every loss
+    /// — the bandwidth-delay product of duplicates per loss event, and the
+    /// reason a lossy path carried a fraction of what the same path carries over
+    /// TCP. A repair is the hole and nothing else, and fresh data keeps flowing
+    /// while it is owed.
     #[test]
-    fn a_rewind_never_advances_the_send_point() {
+    fn a_loss_owes_only_its_own_range() {
         let mut send = SendBuf::default();
         send.write(&[7u8; 3000]);
         send.mark_sent(3000);
         assert_eq!(send.next_offset(), 3000);
 
-        send.rewind_to(1400);
-        assert_eq!(send.next_offset(), 1400, "the lower hole is in front");
+        send.repair(1400, 200);
+        assert_eq!(send.next_offset(), 3000, "the send point does not move");
+        assert_eq!(
+            send.next_repair(1400),
+            Some((1400, 200)),
+            "the hole is what is owed"
+        );
 
-        // A second loss in the same acknowledgement, further along. The send
-        // point must stay at the lower one: assigning it would skip everything
-        // between the two, and the stream's frontier would stop at the first
-        // hole for the rest of the connection.
-        send.rewind_to(2800);
-        assert_eq!(send.next_offset(), 1400, "a rewind never moves forward");
+        // Two losses in one acknowledgement merge with the ranges they touch
+        // into one entry, and a third that is still separate stays separate.
+        send.repair(1600, 100);
+        assert_eq!(send.next_repair(usize::MAX), Some((1400, 300)));
+        send.repair(2500, 100);
+        assert_eq!(send.next_repair(usize::MAX), Some((1400, 300)));
+
+        // Sending part of it trims what is owed, not the whole range.
+        send.repair_sent(1400, 100);
+        assert_eq!(send.next_repair(usize::MAX), Some((1500, 200)));
+        send.repair_sent(1500, 200);
+        assert_eq!(send.next_repair(usize::MAX), Some((2500, 100)));
+        send.repair_sent(2500, 100);
+        assert_eq!(send.next_repair(usize::MAX), None, "nothing is owed");
+        assert_eq!(send.next_offset(), 3000, "and the send point never moved");
+    }
+
+    /// Once the peer acknowledges a range, a repair for it is not owed any more;
+    /// one that straddles the new frontier keeps only its unacknowledged tail.
+    #[test]
+    fn an_acknowledged_range_is_not_repaired() {
+        let mut send = SendBuf::default();
+        send.write(&[1u8; 3000]);
+        send.mark_sent(3000);
+        send.repair(0, 1000);
+        send.repair(1000, 1000);
+
+        // The peer's prefix reaches 1500: the first range is gone and the second
+        // is owed from 1500 on.
+        assert_eq!(send.advance_to(1500), 1500);
+        assert_eq!(send.next_repair(usize::MAX), Some((1500, 500)));
+        assert!(send.has_repair(), "one range is still owed");
+
+        assert_eq!(send.advance_to(3000), 1500);
+        assert_eq!(send.next_repair(usize::MAX), None, "nothing is owed");
+        assert_eq!(send.held(), 0, "and the buffer is empty");
     }
 
     /// An acknowledgement that overlaps one already held extends it instead of

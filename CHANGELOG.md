@@ -90,6 +90,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **A lost datagram is re-sent as the hole, not as everything after it.** The
+  carrier kept one send cursor, so declaring a packet lost moved it back to that
+  offset and the transmitter re-sent from there to the end of what was buffered:
+  one lost packet on a full window cost the whole window in duplicates, and a
+  lossy path paid that per loss event. A declared loss is now an owed *range*
+  beside the cursor — merged with the ones it touches, trimmed as it is re-sent,
+  dropped when the peer's prefix passes it — so fresh data keeps flowing and the
+  re-send is the hole. Measured in the in-memory harness: one lost 1 349-byte
+  datagram re-sent **12 000 bytes** before the change and **1 349** after.
 - **A stream's opening packet no longer waits the burst's timer.** The
   retransmission timer's floor is what a lost packet costs, and one floor was
   serving two different situations: a handshake's single outstanding packet,

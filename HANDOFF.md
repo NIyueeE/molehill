@@ -2328,6 +2328,29 @@ three passing suite runs at `=mhd`), and the run that would show the floor movin
 it is the saturated-pool scenario with the open latency read from the log, plus a
 `cost` cell for the invariant that the wide path is unchanged.
 
+**A loss is now an owed range, not a rewind of the send point (2026-11-01).** The
+send buffer kept one cursor, so a declared loss moved it back to the hole and the
+transmitter re-sent from there to the tail of the buffer: every byte already
+delivered and every byte not yet sent, as new packet numbers, on **every** loss
+event. The repair is now a range beside the cursor — merged with the ranges it
+touches, trimmed as it goes out, dropped when the peer's byte prefix passes it —
+and the send point only ever moves forward.
+
+The harness measures what that cost, and it is the reason this is the first item
+after the timer: one lost 1 349-byte datagram re-sent **12 000 bytes** before the
+change and **1 349** after, which is the difference between a loss costing one
+datagram and a loss costing the stream's whole buffered remainder. The same
+number is what the two `loss1` cells were showing from the other side — mhd
+carrying 9.5-9.9 Gbit/s against TCP's 15.9-16.1 under one percent loss — and
+**that comparison has not been re-run**, so it is the next measurement and not a
+claim.
+
+Two properties the change keeps, because they were the rewind's excuse: a repair
+is *ordered* only by offset in the buffer, never against fresh data (the receiver
+reassembles by offset, so both may be in flight), and the probe path that
+re-sends a whole silent flight now queues those ranges the same way instead of
+moving the cursor past them.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The

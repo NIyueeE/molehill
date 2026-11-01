@@ -154,6 +154,23 @@ enum Refusal {
     Credit,
 }
 
+/// What the scheduler picked for one packet.
+///
+/// `repair` is the difference between new data and a range the recovery already
+/// declared lost: the send point moves for the first and not for the second, and
+/// mixing them up either re-sends a burst or loses a hole.
+#[derive(Debug, Clone, Copy)]
+struct Pick {
+    /// Which stream.
+    id: u32,
+    /// Where the range starts in it.
+    offset: u64,
+    /// How many bytes it may carry, before the buffer's own bound.
+    len: usize,
+    /// Whether this range is being re-sent rather than sent.
+    repair: bool,
+}
+
 /// What this end is holding that its own readers have not taken.
 ///
 /// The receive-side mirror of [`Conn::waiting`]. The credit this end advertises
@@ -745,13 +762,26 @@ impl Conn {
         // more than the work it measures at this size (see `stats`).
         let sampled = stats::enabled() && stats::PHASES.timing();
         let pick = stats::Timing::start(sampled);
-        let (id, offset, want) = self.next_stream_range()?;
+        let Pick {
+            id,
+            offset,
+            len: want,
+            repair,
+        } = self.next_stream_range()?;
         let number = self.recovery.next_number();
         let state = self.streams.get(&id)?;
         // How much the packet carries, and whether it ends the stream: the
         // buffer answers both without being walked, because the payload is
-        // appended straight into the run afterwards.
-        let len = state.send.available(offset, want);
+        // appended straight into the run afterwards. A repair already came back
+        // clamped to what is still owed, so only new data is bounded here.
+        let len = if repair {
+            want.min(state.send.available(offset, want))
+        } else {
+            state.send.available(offset, want)
+        };
+        if len == 0 {
+            return None;
+        }
         let fin = state.send.ends_at(offset, len);
         pick.stop(&stats::PHASES.tx_pick);
         let encode = stats::Timing::start(sampled);
@@ -783,7 +813,15 @@ impl Conn {
             }),
         );
         if let Some(state) = self.streams.get_mut(&id) {
-            state.send.mark_sent(len);
+            if repair {
+                // The range is on the wire again; what is still owed stays
+                // queued. The send point does not move: fresh data must not be
+                // forced to wait behind a repair, and a repair must not be
+                // forgotten because the send point moved past it.
+                state.send.repair_sent(offset, len);
+            } else {
+                state.send.mark_sent(len);
+            }
         }
         self.advance_cursor();
         book.stop(&stats::PHASES.tx_book);
@@ -893,7 +931,7 @@ impl Conn {
     /// vector of ids: a packet is built for every pass, and allocating a list of
     /// every live stream per packet is a cost that grows with the connection's
     /// width.
-    fn next_stream_range(&mut self) -> Option<(u32, u64, usize)> {
+    fn next_stream_range(&mut self) -> Option<Pick> {
         if self.streams.is_empty() {
             self.unsent_at = None;
             return None;
@@ -904,12 +942,29 @@ impl Conn {
             // other direction is still ours to use (that is what half-close
             // means). Only an abort or a refusal stops our writes too.
             let open = state.reset.is_none_or(|code| code == ResetCode::Finished);
-            let queued = state.send.has_unsent();
-            (open && queued).then(|| {
+            if !open {
+                return None;
+            }
+            // A declared loss first: it is the range that unblocks the peer's
+            // reader, and it is one range — not a rewind of everything after it.
+            if let Some((offset, len)) = state.send.next_repair(MAX_STREAM_PAYLOAD) {
+                return Some(Pick {
+                    id: *id,
+                    offset,
+                    len,
+                    repair: true,
+                });
+            }
+            state.send.has_unsent().then(|| {
                 let offset = state.send.next_offset();
                 let unsent = (state.send.unacked()).min(STREAM_BURST as u64);
                 let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
-                (*id, offset, want)
+                Pick {
+                    id: *id,
+                    offset,
+                    len: want,
+                    repair: false,
+                }
             })
         };
         self.streams
@@ -1170,13 +1225,13 @@ impl Conn {
         for sent in acked.lost {
             if let Some(range) = sent.range {
                 if range.len == 0 && range.fin {
-                    // A finish-only packet: nothing to rewind, so queue the
+                    // A finish-only packet: nothing to re-send, so queue the
                     // finish again.
                     self.pending_fins.push_back((range.stream, range.offset));
                     continue;
                 }
                 if let Some(state) = self.streams.get_mut(&range.stream) {
-                    state.send.rewind_to(range.offset);
+                    state.send.repair(range.offset, usize::from(range.len));
                 }
             }
         }
@@ -1237,7 +1292,7 @@ impl Conn {
                     continue;
                 }
                 if let Some(state) = self.streams.get_mut(&range.stream) {
-                    state.send.rewind_to(range.offset);
+                    state.send.repair(range.offset, usize::from(range.len));
                 }
             }
         }
@@ -1602,6 +1657,89 @@ mod tests {
         assert!(
             accepted.contains(&interactive.id),
             "the interactive stream must be there too"
+        );
+    }
+
+    /// A loss is re-sent as **the hole**, not as everything after it.
+    ///
+    /// This is the bandwidth a rewind cost: a stream that lost one packet
+    /// re-sent every byte from that offset to the tail, so a lossy path paid the
+    /// bandwidth-delay product in duplicates per loss event. The assertion is on
+    /// the wire — the next stream frame's offset is the dropped one's, and its
+    /// length is the dropped range's — because that is what the peer and the
+    /// path see.
+    #[test]
+    fn a_loss_re_sends_the_hole_and_not_what_follows_it() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let stream = link.a.open();
+        let bytes = payload(12_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        // Send the stream, dropping one datagram in the middle and remembering
+        // exactly what it carried.
+        let mut buf = Vec::new();
+        let mut seen = 0usize;
+        let mut dropped: Option<(u64, usize)> = None;
+        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+            let packet = &buf[buf.len() - len..];
+            if let Ok(wire::Packet {
+                frame: Frame::Stream { offset, data, .. },
+                ..
+            }) = wire::decode(packet)
+            {
+                seen += 1;
+                if seen == 2 {
+                    dropped = Some((offset, data.len()));
+                    continue;
+                }
+            }
+            link.a_to_b.push_back(packet.to_vec());
+        }
+        let Some((dropped_at, dropped_len)) = dropped else {
+            unreachable!("a middle datagram is dropped")
+        };
+        assert!(
+            seen >= 4,
+            "the transfer must span several packets, got {seen}"
+        );
+
+        for datagram in std::mem::take(&mut link.a_to_b) {
+            link.b.on_datagram(now, &datagram).unwrap();
+        }
+        // The acknowledgements that read the hole as a loss.
+        let mut acked = Vec::new();
+        while let Some(len) = link.b.poll_transmit(now, &mut buf) {
+            acked.push(buf[buf.len() - len..].to_vec());
+        }
+        for datagram in acked {
+            link.a.on_datagram(now, &datagram).unwrap();
+        }
+
+        // Everything the connection now puts on the wire for streams: with a
+        // repair it is the hole and nothing else, with a rewind it was every
+        // byte from the hole to the tail.
+        let mut resent = 0usize;
+        let mut first = None;
+        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+            if let Ok(wire::Packet {
+                frame: Frame::Stream { offset, data, .. },
+                ..
+            }) = wire::decode(&buf[buf.len() - len..])
+            {
+                first.get_or_insert((offset, data.len()));
+                resent += data.len();
+            }
+        }
+        assert_eq!(
+            first,
+            Some((dropped_at, dropped_len)),
+            "the first frame re-sent is the hole itself"
+        );
+        assert_eq!(
+            resent, dropped_len,
+            "one lost datagram costs one datagram of re-send, not the rest of the stream"
         );
     }
 
