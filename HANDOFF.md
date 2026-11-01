@@ -2454,6 +2454,28 @@ dialer's write of the handshake, the server's receipt of it, the server's reply
 and the dialer's receipt — because each end currently measures only its own
 awaits and each says it was fast.
 
+**And the tail is not per-connection at all, which the pool's own counters show
+(2026-11-01).** With `MOLEHILL_POOL_STATS=1` on the same ramp, the pool holds four
+tunnels with one stream each — `1/0/0, 1/0/0, 1/0/0, 1/1/0` — and the datagram
+counts say which one carries the bulk transfer: `mhd_health` reads 96-129
+datagrams on three of them and **67 909** on the fourth. Least-loaded placement
+put every probe channel on a *different* connection from the bulk stream, so the
+two share no credit, no congestion window and no send buffer. The tail is still
+there (p99 **2 563 ms**, p50 2.26 ms, same run). So the seconds are **not** the
+carrier's per-connection budgets — my own reserve, and the shared-flight
+hypothesis before it, were both aimed at a resource the two streams do not share.
+
+What is left is process-wide: the busy lane's datagram rate against a lock the
+accept path needs. The two candidates are the listener's connection table
+(`registry.lock()`, taken once per datagram by the dispatcher) and each
+connection's own mutex, which `wait_stream`/`accept` needs to hand a new stream to
+its task — the dispatcher holds that mutex per datagram, and the accept happens
+*before* the server's per-stream instrumentation starts, which is exactly why the
+server measures a fast opening while the dialer waits seconds. That is the next
+thing to measure, and the fix it points at is structural: hand the stream to its
+task from inside the critical section the dispatcher already holds, instead of
+making the accept task contend for it.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
