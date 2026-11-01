@@ -208,7 +208,7 @@ gone:
 | `[transparent.claims.<name>].retry_interval` | `[transparent.claims.<name>].retry_backoff_max`: unset inherits `[transparent.control].retry_backoff_max` |
 | `[transparent.claims.<name>].tunnels` | `[transparent.data].tunnels`: a claim's lane count is its share of the client's budget |
 | `[server.data].max_tunnels_per_client` | `[server.data].max_tunnels`: the valve is global now; unset derives it from the open-file limit and 0 is unlimited |
-| `[server.data].stripe_count` | Nothing: striping starts at one channel per visitor and grows under backpressure |
+| `[server.data].stripe_count` | Nothing: a visitor's group starts on one channel, and no configuration key sets how wide it becomes |
 
 ## Choosing your configuration (decision tree)
 
@@ -831,8 +831,8 @@ first and the last line of a run — gets per-second rates and cost per unit. Th
 pool and placement lines are the S1 observation of the shared pool (what it
 does, and why the numbers are aggregated rather than per event:
 [internals.md](internals.md#the-tunnel-pool)). `MOLEHILL_STRIPE_COUNT` is an
-internal measurement override for the *initial* stripe target; the production
-default starts at one and grows under backpressure, without a configuration key.
+internal measurement override for the width a visitor's group *starts* at; the
+production default starts at one, without a configuration key.
 
 ## Tuning
 

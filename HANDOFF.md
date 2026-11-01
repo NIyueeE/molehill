@@ -3351,6 +3351,30 @@ does not re-derive it:
    group that stops parking stops growing; nothing raises a target another
    visitor will pay for.
 
+**Its first half landed and is measured (2026-11-01).** The process-wide width is
+off the arrival path: a visitor starts on one channel, the width comes from the
+internal measurement override (`initial_stripes`, 1 in production), and the
+gather lock is only taken when a test or a measurement asks for more than one.
+One build, both cells, four rounds with the run's own A/A twin
+(`target/evidence/p1-single.json`, `p1-bulk1.json`):
+
+| cell | before | after | TCP |
+|---|---|---|---|
+| `churn-16` `rtt_p50_ms` | 34.66 | **2.5–4.5** | 2.815 |
+| `churn-16` `rtt_p99_ms` | 55.65 | **14.8–22.6** | 3.461 |
+| `churn-16` `rate_per_s` | 453 | **2467–3523** | 5341 |
+| `bulk-n` `throughput_gbps` | 8.155 | **11.8–12.4** | 10.901 |
+| `bulk-1` `throughput_gbps` | 5.5–5.6 (width 1) / 6.6–7.1 (width 4) | 5.54–6.00 | — |
+
+Two things to read carefully. The multi-stream cell **improved** by 46 % and now
+sits above TCP: the old width was costing bulk throughput too, because a wide
+gather multiplied every visitor's channel count against the same pool. And the
+single-stream cell lost the +23 % that width four was worth — that is the debt
+the growth half repays, and it is confined to one visitor moving bulk alone.
+`churn-16`'s p99 is still 4–6× TCP's, which is the residual cold path (one
+control round trip and one stream open before the visitor's first byte): that is
+P2′'s target, and the `FirstByte` line says which half of it is which.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —

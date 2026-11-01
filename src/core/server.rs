@@ -3467,11 +3467,6 @@ where
     let mut backoff = backoff_builder.build();
     let listen_notice = RepeatNotice::new();
 
-    // A striped gather is atomic by construction: K channels consumed by one
-    // visitor, all or none. Concurrent unstriped pairings take channels one by
-    // one from the shared queue and cannot interfere with each other, but a
-    // gather in flight must not steal the channel a waiting unstriped visitor
-    // was promised — so the striped path holds this lock for the whole group.
     let stripe_gather = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let pool = VisitorPool {
         data_ch_rx,
@@ -3586,10 +3581,12 @@ struct VisitorPool<C> {
     /// How to ask the client for one more (or K more) data channels, named as
     /// a group when they are a visitor's stripes.
     data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
-    /// Held for the whole gather, so a striped group's K channels stay atomic.
+    /// Held for the whole pairing only when the start width is above one — a
+    /// test or a measurement, never production (see `serve_tcp_visitor`).
     stripe_gather: std::sync::Arc<tokio::sync::Mutex<()>>,
-    /// The server-wide stripe plan: the target this visitor's group is sized
-    /// to, and the plan whose backpressure signal grows it.
+    /// The server-wide stripe plan. Retained for the growth step's policy
+    /// constants; a visitor's width no longer comes from it (see
+    /// `serve_tcp_visitor`).
     plan: Arc<crate::stripe::StripePlan>,
 }
 
@@ -3694,14 +3691,21 @@ async fn serve_tcp_visitor<C>(
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Every visitor is a stripe group; the target starts at one and grows
-    // when a group reports path backpressure, so a quiet path pays one
-    // channel and a busy one spreads.
-    let target = pool.plan.target();
-    // A multi-stripe gather is atomic: hold the group lock for the whole
-    // attempt so concurrent visitors cannot interleave their K channels. A
-    // one-channel group takes one item from the shared queue (already atomic)
-    // and must not serialize every visitor behind a slow peer.
+    // A visitor starts on **one** channel. The width a visitor needs is a
+    // property of its own traffic — a bulk transfer that parks its sender wants
+    // another channel, an interactive request never does — so it cannot be
+    // decided before the visitor's first byte, and a global target decided it
+    // for every visitor at once. Measured (2026-11-01, `churn-16`, one build):
+    // starting on four channels instead of one cost 8x the arrival latency with
+    // no bulk traffic in the run (`HANDOFF.md`, "the stripe width is the arrival
+    // tail"). The start width is the internal measurement override
+    // (`initial_stripes`), 1 in production.
+    let target = crate::stripe::initial_stripes();
+    // A multi-stripe start is atomic only for tests and measurements that ask
+    // for one: hold the group lock so two such pairings cannot interleave their
+    // K channels. Production's one-channel pairing takes one item from the
+    // shared queue (already atomic) and never touches the lock, so it cannot
+    // serialize visitors behind each other.
     let _gather = if target > 1 {
         Some(pool.stripe_gather.lock().await)
     } else {
@@ -3724,27 +3728,23 @@ async fn serve_tcp_visitor<C>(
     }
 }
 
-/// Pair one visitor connection with a stripe group: gather `stripe_count`
-/// healthy data channels, announce each one as a stripe of the group, and
-/// spawn the group's forwarding.
+/// Pair one visitor connection with its data channels and start the group's
+/// forwarding.
 ///
-/// The caller holds the stripe-gather lock for the whole call, which is what
-/// keeps a gather atomic: concurrent unstriped pairings take channels one by
-/// one and cannot interfere with each other, but two gathers in flight would
-/// interleave their K channels and produce two broken groups.
+/// Called with a count of one: the visitor's width is decided by its own
+/// traffic later, not here (see `serve_tcp_visitor`). The multi-channel loop is
+/// kept because the same code pairs one channel either way, and a broken pooled
+/// channel still discards the attempt and retries under a fresh group id.
 ///
 /// The requests name the group (see [`DataChannelRequest::Stripe`]), so the
-/// client can place the K channels on K distinct tunnels. The index a request
-/// carries is the slot the stripe will take *when it arrives*: the gather
-/// labels channels in arrival order, and the client learns its real index from
-/// `StartForwardStripedTcp` — nothing about the pairing depends on a request's
-/// index coming back with it.
+/// client can place each channel on a tunnel the group does not already
+/// occupy. The index a request carries is the slot the stripe will take *when
+/// it arrives*: the pairing labels channels in arrival order, and the client
+/// learns its real index from `StartForwardStripedTcp` — nothing about the
+/// pairing depends on a request's index coming back with it.
 ///
-/// Returns `Ok(true)` when the control channel ended mid-gather (the pool must
-/// stop) and `Ok(false)` once the group is forwarding. A broken pooled
-/// channel discards the whole attempt — the client already parked the
-/// group's stripes, and a retry under a fresh group id is the only way to
-/// keep the indices consistent.
+/// Returns `Ok(true)` when the control channel ended mid-pairing (the pool must
+/// stop) and `Ok(false)` once the group is forwarding.
 ///
 /// Every way an attempt can end without forwarding **releases its group** on
 /// the client: the stripes parked there are channels the pool has already

@@ -57,6 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A visitor no longer pays for another visitor's striping.** The server kept
+  one striping width for the whole process and grew it whenever *any* group's
+  send direction parked; a group already forwarding kept the width it started
+  with, so the only thing that grew was what the *next* visitor had to gather —
+  under a lock that let one visitor collect its channels at a time. One bulk
+  burst therefore made every later connection slower, including interactive ones
+  that never needed a second channel. A visitor now starts on one channel and
+  the process-wide width is gone from the arrival path. Measured on one build,
+  `churn-16` (a fresh connection per request, 16 at once): round-trip p50
+  **34.66 ms → 2.5–4.5**, p99 **55.65 → 14.8–22.6**, rate **453 → 2467–3523/s**;
+  `bulk-n` throughput **8.155 → 11.8–12.4 Gbit/s**. The width is still an
+  internal measurement override (`MOLEHILL_STRIPE_COUNT`), 1 in production.
+
 - **A stream's send buffer no longer depends on a packet number that may be
   lost for good.** The acknowledgement block now carries the receiving stream
   and how many of its bytes have arrived with no hole (twelve bytes on every
