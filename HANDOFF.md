@@ -3714,6 +3714,38 @@ one piece of work this cycle has not attempted. It is a wire change inside the
 unreleased 6.0 dialect: a stream's prologue names its key material, the packet
 carries the tag, and there is no second length prefix and no partial-record wait.
 
+**And the arrival cost is mostly scheduling, not crypto (2026-11-01, measured).**
+A release-mode micro-benchmark of the exact handshake this carrier runs
+(`Noise_KK_25519_ChaChaPoly_BLAKE2s`, snow 0.10 with the ring resolver), 200
+rounds:
+
+| act | cost |
+|---|---|
+| `Builder::new(params.clone())` + `build_initiator()` | **45.0 µs** |
+| initiator `write_message` (msg 1: `e, es`) | **181.8 µs** |
+| initiator `read_message` (msg 2: `e, ee, se`) | **141.8 µs** |
+| `into_transport_mode()` (both ends) | 0.3 µs |
+
+So the whole handshake is **369 µs of crypto** — and the in-process instrument
+reads **1 818 µs** for the same phase on the arrival path. The remaining
+**~1 450 µs is the wire and the scheduler**: the carrier's own write act costs
+103 µs (three `poll_write`s through `Conn::write`), and the rest is await
+queueing under the sixteen concurrent arrivals the cell drives. Two details
+worth knowing before anyone optimises the crypto: snow's ring resolver returns
+`None` from `resolve_dh`, so X25519 runs `curve25519_dalek`'s `mul_clamped`
+rather than ring's, and `resolve_hash` returns `None` for BLAKE2s, so the hash
+runs the pure-Rust `blake2` crate — both sit inside that 369 µs, and neither is
+the bottleneck.
+
+That reframes the defect. The derived keys remove 369 µs of crypto *and* three
+awaits from the arrival path, which is why they took the p99 by 74 % on a
+handshake that is 14 % of the measured open cost — the saving is the scheduling,
+not the arithmetic. So the arrival tail is an **await-count problem**, and the
+two ways to reduce it that do not touch the record layer are: fewer messages in
+the handshake (session resumption, which `src/protocol.rs`'s selector doc names
+a `0x02` for and no module implements), and fewer pump hand-offs per arrival.
+Both are un-attempted, and both are smaller than the record layer.
+
 **P4′ is half done, and the half that is left is left on purpose (2026-11-01).**
 The two frame classes nothing sent are gone: a datagram frame and a whole-IP-packet
 frame were declared, acknowledged and dropped by the connection, and no sender in
