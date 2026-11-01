@@ -2826,11 +2826,34 @@ invariant is now pinned by a unit test (`a_stream_owing_bytes_is_found_whatever_
 including the state the bench logged: a cursor past every live id, which is what
 a retired stream leaves behind.
 
-So the sender-side seven seconds is still unexplained, and the next instrument is
-the one the third item implies: a **dwell** counter for bytes already in a stream's
-send buffer — stamped when a write makes a stream non-empty and charged when a
-packet for it is built. That is the only interval between "`Conn::write` accepted
-it" and "the pump put it on the wire", and nothing measures it yet.
+**The buffers are not it either, so the seven seconds is between the two sockets
+(2026-11-01).** The dwell counter — stamped when a write makes a stream non-empty,
+charged when a packet carries its oldest owed byte — reads, over two runs, with
+both ends logging:
+
+| run | server dwells | longest (µs) | client dwells |
+|---|---|---|---|
+| 1 | 7 | 23 957, 23 604 | **0** |
+| 2 | 7 | 32 762, 25 323 | **0** |
+
+So a byte enters a send buffer and leaves it within tens of milliseconds on both
+ends, and the client's buffer never holds anything at all. Put beside the rest,
+the picture is now complete enough to say where the time is *not*:
+
+- the client asks for a channel and the server asks for it in microseconds;
+- both ends' stream opens, handshakes and acknowledgements complete inside 100 ms;
+- neither end parks a writer, stalls a socket, or holds a byte in a buffer;
+- the client's reader waits seven seconds, and the bytes appear in its receive
+  buffer **16 microseconds** before it reads them.
+
+Everything in userspace is fast, and the packet spends its seven seconds between
+the server's socket and the client's receive path. That is the kernel and the
+topology — the `veth` pair, the qdisc's queue on the tunnel leg, and the socket
+buffers a saturating UDP sender fills — and it is measurable only from outside
+the process: `ss -n -u -m` for the socket queues, `tc -s qdisc` for the leg's
+backlog and drops, and the namespace counters the model already collects. **That
+is a different instrument family from every one above**, and it is the next thing
+to take, on a cell that reproduces the tail.
 
 
 

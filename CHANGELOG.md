@@ -90,6 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **A byte's dwell in the send buffer is now measured, on both ends.** Stamped
+  when a write makes a stream non-empty and charged when a packet finally carries
+  its oldest owed byte, it is the only interval between "the write was accepted"
+  and "the pump put it on the wire" — and it closes the userspace side of the
+  carrier's latency question, by showing that no byte waits there.
 - **A parked stream reports how long it waited, in both directions.** Every
   per-stage timer in the carrier measures work *inside* a stage, so nine of them
   read "fast" while a stream open took seconds: the time was in the intervals

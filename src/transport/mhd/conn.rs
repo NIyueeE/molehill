@@ -156,6 +156,15 @@ struct StreamState {
     /// when there is one; otherwise it is the reset frame this flag records, so
     /// it is queued once and never lost.
     fin_sent: bool,
+    /// When this stream's send buffer first held bytes nobody had put on the
+    /// wire yet.
+    ///
+    /// The last interval between "`Conn::write` accepted it" and "a packet
+    /// carries it": every stage on both ends measured fast, the writer never
+    /// parked, and a reader waited seven seconds, so the bytes were somewhere in
+    /// between — and this is the only place that is. Cleared when a packet is
+    /// built for the stream, so a backlogged stream is measured once per burst.
+    queued_at: Option<Instant>,
     /// How many times this stream's bytes were declared lost and re-queued.
     ///
     /// Per stream, unlike the connection's own counter, because the question it
@@ -570,6 +579,7 @@ impl Conn {
             return 0;
         }
         state.send.write(&bytes[..take]);
+        state.queued_at.get_or_insert_with(Instant::now);
         self.written += take as u64;
         self.buffered += take as u64;
         take
@@ -908,6 +918,22 @@ impl Conn {
             return None;
         };
         let number = self.recovery.next_number();
+        // The dwell: from the write that made this stream non-empty to the packet
+        // that carries its oldest owed byte.
+        if let Some(at) = self
+            .streams
+            .get_mut(&id)
+            .and_then(|state| state.queued_at.take())
+        {
+            let waited = now.saturating_duration_since(at);
+            if waited >= Duration::from_millis(20) {
+                tracing::debug!(
+                    stream = id,
+                    dwell_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                    "mhd stream byte waited in the send buffer"
+                );
+            }
+        }
         let Some(state) = self.streams.get(&id) else {
             self.none_reason = Some("stream retired mid-pick");
             return None;
