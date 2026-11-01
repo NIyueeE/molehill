@@ -3481,6 +3481,38 @@ change and not yet explained: one round in three of `churn-16` collapses to
 ~190–270 visitors/s against ~4500 in the others, and runs from before this change
 show the same bimodality.
 
+**Prefill was tried next, three ways, and it is measured out too (2026-11-01).**
+The plan's P2′ was "keep authenticated channels ready before demand": the same
+opens, charged to a background tick instead of to a visitor's first byte. It was
+built in three shapes and each was measured on the same two cells (`bulk-n`,
+`churn-16`, four rounds, medians):
+
+| warm-pool shape | `bulk-n` Gbit/s | `churn-16` p50 | p99 |
+|---|---|---|---|
+| none (the tree as it stood) | 11.88 | 2.62 | 21.49 |
+| 16 ready, refilled on a 25 ms tick, target halved on any unanswered ask | 9.94 | 3.14 | 14.02 |
+| the same with the target recovering +4 per tick | 11.34 | 2.89 | 13.98 |
+| the same, refilled the moment a channel is taken | 10.28 | 3.47 | 16.93 |
+
+The best of them is 14.0 ms against the tree's own 21.5 and TCP's 3.46, and it
+costs 5–16 % of `bulk-n`. The arithmetic says why, and it is the reason this is
+not a tuning problem:
+
+- a channel costs **2.65 ms** to open, so a service that answers 3 300 arrivals
+  per second needs **nine opens in flight continuously**, on top of the ready
+  depth that absorbs a burst of sixteen — a target of ~25, not 16;
+- at that width the pool's background work competes with the arrivals it exists
+  to serve: the third shape, which refills on every take (the most aggressive),
+  measured the *worst* arrival tail of the three;
+- and every ready channel is a stream the pool has charged, which is exactly what
+  `bulk-n` loses.
+
+So prefill buys a constant factor and pays for it twice. It was reverted, and the
+conclusion is written down rather than tuned around: **a 2.65 ms open cannot be
+hidden by a pool — it has to stop costing 2.65 ms.** That is the key-derivation
+change above, which keeps every stream its own flow (so the mux experiment's
+failure does not repeat) and removes the two round trips a stream pays today.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —
