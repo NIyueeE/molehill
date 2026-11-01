@@ -3164,11 +3164,35 @@ client's reader is woken hundreds of times, is polled, calls `poll_read`, and th
 stream it reads from has received nothing. **Every instrument that has been
 pointing at the client has therefore been measuring a symptom on the wrong end.**
 
-The producer is the server: its forwarding loop reads the visitor's bytes off the
-visitor socket and writes them into the tunnel stream, and neither that loop nor the
-accept-and-pair path ahead of it has ever been instrumented. That is where the next
-look belongs, and it is the first time in this cycle that the suspect is a component
-the carrier does not own.
+**And the forwarding loop names the stage: the visitor's bytes wait in their socket
+while the server waits for a data channel (2026-11-01).** `stripe::send_loop` was
+timed in both halves — the read from the visitor and the write into the stripe
+group — and one cell answers it:
+
+| end | reads that waited ≥ 20 ms | longest | writes that waited |
+|---|---|---|---|
+| server | 4 | **7 006 589 µs**, 7 004 215, 7 003 971 | 28 |
+| client | 4 | 7 001 698, 7 001 672, 7 001 478 | 0 |
+
+The server's **first read from the visitor socket** waited seven seconds. That is
+before any tunnel exists for that visitor: `serve_tcp_visitor` accepts the socket,
+then `pair_striped_group` waits for a data channel, and only when the gather
+completes does `spawn_group` start `send_loop`. So the visitor's four bytes sat
+unread in their socket for exactly as long as the pairing took.
+
+**That is the whole tail, and it is where it was first measured — in round 10, as
+`visitor waited for its data channels`, with waits of 293 ms to 5 s and
+`PAIR_WAIT_BUDGET` expiries at exactly 5 000.** Everything measured since then
+described the same wait from further downstream: the client's reader waiting for
+bytes that had not been sent, the pool filling because connections were slow to
+finish, the soak's stages dying because a visitor was refused. The instruments were
+right and they were pointed at symptoms.
+
+So the question is now one question, stated once: **why does a data channel take
+hundreds of milliseconds to seconds to arrive after `CreateDataChannelFor` is
+sent?** Its two ends are measured — the request crosses in 102 µs and the client's
+open completes in milliseconds — so the interval is inside the gather, and the next
+instrument belongs there rather than anywhere downstream.
 
 **What is still not met**: the soak's four stage failures, the multi-second tail on
 a fresh connection (which is what the `capacity` cell and the soak's `clean` stage

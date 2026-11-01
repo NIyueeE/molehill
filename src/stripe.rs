@@ -374,15 +374,33 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     let mut seq = 0u64;
+    // The two halves of a forwarded chunk, timed only while the switch is on.
+    // They answer a question no carrier counter can: a stalled tunnel stream may
+    // be waiting for its visitor (this end's read) or for the tunnel to take what
+    // was read (the write) — and the carrier's own instruments say the stream
+    // received nothing, so the difference is upstream of it.
+    let sampled = crate::transport::stats::enabled();
     loop {
         let mut frame = BytesMut::with_capacity(STRIPE_HEADER_LEN + STRIPE_CHUNK_SIZE);
         // Reserve the header room; the read appends behind it.
         frame.resize(STRIPE_HEADER_LEN, 0);
+        let reading = std::time::Instant::now();
         let n = match src.read_buf(&mut frame).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => anyhow::bail!("stripe source read failed: {e}"),
         };
+        if sampled {
+            let waited = reading.elapsed();
+            if waited >= std::time::Duration::from_millis(20) {
+                debug!(
+                    seq,
+                    read_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                    bytes = n,
+                    "stripe source read waited"
+                );
+            }
+        }
         encode_header(
             (&mut frame[..STRIPE_HEADER_LEN])
                 .try_into()
@@ -391,10 +409,21 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             n,
         )
         .map_err(|e| anyhow::anyhow!("stripe frame header: {e}"))?;
+        let writing = std::time::Instant::now();
         sender
             .send_owned(frame.freeze())
             .await
             .map_err(|e| anyhow::anyhow!("stripe write failed: {e}"))?;
+        if sampled {
+            let waited = writing.elapsed();
+            if waited >= std::time::Duration::from_millis(20) {
+                debug!(
+                    seq,
+                    write_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                    "stripe write waited"
+                );
+            }
+        }
         activity.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
         seq += 1;
     }
