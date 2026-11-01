@@ -2926,14 +2926,35 @@ unexpectedly` — on `loss1`, `rtt100`, `loss5` and `clean#2`, leaving no metric
 any shaped stage. Host load was 0.55 at the start, so this is not the load
 correlation recorded earlier.
 
-That error is the one AGENTS.md §10 names for exactly this shape: a wedged
-single-test `iperf3` server turning every later repetition into a null. The
-discriminator is the same profile on the other carrier, which is running now; if
-TCP fails identically the profile is unusable here and the drift axis has to be
-taken differently, and if TCP passes the failure is the carrier's and jumps the
-queue. **No conclusion is drawn from this run in either direction until that
-answer is in** — a soak whose only output is a harness error is not evidence
-about `mhd` at all.
+**The answer is in, and it is the carrier (2026-11-01).** The same profile, one
+round, with `MOLEHILL_DATA_CARRIER=tcp`:
+
+| stage | mhd | tcp |
+|---|---|---|
+| `clean` | ok, **p99 1 247.2 ms** | ok, **p99 48.6 ms** |
+| `loss1` | **failed** — control socket closed | ok, p99 1 059.3 ms |
+| `rtt100` | **failed** | ok, p99 401.2 ms |
+| `loss5` | **failed** | ok, p99 2 452.2 ms |
+| `clean#2` | **failed** | ok, p99 50.7 ms |
+
+TCP carries every stage of the same topology on the same host minutes apart, so
+the wedged-server explanation is wrong and the profile is usable. Two things
+follow, and the second is the one that changes the plan:
+
+- **The drift axis cannot be taken on `mhd` until this is fixed**: four of five
+  stages produce no metric, so there is nothing to slope.
+- **The tail is not a `capacity`-cell artifact.** The soak's own `clean` stage
+  reads **1 247 ms** on mhd against TCP's **48.6 ms** — twenty-five times — in a
+  workload with a different shape, a different load and a different stage
+  schedule. And the stages that fail do so by *killing a control connection*,
+  which is the same signature as the `bulk-n` `loss1` failures recorded earlier
+  in this cycle.
+
+So one defect now explains a latency tail on a clean path, four failed soak
+stages, and that earlier loss-cell failure. **That raises it above the work
+packages this page recommended deferring it behind**: a carrier that drops a
+control connection under a shaped path cannot be the default one, whatever its
+per-byte cost.
 
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
