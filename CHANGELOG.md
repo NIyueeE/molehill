@@ -90,6 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **The carrier's read of a slow stream now includes that stream's own
+  retransmits.** A stream that opens in seconds and a stream that opens in
+  milliseconds look identical in every connection-wide counter; the per-stream
+  count separates a queue from lost packets, and it is what showed a 3.8-second
+  open with exactly one retransmission.
 - **A small flight's retransmission ladder stops at the wide timer.** The cheap
   first step is what a stream open wants; an unbounded geometric climb is not.
   Without the cap a sample-less lane walked 20, 40, … 2 560 ms — summing to more

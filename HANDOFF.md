@@ -2690,15 +2690,25 @@ with the cap still read opens of 7 003 819, 4 857 053 and 4 262 882 µs — so t
 ladder is excluded as well. What is left is that the probes are not getting
 through at all, for seconds.
 
-That narrows the next measurement to one question with two answers: **does the
-server write the acknowledgement for the handshake packet, and the client never
-read it — or does the server never write it?** The server's opening instrument
-brackets the first half (it wrote its ack inside 100 ms in every slow sample it
-saw) and the client's `ack_us` brackets the second (481 µs on a slow open), so
-between them sits the mhd delivery of one small reliable frame on a lane carrying
-bulk in the same direction. That is now the only place left to look, and the fix
-it points at is the plan's own: a small stream's bytes must not queue behind a
-bulk stream's.
+**Sharing a lane is what costs, and it is now measured as a variable
+(2026-11-01).** `pool_cap` writes `[client.data].tunnels`, so the same cell can be
+run with the handshake on four lanes and with every stream on one:
+
+| `tunnels` | slow opens | slowest (µs) | p99 |
+|---|---|---|---|
+| 4 (the default) | 7 | 885 300, 426 843 | 431, 887 |
+| 1 | 4 | **3 174 945, 2 939 585** | **2 941, 2 796** |
+
+Four to seven times worse when the handshake has to share a lane with a bulk
+stream. That is the first *positive* evidence about this defect's mechanism —
+every earlier measurement excluded a candidate, this one names a variable — and it
+makes the plan's own fix the justified next build: **a small stream's bytes must
+not queue behind a bulk stream's.** The reserve already in the tree is not enough
+on its own, and the reason is visible in the numbers above: when the lane is idle
+the write budgets are not binding at all (`window` reads one initial cwnd,
+`credit` is full, `queued_streams` is 0), so what a shared lane costs is not the
+budget but the *turn* — the pump's run, the socket's queue, and the sender's
+starvation, none of which a per-write reservation touches.
 
 
 
