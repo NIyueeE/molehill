@@ -2670,14 +2670,35 @@ The handshake is three round trips over one mhd stream, so a 5.27-second value i
 not a queue: it is **20 + 40 + 80 + 160 + 320 + 640 + 1 280 + 2 560 = 5 100 ms**,
 the exponential backoff after eight unanswered timers, which is what
 `MIN_RTO_SMALL_FLIGHT` climbs through since this round's earlier change. The
-hypothesis that follows is therefore specific and testable: the handshake's
-packets are being **lost** on a lane that is carrying bulk in the same direction,
-or its write is being refused while the flight is full, and the timer is what
-turns one loss into seconds. The next instrument is the retransmit counter for
-that specific stream, not another timer study — and the fix, if the hypothesis
-holds, is the one the plan already names: a small stream's bytes must not queue
-behind a bulk stream's, which is a scheduler and budget question rather than a
-recovery one.
+**One retransmit, not eight — so the ladder was the wrong suspect, and capping it
+proves it (2026-11-01).** The per-stream retransmit count settles the arithmetic:
+
+| run | slow opens (µs) | retransmits recorded |
+|---|---|---|
+| 1 | 3 827 595 / 2 684 117 / 969 407 | **1 / 1 / 1** |
+| 3 | 3 373 875 / 2 283 357 / 1 644 988 | **1 / 1 / 1** |
+
+A stream that opened in **3.8 seconds** had its ranges declared lost **once**, so
+the eight-doublings reading above was wrong, and with it the idea that the sum of
+the backoff steps is the mechanism.
+
+The cap that reading suggested was still worth making, and is in: a small flight's
+ladder now stops at the wide timer, because a cheap first step must not extend how
+long the ladder runs (20, 40, … 2 560 ms sums past five seconds where the flat
+333 ms it replaced summed to three). **It does not fix the stall** — three runs
+with the cap still read opens of 7 003 819, 4 857 053 and 4 262 882 µs — so the
+ladder is excluded as well. What is left is that the probes are not getting
+through at all, for seconds.
+
+That narrows the next measurement to one question with two answers: **does the
+server write the acknowledgement for the handshake packet, and the client never
+read it — or does the server never write it?** The server's opening instrument
+brackets the first half (it wrote its ack inside 100 ms in every slow sample it
+saw) and the client's `ack_us` brackets the second (481 µs on a slow open), so
+between them sits the mhd delivery of one small reliable frame on a lane carrying
+bulk in the same direction. That is now the only place left to look, and the fix
+it points at is the plan's own: a small stream's bytes must not queue behind a
+bulk stream's.
 
 
 
