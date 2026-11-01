@@ -2371,6 +2371,58 @@ reassembles by offset, so both may be in flight), and the probe path that
 re-sends a whole silent flight now queues those ranges the same way instead of
 moving the cursor past them.
 
+**The loss cell's bound is the tool, and the phase budget says where
+(2026-11-01).** Three runs on the same cell (`bulk-n`, `loss1`, mhd forced,
+`dev`, two rounds) change what the next work item is:
+
+- **The path is not the limit.** `--arms control,l4` on that cell: the tool-free
+  arm carries **60.81 % more** than `l4` (12.1 Gbit/s against about 30.8), so
+  there is headroom above this carrier and the cell is a tool question.
+- **The sender is not waiting on the window.** 4 346 `mhd stalled` lines in one
+  30-second arm, and every one reads `unsent_ms=0 unacked_ms=0
+  credit_blocked=false` with a single stream's receive backlog at 1.0-1.1 MB.
+  Nothing is queued behind the window: the stream's send buffer is empty because
+  its *writer* has not produced. That is the copy pipeline, not the congestion
+  window — so the shared flight and the missing pacer are **not** what limits this
+  cell either.
+- **The phase budget, one round of 81.9 Gbit carried** (`bench phases`): the
+  server side costs about 0.32 s/Gbit and the client 0.17, against the cell's
+  0.59. Server, largest first: `seal` 0.0844 (22.83 µs per record), `tx_build`
+  0.0652 (**31.91 µs per pass** for 2.7 packets), `tx_call` 0.0671 (0.75 µs per
+  packet over 462 050 packets), `tx_send` 0.0442, `ack` 0.0221 (**13.26 µs per
+  acknowledgement** against the client's 0.08 µs on the same code), `io_write`
+  0.0193.
+
+**Batching that run is refuted by the phase number it was aimed at.** The change
+was built and measured: `Conn::poll_run` filled the whole run under one lock and
+one clock read. It does what it says — the server's `tx_build` fell from **0.0652
+to 0.0516/0.0544 s/Gbit** (31.9 → 25.2/26.6 µs per pass) and `tx_call` from
+0.0671 to 0.0571/0.0594, about **0.024 s/Gbit of timed work removed** — and it
+does not survive into the metric:
+
+| arm | build | `throughput_gbps` | `cpu_s_per_gbit` |
+|---|---|---|---|
+| `l4` | batched run | 12.076 [11.932..12.164] | 0.5784 [0.5748..0.5820] |
+| `l4~aa` | the same build again | 12.218 [12.043..12.363] | 0.5753 [0.5511..0.5806] |
+| `l4~b` | before it (`70cb419`) | 12.326 [11.662..12.425] | **0.5670** [0.5607..0.5939] |
+
+Floor 1.31 % on throughput and about 2 % on CPU; every difference is inside them,
+and the point estimates lean the wrong way. The mechanism is the same lock:
+holding it for a whole run is holding it against the dispatcher, which applies the
+peer's acknowledgements — the 0.024 s/Gbit saved on the build side is paid back as
+contention on the receive side, where no phase charges it. **Reverted, not
+landed** (`target/evidence/bench-runbatch-loss1.json`,
+`target/evidence/phases-batch-work`). The lesson is the round's: a phase-budget
+win is a hypothesis about the total, not a result, and the lock the sender saves
+is the lock the receiver needs.
+
+What is left by size is therefore not the run boundary: `seal` 0.0844 s/Gbit (the
+AEAD at 0.7 ns per byte, which is the cipher's own rate), `tx_send` 0.044, and the
+server's `ack` at **13.3 µs per acknowledgement against the client's 0.08 µs on
+the same code** — a 165x asymmetry that is state, not code, and the one number
+here nobody has explained. It is the next thing to measure rather than the next
+thing to change.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The
