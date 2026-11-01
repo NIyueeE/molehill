@@ -66,7 +66,7 @@ impl SendBuf {
     }
 
     /// One past the last byte the writer has queued.
-    fn written(&self) -> u64 {
+    pub(crate) fn written(&self) -> u64 {
         self.tail
     }
 

@@ -2258,6 +2258,11 @@ async fn serve_mhd_stream(
 ) -> Result<()> {
     use crate::transport::multiplex::PoolLane;
 
+    // Where a stream's opening went, in microseconds from this task's start.
+    // Read only when the whole opening was late (see the line below), because a
+    // clock read per phase is what makes a healthy open cost nothing.
+    let opened = std::time::Instant::now();
+
     // Bound the crypto + hello phase: an unresponsive or bogus peer must not
     // park this stream's task forever (the same role HANDSHAKE_TIMEOUT plays on
     // the TCP accept path).
@@ -2265,6 +2270,7 @@ async fn serve_mhd_stream(
     let selector = tokio::time::timeout(deadline, stream.read_u8())
         .await
         .with_context(|| "mhd transport selector timed out")??;
+    let sel_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
     let stream: crate::transport::multiplex::CarrierStream = Box::new(stream);
     let mut io: crate::transport::multiplex::CarrierStream = match selector {
         PLAIN_SELECTOR => stream,
@@ -2289,6 +2295,9 @@ async fn serve_mhd_stream(
         }
         other => bail!("Unknown transport selector {other:#04x}"),
     };
+    let hs_us = u64::try_from(opened.elapsed().as_micros())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(sel_us);
 
     let (_version, hello) = tokio::time::timeout(deadline, read_hello(&mut io))
         .await
@@ -2334,6 +2343,19 @@ async fn serve_mhd_stream(
             drop(registered);
             // The client's open waits for this before it names its service.
             write_and_flush(&mut io, &postcard::to_stdvec(&Ack::Ok)?).await?;
+            let total_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
+            // A hundred milliseconds is fifty times the round trip a healthy path
+            // here measures: past it the opening is a stall, and the split says
+            // which of its three waits owns it.
+            if total_us >= 100_000 {
+                debug!(
+                    sel_us,
+                    hs_us,
+                    hello_us = total_us.saturating_sub(sel_us).saturating_sub(hs_us),
+                    total_us,
+                    "mhd slow stream opening on the server: selector, handshake and hello"
+                );
+            }
             let (service_id, _tunnel) = read_tunnel_prologue(&mut io).await?;
             debug!(%service_id, "mhd tunnel stream routed");
             route_mhd_stream(io, &registry, &nonce, service_id).await

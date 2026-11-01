@@ -700,11 +700,23 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
             .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
         match ack {
             crate::protocol::Ack::Ok => {
-                tracing::debug!(
-                    lane = self.id,
-                    us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    "mhd stream opened and acknowledged"
-                );
+                let us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+                tracing::debug!(lane = self.id, us, "mhd stream opened and acknowledged");
+                // A hundred milliseconds is fifty times the round trip a healthy
+                // path here measures, so an open past it is a stall and worth the
+                // four numbers that tell its four causes apart (`Conn::budget`).
+                if us >= 100_000 {
+                    let (credit, window, buffer, queued) = self.shared.with(|conn| conn.budget());
+                    tracing::debug!(
+                        lane = self.id,
+                        us,
+                        credit,
+                        window,
+                        buffer,
+                        queued_streams = queued,
+                        "mhd slow stream open: what the write budgets had left"
+                    );
+                }
                 Ok(stream)
             }
             _ => Err(crate::transport::multiplex::LaneError::Closed),

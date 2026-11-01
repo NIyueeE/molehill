@@ -65,12 +65,37 @@ pub(crate) const WINDOW: u64 = 16 * 1024 * 1024;
 /// connection's own stall line names the reason.
 const MAX_BUFFERED: u64 = 2 * WINDOW;
 
-/// How many bytes one stream may put in a row before the cursor moves on.
+/// How many bytes of the connection's budgets an **opening** stream may always
+/// use, whichever stream has filled the rest.
 ///
-/// Without it a bulk transfer takes every packet the credit allows and an
-/// interactive stream on the same connection waits behind it: the fair share the
-/// connection-level window alone cannot give.
-const STREAM_BURST: usize = MAX_STREAM_PAYLOAD * 4;
+/// The three budgets a write draws on — the peer's credit, the congestion
+/// window, the buffer ceiling — are the connection's, not a stream's, so a bulk
+/// stream takes them in arrival order and a stream that opens behind it waits for
+/// them to drain. Measured on the model's `capacity` ramp with one bulk stream
+/// running: the interactive probe's p50 stayed at **1.9-2.0 ms** while its p99
+/// read **2 704, 5 002 and 5 002 ms** in three cells. The median is a healthy
+/// path and the tail is a stream open waiting for a budget the bulk stream holds.
+///
+/// So the last `OPEN_RESERVE` bytes of every budget are reserved: a stream that
+/// has not yet written this many bytes may use them, and a stream that has must
+/// stop short of them. Eight packets carry a Noise handshake with room to spare
+/// (the KK handshake is about 200 bytes).
+///
+/// The reserve is taken *inside* the peer's credit, never on top of it: a sender
+/// that overran the advertised window would have its frames rejected as
+/// `OverWindow`, never acknowledged, and re-sent until the lane was declared
+/// dead — the failure this file's `write` comment records. Bulk stopping short
+/// is what keeps the reserve genuinely free.
+///
+/// It replaces `STREAM_BURST`, which never bound: it clamped a byte count that
+/// the next line clamped again to one packet, so the fairness its comment
+/// described did not exist.
+pub(crate) const OPEN_RESERVE: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
+
+/// Whether a stream is still opening: it has not written a reserve's worth yet.
+fn opening(state: &StreamState) -> bool {
+    state.send.written() < OPEN_RESERVE
+}
 
 /// The congestion window a connection starts with: ten full packets.
 ///
@@ -422,6 +447,13 @@ impl Conn {
         let room = credit.min(window).min(held);
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
+        };
+        // A stream that has already written a reserve's worth stops short of it,
+        // so an opening stream always finds room (see `OPEN_RESERVE`).
+        let room = if opening(state) {
+            room
+        } else {
+            room.saturating_sub(OPEN_RESERVE)
         };
         let take = usize::try_from(room).map_or(0, |room| room.min(bytes.len()));
         if take < bytes.len() {
@@ -957,7 +989,7 @@ impl Conn {
             }
             state.send.has_unsent().then(|| {
                 let offset = state.send.next_offset();
-                let unsent = (state.send.unacked()).min(STREAM_BURST as u64);
+                let unsent = state.send.unacked();
                 let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
                 Pick {
                     id: *id,
@@ -1055,6 +1087,26 @@ impl Conn {
     /// Whether the last refusal was the peer's credit (see [`Conn::write`]).
     pub(crate) fn credit_blocked(&self) -> bool {
         matches!(self.last_refusal, Some(Refusal::Credit))
+    }
+
+    /// What the connection's three write budgets have left, for the
+    /// open-latency line: `(credit, window, buffer, streams with bytes queued)`.
+    ///
+    /// A stream that opens slowly is slow for one of four reasons, and they look
+    /// identical from outside: the peer's credit is spent, the congestion window
+    /// is full, the send buffers are at their ceiling, or none of them is short
+    /// and the open is waiting on the wire. Read only when an open is already
+    /// late (see `MhdLane::open_stream`), so a healthy run pays nothing.
+    pub(crate) fn budget(&self) -> (u64, u64, u64, usize) {
+        (
+            self.send_credit.saturating_sub(self.written),
+            self.cwnd.saturating_sub(self.recovery.flight_bytes()),
+            MAX_BUFFERED.saturating_sub(self.buffered),
+            self.streams
+                .values()
+                .filter(|state| state.send.has_unsent())
+                .count(),
+        )
     }
 
     /// Feed one datagram from the peer.
@@ -1658,6 +1710,50 @@ mod tests {
             accepted.contains(&interactive.id),
             "the interactive stream must be there too"
         );
+    }
+
+    /// An opening stream finds room in the connection's budget even when a bulk
+    /// stream has taken all of it.
+    ///
+    /// This is the tail the `capacity` ramp measured: the interactive probe's
+    /// p50 stayed at two milliseconds while its p99 read seconds, because the
+    /// stream it opened behind a bulk transfer could not write its handshake at
+    /// all. The reserve is what makes that impossible, and it is taken *inside*
+    /// the peer's credit so no frame is ever over the advertised window.
+    #[test]
+    fn an_opening_stream_finds_room_a_bulk_stream_holds() {
+        let mut conn = Conn::new(9, true);
+        // A window wide enough for the credit to be the binding bound.
+        conn.cwnd = WINDOW;
+
+        let bulk = conn.open();
+        let chunk = payload(usize::try_from(OPEN_RESERVE).unwrap() + 100);
+        assert_eq!(conn.write(bulk.id, &chunk), chunk.len());
+
+        // Fill the rest: the bulk stream may not take the reserve.
+        let filler = payload(4096);
+        let mut written = chunk.len();
+        loop {
+            let took = conn.write(bulk.id, &filler);
+            if took == 0 {
+                break;
+            }
+            written += took;
+        }
+        let reserved = conn.send_credit.saturating_sub(conn.written);
+        assert!(
+            reserved > 0 && reserved <= OPEN_RESERVE,
+            "the bulk stream stops a reserve short of the credit, left {reserved}"
+        );
+
+        // A stream that opens now can still write its handshake.
+        let fresh = conn.open();
+        assert_eq!(
+            conn.write(fresh.id, b"handshake"),
+            9,
+            "the reserve belongs to the stream that is opening"
+        );
+        assert!(written > chunk.len(), "the bulk stream really did fill it");
     }
 
     /// A loss is re-sent as **the hole**, not as everything after it.

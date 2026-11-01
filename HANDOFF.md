@@ -2423,6 +2423,37 @@ the same code** — a 165x asymmetry that is state, not code, and the one number
 here nobody has explained. It is the next thing to measure rather than the next
 thing to change.
 
+**The latency axis has one measured number, and it is the whole story so far
+(2026-11-01).** The model's `capacity` ramp on mhd, one bulk stream (L1): the
+interactive probe's **p50 1.9-2.1 ms and p99 2 704 / 5 002 / 5 002 ms** across
+three runs, with the ramp never reaching a second level it could pass — so
+`capacity_streams` reads **0**. The same ramp on the TCP carrier holds
+`capacity_streams` **6 [4..8]** (its own A/A twin 2 [1..4], so the instrument is
+wide, but the direction is not in doubt: TCP is at single-digit milliseconds
+where mhd is at seconds). **The trigger is bulk, and that is measured rather than
+assumed**: `rr-16` without a bulk stream reads p99 **1.37-1.41 ms** over 48 000
+samples at 29 500 round trips/s, on the same binary and host.
+
+Two instruments then excluded the two obvious causes:
+
+| instrument | reading | what it excludes |
+|---|---|---|
+| `Conn::budget` at the moment a slow open completes (11 samples) | `credit=16 777 112`, `window=13 490` (a whole initial cwnd, so **nothing in flight**), `buffer=33 554 432`, `queued_streams=0` | the open is **not** waiting on a write budget |
+| the server's own opening split (selector / handshake / hello / ack), every open of one ramp | **0** openings past 100 ms | the stall is **not** the server's per-stream work |
+
+So the seconds are spent getting a small message *delivered* while bulk
+saturates the lane, in a direction neither instrument covers yet. The reserve
+(`OPEN_RESERVE`) is in the tree as a **guarantee** — a stream that opens behind
+bulk can always write ten kilobytes, with a test that fails without it ("the bulk
+stream stops a reserve short of the credit, left 0") — but it is **not** a
+latency win: with it, p99 still read 10.8, 5 002, 5 002 and 450 ms across four
+cells. Stated plainly: mechanism pinned, cause not yet found, no claim.
+
+The next instrument has to timestamp **one opening's packets on both ends** — the
+dialer's write of the handshake, the server's receipt of it, the server's reply
+and the dialer's receipt — because each end currently measures only its own
+awaits and each says it was fast.
+
 
 
 - **The release sweep is done and the PR is ready (2026-10-19).** The

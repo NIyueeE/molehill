@@ -90,6 +90,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `control socket has closed unexpectedly`, against one of six at 200 ms. A path
   must now also have been silent for five seconds, which changes nothing at the
   default and is what a lower floor would need before it could be considered.
+- **A stream that opens behind a bulk transfer always finds room to say so.** The
+  three budgets a write draws on — the peer's credit, the congestion window, the
+  send-buffer ceiling — belong to the connection, so a bulk stream took them in
+  arrival order and a stream opening behind it could not write its handshake at
+  all: measured on the model's `capacity` ramp, the interactive probe's median
+  stayed at two milliseconds while its tail read seconds. The last ten kilobytes
+  of every budget are now reserved for a stream that has not yet written that
+  much. The reservation is taken *inside* the peer's credit rather than on top of
+  it, because a sender over the advertised window has its frames refused and
+  re-sends them until the lane dies. It replaces a `STREAM_BURST` constant that
+  never bound anything.
+- **A late opening says where its time went, on both ends.** The dialer's
+  `mhd stream opened and acknowledged` line gains the four numbers that separate
+  an open's causes — credit, window, buffer and how many streams have bytes
+  queued — and is joined by a second line only when the opening passed a hundred
+  milliseconds. The server logs the same opening's three waits (selector,
+  handshake, hello) past the same threshold. A healthy run pays nothing: the
+  clocks are read only when an opening is already late.
 - **A lost datagram is re-sent as the hole, not as everything after it.** The
   carrier kept one send cursor, so declaring a packet lost moved it back to that
   offset and the transmitter re-sent from there to the end of what was buffered:
