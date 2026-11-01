@@ -2847,13 +2847,47 @@ the picture is now complete enough to say where the time is *not*:
   buffer **16 microseconds** before it reads them.
 
 Everything in userspace is fast, and the packet spends its seven seconds between
-the server's socket and the client's receive path. That is the kernel and the
-topology — the `veth` pair, the qdisc's queue on the tunnel leg, and the socket
-buffers a saturating UDP sender fills — and it is measurable only from outside
-the process: `ss -n -u -m` for the socket queues, `tc -s qdisc` for the leg's
-backlog and drops, and the namespace counters the model already collects. **That
-is a different instrument family from every one above**, and it is the next thing
-to take, on a cell that reproduces the tail.
+the server's socket and the client's receive path.
+
+**Two more candidates are out, and this is where the honest list stops
+(2026-11-01).** The qdisc's queue depth was the obvious kernel-side suspect, so the
+cell was run at `txqueuelen` 1000 and 10 000 — a deeper queue must make a queueing
+tail *worse*:
+
+| `txqueuelen` | p99 (ms) | `dropped_packets` |
+|---|---|---|
+| 1000 | 3 388, 311, 22, 229 | 0, 0, 0, 0 |
+| 10 000 | 688, 1 903, 3 537 | 0, 0, 0 |
+
+Same tail, and **nothing dropped anywhere in the topology**. Nor is a lane being
+torn down and replaced under the wait: `lane declared dead`, `mhd connection
+closed` and `reaped dead tunnels` are all zero on both ends across three runs, so
+the 5-second `DEAD_FLOOR` theory is out as well.
+
+The exclusion list for the `capacity` cell's tail is therefore complete for
+everything the process can see: request delivery, both ends' stream opens,
+handshakes and acknowledgements, write and read parks, socket writability, the
+send buffer's dwell, the receive buffer's readiness, worker count, lock
+contention, scheduling order, lane sharing (measured as a 4-7x factor), the pool's
+ceiling, the pairing queue, qdisc depth, and drops on every device and qdisc the
+model counts.
+
+**That is twelve rounds on one defect, and it stops here by the repository's own
+rule** (AGENTS.md §9: three failed attempts, then write the findings down and ask).
+What is left needs a decision rather than another counter: the interval is between
+two sockets with nothing dropped, which points at path-level behaviour no
+userspace instrument can reach — the tier of `ss -n -u -m` socket-queue readings,
+`tc -s qdisc` backlogs and per-namespace UDP MIB counters taken *during* a
+reproducing cell. That is a different instrument family, and it is worth doing —
+but it should be a decision, not a fourteenth guess.
+
+Meanwhile the work packages this defect has been crowding out are untouched, and
+the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
+the wire and **dropped** by the connection (`conn.rs`, `Frame::Datagram { .. } |
+Frame::L3 { .. } => { self.ack_pending = true; }`), the owned-write path is
+implemented for `StreamIo` by neither end, and the carrier's two-way quality rule
+is still off by default. Those are next, and the tail above stays open with this
+record.
 
 
 
