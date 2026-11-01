@@ -3533,6 +3533,50 @@ candidates are now ordered by what is left, not by preference:
    one round trip instead of two and no shared window; it cannot reach parity on
    its own.
 
+**The mux's loss is not striping's fault, and it is not a torn frame (2026-11-01).**
+The change was re-applied to diagnose it, and the test was run at three widths
+through the internal override:
+
+| `MOLEHILL_STRIPE_COUNT` | result |
+|---|---|
+| 1 | fails after 17.8 s (a stall, not a truncation) |
+| 2 | fails after 18.4 s |
+| 4 | fails after 3.8 s, `echo service closed after 5 807 104/8 388 608 bytes` |
+
+So it fails at width **one** — every visitor on this carrier shares one stream and
+one window — and the width only changes how it presents. With the reader's own
+end logged, the failing direction *sent* 202 frames while its four readers ended
+at sequence **195, 201, 176 and 150**, every one of them a clean EOF **at a frame
+boundary**. Bytes disappeared before the FIN, on several stripes at once, with no
+torn frame anywhere. That rules out the striping logic and points at the layer
+underneath: a yamux session carrying its streams over one mhd stream loses data
+when that stream is under its own backpressure — the carrier's dwell line put
+those writes 20–87 ms in the send buffer. Two candidates remain, both worth a
+dedicated round: what mhd's stream does with queued bytes when its own buffer is
+near `MAX_BUFFERED` and the peer's window is closed, and whether a `MuxStream`
+reset can discard frames the yamux session had already queued.
+
+**And P3′ was built and measured out (2026-11-01).** The rule was the one TCP
+cannot implement: a packet is declared lost the moment the peer's *per-stream
+cumulative byte prefix* passes its range, instead of waiting for three later
+packets to be acknowledged. It was unit-tested in two cases (the proof fires; a
+prefix on one stream never judges another), then A/B'd against the same build
+without it, under `loss1`, on `bulk-n` and `rr-16`, four rounds with `--ab-arm`
+and `--binary-b`:
+
+- `rtt_p99_ms`: the run's floor is **0.10 %**, and the difference is inside it —
+  no repair-latency effect at all;
+- `bulk-n` `throughput_gbps`: floor 2.3 %, no difference;
+- `retrans_segments`: **−1 464** directional for the rule, and *fragile* — one
+  round's removal flips it.
+
+Reverted, because a change with no measured win is one to drop rather than keep to
+look tidy. The mechanism is sound and the reason it does not pay here is worth
+recording: the request/response cells have **no bytes after a lost packet on the
+same stream**, so the prefix can prove nothing and the peer waits for the
+retransmit either way; and `loss1` is a *drop-based* shaper, so the bulk cell's
+throughput is not RTO-limited and a faster repair has nothing to buy.
+
 The A/A reading also needs one correction to an earlier entry: a twin that
 reproduces a tail is evidence that the tail is *reproducible*, not that the cell
 cannot resolve a change. What the twin cannot do is price a change by itself —

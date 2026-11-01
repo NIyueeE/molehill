@@ -446,12 +446,16 @@ enum StripeEvent {
 /// sequence number that will never arrive.
 async fn stripe_reader<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<StripeEvent>) {
     let mut header = [0u8; STRIPE_HEADER_LEN];
+    let mut last: Option<u64> = None;
     loop {
         // The first byte alone: a clean end between frames is a normal
         // half-close, a partial header is a broken frame.
         match r.read_u8().await {
             Ok(b) => header[0] = b,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                debug!(last_seq = ?last, "stripe reader ended at a frame boundary");
+                return;
+            }
             Err(e) => {
                 let _ = tx
                     .send(StripeEvent::Broken(format!("stripe read failed: {e}")))
@@ -468,6 +472,7 @@ async fn stripe_reader<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<StripeEv
             return;
         }
         let (seq, len) = decode_header(&header);
+        last = Some(seq);
         let mut payload = BytesMut::zeroed(len);
         if let Err(e) = r.read_exact(&mut payload).await {
             let _ = tx
