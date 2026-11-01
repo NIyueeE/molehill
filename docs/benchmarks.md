@@ -847,6 +847,34 @@ The figures that shaped a TCP-versus-KCP axis are published history in
 longer be built, and they are not a baseline. What compares today is the table
 each scenario prints, tool against the control arm of the same run.
 
+### What a fresh connection costs, per carrier (2026-11-01)
+
+The one axis where the two carriers are not close, measured with
+`MOLEHILL_DATA_CARRIER` pinning one per run over the `dev` profile's `churn-16`
+cell (a fresh connection per request, sixteen at once, five rounds, each run's
+own A/A twin):
+
+| | `mhd` | TCP |
+|---|---|---|
+| first request round trip, p50 | 2.62 ms | 2.82 ms |
+| first request round trip, p99 | **21.49 ms** | **3.46 ms** |
+| completed arrivals per second | 3 328 | 5 341 |
+
+The in-process split says where the median's parity ends: a visitor waits
+**2 603 µs** at p50 and **14 127 µs** at p99 for its channel to be paired, and
+the pairing's own cost is one channel open at 2 648 µs — of which **1 818 µs is
+a Noise handshake** this carrier does not need to pay, because a TCP tunnel runs
+one handshake for every stream inside it. Everything after the pairing is at
+parity: the first byte follows the pairing in **12 µs** at p50.
+
+Removing the handshake — deriving each stream's record keys from the lane's own
+— was built and measured three ways. It takes the p99 to **3.79 ms** and doubles
+the arrival rate at half the CPU per bit, and every version costs the bulk cell
+(`bulk-n` throughput −15.67 %, a claim past its 10 % floor). The mechanism, the
+numbers and the two remaining ways forward are recorded in `HANDOFF.md`; the
+release notes name the gap. A deployment whose traffic is mostly short-lived
+connections should measure its own path before choosing a carrier.
+
 ## The transparent-L3 wire question (the acceptance harness)
 
 An L3 client carries whole IP packets, so the question "how much of the wire is
