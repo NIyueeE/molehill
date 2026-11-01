@@ -2888,7 +2888,7 @@ which is the same conclusion the qdisc gave (`dropped_packets` 0 at both queue
 depths) from a different direction.
 
 That is twelve rounds on one defect, and it stops here by the repository's own
-rule** (AGENTS.md §9: three failed attempts, then write the findings down and ask).
+rule (AGENTS.md §9: three failed attempts, then write the findings down and ask).
 The socket-queue reading above was the first of the outside-the-process family, and
 it closes that family too: one datagram in flight at the sender, two at the
 receiver, nothing dropped, no qdisc backlog. **Every stage, every buffer and every
