@@ -2950,11 +2950,36 @@ follow, and the second is the one that changes the plan:
   which is the same signature as the `bulk-n` `loss1` failures recorded earlier
   in this cycle.
 
-So one defect now explains a latency tail on a clean path, four failed soak
-stages, and that earlier loss-cell failure. **That raises it above the work
-packages this page recommended deferring it behind**: a carrier that drops a
-control connection under a shaped path cannot be the default one, whatever its
-per-byte cost.
+**Correction, one round later: the soak failure is pool exhaustion, not the tail
+(2026-11-01).** The daemons' own logs name it, forty-six seconds in:
+
+```
+06:18:38 INFO pool-stats: pool at its stream ceiling; raise [client.data.mhd].tunnels
+                   pool=session:10.10.0.254:2400 carrier="mhd" count=4 ceiling=56
+06:18:38 INFO the pool refused a data channel: every tunnel is at its stream ceiling
+```
+
+So the pool reached `4 × 56 = 224` streams and refused the next data channel, which
+killed the visitor that needed it — i.e. the `iperf3` control connection of the
+stage that was running. Nothing about the latency tail is involved, and the
+attribution in the paragraph above was wrong.
+
+**That is itself the finding, and a more tractable one**: a soak that merely holds
+connections for minutes exhausts the pool on `mhd` in under a minute while TCP
+carries the same workload for seventeen. Either the workload genuinely wants more
+than 224 concurrent streams — in which case the profile is misconfigured for the
+default `tunnels = 4` and says so honestly — or **`mhd` streams are not being
+retired**, so the count only ever climbs. The second is a leak, it is the family
+`pool_test` exists for (`a saturated pool still serves the next visitor`, the
+"give the window back" fix), and it would explain a great deal besides: a pool
+pinned at its ceiling answers every later open with a 250 ms capacity wait and then
+a refusal, which is exactly the shape of a latency tail that no per-stream counter
+can see.
+
+The discriminating measurement is a soak with `MOLEHILL_POOL_STATS=1`, watching the
+live stream count against the clock: a plateau means the workload is simply wide,
+a monotonic climb means a leak. It is running now, and the answer decides whether
+the next change is in stream retirement or in the profile.
 
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
