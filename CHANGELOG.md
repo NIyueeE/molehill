@@ -113,6 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   costs a branch when the list is empty. Measured on that profile: the pool's peak
   live streams fell from 224 (its ceiling) to **17**, and the ceiling refusals from
   2 to **0**.
+- **A parked reader reports how many wake-ups it took.** A stall says nothing
+  about itself from inside the reader: it may have been ignored or it may have had
+  nothing to read. The connection counts its own reader wake-ups and each park
+  records the count it began at, which is what showed a reader woken **hundreds**
+  of times over a seven-second stall, taking every wake-up and finding the buffer
+  empty each time.
 - **The pool reports how long a stream slot was actually held.** Its telemetry
   carried a count and nothing else, which cannot separate "the workload is wide"
   from "slots are taken and not returned": the soak reached the pool's ceiling at

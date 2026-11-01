@@ -3115,6 +3115,39 @@ both read), and therefore every part of the objective that depends on them — t
 drift axis, the release sweep, and any statement that this carrier is preferable
 to TCP on a latency-sensitive path.
 
+**And the last userspace suspicion is now eliminated, by counting wakes
+(2026-11-01).** A parked reader cannot know whether it was reached, so the
+connection now counts its own `wake_readers` calls and each park records the count
+it began at. One cell, and the numbers end the question this page has been asking
+for thirteen rounds:
+
+| parked (µs) | the bytes had been ready for | **wakes while parked** |
+|---|---|---|
+| 7 003 866 | 26 µs | **280** |
+| 7 003 718 | 10 µs | **533** |
+| 7 001 611 | 5 µs | **432** |
+| 2 892 303 | 24 µs | **71 480** |
+
+So the reader was woken **hundreds — and in one case seventy-one thousand — times**
+during the stall, took every one of those wake-ups, was polled, ran `poll_read`, and
+found nothing to read. The wake path works, the task is scheduled, and the bytes are
+genuinely absent.
+
+That is the end of the carrier as a suspect for this symptom. Every layer inside
+`mhd` is now measured and clear: the request, both ends' opens, handshakes and
+acknowledgements, write and read parks, the socket's writability, the send buffer's
+dwell, the receive buffer's readiness, the wake path itself, the per-stream and
+per-connection budgets, the pool's slots, the kernel's socket queues and qdisc, and
+drops on every device. What produces the bytes — the forwarding loop above the
+tunnel stream and the backend behind it — has never been instrumented at all, and
+that is now the only place this symptom can live.
+
+**What is still not met**: the soak's four stage failures, the multi-second tail on
+a fresh connection (which is what the `capacity` cell and the soak's `clean` stage
+both read), and therefore every part of the objective that depends on them — the
+drift axis, the release sweep, and any statement that this carrier is preferable
+to TCP on a latency-sensitive path.
+
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
 the wire and **dropped** by the connection (`conn.rs`, `Frame::Datagram { .. } |

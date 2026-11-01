@@ -50,6 +50,14 @@ pub(crate) struct Shared {
     ended: tokio::sync::Notify,
     /// The per-connection counters the status API reads.
     pub(crate) health: std::sync::Arc<SessionHealth>,
+    /// How many times this connection has woken its readers.
+    ///
+    /// The discriminator a parked reader cannot answer for itself: one that
+    /// stayed parked across **many** wakes was not reached by them (a lost
+    /// wake-up), while one parked across **none** waited for a pump that never
+    /// ran (starvation). Different fixes, and a park duration cannot tell them
+    /// apart.
+    wakes: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -63,6 +71,7 @@ impl Shared {
             streams: tokio::sync::Notify::new(),
             ended: tokio::sync::Notify::new(),
             health,
+            wakes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -178,6 +187,8 @@ impl Shared {
 
     /// Wake readers: bytes arrived, or the stream ended.
     pub(crate) fn wake_readers(&self) {
+        self.wakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let wakers = std::mem::take(&mut self.wakers.lock().readers);
         for waker in wakers {
             waker.wake();
@@ -229,6 +240,8 @@ pub(crate) struct StreamIo {
     /// arrived late, and the two are told apart by comparing this number with the
     /// peer's own send time.
     read_parked_at: Option<std::time::Instant>,
+    /// The connection's wake count when that park began.
+    read_wakes_at_park: u64,
 }
 
 impl StreamIo {
@@ -239,6 +252,7 @@ impl StreamIo {
             id,
             parked_at: None,
             read_parked_at: None,
+            read_wakes_at_park: 0,
         }
     }
 }
@@ -297,6 +311,11 @@ impl AsyncRead for StreamIo {
                         parked_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
                         ready_us = ready_before.map_or(u64::MAX, |d| u64::try_from(d.as_micros())
                             .unwrap_or(u64::MAX)),
+                        wakes_while_parked = this
+                            .shared
+                            .wakes
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .saturating_sub(this.read_wakes_at_park),
                         "mhd stream reader was parked"
                     );
                 }
@@ -307,8 +326,10 @@ impl AsyncRead for StreamIo {
         if ended || !open {
             return Poll::Ready(Ok(()));
         }
-        this.read_parked_at
-            .get_or_insert_with(std::time::Instant::now);
+        if this.read_parked_at.is_none() {
+            this.read_parked_at = Some(std::time::Instant::now());
+            this.read_wakes_at_park = this.shared.wakes.load(std::sync::atomic::Ordering::Relaxed);
+        }
         Poll::Pending
     }
 }
