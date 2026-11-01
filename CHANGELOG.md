@@ -113,6 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   costs a branch when the list is empty. Measured on that profile: the pool's peak
   live streams fell from 224 (its ceiling) to **17**, and the ceiling refusals from
   2 to **0**.
+- **A service no longer serves its visitors one at a time.** The queue of data
+  channels was an `Arc<Mutex<Receiver>>` and a pairing held that mutex for as long
+  as it waited, so only one visitor could be waiting for a channel at any moment:
+  the rest queued on the mutex, and one that found the queue empty waited out its
+  whole pairing budget before the next could even look. The queue now owns both
+  ends, takes under a short ordinary lock and waits on a notification the producer
+  raises after every push — which is what the type's own documentation had claimed
+  all along.
 - **A parked reader reports how many wake-ups it took.** A stall says nothing
   about itself from inside the reader: it may have been ignored or it may have had
   nothing to read. The connection counts its own reader wake-ups and each park

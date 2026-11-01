@@ -1685,9 +1685,9 @@ async fn do_v4_data_channel(
 
     handle
         .data_channel
-        .send(conn)
+        .push(conn)
         .await
-        .map_err(|_| anyhow!("Data channel for a stale control session"))?;
+        .map_err(|()| anyhow!("Data channel for a stale control session"))?;
     Ok(())
 }
 
@@ -1980,7 +1980,7 @@ where
                 // tunnel or the session.
                 continue;
             };
-            if queue.send(DataChannel::Mux(stream)).await.is_err() {
+            if queue.push(DataChannel::Mux(stream)).await.is_err() {
                 break;
             }
         }
@@ -2167,7 +2167,7 @@ async fn route_tunnel_stream<S>(
         )
     )]
     tunnel_id: &std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>,
-) -> Option<mpsc::Sender<DataChannel>>
+) -> Option<std::sync::Arc<ChannelQueue<DataChannel>>>
 where
     S: AsyncRead + Unpin,
 {
@@ -2442,7 +2442,7 @@ async fn route_mhd_stream(
     // for a channel that already exists. A hundred milliseconds is fifty times a
     // healthy pairing, so anything past it is worth one line.
     let queued = std::time::Instant::now();
-    let sent = queue.send(DataChannel::RawMhd(io)).await;
+    let sent = queue.push(DataChannel::RawMhd(io)).await;
     let waited = queued.elapsed();
     if waited >= std::time::Duration::from_millis(100) {
         debug!(
@@ -2451,7 +2451,7 @@ async fn route_mhd_stream(
             "mhd data channel waited for the pairing queue"
         );
     }
-    sent.map_err(|_| anyhow!("Data channel for a stale control session"))
+    sent.map_err(|()| anyhow!("Data channel for a stale control session"))
 }
 
 /// A live control channel, kept alive by holding the three channel
@@ -2467,7 +2467,7 @@ pub struct ControlChannelHandle {
     endpoint: SocketAddr,
     // Shutdown the control channel by dropping it
     shutdown: broadcast::Sender<bool>,
-    data_channel: mpsc::Sender<DataChannel>,
+    data_channel: std::sync::Arc<ChannelQueue<DataChannel>>,
     // Keeps the data-channel request channel alive for as long as the handle
     // exists: the control channel loop exits when every sender is gone.
     data_ch_req: mpsc::UnboundedSender<DataChannelRequest>,
@@ -2688,7 +2688,14 @@ impl ControlChannelHandle {
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
         // Store data channels
-        let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
+        let data_channels: std::sync::Arc<ChannelQueue<DataChannel>> =
+            ChannelQueue::pair(CHAN_SIZE * 2);
+        // One clone per task that moves it: an `async move` captures by move even
+        // when the body only borrows it through `Arc::clone`, so a single binding
+        // cannot serve three spawns.
+        let channels_udp = std::sync::Arc::clone(&data_channels);
+        let channels_l3 = std::sync::Arc::clone(&data_channels);
+        let channels_direct = std::sync::Arc::clone(&data_channels);
 
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
@@ -2747,7 +2754,7 @@ impl ControlChannelHandle {
                         if let Err(e) = run_tcp_connection_pool::<DataChannel>(
                             listener,
                             sock_opts,
-                            data_ch_rx,
+                            channels_direct,
                             data_ch_req_tx,
                             shutdown_rx_clone,
                             control_task,
@@ -2774,7 +2781,7 @@ impl ControlChannelHandle {
                         if let Err(e) = run_udp_connection_pool::<DataChannel>(
                             Arc::new(socket),
                             buffer_size,
-                            data_ch_rx,
+                            channels_udp,
                             data_ch_req_tx,
                             shutdown_rx_clone,
                             control_task,
@@ -2794,7 +2801,7 @@ impl ControlChannelHandle {
             // operator's TUN, and this task moves them to and from the tunnel.
             BoundEndpoint::Transparent => spawn_transparent_service(
                 service,
-                data_ch_rx,
+                channels_l3,
                 data_ch_req_tx.clone(),
                 shutdown_rx_clone,
                 control_task,
@@ -2806,7 +2813,7 @@ impl ControlChannelHandle {
         ControlChannelHandle {
             endpoint: service.bind_addr,
             shutdown: shutdown_tx,
-            data_channel: data_ch_tx,
+            data_channel: std::sync::Arc::clone(&data_channels),
             data_ch_req: data_ch_req_tx,
         }
     }
@@ -3006,7 +3013,7 @@ impl MemberSupervisor {
               same fields into one struct"
 )]
 async fn run_transparent_service<C>(
-    mut data_ch_rx: mpsc::Receiver<C>,
+    data_ch_rx: SharedChannels<C>,
     data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     tun: String,
     endpoint: SocketAddr,
@@ -3052,7 +3059,7 @@ where
 
     loop {
         tokio::select! {
-            channel = data_ch_rx.recv() => {
+            channel = data_ch_rx.take() => {
                 // The lane the client named rides with the channel: the hub
                 // attributes its counters to that connection, so the end that
                 // decides can be told about the lane that actually carried the
@@ -3160,7 +3167,7 @@ where
 )]
 fn spawn_transparent_service(
     service: &RegisteredService,
-    data_ch_rx: mpsc::Receiver<DataChannel>,
+    data_ch_rx: SharedChannels<DataChannel>,
     data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     shutdown_rx: broadcast::Receiver<bool>,
     control_task: tokio::task::JoinHandle<()>,
@@ -3344,7 +3351,89 @@ const MAX_CONCURRENT_VISITORS: usize = 128;
 /// A channel is interchangeable between the service's visitors — the queue
 /// belongs to one service and every channel on it carries that service's
 /// prologue — so the mutex serializes only the *take*, never the wait.
-type SharedChannels<C> = std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<C>>>;
+type SharedChannels<C> = std::sync::Arc<ChannelQueue<C>>;
+
+/// One service's queue of data channels, shared by every visitor pairing.
+///
+/// The mutex guards **the take only**, never the wait. That distinction is the
+/// whole type: a pairing that held it across `recv().await` made every other
+/// visitor queue behind it on the mutex, so a service served its visitors strictly
+/// one at a time and each one that found the queue empty waited out its own
+/// `PAIR_WAIT_BUDGET` before the next could even look. That is the serial queue
+/// measured as this carrier's latency tail: a visitor's own bytes sitting unread in
+/// its socket for seven seconds because its pairing had not started
+/// (`HANDOFF.md`, "the forwarding loop names the stage").
+///
+/// So a take is a `try_recv` under a short lock, and the wait is a `Notify` the
+/// producer raises after every push. The notification is registered *before* the
+/// second look, which is what keeps a push landing between them from being lost.
+pub(crate) struct ChannelQueue<C> {
+    /// The producer's half, held here so a push cannot be separated from its
+    /// wake-up: a `send` without a `wake` leaves every waiting pairing asleep.
+    tx: mpsc::Sender<C>,
+    rx: std::sync::Mutex<mpsc::Receiver<C>>,
+    ready: tokio::sync::Notify,
+}
+
+impl<C> ChannelQueue<C> {
+    /// A queue of the given capacity, both ends owned by one handle.
+    fn pair(capacity: usize) -> std::sync::Arc<Self> {
+        let (tx, rx) = mpsc::channel(capacity);
+        std::sync::Arc::new(Self {
+            tx,
+            rx: std::sync::Mutex::new(rx),
+            ready: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Hand a channel over, and wake every pairing waiting for one.
+    ///
+    /// `notify_waiters` rather than `notify_one`: each waiter re-reads the queue,
+    /// so the wake-up is a hint that the state changed, not a hand-off of one item.
+    async fn push(&self, channel: C) -> Result<(), ()> {
+        self.tx.send(channel).await.map_err(|_| ())?;
+        self.ready.notify_waiters();
+        Ok(())
+    }
+
+    /// Whether no channel can arrive any more: the producer side is gone.
+    ///
+    /// The queue owns both ends, so this is the honest form of a receiver's own
+    /// `is_closed` — a property of the producer, not of a handle someone kept.
+    #[cfg(all(test, feature = "multiplex"))]
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Lock, look, unlock. `Err` means the producer side is gone, so no channel
+    /// can arrive again.
+    fn try_take(&self) -> Result<Option<C>, ()> {
+        let mut rx = self
+            .rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match rx.try_recv() {
+            Ok(channel) => Ok(Some(channel)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(()),
+        }
+    }
+
+    /// Take one channel, waiting for as long as the caller's own budget decides.
+    async fn take(&self) -> Option<C> {
+        loop {
+            let notified = self.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_take() {
+                Ok(Some(channel)) => return Some(channel),
+                Ok(None) => {}
+                Err(()) => return None,
+            }
+            notified.await;
+        }
+    }
+}
 
 /// Take one data channel from the shared queue, or `None` when the pool's
 /// channel source ended (the control channel did).
@@ -3355,14 +3444,14 @@ async fn take_channel<C>(rx: &SharedChannels<C>) -> Option<C>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    rx.lock().await.recv().await
+    rx.take().await
 }
 
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<C>(
     l: TcpListener,
     sock_opts: SocketOpts,
-    data_ch_rx: mpsc::Receiver<C>,
+    data_ch_rx: SharedChannels<C>,
     data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
@@ -3378,7 +3467,6 @@ where
     let mut backoff = backoff_builder.build();
     let listen_notice = RepeatNotice::new();
 
-    let data_ch_rx: SharedChannels<C> = std::sync::Arc::new(tokio::sync::Mutex::new(data_ch_rx));
     // A striped gather is atomic by construction: K channels consumed by one
     // visitor, all or none. Concurrent unstriped pairings take channels one by
     // one from the shared queue and cannot interfere with each other, but a
@@ -4039,7 +4127,7 @@ fn retire_idle_udp_worker(
 async fn run_udp_connection_pool<C>(
     l: Arc<UdpSocket>,
     buffer_size: usize,
-    mut data_ch_rx: mpsc::Receiver<C>,
+    data_ch_rx: SharedChannels<C>,
     data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
@@ -4115,7 +4203,7 @@ where
                 shutting_down.store(true, Ordering::Relaxed);
                 break;
             }
-            maybe_chan = data_ch_rx.recv() => {
+            maybe_chan = data_ch_rx.take() => {
                 let Some(mut conn) = maybe_chan else {
                     shutting_down.store(true, Ordering::Relaxed);
                     break;
@@ -4599,22 +4687,19 @@ mod tests {
         assert!(table.contains_key(&peer(1000)));
     }
 
-    /// Build a session holding one service per id, and the queue receivers
+    /// The queue handles one session's services are served from.
+    #[cfg(feature = "multiplex")]
+    type Queues = Vec<std::sync::Arc<ChannelQueue<DataChannel>>>;
+
+    /// Build a session holding one service per id, and the queue handles
     /// those services would be served from.
     #[cfg(feature = "multiplex")]
-    fn session_with_services(
-        nonce: Nonce,
-        ids: &[u32],
-    ) -> (
-        RwLock<SessionMap>,
-        Vec<mpsc::Receiver<DataChannel>>,
-        Vec<mpsc::Sender<DataChannel>>,
-    ) {
+    fn session_with_services(nonce: Nonce, ids: &[u32]) -> (RwLock<SessionMap>, Queues, Queues) {
         let mut services = HashMap::new();
         let mut receivers = Vec::new();
         let mut senders = Vec::new();
         for id in ids {
-            let (data_ch_tx, data_ch_rx) = mpsc::channel(4);
+            let queue: std::sync::Arc<ChannelQueue<DataChannel>> = ChannelQueue::pair(4);
             let (request_tx, _request_rx) = mpsc::unbounded_channel();
             let (shutdown_tx, _) = broadcast::channel(1);
             services.insert(
@@ -4622,12 +4707,12 @@ mod tests {
                 ControlChannelHandle {
                     endpoint: "127.0.0.1:0".parse().unwrap(),
                     shutdown: shutdown_tx,
-                    data_channel: data_ch_tx.clone(),
+                    data_channel: std::sync::Arc::clone(&queue),
                     data_ch_req: request_tx,
                 },
             );
-            receivers.push(data_ch_rx);
-            senders.push(data_ch_tx);
+            receivers.push(std::sync::Arc::clone(&queue));
+            senders.push(queue);
         }
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -4677,7 +4762,7 @@ mod tests {
     #[tokio::test]
     async fn tunnel_streams_route_by_their_prologue() {
         let nonce = [7u8; HASH_WIDTH_IN_BYTES];
-        let (sessions, mut queues, senders) = session_with_services(nonce, &[1, 2]);
+        let (sessions, queues, senders) = session_with_services(nonce, &[1, 2]);
         let queue_a = senders[0].clone();
         let queue_b = senders[1].clone();
 
@@ -4687,8 +4772,8 @@ mod tests {
         let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
             .await
             .expect("a registered service must route");
-        assert!(routed.same_channel(&queue_a));
-        assert!(!routed.same_channel(&queue_b));
+        assert!(std::sync::Arc::ptr_eq(&routed, &queue_a));
+        assert!(!std::sync::Arc::ptr_eq(&routed, &queue_b));
 
         // An unregistered id is dropped.
         let (mut tx, mut rx) = tokio::io::duplex(64);
@@ -4716,15 +4801,15 @@ mod tests {
         let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
             .await
             .expect("the sibling service must route too");
-        assert!(routed.same_channel(&queue_b));
-        assert!(!routed.same_channel(&queue_a));
+        assert!(std::sync::Arc::ptr_eq(&routed, &queue_b));
+        assert!(!std::sync::Arc::ptr_eq(&routed, &queue_a));
 
         // A stream that routed lands in *that* service's pool queue and in no
         // other, which is what the pool pairing later consumes.
-        routed.send(probe_data_channel().await).await.unwrap();
-        assert!(queues[1].try_recv().is_ok());
+        routed.push(probe_data_channel().await).await.unwrap();
+        assert!(queues[1].try_take().is_ok_and(|o| o.is_some()));
         assert!(
-            queues[0].try_recv().is_err(),
+            queues[0].try_take().is_ok_and(|o| o.is_none()),
             "the stream must not reach another service's queue"
         );
 
@@ -4913,9 +4998,7 @@ mod tests {
 
         // A channel queue nobody fills: this gather is the shape of a pool at
         // its ceiling, where the client has no channel to give.
-        let (_ch_tx, ch_rx) = mpsc::channel::<tokio::io::DuplexStream>(8);
-        let data_ch_rx: SharedChannels<tokio::io::DuplexStream> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(ch_rx));
+        let data_ch_rx: SharedChannels<tokio::io::DuplexStream> = ChannelQueue::pair(8);
         let (req_tx, mut req_rx) = mpsc::unbounded_channel();
         let (_shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
         let (_alive_tx, mut alive_rx) = tokio::sync::watch::channel(true);

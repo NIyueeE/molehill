@@ -3210,16 +3210,27 @@ page has been describing since before the cycle started, and the type's own doc
 comment says the opposite of what the code does: "the mutex serializes only the
 *take*, never the wait". The comment is the intent; the code is the defect.
 
-The fix is a take-only lock plus a notification the producer raises after each
-push (`try_recv` under a short `std::sync::Mutex`, wait on `tokio::sync::Notify`,
-registering before the second look so a push between them cannot be lost). It was
-**started and reverted** in this round: the queue is shared by four consumer paths
-(the L4 pool, the UDP pool, the transparent service and the direct-channel route)
-and a partial conversion left the tree uncompilable. Recording the finding with the
-code that proves it is worth more than a rushed refactor at the end of a long
-session — the next attempt starts from the design above and converts all four
-callers in one commit, with `take_channel`'s signature unchanged so the call sites
-stay mechanical.
+**The fix landed, and it does not move the cell (2026-11-01).** `ChannelQueue` now
+owns both ends of its `mpsc`: `try_recv` under a short `std::sync::Mutex`, a
+`tokio::sync::Notify` raised by the producer after every push, and the notification
+registered *before* the second look so a push landing between them cannot be lost.
+All four consumer paths were converted in one commit — the L4 pool, the UDP pool,
+the transparent service and the direct-channel route — and `take_channel`'s
+signature is unchanged, so every call site stayed mechanical. `just check` green,
+330 lib tests, both clippy passes.
+
+Two cells of the `capacity` scenario afterwards: p99 **4 109 / 5 003 / 3 242 /
+2 352 / 12 / 12 / 255** with p50 at 2.1-2.4 ms, and the A/A twin itself at
+**5 003** and 5 002. So the serialization was real and is gone, and **it is not
+what the tail is** — the twin proves the tail is present in the same build measured
+twice.
+
+That is worth stating plainly because it is the fourth mechanism this cycle has
+found and removed without moving the metric, and the pattern is now unmistakable:
+each of them was a genuine defect found by reading the code, and none of them is
+the one the `capacity` cell is measuring. The tail has now survived a repair-queue
+rewrite, a timer re-scoping, an unconditional wake, and the removal of a
+service-wide serialisation.
 
 **What is still not met**: the soak's four stage failures, the multi-second tail on
 a fresh connection (which is what the `capacity` cell and the soak's `clean` stage
