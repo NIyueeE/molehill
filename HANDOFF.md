@@ -2918,6 +2918,23 @@ This is the first evidence in the cycle that the carrier changes are safe *outsi
 the L4 cost cell, and it matters because the L3 path is the one the maintainer's
 own deployment waits on.
 
+**The soak profile produces nothing on this host, and that is a measurement
+failure rather than a carrier one (2026-11-01).** `--profile soak` on mhd, one
+round, 683 s: the first stage (`clean`) passed and **every stage after it failed**
+with the same typed reason — `iperf3 error: control socket has closed
+unexpectedly` — on `loss1`, `rtt100`, `loss5` and `clean#2`, leaving no metric for
+any shaped stage. Host load was 0.55 at the start, so this is not the load
+correlation recorded earlier.
+
+That error is the one AGENTS.md §10 names for exactly this shape: a wedged
+single-test `iperf3` server turning every later repetition into a null. The
+discriminator is the same profile on the other carrier, which is running now; if
+TCP fails identically the profile is unusable here and the drift axis has to be
+taken differently, and if TCP passes the failure is the carrier's and jumps the
+queue. **No conclusion is drawn from this run in either direction until that
+answer is in** — a soak whose only output is a harness error is not evidence
+about `mhd` at all.
+
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
 the wire and **dropped** by the connection (`conn.rs`, `Frame::Datagram { .. } |
