@@ -3674,6 +3674,46 @@ must stay near 4 ms. Until one of them lands, the tree carries the per-stream
 handshake and the arrival tail, and this entry is the record of what the
 alternative costs.
 
+**Way (1) was tried and it is refuted, and the credit path was a red herring
+(2026-11-01).** `credit_due()` became `recv_credit > advertised` — any movement
+asks for a pass — and the derived keys were re-applied over it. `bulk-n` still
+failed **0 of 8** across both arms where the baseline passes 4 of 4, and
+`churn-16`'s p99 got **1 068 % worse** (a directional claim past its 15 % floor):
+`poll_transmit` answers a due credit *instead of* a data packet, so a credit due
+on every read preempts the path the arrival itself needs. Reverted.
+
+The `credit_blocked=true` in the stall line that sent this investigation here is
+**not** evidence of a spent window: `last_refusal` is stamped by any *partial*
+`Conn::write` and cleared by nothing, and a record layer writing 32 KiB at a time
+into a shared window is partial almost every time. The line reads `true` on a
+healthy connection. That is a separate small defect worth fixing (the predicate
+should be re-derived per pass, like `none_snapshot` was), and it cost this
+investigation two runs.
+
+**And the arrival tail is now the release blocker, not a latency footnote
+(2026-11-01).** The sweep's `timeline` scenario drives an **interactive probe
+that opens a fresh TCP connection per ping** (`bench/src/bench/probes/series.py`:
+"a visitor arriving, not a session already open"), twenty per second, beside four
+bulk streams, sixteen churn connections per second and a UDP session. So the
+stage's p99 *is* the arrival cost under load, and the 1.0.0 sweep's molehill arm
+read: clean **125 ms** (the v0.11.2 record's 30.8), rtt100 421, loss1 1 087,
+loss5 2 471, and **loss5, rate100, jitter and clean#2 all FAILED** with
+`iperf3 error: control socket has closed unexpectedly` — the loss5 cell carried
+**0.0 Gbit/s for all 118 of its seconds**. The capacity ramp stopped at
+**2 streams**. The same scenario at `--scale 0.2` passes every stage (the holds
+are too short for the degradation to develop), which is why the failure needs
+the full schedule to appear.
+
+That reframes the trade the last three entries recorded: the arrival tail is not
+a number on a latency chart, it is what fails four of eight stages of the
+release sweep and holds the capacity ramp at two streams. The derived keys would
+fix it (p99 3.79 ms, level with TCP) and their cost is the bulk cell — which the
+eager-credit experiment shows is *not* the credit path. So the remaining
+candidate is way (2), sealing inside the carrier's own framing, and it is the
+one piece of work this cycle has not attempted. It is a wire change inside the
+unreleased 6.0 dialect: a stream's prologue names its key material, the packet
+carries the tag, and there is no second length prefix and no partial-record wait.
+
 **P4′ is half done, and the half that is left is left on purpose (2026-11-01).**
 The two frame classes nothing sent are gone: a datagram frame and a whole-IP-packet
 frame were declared, acknowledged and dropped by the connection, and no sender in
