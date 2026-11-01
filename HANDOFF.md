@@ -2976,10 +2976,35 @@ pinned at its ceiling answers every later open with a 250 ms capacity wait and t
 a refusal, which is exactly the shape of a latency tail that no per-stream counter
 can see.
 
-The discriminating measurement is a soak with `MOLEHILL_POOL_STATS=1`, watching the
-live stream count against the clock: a plateau means the workload is simply wide,
-a monotonic climb means a leak. It is running now, and the answer decides whether
-the next change is in stream retirement or in the profile.
+**The count is not a leak: it is the workload (2026-11-01).** The same soak with
+`MOLEHILL_POOL_STATS=1`, live stream count against the clock:
+
+| sample | 1 | 20 | 40 | 60 | 80 | 100 | 120 | last |
+|---|---|---|---|---|---|---|---|---|
+| `streams` | 0 | 23 | 27 | 61 | 69 | 103 | **23** | **224** |
+
+It climbs, **falls back to 23** and climbs again to the 224 ceiling, with two
+refusals logged. So retirement works — a monotonic leak would never fall — and what
+happens is that this profile's own burst is wider than `4 x 56` streams.
+
+Which leaves a finding that must not be papered over: **the soak profile was never
+verified on `mhd` at the default `tunnels = 4`, and it does not fit.** TCP carries
+the same profile at the same width, so either its streams retire faster under this
+shape or its burst stays under the ceiling; either way the honest statement is that
+the drift axis cannot be taken on `mhd` at the default width until someone decides
+between two things: raise `[client.data].tunnels` for this workload (which the
+configuration page already prices at 0.5-0.8 MiB per lane per end), or find out why
+`mhd` needs more stream slots per carried connection than TCP does for the same
+workload. **Tuning the profile until it passes would hide the second question**, and
+the repository's measurement rules forbid that — a gate is not made green by
+changing the thing it measures.
+
+The next measurement is the count's *composition*: how many of those 224 streams
+are forwarding channels that have finished their byte work but not yet been
+retired, versus live visitors. `mhd` retires a stream only when it is abandoned,
+its finish has been sent and everything is acknowledged — three conditions a
+`yamux` stream does not have — and that is the most likely reason the same workload
+sits higher on `mhd` than on TCP.
 
 Meanwhile the work packages this defect has been crowding out are untouched, and
 the objective names them: the `Frame::Datagram`/`Frame::L3` classes are declared by
