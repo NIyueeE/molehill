@@ -4165,6 +4165,30 @@ One measurement note: this run failed level 1 in **3 of 3** rounds where the ear
 one gave `0, 1, 0`. Either the added logging costs enough to matter at this margin or
 the cell is more variable than three samples can say; treated as the latter until
 measured, because the logging is off unless the stats switch is set.
+
+**And the defect has a name: the small-flight timer keys on the lane, not on the
+packet (2026-11-02).** `Recovery::rto` decides the cheap floor with
+
+`let small = self.live <= SMALL_FLIGHT_PACKETS;`
+
+`self.live` is how many packets *this connection* has in flight. On a lane carrying
+bulk that number is large, so `small` is false and a retransmission waits
+`MIN_RTO`'s 200 ms and doubles — even when the packet being re-sent is an
+**opening**, which is one handshake packet in the air no matter what else the lane
+carries. The design intent is already written down and already tested (there is a
+test named "a lost opening packet costs the cheap timer, not the burst's"); what it
+keys on is the wrong quantity. That is why the exemption works on an idle lane and
+does nothing on a busy one, and it matches every number this round produced: 279 ms
+= one step of the wide timer, `hs_us=1` because the handshake is free once the
+packets flow, `retransmits=1` because exactly one retransmission was needed, and no
+drops anywhere because nothing was refused.
+
+**The change, for the next round:** carry "this packet is an opening" on `Sent` and
+let it take the small-flight floor regardless of `live`. It is a flag, one predicate
+and a test, and it has a gate that is already measured: the capacity level-1 stall
+should fall from ~279 ms toward the 20-40 ms the cheap timer costs, `churn-16`'s p99
+should fall with it, and `bulk-n` must not move — the last one because a bulk lane's
+retransmissions are not openings and must keep the wide timer.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
