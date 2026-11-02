@@ -4685,6 +4685,35 @@ That is what the release status should look like: not "the carrier is not ready"
 "four axes pass and two clean-stage p99s fail, for one reason, which is documented in
 `CHANGELOG.md` and in this file". A release can be held on that, and a reviewer can
 argue with a named number instead of a summary.
+
+**A diagnostic built for the stall asked the wrong table, and that is itself the
+finding (2026-11-02).** The parked-reader line already says how long a reader waited
+and what the hole is; what it did not say is whether the packet carrying the missing
+byte is tracked, lost-and-owed, or unknown. So `Conn::describe_hole` was added to
+answer that, and on a real stall it says, every time:
+
+`parked_us=7000974 hole_state="no packet covers this byte" wakes_while_parked=169`
+`parked_us=5484959 hole_state="no packet covers this byte" wakes_while_parked=127377`
+
+**And it says that because it is answering about the wrong direction.** `hole` is the
+**receive** buffer's `prefix_state`: the server is waiting to *receive* byte 229.
+`describe_hole` searched `recovery.in_flight`, which is the **send** table. A receive
+hole has no send-table answer, so "no packet covers this byte" is a tautology there
+and means nothing at all. Reverted.
+
+The correct consequence is worth more than the instrument: **a receiver cannot
+diagnose its own hole.** Bytes that never arrived are indistinguishable, from the
+receiving end, from bytes that were never sent — and the connection's own counters
+cannot tell them apart, which is exactly why every attempt to instrument the
+receiver has ended in an ambiguity (the cadence gaps that might be idle time, the
+spurious wake-ups that might be a spinning reader).
+
+**The sender can tell them apart, and already does.** `Conn::stall_report` logs
+`unsent_ms`, `unacked_ms`, the backlog and the worst stream whenever a connection has
+had bytes waiting for 200 ms with a megabyte queued. On a stall, that line answering
+"nothing waiting" convicts the receiver, and answering "these bytes waiting" convicts
+the sender. **That is the measurement to take next**, and it needs no new code — only
+a run that captures those lines across a stall.
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
