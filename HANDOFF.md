@@ -4279,6 +4279,34 @@ around it — specifically whether the opening datagram is *posted* when the lan
 pump is busy, which `mhd pump waited on the socket` and the send-buffer dwell line
 already half-answer.
 
+**The send path is excluded too, which leaves the repair itself (2026-11-02).**
+Four instruments now say the opening datagram is not delayed on its way out, on a
+`--rounds 8` capacity run with the whole crate at `DEBUG`:
+
+| question | instrument | answer |
+|---|---|---|
+| was the opening refused a buffer? | `mhd opening refused: which bound had no room` | **0 lines** |
+| did the peer's stream sit unaccepted? | `mhd stream waited for its accept` | **0 lines** |
+| did the pump block on the socket? | `mhd pump waited on the socket` | **0 lines** |
+| did it wait for a channel? | `pairing budget expired` | **1** line in 8 rounds |
+
+And the arithmetic of the timer rules out a long ladder step: with the cheap floor
+in force, `arm` computes `rto(...).saturating_mul(1 << backoff)` and *then* caps it
+with `.min(INITIAL_RTO)`, so **every step is ≤ 333 ms whatever the backoff is**. A
+3–4.6 s stall therefore means **nine to fourteen consecutive steps** — nine
+consecutive losses of one handshake datagram, on a path that records no drops on any
+leg. That is not a path losing packets; that is a retransmission that never leaves.
+
+So the next thing to read is the **repair path**, not the timer: `on_timeout`
+declares the packet lost and returns it, and something between that vector and the
+next `poll_transmit` must be failing to put it in a packet — the same class of defect
+as the earlier "range is empty" refusal, and the refusal line for a repair is
+`none_reason`. One line there decides it.
+
+This is also where the objective's own list points: P3′ is "SACK fast retransmit
+instead of RTO-only", and a repair that only the timer can ever trigger is the
+degenerate case of exactly that.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
