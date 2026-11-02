@@ -1380,6 +1380,12 @@ impl Conn {
         self.window_reported_at = at;
     }
 
+    /// This connection's wire id, so a periodic line can be read as one series
+    /// per lane instead of four interleaved ones.
+    pub(crate) fn wire_id(&self) -> u32 {
+        self.id
+    }
+
     /// The congestion window's own state, for the periodic stats line.
     ///
     /// `(cwnd, flight, slow_start)` — the three numbers that say whether a lane

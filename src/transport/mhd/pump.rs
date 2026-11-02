@@ -170,6 +170,36 @@ impl Staging {
 /// every one of them then classified lost, and the connection re-sent megabytes
 /// the peer already had. The caller alternates a run with a non-blocking ack
 /// drain, so send and acknowledgement progress together.
+/// Once a second, the window itself: whether a lane that has fallen behind a
+/// clean path is growing or sitting on one.
+///
+/// `slow_start` latches off at the first loss and never returns, so a lane read
+/// late in a shaping schedule is in congestion avoidance by construction, and the
+/// two numbers beside this flag are what say whether that is why its throughput is
+/// flat. The lane id is part of the line because four connections report
+/// independently: without it the four series interleave and read as one that
+/// oscillates.
+fn report_window(shared: &Arc<Shared>) {
+    if !crate::transport::stats::enabled() {
+        return;
+    }
+    shared.with(|conn| {
+        let now = Instant::now();
+        if now.duration_since(conn.window_reported_at()).as_secs() < 1 {
+            return;
+        }
+        conn.note_window_reported(now);
+        let (cwnd, flight, slow_start) = conn.window_state();
+        tracing::debug!(
+            lane = conn.wire_id(),
+            cwnd,
+            flight,
+            slow_start,
+            "mhd window"
+        );
+    });
+}
+
 async fn flush(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -256,21 +286,7 @@ async fn flush(
     }
     posting.stop(&crate::transport::stats::PHASES.tx_send);
     crate::transport::stats::sent_run(sent, run.len());
-    // Once a second, the window itself: whether a lane that has fallen behind a
-    // clean path is growing or sitting on one. `slow_start` latches off at the
-    // first loss and never returns, so a lane read late in a shaping schedule is
-    // in congestion avoidance by construction, and the two numbers beside this
-    // flag are what say whether that is the reason its throughput is flat.
-    if crate::transport::stats::enabled() {
-        shared.with(|conn| {
-            let now = Instant::now();
-            if now.duration_since(conn.window_reported_at()).as_secs() >= 1 {
-                conn.note_window_reported(now);
-                let (cwnd, flight, slow_start) = conn.window_state();
-                tracing::debug!(cwnd, flight, slow_start, "mhd window");
-            }
-        });
-    }
+    report_window(shared);
     if let Some(stall) = shared.with(|conn| conn.stall_report(Instant::now())) {
         let credit_blocked = shared.with(|conn| conn.credit_blocked());
         tracing::debug!(

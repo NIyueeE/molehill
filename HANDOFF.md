@@ -3958,6 +3958,24 @@ lacks — re-arm exponential growth instead of paying additive-only for the rest
 the process's life. It is on the throughput axis, it is local to `conn.rs`'s growth
 path, and the instrument above is how its effect gets measured: `slow_start=true`
 must reappear, and `cwnd` must reach the path's BDP rather than 60 KiB.
+
+**The instrument was wrong first, and the corrected one contradicts the code
+(2026-11-02).** The line originally carried no lane id, so four connections
+reported into one stream and the first reading — "13 → 42 → 19.8 → 26.3 KiB" — was
+four interleaved series read as one. With `lane=` added, `bulk-n` (three client
+runs, 84 samples) reads:
+
+**`cwnd` = 13 490 bytes in every one of the 84 samples, and `slow_start` false in
+every one.** Not "grows slowly": does not grow by a byte, on the product's primary
+workload, while the cell carries 11.5 Gbit/s.
+
+That contradicts `on_ack`'s own comment, which says the cumulative retirement path
+feeds the round-trip sample precisely so that "the congestion window would never
+grow" cannot happen, and the growth branch under it. Two readings are possible and
+they are cheap to separate: either the growth branch is not reached (`acked.progress`
+false, or `bytes` zero on this path), or `cwnd` is being read from a different
+`Conn` than the one growing. The next instrument is a counter of growth attempts
+per lane, not another minute of the timeline.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
