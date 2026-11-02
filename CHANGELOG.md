@@ -27,7 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quarter of pairings take at least 5 ms and their distribution runs p50 8.1 ms, p90
   16.0, p99 27.1, while the client's own stream open stays under 5 ms in all but one
   case in two thousand. So the wait is not the open — it is what happens between the
-  server asking for a channel and that channel's first packet arriving. Where a connection is
+  server asking for a channel and that channel's first packet arriving. Narrowed again
+  with the client's own open line at the same five-millisecond scale: 291 slow opens in
+  two rounds, p50 **5.6 ms**, p90 7.6, worst 23.6, and **every microsecond of it in the
+  handshake** (`ack_us` is zero). The tail is one Noise handshake's round trip taking
+  five milliseconds where the path's own is a tenth of one — the same single-flight cost
+  this release measures everywhere, at millisecond rather than second scale. Where a connection is
   *reused* the carriers are indistinguishable: `rr-16` agrees to within 1 % on the
   tail and 5 % on the rate. The cause is structural rather than a tuning error —
   every visitor channel runs its own Noise handshake before its first byte can

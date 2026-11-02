@@ -931,7 +931,11 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 // A hundred milliseconds is fifty times the round trip a healthy
                 // path here measures, so an open past it is a stall and worth the
                 // four numbers that tell its four causes apart (`Conn::budget`).
-                if us >= 100_000 {
+                // Five milliseconds behind the stats switch, the same scale as the
+                // server's two halves of this wait. At a hundred milliseconds this line
+                // reported nothing on a cell whose tail is twenty: the instrument was
+                // four times coarser than the defect it was written to find.
+                if us >= 5_000 && crate::transport::stats::enabled() {
                     let (credit, window, buffer, queued, retransmits) = self.shared.with(|conn| {
                         let (credit, window, buffer, queued) = conn.budget();
                         (
