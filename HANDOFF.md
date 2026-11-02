@@ -5936,6 +5936,25 @@ better statement than the one the release started with, and it is the last one t
 can make with evidence: **six measurement rounds remain, and they go to leaving the tree
 green and the record honest rather than to a seventh hypothesis.**
 
+**And the `control socket` failure is at the *end* of a test, not during one
+(2026-11-02).** That run's `jitter` sample was asked for 120 seconds and ran **120.38** —
+a completed test — and still exited 1 with `control socket has closed unexpectedly`. Its
+long-lived groups ended at `lived_s` 130-162, at or past the stage, so nothing closed a
+data stream early either.
+
+So the shape is: the data phase completes, and the *control* connection — a separate
+forwarded stream that iperf3 keeps open across the whole test and uses to report — is
+closed by the tool before the peer it is talking to has finished with it. That is a real
+behaviour and a user-visible one: any protocol that finishes with a shutdown handshake
+rather than a bare close sees a reset where it expected an orderly end. It is also the one
+thing that has cost a cell of coverage in *every* run this cycle, which is why the gate has
+reported missing cells more often than failing ones.
+
+Converting that from "unknown" to "at end-of-test, on the control leg" is the last
+narrowing this cycle can make. The fix — half-close and wait, rather than drop — touches
+the close path for every visitor and needs its own measurement round, which is more than
+the five rounds left can do honestly.
+
 
 
 
