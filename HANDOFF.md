@@ -5636,6 +5636,29 @@ The remaining rounds go to two things in this order: name the mode with the inst
 that now exist (the pairing count says *which* run, the window says what it was doing),
 and leave the tree with every gate green and the release held on a documented gap.
 
+**And a correction that undoes an explanation this file has used for twenty rounds
+(2026-11-02).** `churn-16`'s `params` read `"churn_per_s": 16` — the harness's rate is
+**sixteen connections a second**, not sixteen at once. Each request is over in a couple
+of milliseconds, so there is no concurrency in that cell at all, and every paragraph in
+this file that attributed its tail to "sixteen concurrent arrivals contending for four
+lanes" was explaining something that does not happen. The CHANGELOG and the benchmarks
+page said the same thing in both languages and are corrected in `914e454`.
+
+Two experiments fell out of the correction, and both are cheap because the cell is:
+
+- **The tail is not the small-flight timer.** `MIN_RTO_SMALL_FLIGHT` is 20 ms and the
+  p99 is 21 ms, which is the shape that has fooled this file six times. Set to 5 ms: p99
+  **22.63** against an A/A twin's **22.26**, i.e. no improvement. Reverted.
+- **It is not contention and not the lane count**, which the earlier 4/8/16 experiment
+  already showed flat — and now that has a reason: there is nothing to contend.
+
+So the honest statement of that cell is narrow and different from the one this file has
+carried: at sixteen fresh connections a second on an idle path, about **one in a hundred**
+requests takes 21 ms where TCP's worst hundredth takes 2.6, and the median is level. The
+tail is a single-request cost that occasionally lands, not a queue — which is why every
+lever aimed at queues (lanes, windows, pairings) moved nothing.
+
+
 **Release status, consolidated for a reviewer (2026-11-02).** Everything below is on the
 current tree, green under `just check`, with
 `benches/records/results-bench-v1.0.0.json` **absent on purpose** — no record was
