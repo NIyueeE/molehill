@@ -5781,6 +5781,35 @@ last stage in the chain without a number, and the honest alternative — if it i
 measurable in the time left — is to publish the distribution, which the CHANGELOG's Known
 gaps already does.
 
+**And the delay is one wake, seen by both ends (2026-11-02).** The two sides measure the
+same exchange independently, and the numbers agree:
+
+| side | what it measures | value |
+|---|---|---|
+| client | `hs_us`: opening message written → reply parsed | **5 639 µs** (p50 of 291) |
+| server | `hs_us`: first read → handshake complete | **6 124** (its one slow line that run) |
+
+The server's `hs_us` starts when it begins reading the stream's first bytes, so it
+includes waiting for the client's opening message to arrive. Both ends therefore spend
+about six milliseconds on the same exchange, which is what **one** delayed wake looks
+like from either side — not a chain of small delays, and not a queue (there is no
+concurrency in this cell to queue behind).
+
+That is as far as this cycle can narrow it without a per-datagram timestamp on the wire,
+and the honest statement is: **a single userspace wake on a loopback path occasionally
+costs about six milliseconds, two and a half per cent of the time, and it lands on the
+per-stream handshake because that is the only thing on this carrier's arrival path that
+needs two of them.** A multiplexed carrier needs none per arrival, which is exactly the
+structural difference the CHANGELOG's Known gaps describes — and it is now measured at
+millisecond rather than second scale, with the queueing explanations all excluded.
+
+**Eleven rounds remain and the work that is left is not another experiment.** The release
+is held on two SLO failures whose numbers swing with a host state that has no instrument;
+every mechanism reachable from the code has been measured; the tree is green and the
+record is complete. The remaining rounds go to keeping it that way and to the end-of-session
+ritual, not to a twelfth hypothesis.
+
+
 
 
 
