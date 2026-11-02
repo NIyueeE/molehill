@@ -1005,10 +1005,47 @@ def run_staged(ctx: Ctx, params: dict) -> list:
     return cells
 
 
+class _RestoresCondition:
+    """Put the leg back to clean however the stage ends.
+
+    `_one_stage` imposes a condition and, until this guard existed, never took it
+    off: `run_staged`'s own `finally` restores `ctx.condition`, which is `None` for
+    a staged run, so it restored nothing. The last stage of the timeline is
+    `clean#2` and therefore benign — but a stage that *dies* early used to leave
+    whatever it had installed in place, and every stage and every arm after it ran
+    on that path.
+
+    Measured, and it cost a whole five-arm sweep: one arm lost `loss5`, four of its
+    stages followed, the next arm lost two of its own plus all eight capacity
+    levels, and the two arms after that carried nothing at all — the gate reported
+    69 failures and the reference tools were the ones with zero streams. **One bad
+    stage must not cost every measurement after it**, which is AGENTS §10's rule
+    about a failure poisoning the next sample, applied to a condition instead of a
+    process.
+    """
+
+    def __init__(self, topo, leg: str) -> None:
+        self.topo, self.leg = topo, leg
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_: object) -> None:
+        with contextlib.suppress(Exception):
+            self.topo.set_condition(self.leg, model.CONDITIONS["clean"])
+
+
 def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     """One stage: impose the condition, let the leg go quiet, then measure."""
-    label, condition, secs = stage
+    condition = stage[1]
     ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
+    with _RestoresCondition(ctx.topo, ctx.leg):
+        return _measure_stage(ctx, stage, params, logs)
+
+
+def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
+    """The body of one stage, with its condition already imposed."""
+    label, condition, secs = stage
     drain = ctx.topo.drain(ctx.leg)
     port = topology.IPERF_PORT
     # `streams: 0` is the bulk spine switched off: the staged timeline still
