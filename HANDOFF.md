@@ -5873,6 +5873,17 @@ the gate applies does not distinguish the two. A reviewer can hold the release o
 start or accept it, but no longer on "a tail nobody can attribute" — the distribution says
 where the cost is.
 
+**And it is now on the pages that own it (2026-11-02, `494dd83` and `586391f`).** The
+warm-and-cold table is a section of `docs/benchmarks.md` (+ `.zh.md`) with the reading
+rule the schedule depends on — a schedule that measured only the first stage would report
+the cold number and one that measured only the last would report the warm one, which is
+why the order is part of the method — and the `CHANGELOG`'s known gap states the same two
+numbers in the release notes, because a reader deciding whether to adopt this carrier is
+choosing between quicker-than-TCP once running and slower for the first minutes of its
+life. Nothing about the release decision changed except that it can now be made from a
+number instead of from a caveat.
+
+
 
 
 
