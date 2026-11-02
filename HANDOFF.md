@@ -4748,6 +4748,29 @@ together with what its forwarding task is waiting on. That is one line in the co
 loop of `route_mhd_stream`, and it is the first instrument this cycle that sits
 *above* the carrier rather than inside it.
 
+**Where that instrument goes, located (2026-11-02).** The forwarding above the carrier
+is `stripe::spawn_group`: it splits each data channel into read and write halves and
+spawns exactly two tasks — `send_loop(src, StripeSender::new(writes, plan))` and
+`recv_loop(reads, dest, …)` — then only awaits them and watches an activity clock for
+its watchdog. So on the server, visitor bytes travel `src → send_loop → stripes`, and
+tunnel bytes travel `reads → recv_loop → dest`; the megabyte of unread receive buffer
+that a stall leaves behind belongs to a **carrier stream read by `recv_loop`**, which
+means `recv_loop` is the task that is not draining it.
+
+That is where the next instrument goes, and it is one line: in `recv_loop`, when a
+read returns `Pending` while the source still has data (which for a carrier stream is
+`held() > 0`), log the stream, the held bytes and how long the same read has been
+pending. A `Pending` with data available is a contradiction the carrier cannot
+produce, so the answer will be one of exactly two things — the wake-up did not arrive,
+or the task was never polled — and both are visible from inside the loop.
+
+Two bounds on this, so the next round does not repeat this cycle's mistake: read what
+`held()` counts for the specific stream type before concluding from it (a `StreamIo`
+exposes `held` through `Conn`, and a split half does not), and do not infer the
+direction of a backlog from the process that logs it — the megabyte above is on the
+**client**, whose `recv_loop` writes to the iperf3 sink, and the stalls that matter are
+the **server**'s readers.
+
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
