@@ -5110,6 +5110,37 @@ record layer that the bulk cell rejected three times). **P1′'s p99 gate and P2
 choice this release does not reverse**, which is exactly what `CHANGELOG.md`'s Known
 gaps says in the release notes.
 
+**P5′: the release ritual, run in order, and held where the gate says (2026-11-02).**
+The five steps of `docs/release.md`, with what each produced:
+
+1. **`just interop`** — 3 of 3. `new_server_refuses_old_client_and_keeps_serving`
+   passes, so a 1.0.0 client meets a v0.11.2 binary and both refuse each other on the
+   connection it happens on while each keeps serving its own version. (This step was
+   broken for the whole cycle until `3dc48aa`: the released-side config was still
+   written in v0.11.1's schema, so the old server refused its own config before the
+   wire was ever tested.)
+2. **`just bench peers fetch`** — frp 0.71.1, rathole 0.5.0, nps 0.26.10, from their
+   latest GitHub releases, recorded in the results meta.
+3. **The sweep** — `just bench --profile sweep --binary target/release/molehill --out
+   benches/records/results-bench-v1.0.0.json`, five arms over the staged schedule and
+   the capacity ramp, fingerprint `0e549bbb810395a3`, running now.
+4. **The charts and the README tables** — cannot be produced from a record whose gate
+   fails, and are not produced speculatively.
+5. **`just bench gate`** — **the honest blocker.** Run against the timeline alone on
+   this tree it reports four of its five axes green (coverage, the endpoint invariant,
+   drift, and the regression half correctly reported as absent) and **two named SLO
+   failures**: `timeline[clean]` p99 **93.02 ms** and `timeline[clean#2]` p99
+   **93.56 ms**, against a 50 ms bar.
+
+So the release is **held at step 5**, on two numbers, and the numbers moved by an order
+of magnitude in this cycle (they were 668 and 376 ms). What remains is the same
+structural gap the Known gaps entry describes: a fresh connection runs its own
+handshake, sixteen concurrent arrivals contend for it, and the tail that produces is
+43 ms too long for this SLO. **No tag is pushed, and none will be by me** — the CHANGELOG
+section, the version and the ritual are in place so that a human who accepts the gap can
+tag, and one who does not has the number to argue with.
+
+
 
 
 
