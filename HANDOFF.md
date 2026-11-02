@@ -5375,6 +5375,36 @@ twin agreed to the hundredth of a millisecond, which is what a 100 ms one-way de
 real 4× regression from a twin that was itself in the bad mode, and it is the difference
 between reverting a fix and shipping one.
 
+**And the A/B settles it: the revert was wrong (2026-11-02, `a395044`).** Interleaved,
+four rounds each, under `--condition loss5` (100 ms, 1 %), with the exemption as A, the
+tree without it as B, and an A/A twin in the run:
+
+| | p50 | p99 | `bulk-n` |
+|---|---|---|---|
+| **A** (exempt) | 202.05 ms | **861.7** | 1.68 Gbit/s |
+| B (no exemption) | 202.06 ms | **1 426.9** | 1.71 |
+| A/A twin | 202.05 ms | 861.5 | 1.45 |
+
+**The medians are identical to a hundredth of a millisecond; the tail is 40 % better
+with the exemption; and the twin confirms it.** Throughput is inside the cell's own
+scatter (1.68 against 1.71, twin 1.45). So the exemption costs nothing and buys the
+`loss5` tail.
+
+Two lessons, both already written down and both earned again here. **A single-arm
+comparison under a lossy condition is worthless in this cell** — the earlier revert was
+made against a baseline whose own A/A disagreement (6.36 against 11.22 Gbit/s) was
+larger than the effect being judged. And **a median of 202 ms under a 100 ms one-way
+delay is the correct reading, not a regression**: two traversals of the shaped leg. The
+2.63 ms that a previous run showed at the same condition was the anomaly, and it is the
+same degraded mode this whole round has been chasing.
+
+So the release picture improves by one tail: the `loss5` stage's p99 with the exemption
+is 861 ms, against 1 426 ms without. What it does not do is make `loss5` pass — and the
+first-stage problem the diagnostic named (845 pairings waiting, a 613 ms handshake under
+load) is a *different* effect that this fix only partly touches, because the handshake in
+that measurement was slow on a **clean** path where the age bound was not refusing it.
+
+
 
 
 
