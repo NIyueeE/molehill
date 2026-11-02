@@ -4307,6 +4307,38 @@ This is also where the objective's own list points: P3′ is "SACK fast retransm
 instead of RTO-only", and a repair that only the timer can ever trigger is the
 degenerate case of exactly that.
 
+**And that conclusion was wrong: the repair does leave (2026-11-02).** The pumps
+discard `on_timeout`'s returned vector — `let (expiry, _) = conn.on_timeout(now)` —
+which looked like the answer, but `Conn::on_timeout` registers the repairs itself
+before returning:
+
+```rust
+for sent in &lost {
+    if let Some(range) = sent.range {
+        ...
+        state.send.repair(range.offset, usize::from(range.len));
+```
+
+so the discard is correct and the bytes are re-sent on the pump's next pass. The
+previous paragraph's "a retransmission that never leaves" is withdrawn: it was
+inferred from the arithmetic (nine to fourteen 333 ms steps) without reading the
+handler, and the handler contradicts it. **Reading the code before writing the
+conclusion is the step I skipped**, and it cost a round.
+
+The arithmetic still stands and is still unexplained: a stall of 3-4.6 s at ≤333 ms
+per step is nine to fourteen steps, on a path that records no drops. So the loss
+declarations are happening repeatedly while the path is healthy. One line of
+`Conn::on_timeout` also explains part of it and is a defect in its own right —
+`self.slow_start = false` on *every* timeout with losses — but that is a throughput
+wound, not the latency one.
+
+**What is left, and it is now narrow:** either `recovery.on_timeout` is declaring
+packets lost that were in fact delivered (a reordering error, not a loss), or the
+acknowledgement for the opening never comes back. The instrument that separates them
+is one counter pair per lane — timeouts that found a packet stale, and acks that
+arrived for a packet already declared lost — and the second of those is the signature
+of a false loss.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
