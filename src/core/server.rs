@@ -4102,13 +4102,14 @@ where
             }
         }
         let paired = pairing_started.elapsed();
-        if paired >= std::time::Duration::from_millis(100) {
-            // **`info!`, like a slow opening**, and for the same reason: a visitor
-            // that waited a tenth of a second for its channel is an SLO breach on
-            // the clean stages, and a line nobody captures cannot explain the gate
-            // that reports it. A healthy pairing here is ~2.6 ms, so this fires
-            // only when something is wrong, and `note_slow_opening` already made
-            // the same choice for the server's half of the same wait.
+        // Five milliseconds and the stats switch, exactly like `note_slow_opening`,
+        // because the two halves of one wait must be readable at the same scale: a
+        // twenty-millisecond tail on a two-and-a-half-millisecond median is invisible
+        // to a hundred-millisecond threshold, and that is how this cell's tail stayed
+        // unattributed through every instrument aimed at it.
+        if paired >= std::time::Duration::from_millis(5) && crate::transport::stats::enabled() {
+            // `info!`, like a slow opening, and for the same reason: a line nobody
+            // captures cannot explain the gate that reports the SLO breach.
             info!(
                 group,
                 stripes = stripe_count,
