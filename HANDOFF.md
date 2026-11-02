@@ -4591,6 +4591,45 @@ rounds on without the operator knowing what is at stake. It is recorded in
 `CHANGELOG.md` under Known gaps so a deployment can decide for itself, and the release
 ritual's capacity cell reports it honestly as a failure rather than being massaged.
 
+**P4′: the constants audited against what this cycle measured (2026-11-02).** The
+plan item is "复核常量", and this is the audit: every constant the carrier's
+behaviour depends on, with the measurement that supports it or the note that nothing
+does.
+
+| constant | value | what measures it |
+|---|---|---|
+| `WINDOW` | 16 MiB | **binds on a long path, by design.** `rtt100`'s 1.70 Gbit/s is 16 MiB ÷ 400 ms × four lanes ≈ 1.34; the CHANGELOG records the 32 → 16 MiB trade. |
+| `MAX_BUFFERED` | 2 × `WINDOW` | not exercised — no cell fills it. |
+| `INITIAL_CWND` | 10 packets (13 490 B) | **the ceiling for a lane that sends little**, since slow start needs bytes to grow on: measured at exactly this value on the acknowledgement-only side. |
+| `SLOW_START_CEILING` | 2 MiB | **reached and passed** — every tunnel lane opens at exactly 2 MiB, then additive growth carries it to 5.6-11.7 MiB. The ceiling is a slow-start ceiling, which is what it says. |
+| `MAX_CWND` | 16 MiB | **never reached** in any sample (peak 11.7 MiB). Unexercised; its value is unjustified but not wrong. |
+| `OPEN_RESERVE` | 8 packets (10 792 B) | arithmetic only: on a fresh lane (`cwnd` 13 490) a non-opening stream is left 2 698 B. Plausible by design, unmeasured. |
+| `MIN_RTO` | 200 ms | **below the carrier's own queue on a fast lane** — a 16 MiB window on a 1.25 Gbit/s lane spans ~128 ms, so the floor is within a factor of two of a healthy flight. This is the documented root of the tail, and it is the constant whose value the measurements actually challenge. |
+| `MIN_RTO_SMALL_FLIGHT` / `SMALL_FLIGHT_INITIAL_RTO` | 20 ms | floor for an opening; the ladder's *cap* is what was wrong, not this. |
+| `SMALL_FLIGHT_PACKETS` | 2 | **too narrow by construction**: an opening on a busy lane has `live` in the hundreds, so this predicate never fired where it was needed — hence `Sent::opening`. |
+| `INITIAL_RTO` | 333 ms | the pre-sample fallback; measured as the "open of 5 266 433 µs" defect the cheap floor was introduced for. |
+| `DEAD_LINK` / `DEAD_FLOOR` | 10 / 5 s | shown to be floor-bound when the ladder is flat: a dead path is declared at 5 s, not at ten ticks. |
+| `PAIR_ATTEMPTS` / `PAIR_WAIT_BUDGET` | 2 / 5 s | **changed this cycle** 5 → 2 (25 s → 10 s), measured with no regression. |
+| `PACKET_THRESHOLD` | 3 | standard; and the bitmap's 64-number reach is what leaves holes beyond it unrecoverable. |
+| `LOST_HOLD` / `MAX_LOST` | 3 s / 4 096 | bounded by construction and tested. |
+| `GRANULARITY` | 1 ms | the floor under every estimate; **1 ms is what makes `loss_delay` 1 ms** while the timer is 200, the mismatch recorded above. |
+| `KEEPALIVE` / `DEAD_AFTER` | 2 s / 20 s | not measured this cycle. |
+| `SEND_RUN` | 44 | GSO batching; not measured directly. |
+
+Two conclusions the audit supports and one it refuses:
+
+- **`SMALL_FLIGHT_PACKETS = 2` is demonstrably too narrow** for the rule it carries,
+  which is why the fix was to move the decision onto the packet (`Sent::opening`)
+  rather than to widen it — widening would have made any two-packet flight cheap.
+- **`MIN_RTO` is the constant the evidence challenges**, and it is the one that must
+  not be changed on this evidence alone: raising it slows real loss recovery on every
+  lossy cell, and the measurement that would justify a specific value is the
+  per-datagram trace the tail needs anyway.
+- **`MAX_CWND`, `MAX_BUFFERED`, `OPEN_RESERVE`, `SEND_RUN`, `KEEPALIVE` and
+  `DEAD_AFTER` are unexercised by every measurement this cycle made**, and this audit
+  does not invent values for them. Recording that is the point: a constant nothing
+  measures is a constant nobody can defend.
+
 
 The capacity cell did improve sharply on the timer fix before the regression was
 visible on other cells — p99 358, 821, 1 025, 1 715, 1 895, 2 061 ms against
