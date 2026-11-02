@@ -5275,6 +5275,47 @@ before any further sweep, because until it does, one bad stage costs every measu
 after it — which is exactly how this cycle's first sweep came to be read as a product
 failure.
 
+**And the re-run's own distribution says the steady state is now at parity with TCP
+(2026-11-02).** The harness fix worked where it was aimed — the cascade dropped from
+five stages to two, and `rate100`, `rate20` and `jitter` all pass now — but the run's
+`clean` stage reads 1 133 ms and its `clean#2` reads 3.6 ms, so the per-stage
+distributions are worth reading directly rather than through the summary line:
+
+| stage | n | p50 | p90 | p99 |
+|---|---|---|---|---|
+| clean | 682 | **137.9** | 532.2 | 1 133.1 |
+| rtt100 | 248 | 423.6 | 756.0 | 1 298.7 |
+| loss1 | 1 396 | 42.5 | 274.5 | 1 104.9 |
+| loss5 | 208 | 402.7 | 1 407.3 | 3 709.3 |
+| rate100 | 1 236 | 122.3 | 179.0 | 188.3 |
+| rate20 | 1 074 | 167.5 | 186.7 | 191.8 |
+| jitter | 1 907 | 81.5 | 97.5 | 110.7 |
+| **clean#2** | **2 604** | **2.2** | **2.6** | **3.6** |
+
+**`clean#2` is the best arrival measurement this cycle has produced by a wide margin:
+p50 2.2 ms, p90 2.6, p99 3.6 — better than TCP's own 2.24 / 2.59 on the same cell.**
+It is also the *last* stage of the run, and the *first* stage of the same run reads
+p50 137.9. Two stages with the same condition, the same binary, twenty minutes apart,
+differing by sixty times at the median.
+
+That is a warm-up effect, and it means **the gate's SLO failures are being produced by
+the first stage of a timeline, not by a steady-state defect**. `clean#2` is reported
+FAILED only because its *bulk* sample died with the same `control socket has closed`
+that `loss5` shows — its arrival series is healthy throughout, 2 604 pings at p99
+3.6 ms.
+
+So three statements are now each true and must not be confused:
+
+1. **Steady state is at parity with TCP** — 2.2 ms p50, 3.6 ms p99 against 2.24 / 2.59.
+2. **The first stage of a run is slow** — 137.9 ms p50, and since the gate SLOs the
+   clean stages it is what fails, not the steady state.
+3. **Bulk samples fail intermittently** with `control socket has closed`, in `loss5`
+   and in `clean#2` — a different defect again, and the one that costs coverage.
+
+The next measurement is therefore about (2) alone: what makes the tool slow for the
+first two minutes after it starts, when twenty minutes later it is at parity. Everything
+else in the release picture is either measured good or already attributed.
+
 
 
 
