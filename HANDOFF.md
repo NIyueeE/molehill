@@ -3812,6 +3812,43 @@ own messages. The model marks it directional rather than a claim only because it
 was not pre-registered as this run's endpoint. The terminal latency stays flat, and
 that is the honest reading: on this cell the queue is longer than the flight.
 
+**And the cell's 16x collapses were never the carrier (2026-11-02, `15d43a0`).**
+The intermittent `churn-16` rounds that read ~180 arrivals/s where the same code
+reads 2 900 turned out to be the **visitor namespace running out of ephemeral
+ports**: a fresh connection per request at ~2 900/s accumulates ~174 000 sockets
+in `TIME_WAIT` against a 28 231-port default range, the probe's connect is
+refused, and it backs off 50 ms per refusal — waits that land inside the measured
+window. The raw sample states it: `connect_errors=3773` of 6 400 attempts, and
+`2627 + 3773 = 6400` exactly. It hit the A/A twin as readily as the arm under
+test, which is the signature that should have been noticed far earlier: **a
+"collapse" that respects no arm is an instrument, not a subject.**
+
+The topology now sets `tcp_tw_reuse=1` and `ip_local_port_range=1024 65535` in the
+visitor namespace only, and a round with more than one connect in twenty refused
+is a failed cell naming port exhaustion. Six rounds after: `connect_errors=0` on
+every one, 1.76–2.12 s each. **Every `churn-16` number recorded anywhere in this
+file before `15d43a0` carries that contamination**, and the ones on rounds that
+did not starve are fine while the ones on rounds that did are 16x low.
+
+**The one-flight open, re-measured on the repaired instrument** (`--ab-arm`,
+`--binary-b` at `891129d`, six rounds, mhd forced). The A/A twin reported 0 claims,
+so the noise floor is clean at this run's alpha:
+
+| | vs baseline |
+|---|---|
+| `churn-16` `wire_per_visitor_byte` | **−15.09 %** (CI [−0.727, −0.656], p 0.031) |
+| `churn-16` `rtt_p50_ms` | −23.64 % (FRAGILE, p 0.219) |
+| `churn-16` `rate_per_s` | +16.67 % (FRAGILE, CI crosses zero) |
+| `bulk-n` `throughput_gbps` | +39.55 % (CLAIM at n=6, but the weakest one the sign test allows) |
+
+Only the wire ratio is beyond argument: its interval is tight, it does not cross
+zero, and the mechanism *is* a reduction in wire bytes. The p50 and the rate move
+in the right direction and stay inside what six rounds can settle. The `bulk-n`
+claim is reported by the model and is `FRAGILE` — one round dropped flips it, and
+the baseline's own samples contain two rounds at ~3.1 Gbit/s against its usual
+6.5, which is a bimodality on *that* cell that has not been explained. **Do not
+build on it**: the honest status is "unresolved, needs ~28 rounds".
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
