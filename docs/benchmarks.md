@@ -927,6 +927,29 @@ and multiplexes every stream inside it. A visitor's channel open costs 2 648 µs
 of which 1 818 µs is that handshake; everything after it is at parity, and the
 first byte follows the pairing in 12 µs.
 
+### Warm and cold
+
+The staged schedule's first stage and its last carry the **same condition**, and they
+disagree by a factor of six at the median. Both numbers are real and they answer
+different questions:
+
+| | p50 | p90 | p99 |
+|---|---|---|---|
+| first `clean` stage, minutes after start | 12.13 ms | 51.65 ms | 103.70 ms |
+| last `clean#2` stage, the same run | **1.87** | **2.27** | **15.07** |
+
+Read against TCP on the same cell — p50 2.24 ms, p99 2.58 — **the warm carrier is faster
+at the median and at the ninetieth percentile and slower at the ninety-ninth**, while the
+first stage after a restart is six times worse at the median than the carrier will be.
+So a deployment is choosing between a carrier that beats TCP once it has been running and
+one that pays a start-up cost for the first minutes of its life; the cost is the
+carrier's own state filling in — its congestion window ramping from its initial ten
+packets to the megabytes it settles at — and not a queue of unopened channels.
+
+A schedule that measured only the first stage would report the cold number and a schedule
+that measured only the last would report the warm one. This one reports both, in order,
+which is why the order is part of the method.
+
 Removing the handshake by deriving each stream's keys from the lane's own was
 built and measured three times. It takes the tail to 3.79 ms and doubles the
 arrival rate at half the CPU per bit, and **every version cost the bulk cell** —
