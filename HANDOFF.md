@@ -5140,6 +5140,40 @@ handshake, sixteen concurrent arrivals contend for it, and the tail that produce
 section, the version and the ritual are in place so that a human who accepts the gap can
 tag, and one who does not has the number to argue with.
 
+**And the sweep found that the two SLO failures were not the only blocker — a
+five-stage cascade starts at `loss5` (2026-11-02).** The five-arm sweep's molehill arm
+reads:
+
+`clean: 46.248 ms; rtt100: 403.175; loss1: 1101.306; loss5: FAILED; rate100: FAILED;
+rate20: FAILED; jitter: FAILED; clean#2: FAILED`, and `capacity: ramp 8`.
+
+**Two landmarks, and they are the first of the cycle:** `clean` at **46.2 ms is inside
+the 50 ms SLO** — the arrival fix did that, from 668 ms two runs ago — and
+**`capacity` climbed all eight levels**, `capacity_streams = 8` = `streams_max`, where
+five rounds in six had never passed level one.
+
+And five stages failed, all with `iperf3 error: control socket has closed
+unexpectedly`, cascading from the first. The `loss5` sink's own log says what the
+first one was:
+
+`unable to receive cookie at server: Bad file descriptor`, `wall_s 0.85`.
+
+So the `loss5` sample died 0.85 s in, and **every stage after it failed for the same
+reason** — AGENTS §10 names this exact hazard ("a wedged iperf3 server turned every
+later repetition into a null"), and it is the same signature as the sweep that opened
+this cycle, which was attributed to the arrival tail at the time and may not have
+been. **A `Bad file descriptor` on the sink's first test is either the product closing
+a stream under 5 % loss or the harness's sink lifetime; the two are separable, and
+until they are, a single failure costs five stages of evidence.**
+
+Two things follow, and the second one is uncomfortable. The cascade is a harness defect
+worth fixing on its own (restart the sink after a failed sample, which §10 requires and
+`iperf_sink` does not do mid-stage). And the earlier conclusion that "the arrival gap
+fails the release sweep" now has a competing explanation for four of those five
+failures — the same cascade — which means **the `clean` and `capacity` numbers above,
+not the failure list, are the part of this run to trust**.
+
+
 
 
 
