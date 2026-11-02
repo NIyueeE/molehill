@@ -5658,6 +5658,34 @@ requests takes 21 ms where TCP's worst hundredth takes 2.6, and the median is le
 tail is a single-request cost that occasionally lands, not a queue — which is why every
 lever aimed at queues (lanes, windows, pairings) moved nothing.
 
+**And the tail is measurable once the instrument reads at the right scale: it is the
+pairing (2026-11-02, `e7e5ba9`).** The pairing line's threshold was 100 ms — four times
+the tail it was meant to catch — so it reported nothing, ever. At 5 ms, behind the same
+stats switch as the opening line, one run of three rounds (6 400 requests a round):
+
+| | pairings ≥ 5 ms |
+|---|---|
+| count | 5 035 |
+| p50 | **8 084 µs** |
+| p90 | 16 002 |
+| p99 | 27 075 |
+| max | 43 886 |
+
+and the same run's `churn-16` reads p50 **2.45 ms**, p99 **20.47**. Those numbers fit
+together exactly: a quarter of requests wait at least 5 ms for a channel, which leaves
+the median untouched, and the worst of those waits are what the p99 catches.
+
+**And the wait is not the open.** The client's own `mhd slow stream open` fires once in
+that whole run, at the same 5 ms threshold. So a channel that takes 8-27 ms to arrive was
+opened in under five: the time is between the server asking for a channel and that
+channel's first packet arriving. Three things live there — the control channel carrying
+the request, the client's pool handing the lane over, and the new stream's first datagram
+reaching the server — and each is now one instrument away.
+
+That is the first time this cell's tail has been localised to a stage rather than to a
+suspicion, and it holds this cycle's lesson: **every threshold is part of the method, and
+an instrument set four times too coarse reports a healthy system.**
+
 
 **Release status, consolidated for a reviewer (2026-11-02).** Everything below is on the
 current tree, green under `just check`, with
