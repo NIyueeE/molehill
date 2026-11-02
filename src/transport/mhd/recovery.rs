@@ -481,7 +481,14 @@ impl Recovery {
         // exactly one retransmit recorded. The cheap floor is worth having for
         // the first step; it must not extend the ladder.
         let rto = if small { rto.min(INITIAL_RTO) } else { rto };
-        self.timer = Some(now + rto);
+        // Armed from the oldest packet that **carries stream data**, not from the
+        // send that happened to arm it: `now` is the newest packet's time, so a busy
+        // lane pushed the timer forward with every packet and an old hole never
+        // expired (a reader parked seven seconds on one missing byte with
+        // `retransmits` at 1). A packet with no range has nothing to re-send, so its
+        // age must not drive the timer — letting it did cost `churn-16` its median.
+        let base = self.oldest_data_time().unwrap_or(now);
+        self.timer = Some(base + rto);
     }
 
     /// Fold one acknowledgement block in.
@@ -659,6 +666,25 @@ impl Recovery {
         // unreachable for exactly the packet it exists for.
         self.arm(now, opening_lost);
         (Expiry::Loss, lost)
+    }
+
+    /// When the oldest packet **carrying stream data** was sent.
+    ///
+    /// The timer follows this, and the write path bounds the flight by its age: a
+    /// carrier that lets a flight grow past its own retransmission timeout cannot
+    /// then time out a hole inside it, and the earlier attempts to do so either
+    /// stormed the latency cells or cost the bulk cell sixty per cent.
+    pub(crate) fn oldest_data_time(&self) -> Option<Instant> {
+        self.in_flight
+            .values()
+            .find(|sent| sent.lost_at.is_none() && sent.range.is_some_and(|r| r.len > 0))
+            .map(|sent| sent.time)
+    }
+
+    /// How long the oldest data packet has been outstanding.
+    pub(crate) fn oldest_data_age(&self, now: Instant) -> Option<Duration> {
+        self.oldest_data_time()
+            .map(|time| now.saturating_duration_since(time))
     }
 
     /// Whether anything is waiting for an acknowledgement, lost records aside.

@@ -92,6 +92,14 @@ const MAX_BUFFERED: u64 = 2 * WINDOW;
 /// described did not exist.
 pub(crate) const OPEN_RESERVE: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
 
+/// The oldest a packet carrying stream data may be before the writer waits.
+///
+/// Half the wide retransmission timer, so the flight stays young enough that a
+/// firing on the oldest data packet means a hole rather than a deep queue. This is
+/// what makes [`MIN_RTO`]'s timeout *sufficient*, which is the one thing every
+/// earlier attempt at the same defect failed to establish.
+const FLIGHT_AGE_LIMIT: Duration = Duration::from_millis(100);
+
 /// Whether a stream is still opening: it has not written a reserve's worth yet.
 fn opening(state: &StreamState) -> bool {
     state.send.written() < OPEN_RESERVE
@@ -565,6 +573,19 @@ impl Conn {
         // that stalls must cost the writer a wait rather than unbounded memory.
         let held = MAX_BUFFERED.saturating_sub(self.buffered);
         let room = credit.min(window).min(held);
+        // The fourth bound, and the one this cycle needed: **the flight may not
+        // outlive the retransmission timer.** A carrier that lets a flight grow
+        // past the timeout supposed to find a hole inside it is asking two
+        // contradictory things of one number — the hole is then older than the
+        // timer, the timer is armed from a newer packet, and nothing recovers it
+        // (measured as one connection in a hundred arriving 0.85-4.1 s late).
+        // Below this age, the oldest data packet is always younger than
+        // [`MIN_RTO`], so a firing means a real hole and not a deep queue.
+        let aged = self
+            .recovery
+            .oldest_data_age(Instant::now())
+            .is_some_and(|age| age >= FLIGHT_AGE_LIMIT);
+        let room = if aged { 0 } else { room };
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
