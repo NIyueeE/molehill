@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own path before choosing this carrier; one whose connections are reused has
   nothing to trade.
 
+- **A visitor waiting for a data channel is shed after ten seconds, not
+  twenty-five.** Five pairing waits of five seconds each was a patience nobody
+  spends: a visitor shed at 25 s has held a queue slot and a socket for the whole
+  of it and gets a close either way, while a browser in front of the proxy gives up
+  long before. Two waits still cover a legitimate slow open — a pool that has to
+  dial a tunnel, which the client bounds at 15 s — and the second one is the retry
+  that re-asks for the channels the first wanted. Measured on `churn-16`,
+  `bulk-n` and `rr-16` against each run's own A/A twin: no regression, and
+  `churn-16`'s tail moved from 20.4 to 19.4 ms inside its own scatter.
+
 - **One stalled arrival decides the capacity measurement.** The ramp carries one
   bulk stream and opens a fresh connection every 50 ms against an SLO of 50 ms at
   the 99th percentile; measured on this host, 63 of 64 arrivals were fine with a

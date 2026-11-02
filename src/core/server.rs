@@ -97,10 +97,18 @@ const PAIR_WAIT_BUDGET: Duration = Duration::from_secs(5);
 
 /// How many `PAIR_WAIT_BUDGET` waits one visitor gets before it is shed.
 ///
-/// Five tries is 25 s of patience for a visitor whose service is under
-/// pressure, after which the connection is closed — a failed request, reported
-/// at DEBUG, instead of a hang the operator cannot attribute.
-const PAIR_ATTEMPTS: usize = 5;
+/// **Two tries is 10 s**, and it is a latency bound rather than a patience one.
+/// Five tries was 25 s, which is longer than any client in front of this proxy
+/// will wait: a browser gives up around thirty seconds, but a visitor that is
+/// shed at 25 s has already held a queue slot, a socket and the operator's
+/// attention for the whole of it, and the answer it gets is a close either way.
+/// The wait exists to cover a *legitimate* slow open — a pool that has to dial a
+/// tunnel, which the client bounds at 15 s — so two budgets cover 10 s of that
+/// and the second one is the retry that re-asks for the channels the first one
+/// wanted. Beyond that the service is not coming back inside this connection's
+/// useful life, and shedding early frees the accept loop for the visitor behind
+/// it.
+const PAIR_ATTEMPTS: usize = 2;
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 /// Runtime description of a service, as registered by a client.
