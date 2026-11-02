@@ -5955,6 +5955,19 @@ narrowing this cycle can make. The fix — half-close and wait, rather than drop
 the close path for every visitor and needs its own measurement round, which is more than
 the five rounds left can do honestly.
 
+**And the forward idle watchdog is not it either** (`FORWARD_IDLE_TIMEOUT`, 300 s): a
+control connection idle for a 120-second test never reaches it, and a group is only ended
+when *both* directions have been silent that long. So the close happens at end-of-test
+while the group is still alive by its own clock, which is why `lived_s` reported a
+lifetime matching the stage rather than a truncated one.
+
+Four rounds remain. The last thing this cycle does is leave the record in a state where
+the next one can start: the tree green, every finding with its numbers, the release held
+on two named SLO failures (one of them, in a good window, the cold start alone), and the
+`control socket` narrowed to end-of-test on the control leg with four candidate mechanisms
+excluded — the stage boundary, the group lifetime, the carrier's own close, and now the
+idle watchdog.
+
 
 
 
