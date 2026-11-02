@@ -5726,6 +5726,35 @@ variance documented in the Known gaps (it is), or to hold the release until the 
 is attributed. Everything a tag needs is in place except a gate that passes every time,
 and no tag has been or will be created by me.
 
+**Updated with the last two rounds' results (2026-11-02).** Three corrections since the
+table above was written, and one new localisation:
+
+- **`churn-16` is sixteen connections a second, not sixteen at once.** Every paragraph
+  that read its tail as contention was wrong, in this file and on two user pages; all
+  three are corrected.
+- **The tail is the pairing, and its cost is the client's handshake.** Measured at last
+  because all three instruments now read at five milliseconds behind the stats switch
+  instead of at a hundred: a quarter of pairings take ≥5 ms (p50 8.1 ms, p90 16.0, p99
+  27.1), the client's own open accounts for it, and **every microsecond of that open is
+  `hs_us` with `ack_us` zero** — 291 slow opens in two rounds, p50 5.6 ms, worst 23.6.
+  So one Noise handshake's round trip occasionally takes five milliseconds where the
+  path's own is a tenth of one.
+- **It is not a flush timer**: the pump's wait has no periodic flush (it selects on a
+  notify, a closed signal and the connection's own timer), so a single write is flushed
+  when it is made.
+- **The guards cost nothing**: at four rounds each with an A/A twin, `churn-16` reads
+  2.47 / 20.66 against 2.53 / 21.98 and `rr-16` 0.47 / 1.33 against 0.47 / 1.32. The
+  `bulk-n` cell in that run read 3.06 against 2.74 — *both* far below the ~11.5 this
+  cell produced earlier today, which is the host in its slow state rather than the
+  change, and is the same variance that keeps the release held.
+
+So the release picture is unchanged in substance and sharper in detail: **the steady
+state is at parity with TCP, the capacity ramp reaches all eight levels, the multi-second
+stalls are gone, and one Noise handshake in forty occasionally pays five milliseconds
+instead of one-tenth** — which is what the two clean-stage SLO failures are, and what a
+reviewer now has a number and a stage for.
+
+
 
 
 
