@@ -143,6 +143,14 @@ pub(crate) enum Rejected {
 struct StreamState {
     send: SendBuf,
     recv: RecvBuf,
+    /// Whether anything this end wrote on this stream has been acknowledged.
+    ///
+    /// While it is false the stream is **opening**: its packets are the handshake
+    /// flight, one or two datagrams in the air however busy the lane is, and a
+    /// lost one must be re-sent on the cheap floor (see `Sent::opening`). The
+    /// first acknowledgement is what ends the opening, because from then on the
+    /// stream has a round-trip sample and a wide flight behind it.
+    acknowledged: bool,
     /// The local writer finished.
     local_fin: bool,
     /// The peer finished.
@@ -1026,6 +1034,11 @@ impl Conn {
                 len: u16::try_from(len).unwrap_or(u16::MAX),
                 fin,
             }),
+            // Every packet of a stream before its first acknowledgement is the
+            // opening flight, not only the one at offset zero: the handshake is
+            // several datagrams (a selector byte, then the message), and losing
+            // any of them costs the arrival its latency.
+            !state.acknowledged,
         );
         if let Some(state) = self.streams.get_mut(&id) {
             if repair {
@@ -1099,6 +1112,8 @@ impl Conn {
                 len: 0,
                 fin: true,
             }),
+            // A finish-only packet carries no bytes of the opening.
+            false,
         );
         self.ack_pending = false;
         self.keepalive_at = now + KEEPALIVE;
@@ -1562,7 +1577,10 @@ impl Conn {
                 continue;
             };
             let moved = match self.streams.get_mut(&range.stream) {
-                Some(state) => state.send.ack(range.offset, usize::from(range.len)),
+                Some(state) => {
+                    state.acknowledged = true;
+                    state.send.ack(range.offset, usize::from(range.len))
+                }
                 None => 0,
             };
             self.buffered = self.buffered.saturating_sub(moved);
@@ -1577,6 +1595,7 @@ impl Conn {
             && let Some(state) = self.streams.get_mut(&ack.stream)
         {
             let moved = state.send.advance_to(ack.prefix);
+            state.acknowledged = true;
             self.buffered = self.buffered.saturating_sub(moved);
         }
         // A loss only rewinds the send point: the bytes are still in the

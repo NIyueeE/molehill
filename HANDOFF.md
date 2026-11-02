@@ -4249,6 +4249,36 @@ call site (pass whether any timed-out packet was an opening, the same way the ac
 path does), and the tests written for it — the busy lane takes the cheap floor, a
 burst packet keeps the wide one — already pin both sides.
 
+**It is fixed and it is still not the answer (2026-11-02).** The hint now reaches
+every arm site — `on_sent` (which arms the timer for a *retransmission*, and where it
+was hardcoded to the burst's floor), the acknowledgement path, and `on_timeout` —
+with two tests pinning both sides (a re-sent opening on a busy lane clears `MIN_RTO`;
+a re-sent burst packet on the same lane keeps it). `just check` green, 333 tests.
+
+Measured, and the result is honest rather than satisfying:
+
+| cell | before | after |
+|---|---|---|
+| capacity level 1, rounds passing | 0 of 8 | **2 of 6** |
+| capacity p99, the rounds that pass | 500–3 000 ms | **104–700 ms** |
+| `churn-16` p50 / p99 | 2.42 / 20.51 ms | 2.44 / **20.37** ms |
+| `bulk-n` (A/A twin in the run) | — | 6.30 vs 6.76 Gbit/s |
+
+No regression, and **no demonstrable win**: 0 of 8 to 2 of 6 is not a difference six
+and eight samples can separate, and `churn-16` did not move at all. So the change is
+kept as a **correctness fix with tests** — the cheap floor now reaches the packet the
+design says it is for — and explicitly *not* as the fix for the arrival tail. The
+multi-second stalls are still there (3.1–4.6 s in four of the six rounds), and they
+are still entirely in the handshake's reply leg.
+
+**What that leaves.** The stall is one handshake datagram's round trip taking seconds
+on a path whose RTT is under a millisecond, and the RTO ladder is now provably not
+the whole story: with the cheap floor actually reachable the stalls only partly
+shrank. The next measurement has to be inside `open_channel_carrying` rather than
+around it — specifically whether the opening datagram is *posted* when the lane's
+pump is busy, which `mhd pump waited on the socket` and the send-buffer dwell line
+already half-answer.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:

@@ -178,6 +178,14 @@ pub(crate) struct Sent {
     /// an acknowledgement of it arrives (see [`LOST_HOLD`]). It is not in
     /// flight: the byte total and the congestion window do not count it.
     pub(crate) lost_at: Option<Instant>,
+    /// Whether this packet is part of a stream's **opening flight**.
+    ///
+    /// A stream's packets before its first acknowledgement are the handshake,
+    /// which is one or two datagrams in the air however busy the lane is, so a
+    /// lost one must be re-sent on the cheap floor (see `MIN_RTO_SMALL_FLIGHT`).
+    /// Keying that on [`Recovery::live`] instead made the exemption work only on
+    /// an idle lane — the one place an opening is never lost.
+    pub(crate) opening: bool,
 }
 
 /// The round-trip estimate.
@@ -271,6 +279,8 @@ pub(crate) struct Acked {
     pub(crate) progress: bool,
     /// How many stream bytes it acknowledged, which is what grows the window.
     pub(crate) bytes: usize,
+    /// Whether a packet it proved lost was part of an opening flight.
+    pub(crate) opening_lost: bool,
 }
 
 /// Why the timer fired.
@@ -424,22 +434,32 @@ impl Recovery {
     /// A packet with no range (an acknowledgement, a credit update) is not
     /// tracked: nothing can be re-sent for it, and counting it would let a
     /// peer's silence be denied by our own chatter.
-    pub(crate) fn on_sent(&mut self, now: Instant, number: u32, range: Option<SentRange>) {
+    pub(crate) fn on_sent(
+        &mut self,
+        now: Instant,
+        number: u32,
+        range: Option<SentRange>,
+        opening: bool,
+    ) {
         let sent = Sent {
             number,
             time: now,
             range,
             lost_at: None,
+            opening,
         };
         if let Some(range) = range {
             self.flight_bytes += u64::from(range.len);
             self.in_flight.insert(number, sent);
             self.live += 1;
         }
-        self.arm(now);
+        // The packet's own nature arms the timer, not the lane's size: a re-sent
+        // opening must get the cheap floor here as well, because this is the call
+        // that arms the timer for the *retransmission* after a timeout.
+        self.arm(now, opening);
     }
 
-    fn arm(&mut self, now: Instant) {
+    fn arm(&mut self, now: Instant, opening_lost: bool) {
         if self.live == 0 {
             self.timer = None;
             return;
@@ -448,7 +468,10 @@ impl Recovery {
         // A flight of one or two packets is a stream opening, not a burst: it
         // gets the cheap floor, because a duplicate of a handshake packet is
         // one datagram the peer drops by offset (see [`MIN_RTO_SMALL_FLIGHT`]).
-        let small = self.live <= SMALL_FLIGHT_PACKETS;
+        // The floor belongs to the *packet*, not to the lane: `opening_lost`
+        // says a handshake datagram is among the losses, and that is small
+        // whatever else this connection is carrying.
+        let small = self.live <= SMALL_FLIGHT_PACKETS || opening_lost;
         let rto = self.rtt.rto(small).saturating_mul(1u32 << backoff.min(10));
         // A small flight's backoff stops at the wide timer. Without this a lane
         // waiting for its first sample climbs 20, 40, ... 2 560 ms, and the SUM
@@ -509,7 +532,7 @@ impl Recovery {
                 self.rtt.sample(sample);
                 self.heard();
             }
-            self.arm(now);
+            self.arm(now, false);
             return result;
         }
         // Delivered: everything the block covers and we still hold.
@@ -553,10 +576,13 @@ impl Recovery {
             .collect();
         for number in lost {
             if let Some(sent) = self.declare_lost(now, number) {
+                if sent.opening {
+                    result.opening_lost = true;
+                }
                 result.lost.push(sent);
             }
         }
-        self.arm(now);
+        self.arm(now, result.opening_lost);
         result
     }
 
@@ -614,16 +640,24 @@ impl Recovery {
             for sent in &all {
                 let _ = self.take(sent.number);
             }
-            self.arm(now);
+            self.arm(now, false);
             return (Expiry::Timeout, all);
         }
         let mut lost = Vec::new();
+        let mut opening_lost = false;
         for number in stale {
             if let Some(sent) = self.declare_lost(now, number) {
+                if sent.opening {
+                    opening_lost = true;
+                }
                 lost.push(sent);
             }
         }
-        self.arm(now);
+        // A lone opening packet has nothing behind it, so no acknowledgement can
+        // ever name it lost: this path is the only one it takes, and arming it
+        // with the burst's floor — as this did — made the cheap timer
+        // unreachable for exactly the packet it exists for.
+        self.arm(now, opening_lost);
         (Expiry::Loss, lost)
     }
 
@@ -686,7 +720,7 @@ mod tests {
 
     fn send_one(recovery: &mut Recovery, now: Instant, offset: u64) -> u32 {
         let number = recovery.next_number();
-        recovery.on_sent(now, number, Some(range(offset)));
+        recovery.on_sent(now, number, Some(range(offset)), false);
         number
     }
 
@@ -827,7 +861,7 @@ mod tests {
         let mut recovery = Recovery::new();
         for i in 0..u32::try_from(MAX_LOST).unwrap() + 16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)));
+            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)), false);
             let _ = recovery.declare_lost(start, number);
         }
         assert!(
@@ -873,6 +907,58 @@ mod tests {
         );
         assert_eq!(acked.lost.len(), 1);
         assert_eq!(acked.lost[0].number, lost);
+    }
+
+    /// A re-sent opening takes the cheap floor even on a busy lane.
+    ///
+    /// This is the case the first version of the rule missed twice over: the hint
+    /// was passed only on the acknowledgement path, and `on_sent` — which is what
+    /// arms the timer for the *retransmission* — hardcoded the burst's floor. A
+    /// lone opening has no later packet for a SACK to name it, so the timer is the
+    /// only thing that can find it lost, and the change was inoperative for
+    /// exactly the packet it was written for.
+    #[test]
+    fn a_re_sent_opening_takes_the_cheap_timer_on_a_busy_lane() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        for step in 1u64..=16 {
+            let number = recovery.next_number();
+            recovery.on_sent(start, number, Some(range(step * 100)), false);
+        }
+        assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
+        let at = start + Duration::from_millis(10);
+        let number = recovery.next_number();
+        recovery.on_sent(at, number, Some(range(0)), true);
+        let waited = recovery
+            .poll_timeout()
+            .unwrap()
+            .saturating_duration_since(at);
+        assert!(
+            waited < MIN_RTO,
+            "an opening cleared from a busy lane must use the cheap floor, \
+             but it armed the wide one: {waited:?}"
+        );
+    }
+
+    /// The contrast: a burst packet on the same lane keeps the wide floor, which
+    /// is the rule that survived every bulk A/B.
+    #[test]
+    fn a_re_sent_burst_packet_keeps_the_wide_timer() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        for step in 1u64..=16 {
+            let number = recovery.next_number();
+            recovery.on_sent(start, number, Some(range(step * 100)), false);
+        }
+        assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
+        let waited = recovery
+            .poll_timeout()
+            .unwrap()
+            .saturating_duration_since(start);
+        assert!(
+            waited >= MIN_RTO,
+            "a burst keeps the wide floor: it armed {waited:?}"
+        );
     }
 
     /// A packet outstanding longer than the reordering window is lost even when
@@ -958,7 +1044,7 @@ mod tests {
             // is what the kill rule counts.
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range);
+                recovery.on_sent(now, number, sent.range, sent.opening);
             }
         }
         assert_eq!(
@@ -1084,7 +1170,7 @@ mod tests {
             let (_, resent) = recovery.on_timeout(now);
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range);
+                recovery.on_sent(now, number, sent.range, sent.opening);
             }
         }
         assert_eq!(waits[0], MIN_RTO_SMALL_FLIGHT, "the first step is cheap");
