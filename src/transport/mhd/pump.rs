@@ -572,6 +572,18 @@ pub(crate) struct MhdLane {
     noise: Option<crate::config::NoiseConfig>,
     /// The session nonce every stream's hello names.
     nonce: crate::protocol::Digest,
+    /// Whether this lane's first stream was acknowledged, which is the moment
+    /// the server reserved the lane's slot. From then on a stream's hello and
+    /// its acknowledgement can ride the handshake's two messages instead of
+    /// costing a second round trip: the server no longer has to decide anything
+    /// before it replies, because the slot is already held.
+    ///
+    /// Only the client's own view. The server answers either way — a payload in
+    /// the opening message is answered in the reply, an absent one is answered
+    /// with a record as before — so the two views cannot disagree into a
+    /// deadlock; a lane whose first open failed after the server reserved just
+    /// falls back to the two-flight shape.
+    registered: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for MhdLane {
@@ -617,6 +629,7 @@ impl MhdLane {
             crate::transport::health::SessionHealth::new(),
         );
         let task = spawn(Arc::clone(&socket), peer, Arc::clone(&shared));
+        let registered = std::sync::atomic::AtomicBool::new(false);
         // The task owns the socket and the lane; when the lane drops, the
         // connection closes and the task's next pass ends it.
         std::mem::forget(task);
@@ -628,6 +641,7 @@ impl MhdLane {
             shared,
             noise,
             nonce,
+            registered,
         }))
     }
 
@@ -710,6 +724,40 @@ impl MhdLane {
         }
     }
 
+    /// Open a stream whose opening message carries `payload`, answering the
+    /// stream and the payload the peer's reply carried.
+    ///
+    /// One round trip instead of two (see
+    /// [`crate::transport::NoiseStream::handshake_carrying`]).
+    async fn open_channel_carrying(
+        &self,
+        payload: &[u8],
+    ) -> Result<
+        (u32, crate::transport::multiplex::CarrierStream, Vec<u8>),
+        crate::transport::multiplex::LaneError,
+    > {
+        if self.shared.is_closed() {
+            return Err(crate::transport::multiplex::LaneError::Closed);
+        }
+        let id = self.shared.with(|conn| conn.open().id);
+        self.shared.wake_pump();
+        let plain: crate::transport::multiplex::CarrierStream =
+            Box::new(StreamIo::new(Arc::clone(&self.shared), id));
+        match &self.noise {
+            #[cfg(feature = "noise")]
+            Some(config) => {
+                let keys = crate::transport::NoiseKeys::from_config(config)
+                    .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+                let (wrapped, theirs) = keys
+                    .wrap_initiator_carrying(plain, payload)
+                    .await
+                    .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+                Ok((id, Box::new(wrapped), theirs))
+            }
+            _ => Err(crate::transport::multiplex::LaneError::Closed),
+        }
+    }
+
     /// Wait for a stream the peer opens.
     ///
     /// The dispatcher signals the connection when a datagram opens a stream, so
@@ -781,27 +829,51 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // The opening's own phases, because the whole of it says only "late":
         // a slow Noise handshake, a slow hello and a slow acknowledgement are
         // three different waits (see `MIN_RTO` for the timer one).
-        let (stream_id, mut stream) = self.open_channel_with_id().await?;
-        let hs_at = Instant::now();
         let hello = crate::protocol::Hello::DataChannelTunnelHello(
             crate::protocol::CURRENT_PROTO_VERSION,
             self.nonce,
         );
-        stream
-            .write_all(
-                &postcard::to_stdvec(&hello)
-                    .map_err(|_| crate::transport::multiplex::LaneError::Closed)?,
-            )
-            .await
+        let hello = postcard::to_stdvec(&hello)
             .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-        stream
-            .flush()
-            .await
-            .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-        let ack = crate::protocol::read_ack(&mut stream)
-            .await
-            .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+        // A lane whose slot the server already holds takes one round trip: the
+        // hello rides the handshake's opening message and the acknowledgement
+        // rides the reply. The lane's first stream cannot, because the server
+        // has to reserve before it can answer — so it pays the two flights, and
+        // this end learns from it that the slot is held.
+        let hs_at = Instant::now();
+        // Only the encrypted data plane has a carrying handshake: a plain opening
+        // writes its selector byte and nothing else, so there is no first message
+        // to put a hello in and the two flights are the only shape it has.
+        let carries =
+            self.noise.is_some() && self.registered.load(std::sync::atomic::Ordering::Relaxed);
+        let (stream_id, stream, ack) = if carries {
+            let (id, stream, theirs) = self.open_channel_carrying(&hello).await?;
+            let ack = postcard::from_bytes::<crate::protocol::Ack>(&theirs)
+                .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            (id, stream, ack)
+        } else {
+            let (id, mut stream) = self.open_channel_with_id().await?;
+            stream
+                .write_all(&hello)
+                .await
+                .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            stream
+                .flush()
+                .await
+                .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            let ack = crate::protocol::read_ack(&mut stream)
+                .await
+                .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            (id, stream, ack)
+        };
         let ack_us = u64::try_from(hs_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // The server reserved this lane's slot on this open, so the next one can
+        // carry its hello in the handshake's opening message and be answered in
+        // the reply: one round trip instead of two.
+        if matches!(ack, crate::protocol::Ack::Ok) {
+            self.registered
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         match ack {
             crate::protocol::Ack::Ok => {
                 let us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -996,6 +1068,7 @@ fn spawn_dispatcher(
                             shared,
                             noise: None,
                             nonce: [0u8; crate::protocol::HASH_WIDTH_IN_BYTES],
+                            registered: std::sync::atomic::AtomicBool::new(false),
                         });
                         // The lane's owner is gone (the listener dropped): the
                         // dispatcher keeps routing for the connections it

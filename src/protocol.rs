@@ -1060,9 +1060,7 @@ static PACKET_LEN: LazyLock<PacketLength> = LazyLock::new(PacketLength::new);
 /// refused loudly, and — this is what an old server does to a newer client — by
 /// closing without a reply, which that client turns into a typed "server is too
 /// old" error instead of a retry loop.
-pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<(ProtocolVersion, Hello)> {
+pub async fn read_hello<T: AsyncRead + Unpin>(conn: &mut T) -> Result<(ProtocolVersion, Hello)> {
     // The version is read before the digest on purpose. A peer from another
     // dialect may send a hello of a *different* width (v5.0 is one byte
     // narrower), and a fixed-width read of the current hello would sit waiting

@@ -88,6 +88,48 @@ impl NoiseKeys {
             .await
             .with_context(|| "Failed to do noise handshake")
     }
+
+    /// The initiator's handshake carrying `payload` in its opening message,
+    /// answering the stream and the payload the reply carried.
+    ///
+    /// One round trip instead of two: see
+    /// [`NoiseStream::handshake_carrying`].
+    pub(crate) async fn wrap_initiator_carrying<S>(
+        &self,
+        mut stream: S,
+        payload: &[u8],
+    ) -> Result<(NoiseStream<S>, Vec<u8>)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
+    {
+        stream.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
+        stream.flush().await?;
+        let payload = payload.to_vec();
+        NoiseStream::handshake_carrying(stream, self.builder()?.build_initiator()?, move |_| {
+            payload
+        })
+        .await
+        .with_context(|| "Failed to do noise handshake")
+    }
+
+    /// The responder's handshake, whose reply payload `produce` computes from
+    /// the payload the peer's opening message carried.
+    ///
+    /// One round trip instead of two: see
+    /// [`NoiseStream::handshake_carrying`].
+    pub(crate) async fn wrap_responder_carrying<S, F>(
+        &self,
+        stream: S,
+        produce: F,
+    ) -> Result<(NoiseStream<S>, Vec<u8>)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
+        F: FnOnce(&[u8]) -> Vec<u8>,
+    {
+        NoiseStream::handshake_carrying(stream, self.builder()?.build_responder()?, produce)
+            .await
+            .with_context(|| "Failed to do noise handshake")
+    }
 }
 
 #[doc(hidden)]

@@ -2290,6 +2290,109 @@ async fn serve_mhd_lane(
     debug!("mhd lane ended");
 }
 
+/// Wrap one accepted mhd stream in its transport, answering the stream, the
+/// handshake's own cost in microseconds, and what the handshake's opening
+/// message carried.
+///
+/// The last answer is what makes an opening **one round trip instead of two**:
+/// when the lane's slot this server already holds, the client's hello rides the
+/// handshake's opening message and this end's acknowledgement rides the reply,
+/// so the whole open is one flight. A lane's *first* stream cannot — the slot has
+/// to be reserved before it can be answered — so it replies with an empty
+/// payload and the hello arrives as the next record, exactly as it always did.
+/// The two shapes are told apart by the payload's presence, so neither end has
+/// to agree in advance and a disagreement is a fallback rather than a deadlock.
+#[cfg(feature = "mhd")]
+async fn wrap_mhd_stream(
+    stream: crate::transport::mhd::lane::StreamIo,
+    shared: &Arc<ServerShared>,
+    state: &MhdLaneState,
+    deadline: Duration,
+    sel_us: u64,
+    opened: std::time::Instant,
+) -> Result<(
+    crate::transport::multiplex::CarrierStream,
+    u64,
+    Option<Vec<u8>>,
+    bool,
+)> {
+    let mut stream: crate::transport::multiplex::CarrierStream = Box::new(stream);
+    let mut carried: Option<Vec<u8>> = None;
+    // Whether the handshake's reply already carried the lane's acknowledgement,
+    // which is what the one-flight shape does. The caller must not send it twice.
+    let mut ack_sent = false;
+    let io: crate::transport::multiplex::CarrierStream = match tokio::time::timeout(
+        deadline,
+        stream.read_u8(),
+    )
+    .await
+    .with_context(|| "mhd transport selector timed out")??
+    {
+        PLAIN_SELECTOR => stream,
+        NOISE_SELECTOR => {
+            #[cfg(feature = "noise")]
+            {
+                let keys = shared.noise_keys.as_ref().ok_or_else(|| {
+                    anyhow!("Client requested Noise, but the server has no Noise keys")
+                })?;
+                // Read the lane's registration once, synchronously: the closure
+                // below cannot await, and the reservation it would need is the
+                // one thing that forces the two-flight shape.
+                let (slot_held, nonce_of) = {
+                    let guard = state.registered.lock().await;
+                    (guard.is_some(), guard.as_ref().map(|held| held.nonce))
+                };
+                let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let sent = std::sync::Arc::clone(&answered);
+                let (wrapped, theirs) = tokio::time::timeout(
+                    deadline,
+                    keys.wrap_responder_carrying(stream, |payload| {
+                        // A hello in the opening message, on a lane whose slot is
+                        // held: answer it in the reply. Anything else — an empty
+                        // payload, or a first stream that still has to reserve —
+                        // is answered with nothing, and the caller reads the hello
+                        // as a record.
+                        if payload.is_empty() || !slot_held {
+                            return Vec::new();
+                        }
+                        match postcard::from_bytes::<crate::protocol::Hello>(payload) {
+                            Ok(crate::protocol::Hello::DataChannelTunnelHello(_, nonce))
+                                if nonce_of == Some(nonce) =>
+                            {
+                                sent.store(true, std::sync::atomic::Ordering::Relaxed);
+                                postcard::to_stdvec(&crate::protocol::Ack::Ok).unwrap_or_default()
+                            }
+                            // A different session, or a hello this shape does not
+                            // carry: the caller's own read of the hello (or its
+                            // parse of this payload) refuses it with the reason.
+                            _ => Vec::new(),
+                        }
+                    }),
+                )
+                .await
+                .with_context(|| "mhd stream noise handshake timed out")??;
+                if !theirs.is_empty() {
+                    carried = Some(theirs);
+                }
+                ack_sent = answered.load(std::sync::atomic::Ordering::Relaxed);
+                Box::new(wrapped)
+            }
+            #[cfg(not(feature = "noise"))]
+            {
+                let _ = (stream, shared);
+                bail!(
+                    "Client requested Noise, but this binary was built without the `noise` feature"
+                )
+            }
+        }
+        other => bail!("Unknown transport selector {other:#04x}"),
+    };
+    let hs_us = u64::try_from(opened.elapsed().as_micros())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(sel_us);
+    Ok((io, hs_us, carried, ack_sent))
+}
+
 /// Prepare and route one stream the peer opened.
 ///
 /// The opening is the same three acts a TCP data channel performs; the only
@@ -2297,7 +2400,7 @@ async fn serve_mhd_lane(
 /// connection rather than on a fresh socket.
 #[cfg(feature = "mhd")]
 async fn serve_mhd_stream(
-    mut stream: crate::transport::mhd::lane::StreamIo,
+    stream: crate::transport::mhd::lane::StreamIo,
     lane: Arc<crate::transport::mhd::MhdLane>,
     state: Arc<MhdLaneState>,
     registry: Arc<Registry>,
@@ -2315,41 +2418,20 @@ async fn serve_mhd_stream(
     // park this stream's task forever (the same role HANDSHAKE_TIMEOUT plays on
     // the TCP accept path).
     let deadline = Duration::from_secs(HANDSHAKE_TIMEOUT * 2);
-    let selector = tokio::time::timeout(deadline, stream.read_u8())
-        .await
-        .with_context(|| "mhd transport selector timed out")??;
     let sel_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let stream: crate::transport::multiplex::CarrierStream = Box::new(stream);
-    let mut io: crate::transport::multiplex::CarrierStream = match selector {
-        PLAIN_SELECTOR => stream,
-        NOISE_SELECTOR => {
-            #[cfg(feature = "noise")]
-            {
-                let keys = shared.noise_keys.as_ref().ok_or_else(|| {
-                    anyhow!("Client requested Noise, but the server has no Noise keys")
-                })?;
-                let wrapped = tokio::time::timeout(deadline, keys.wrap_responder(stream))
-                    .await
-                    .with_context(|| "mhd stream noise handshake timed out")??;
-                Box::new(wrapped)
-            }
-            #[cfg(not(feature = "noise"))]
-            {
-                let _ = (stream, shared);
-                bail!(
-                    "Client requested Noise, but this binary was built without the `noise` feature"
-                )
-            }
-        }
-        other => bail!("Unknown transport selector {other:#04x}"),
+    let (mut io, hs_us, carried, ack_sent) =
+        wrap_mhd_stream(stream, &shared, &state, deadline, sel_us, opened).await?;
+    // The hello, either from the opening message or as the next record. Both
+    // shapes go through the same reader, so the version check and the decode
+    // cannot differ between them.
+    let (_version, hello) = match carried {
+        Some(bytes) => read_hello(&mut &bytes[..])
+            .await
+            .with_context(|| "mhd hello did not decode")?,
+        None => tokio::time::timeout(deadline, read_hello(&mut io))
+            .await
+            .with_context(|| "mhd hello timed out")??,
     };
-    let hs_us = u64::try_from(opened.elapsed().as_micros())
-        .unwrap_or(u64::MAX)
-        .saturating_sub(sel_us);
-
-    let (_version, hello) = tokio::time::timeout(deadline, read_hello(&mut io))
-        .await
-        .with_context(|| "mhd hello timed out")??;
     match hello {
         Hello::DataChannelHello(_, nonce) => {
             let service_id = read_stream_prologue(&mut io).await?;
@@ -2389,8 +2471,14 @@ async fn serve_mhd_stream(
                 }
             }
             drop(registered);
-            // The client's open waits for this before it names its service.
-            write_and_flush(&mut io, &postcard::to_stdvec(&Ack::Ok)?).await?;
+            // The client's open waits for this before it names its service —
+            // unless the handshake's reply already carried it, which is what the
+            // one-flight shape does: the hello rode the opening message, so the
+            // answer rode the reply. Writing it twice would leave a stray record
+            // the client reads as its first bytes of service data.
+            if !ack_sent {
+                write_and_flush(&mut io, &postcard::to_stdvec(&Ack::Ok)?).await?;
+            }
             let total_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
             note_slow_opening(total_us, sel_us, hs_us);
             let (service_id, _tunnel) = read_tunnel_prologue(&mut io).await?;
