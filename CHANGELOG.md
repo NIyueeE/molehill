@@ -47,14 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own path before choosing this carrier; one whose connections are reused has
   nothing to trade.
 
-  Two more numbers bear on it. On a clean path the staged schedule's first stage now
-  reads **46.2 ms** at the 99th percentile — inside the 50 ms bar — and the capacity
-  ramp climbs **all eight levels** where it had never passed the first; both are on
-  this release. Under five per cent loss and above, four stages of that schedule fail,
-  and **what fails there is not this gap**: one of them never reaches the sink at all,
-  and the tool recovers in time for the capacity scenario in the same run. That is
-  recorded as an open attribution rather than as a known cause, because the release
-  review has to see which of the two it is before either is written down as settled.
+  **The warm carrier beats TCP and the cold one does not, and the difference is the
+  carrier's own start-up.** On a clean path a run's *last* stage reads p50 **1.87 ms**,
+  p90 2.27 and p99 15.07 against TCP's 2.24 and 2.58 on the same cell — faster at the
+  median and at the ninetieth percentile, slower at the ninety-ninth — while the *first*
+  stage of the same run reads p50 **12.13**: six times the median the carrier reaches
+  minutes later, because its congestion window is still ramping from its initial ten
+  packets. A deployment is therefore choosing between a carrier that is quicker than TCP
+  once it has been running and one that is slower for the first minutes of its life.
+  Two further numbers: the capacity ramp climbs **all eight levels**, and on a run whose
+  first stage happened to land well the first stage read **46.2 ms** at the 99th
+  percentile, inside the 50 ms bar.
 
 - **A visitor waiting for a data channel is shed after ten seconds, not
   twenty-five.** Five pairing waits of five seconds each was a patience nobody
