@@ -87,6 +87,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the A/A twin at 861.5 confirming the difference. Throughput unchanged: 1.68 against
   1.71 Gbit/s, twin 1.45.
 
+- **A forwarding group that lived for a minute and then ended says so at `INFO`.**
+  Which side ends a long-lived visitor's connection is otherwise invisible: a release
+  run's records show the probe reporting `control socket has closed` with nothing on
+  the tool's side, and one run cut a 150-second transfer thirty seconds short without a
+  single line to say who did it. The line fires only for a group past a minute, so a
+  healthy run's thousands of short visitors stay silent.
+
 - **A visitor that waited for its data channels says so at `INFO`.** The line exists
   and fires past a tenth of a second, but it was `DEBUG`: a release run keeps the
   default filter, so the one measurement that explains an SLO failure on a clean stage

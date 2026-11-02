@@ -676,6 +676,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
+        let started = std::time::Instant::now();
         let mut reads = Vec::with_capacity(streams.len());
         let mut writes = Vec::with_capacity(streams.len());
         for s in streams {
@@ -759,6 +760,15 @@ where
             grace.abort();
         }
         monitor.abort();
+        // A group that lived a long time and then ended is a *visitor's connection*
+        // ending, and which side ended it is otherwise invisible: the release run's
+        // records show `control socket has closed` from the probe's side with nothing
+        // on the tool's. `INFO` only for a long-lived group, so a healthy run's
+        // thousands of short visitors stay silent.
+        let lived = started.elapsed();
+        if lived >= std::time::Duration::from_secs(60) {
+            tracing::info!(lived_s = lived.as_secs(), "a long-lived stripe group ended");
+        }
         debug!("stripe group finished");
     })
 }
