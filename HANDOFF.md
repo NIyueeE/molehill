@@ -5044,6 +5044,39 @@ replenishment does not become the new arrival cost; and the server's queue alrea
 the shape for it — `ChannelQueue` is bounded at `CHAN_SIZE * 2` and `take_channel`
 takes whatever is there — so the work is on the client side, not in the pairing.
 
+**And a stock opened at registration cannot fix it — measured, refuted
+(2026-11-02).** `ServiceType::Tcp => 0` became `=> 4`, so a TCP service pre-opens
+four channels when its registration is accepted, using the mechanism that already
+exists (`ServiceSlot.channels`, `open_channels`). Six rounds:
+
+| | `churn-16` p50 | p99 | rate |
+|---|---|---|---|
+| `WARM = 4` | 2.65 ms | **16.83 ms** | 3 862 |
+| its A/A twin | 3.20 ms | **19.31 ms** | 3 286 |
+| before (`WARM = 0`) | 2.51 ms | 21.75 ms | 3 469 |
+
+The two copies of the *same binary* disagree by 15 % on the p99, so a move from
+21.75 to 16.83 is not separable from scatter. **Reverted.**
+
+The reason is arithmetic and it was predictable before the run: the cell makes
+**6 400 arrivals**, so a stock of four is consumed by the first four and the other
+6 396 pay exactly what they paid before. **A stock helps a burst, and `churn-16` is
+not a burst — it is a steady 3 000 arrivals a second.** The queueing this cell pays
+(16 × 2.5 ms ÷ 4 lanes) is *throughput* of handshakes, not a cold start.
+
+So P2′ as the plan words it — "pre-warm authenticated channels, with a server-side
+top-up, a TTL and backoff" — **cannot reach its own gate on this cell** unless the
+stock is replenished continuously, and continuous replenishment with no feedback
+would double the handshake count without removing the queue. The only form that could
+work needs the server to say how deep its queue is (or to ask ahead), which is a
+protocol addition and not a constant: **the third plan item the measurements have
+re-specified.**
+
+What the numbers *do* support is the diagnosis behind it: the arrival cost is
+`arrivals ÷ lanes × open cost`, so the levers are the number of lanes (memory) and the
+open cost (already halved by the one-flight open, and the rest needs the record layer
+that bulk rejected). Neither is pre-warming.
+
 
 
 
