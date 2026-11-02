@@ -4630,6 +4630,46 @@ Two conclusions the audit supports and one it refuses:
   does not invent values for them. Recording that is the point: a constant nothing
   measures is a constant nobody can defend.
 
+**The per-stage distributions, sliced exactly for the first time (2026-11-02).** The
+stage boundaries are recoverable from the iperf3 sinks' mtimes, so the interactive
+series can be cut per stage rather than guessed at. One `--scale 1.0` run:
+
+| stage | n | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| clean | 1 972 | **1.9** | 3.5 | 668.1 | 4 157.3 |
+| rtt100 | 464 | 401.1 | 401.7 | **402.4** | 506.0 |
+| loss1 | 1 852 | **41.3** | 48.2 | **1 076.4** | 1 605.4 |
+| loss5 | 219 | 401.2 | 1 416.9 | 2 466.0 | 4 088.1 |
+| rate100 | 758 | 174.4 | 184.2 | 249.2 | 958.9 |
+| rate20 | 405 | 387.3 | 407.8 | 431.1 | 1 282.8 |
+| jitter | 631 | 223.6 | 240.0 | 274.7 | 392.2 |
+| clean#2 | 2 371 | **1.1** | 6.2 | 367.9 | 3 222.6 |
+
+Three readings, and the second one is new:
+
+1. **`rtt100` is tight** — p90 401.7 against p99 402.4, so a 400 ms shaped path costs
+   402 ms and nothing else. There is no tail when the shape is a *delay*.
+2. **`loss1`'s median is 41.3 ms**, which is `MIN_RTO_SMALL_FLIGHT`'s 40 ms plus the
+   path. **Half of all arrivals under one per cent packet loss pay a retransmission
+   timer.** At 1 % loss and two packets per exchange about 2 % should; the measured
+   rate is twenty-five times that, and it is the clearest unexplained number this
+   cycle has produced.
+3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
+   the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
+   the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
+   compresses the tail; loss and jitter spread it.
+
+**P3′'s gate, judged on these numbers.** `loss1`'s p99 is 1 076 ms, and the published
+v0.11.2 record reads 1 083 ms for molehill, 1 065 for frp and 1 058 for rathole — so
+at 1 % loss the p99 is an RTO for **every** tool in the record, a property of TCP's
+retransmission under a drop shaper rather than of this carrier. A SACK-based fast
+retransmit cannot improve it, for the structural reason already in this file: the
+interactive flow has one packet in flight, and there is nothing behind a lost packet
+to acknowledge past it. **So P3′'s stated gate is not reachable by P3′'s stated
+mechanism**, and the honest action is to say so rather than to build it again — the
+third item on the plan that the measurements have re-specified.
+
+
 
 The capacity cell did improve sharply on the timer fix before the regression was
 visible on other cells — p99 358, 821, 1 025, 1 715, 1 895, 2 061 ms against
