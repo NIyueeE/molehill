@@ -69,10 +69,25 @@ pub const STRIPE_HEADER_LEN: usize = 10;
 /// stream budget rather than inventing a new scale.
 pub const MAX_STRIPES: usize = 64;
 
+/// How long a parked reorder buffer waits before it declares the group broken.
+///
+/// `recv_loop` writes only when `seq == next`, so one frame that never arrives
+/// stops the destination for as long as the stripes stay open — which in a bulk
+/// transfer is the whole transfer. Two seconds is far longer than any frame on any
+/// condition this harness applies (a 32 KiB frame at the 20 Mbit/s cell is 13 ms)
+/// and far shorter than a visitor's patience.
+/// How often a receive loop wakes itself when it has nothing to do.
+///
+/// The cheap half of the liveness bound: a loop woken only by its channel cannot
+/// tell a late frame from a task that was never polled again.
+const STRIPE_REORDER_KICK: std::time::Duration = std::time::Duration::from_millis(40);
+
+const STRIPE_REORDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Frames one receive direction may hold out of order before its readers
 /// stall on the queue (the engine's per-stripe window is the real in-flight
 /// bound; this queue is the *reorder* allowance on top of it).
-pub const STRIPE_REORDER_QUEUE: usize = 32;
+const STRIPE_REORDER_QUEUE: usize = 32;
 
 /// How long a group must stay parked — every stripe refusing the frame, or its
 /// only writable stripe parked mid-frame — before its path counts as
@@ -554,7 +569,48 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
 
     let mut next = 0u64;
     let mut pending: BTreeMap<u64, Bytes> = BTreeMap::new();
-    while let Some(event) = rx.recv().await {
+    loop {
+        // While frames are parked, the wait gets a deadline. A sequence number
+        // that has not arrived cannot arrive later if the stripe that owed it is
+        // gone, and without this the loop waits for ever: everything behind the
+        // missing number piles into `pending`, the bounded channel to the readers
+        // fills, the readers stop draining their carrier streams, and the carrier
+        // reports — correctly — that it has nothing to do. Measured as an arrival
+        // stalled 0.85-4.1 s with `unsent_ms=0` and a megabyte of `recv.held()` on
+        // a stream nobody was reading.
+        let event = if pending.is_empty() {
+            // A **periodic wake** even when nothing is parked. Twenty-five times a
+            // second is nothing next to a copy loop, and it is the difference
+            // between "the frame is late" and "this task was never polled again": a
+            // loop woken only by its channel cannot distinguish those, and neither
+            // could the earlier measurement — the carrier kept reporting it had
+            // nothing to do while a reader sat parked. Measured on the capacity
+            // cell: three runs in six now read p99 7.7, 9.5 and 49.2 ms where none
+            // did before, and one climbs the ramp to level five. It does not remove
+            // the stalls (four runs in six still show one), so it is a liveness
+            // bound and not the fix.
+            if let Ok(event) = tokio::time::timeout(STRIPE_REORDER_KICK, rx.recv()).await {
+                event
+            } else {
+                continue;
+            }
+        } else {
+            let waited = tokio::time::timeout(STRIPE_REORDER_DEADLINE, rx.recv()).await;
+            if let Ok(event) = waited {
+                event
+            } else {
+                debug!(
+                    next,
+                    parked = pending.len(),
+                    "stripe receive stalled behind a missing sequence"
+                );
+                anyhow::bail!(
+                    "stripe group stalled behind sequence {next} with {} frame(s) parked",
+                    pending.len()
+                );
+            }
+        };
+        let Some(event) = event else { break };
         match event {
             StripeEvent::Frame { seq, bytes } => {
                 if seq == next {

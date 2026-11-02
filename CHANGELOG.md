@@ -41,6 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bulk-n` and `rr-16` against each run's own A/A twin: no regression, and
   `churn-16`'s tail moved from 20.4 to 19.4 ms inside its own scatter.
 
+- **A forwarding loop wakes itself when it has nothing to do, and a parked
+  reorder buffer now has a deadline.** The stripe layer's receive loop wrote only
+  when the next sequence number arrived and waited on its channel with no deadline,
+  so one frame that never came stopped the destination for as long as the transfer
+  lasted. Everything behind it piled into the reorder buffer, the bounded channel to
+  the readers filled, the readers stopped draining their carrier streams, and the
+  carrier reported — correctly — that it had nothing to do. The loop now wakes every
+  40 ms regardless, and a reorder buffer parked behind a missing sequence for two
+  seconds fails the group with a named reason instead of hanging it. Measured on the
+  capacity cell: three runs in six read p99 7.7, 9.5 and 49.2 ms where none did
+  before, and one climbs the capacity ramp to level five — and four runs in six still
+  show one multi-second stall, so this is a liveness bound and not the fix. No
+  regression on `churn-16`, `rr-16` or `bulk-n` against each run's own A/A twin.
+
 - **One stalled arrival decides the capacity measurement.** The ramp carries one
   bulk stream and opens a fresh connection every 50 ms against an SLO of 50 ms at
   the 99th percentile; measured on this host, 63 of 64 arrivals were fine with a
