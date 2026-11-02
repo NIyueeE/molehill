@@ -4425,6 +4425,39 @@ had landed in the right function by luck and I misread the grep as "dead code").
 And the 2 s figure is worth chasing precisely because it is so round: nothing in the
 carrier's constants is 2 s, so if it is a block it is not one this file declares.
 
+**The reader's own line named the defect, and the fix for it regressed everything
+(2026-11-02).** The reader already reports how long it parked and how many times it
+was woken while parked. On the capacity cell:
+
+`parked_us=7001784 ready_us=6 hole=Some((229, 229, 0, None)) wakes_while_parked=170`
+`parked_us=6054412 ready_us=8 hole=Some((112, 112, 0, None)) wakes_while_parked=138633`
+
+**138 633 wake-ups in six seconds, and `ready_us=6`** — so the reader was not
+missing its wake-up and was not slow to take the data; it was spinning, and the byte
+at the hole never came. A reader that is woken twenty-three thousand times a second
+and still finds nothing is waiting for a packet the *sender* never re-sent.
+
+That pointed at the timer, and the timer is armed wrong: `arm` does
+`self.timer = Some(now + rto)`, and on the send path `now` is the time of the **newest**
+packet. A busy lane therefore pushed the timer forward with every send, so an old
+hole never expired at all — which is exactly `retransmits=1` alongside a
+seven-second park.
+
+Arming from the oldest in-flight packet is the correct rule, it has a test, and it
+**regressed every latency cell**: `churn-16` p50 2.44 → **18.21** ms, `rr-16` p99
+1.23 → **5.73** ms. The reason is the loss window recorded two rounds ago: with the
+timer now firing, `on_timeout` finds *every* packet older than `loss_delay` (1 ms)
+stale and re-sends the whole flight, so the corrected timer turned into a storm.
+**Reverted.** The two changes are one change: the timer must be armed from the oldest
+packet **and** the loss window must be at least the interval that armed it. Landing
+either alone is worse than neither — which is now measured in both directions, and is
+the next thing to build.
+
+The capacity cell did improve sharply on the timer fix before the regression was
+visible on other cells — p99 358, 821, 1 025, 1 715, 1 895, 2 061 ms against
+2 100-5 000 before — so the mechanism is confirmed even though the change cannot
+ship on its own.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
