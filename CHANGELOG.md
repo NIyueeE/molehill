@@ -31,6 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own path before choosing this carrier; one whose connections are reused has
   nothing to trade.
 
+- **One stalled arrival decides the capacity measurement.** The ramp carries one
+  bulk stream and opens a fresh connection every 50 ms against an SLO of 50 ms at
+  the 99th percentile; measured on this host, 63 of 64 arrivals were fine with a
+  median of **2.11 ms** and one took **3.68 s**, so the cell reports zero carried
+  streams where the median says the SLO is met with room to spare. 3.68 s is the
+  retransmission ladder (200 ms doubling to 3.0 s by the fourth attempt) reached by
+  an opening that lost its first packet and had nothing behind it to trigger a fast
+  retransmit, and the wire legs record no drops at all. Until that is fixed, read
+  the capacity number as "did any single arrival stall" rather than as a rate, and
+  a deployment on a lossy path will see the ladder — one lost opening packet costs
+  about four seconds.
+
 - **The carrier loses throughput across a shaping schedule and does not recover
   from it.** It is the one arm in the published record that does: from the staged
   schedule's first `clean` stage to its repeat, `molehill` (L4) falls **8.64 →
