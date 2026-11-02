@@ -51,14 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload, so neither end has to agree in advance and a disagreement falls back
   instead of deadlocking. Measured on the `churn-16` cell: the open's p50 falls
   from **3 313 µs to 927 µs** and 494 of the first 500 opens land under 1.5 ms
-  where the previous shape managed 87; the tunnel also carries **15 % fewer bytes
-  per visitor byte**, because the hello and its acknowledgement now ride the
-  handshake's own two messages instead of two records of their own. The cell's
-  round-trip number itself does not move: sixteen concurrent arrivals on four
-  lanes queue for longer than the flight saves, so the win shows in the open's
-  own instrument and in the wire ratio rather than in the terminal latency. A
-  deployment whose arrivals are mostly serial sees the flight; one that is
-  already saturated sees the queue.
+  where the previous shape managed 87. Measured against the previous build over
+  six interleaved rounds, the tunnel carries **15.09 % fewer bytes per visitor
+  byte** — the one figure whose interval is tight enough to state, because the
+  mechanism is literally fewer bytes: the hello and its acknowledgement now ride
+  the handshake's own two messages instead of two records of their own. The
+  cell's median round trip falls 23.6 % and its arrival rate rises 16.7 % in the
+  same run, but both stay fragile at that sample count. A deployment whose
+  arrivals are mostly serial sees the flight; one that is already saturated sees
+  the queue.
 
 - **`MOLEHILL_MHD_STATS=1` reports the carrier's own cost.** One line per second
   per process carrying the cumulative counters and phase timings: runs,
