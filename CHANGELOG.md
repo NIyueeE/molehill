@@ -54,14 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send and an old hole never expired at all. The symptom was one connection in a
   hundred arriving **0.85-4.1 s** late, with the carrier's own counters reporting,
   correctly, that it had nothing to do. The write path now stops admitting bytes
-  once the oldest packet carrying data is 100 ms old, which keeps the flight young
-  enough that a timer firing on it means a hole and not a deep queue, and the timer
-  is armed from that packet rather than from the newest one. Measured: the capacity
-  cell's worst arrival over sixteen level-series falls from **3 000-5 000 ms to at
-  most 204 ms**, and the ramp climbs to level five where it had not passed level one.
-  `bulk-n` is unchanged at **11.49 Gbit/s** against an A/A twin's 11.53 over nine
-  rounds, and `churn-16` (2.49 ms p50, 20.31 p99) and `rr-16` (0.46, 1.34) are
-  unchanged against their own twins.
+  once the oldest packet carrying data has been outstanding for the connection's own
+  **retransmission timeout**, which keeps the flight young enough that a timer firing
+  on it means a hole and not a deep queue, and the timer is armed from that packet
+  rather than from the newest one. Measured: the capacity cell's worst arrival over
+  sixteen level-series falls from **3 000-5 000 ms to at most 166 ms**, and the ramp
+  climbs to level five where it had not passed level one. The bound is the connection's
+  own timeout rather than a constant *because* the obvious constant costs: a flat
+  100 ms bounds a 400 ms path to a quarter of its bandwidth, and that was measured
+  (`rtt100` fell from 3.40 to 0.85 Gbit/s) before the bound was derived from the RTT.
+  With the connection's own timeout, `bulk-n` is unchanged at **11.49 Gbit/s** against
+  an A/A twin's 11.53 over nine rounds, `bulk-n` through a 400 ms path reads **5.65**
+  against a twin's 5.29, and `churn-16` (2.49 ms p50, 20.31 p99) and `rr-16` (0.46,
+  1.34) are unchanged against their own twins.
 
 - **A forwarding loop wakes itself when it has nothing to do, and a parked
   reorder buffer now has a deadline.** The stripe layer's receive loop wrote only

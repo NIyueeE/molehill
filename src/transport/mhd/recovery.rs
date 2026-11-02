@@ -668,6 +668,18 @@ impl Recovery {
         (Expiry::Loss, lost)
     }
 
+    /// The retransmission timeout this connection would arm now.
+    ///
+    /// The write path bounds the flight's age with it, which is the invariant that
+    /// makes the timer sufficient: a packet is never admitted that could be older
+    /// than the timeout supposed to find it. It has to be the *RTT-derived* value
+    /// and not a constant: a flat 100 ms bounds a 400 ms path to a quarter of its
+    /// bandwidth (measured — `rtt100` fell from 3.40 to 0.85 Gbit/s), while the RTO
+    /// on that path is already several hundred milliseconds.
+    pub(crate) fn current_rto(&self) -> Duration {
+        self.rtt.rto(false)
+    }
+
     /// When the oldest packet **carrying stream data** was sent.
     ///
     /// The timer follows this, and the write path bounds the flight by its age: a

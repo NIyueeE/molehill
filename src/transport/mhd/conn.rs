@@ -92,14 +92,6 @@ const MAX_BUFFERED: u64 = 2 * WINDOW;
 /// described did not exist.
 pub(crate) const OPEN_RESERVE: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
 
-/// The oldest a packet carrying stream data may be before the writer waits.
-///
-/// Half the wide retransmission timer, so the flight stays young enough that a
-/// firing on the oldest data packet means a hole rather than a deep queue. This is
-/// what makes [`MIN_RTO`]'s timeout *sufficient*, which is the one thing every
-/// earlier attempt at the same defect failed to establish.
-const FLIGHT_AGE_LIMIT: Duration = Duration::from_millis(100);
-
 /// Whether a stream is still opening: it has not written a reserve's worth yet.
 fn opening(state: &StreamState) -> bool {
     state.send.written() < OPEN_RESERVE
@@ -584,7 +576,7 @@ impl Conn {
         let aged = self
             .recovery
             .oldest_data_age(Instant::now())
-            .is_some_and(|age| age >= FLIGHT_AGE_LIMIT);
+            .is_some_and(|age| age >= self.recovery.current_rto());
         let room = if aged { 0 } else { room };
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
