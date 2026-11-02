@@ -4658,6 +4658,33 @@ Three readings, and the second one is new:
    cycle (the 6.2 s "ladder", the 5.00 s "pairing budget", now the 41 ms "timer"),
    which makes it a rule rather than an accident: **read the condition and the code
    before believing a number that matches a constant.**
+
+**And the gate's own verdict on the current tree, which is the release status
+(2026-11-02).** `just bench gate /tmp/p73-tl.json` on the full `--scale 1.0` timeline:
+
+```
+coverage: 9 measured arm/scenario/cell triples
+endpoint invariant: 8 samples carry a dialed endpoint
+SLO: 2 clean-stage cells gated
+drowned cells: 0 refused
+drift: checked the run cells' slopes and wedges
+baseline: none given (--baseline for the regression half)
+gate: 2 FAILURE(S)
+  - SLO: molehill / timeline[clean] p99 668.116 ms > 50.0 ms on a clean stage
+  - SLO: molehill / timeline[clean#2] p99 375.6651 ms > 50.0 ms on a clean stage
+```
+
+So four of the five gate axes the run covers **pass** — coverage, the endpoint
+invariant, drift, and (with no baseline given) the regression half is correctly
+reported as absent rather than assumed — and the release is blocked by **exactly two
+named SLO failures, both of them the tail**: the two clean stages' p99, at 668 ms and
+376 ms against a 50 ms bar. Capacity is not in this record (a separate run reads 0),
+so the ramp half is a third, already-recorded failure.
+
+That is what the release status should look like: not "the carrier is not ready", but
+"four axes pass and two clean-stage p99s fail, for one reason, which is documented in
+`CHANGELOG.md` and in this file". A release can be held on that, and a reviewer can
+argue with a named number instead of a summary.
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
