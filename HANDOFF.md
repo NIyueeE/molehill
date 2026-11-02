@@ -4339,6 +4339,41 @@ is one counter pair per lane — timeouts that found a packet stale, and acks th
 arrived for a packet already declared lost — and the second of those is the signature
 of a false loss.
 
+**The loss-window alignment was tried and is also refuted (2026-11-02).** The two
+windows genuinely disagree — the timer fires on a floor of `MIN_RTO` (or the cheap
+one) while `loss_delay` is `rtt × 9/8` floored at 1 ms, so a firing at 333 ms finds
+every packet older than a millisecond stale. Aligning them (`loss_delay` never
+shorter than the interval `arm` used, and the boundary made inclusive so a packet
+exactly that old is due) is a real inconsistency, and it changed nothing:
+`p99` read 1.8, 2.2, 3.5, 4.4, 5.0 and 3.1 s over six rounds, all still failing
+level 1, against 2.1-5.0 s before. **Reverted.** The change is recorded here rather
+than in the tree because the inconsistency is real and someone will meet it again;
+what the measurement says is that it is not what makes an arrival take seconds.
+
+**Where the arrival tail now stands, after six measured attempts.** Excluded, each
+by its own instrument or its own A/A twin: the record layer at three sizes, the
+credit threshold, the congestion window (it reaches `SLOW_START_CEILING` and beyond),
+the pacer, the small-flight timer (built twice, now correct, no measurable win), the
+send path (no refused write, no accept-queue wait, no socket-writability wait), and
+the loss-declaration window. The stall is inside the Noise handshake's reply leg on
+one datagram, it is 2-5 s, and it happens to 1-3 arrivals out of 50-140 in a round.
+
+What the numbers *do* say, consistently and across every cell: **the median is at
+parity with TCP** — `churn-16` p50 2.4-2.5 ms against TCP's 2.24, `rr-16` p50 0.49
+against 0.44, and `capacity`'s p50 1.9-2.3 ms in every one of six rounds. The gap is
+a minority of arrivals that take seconds, and `capacity_streams` — a maximum over
+~50-140 samples — reports that minority as zero throughput. Both statements are
+true and neither is the other.
+
+**So this round pivoted to an item that can be finished and judged.** P4′'s "tighten
+the 25 s pairing patience": `PAIR_ATTEMPTS` 5 → 2, so a visitor whose channel never
+arrives is shed after 10 s instead of 25. Measured on `churn-16`, `bulk-n` and
+`rr-16` against each run's own A/A twin: no regression, and `churn-16`'s tail moved
+20.4 → 19.4 ms inside the scatter. That run also carries a method warning worth
+keeping: its `rr-16` A/A twins read 22 104 and 8 506 arrivals/s, a 2.6× disagreement
+between two copies of the same binary, so that cell resolved nothing in this run and
+its numbers are not evidence either way.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
