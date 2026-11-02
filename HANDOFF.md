@@ -4649,11 +4649,15 @@ Three readings, and the second one is new:
 
 1. **`rtt100` is tight** — p90 401.7 against p99 402.4, so a 400 ms shaped path costs
    402 ms and nothing else. There is no tail when the shape is a *delay*.
-2. **`loss1`'s median is 41.3 ms**, which is `MIN_RTO_SMALL_FLIGHT`'s 40 ms plus the
-   path. **Half of all arrivals under one per cent packet loss pay a retransmission
-   timer.** At 1 % loss and two packets per exchange about 2 % should; the measured
-   rate is twenty-five times that, and it is the clearest unexplained number this
-   cycle has produced.
+2. **`loss1`'s median is 41.3 ms — and that is the shaper, not a retransmission.**
+   I first read it as `MIN_RTO_SMALL_FLIGHT`'s 40 ms and concluded that half of all
+   arrivals were paying a timer, twenty-five times the loss rate. **Withdrawn**: the
+   `loss1` condition is `delay 10ms loss 1%`, so tens of milliseconds is what the
+   *path* costs and the median says nothing about retransmission at all. The number
+   matched a constant and the constant did not produce it — the third time in this
+   cycle (the 6.2 s "ladder", the 5.00 s "pairing budget", now the 41 ms "timer"),
+   which makes it a rule rather than an accident: **read the condition and the code
+   before believing a number that matches a constant.**
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
