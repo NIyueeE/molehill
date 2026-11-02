@@ -4043,6 +4043,38 @@ round of its own: **whether draining the visitor socket sooner after a slow stag
 would let its TCP recover.** The instrument for it is the same stall line, read the
 other way: `backlog_bytes` should stay near zero *and* the server should not be
 sitting on a full per-stream buffer while it refuses to read.
+
+**And the capacity ramp reads zero because of one 3.68-second arrival, not because
+of latency (2026-11-02).** `just bench --profile sweep --arms molehill --scenarios
+capacity` runs the gate's ramp half: one bulk stream, a fresh-connection ping every
+50 ms, SLO `rtt_p99_ms <= 50` and `error_rate_pct <= 0.5`. It stopped at **level
+1** with `capacity_streams = 0`. The level's own series says why:
+
+| samples | errors | p50 | p99 | max |
+|---|---|---|---|---|
+| 64 | 0 | **2.11 ms** | **3 676.65 ms** | 3 676.65 ms |
+
+Sixty-three arrivals were fine and the median is **2.11 ms** — better than the
+`churn-16` median, because one bulk stream is a lighter load than sixteen
+concurrent connections. One arrival took 3.68 s and that single sample is the
+maximum, which at n=64 is also the 99th percentile.
+
+**3.68 s is an RTO ladder, not a queue**: with `MIN_RTO` at 200 ms and doubling,
+the fourth retransmission lands at 3.0 s and the fifth at 6.2 s. So the cell is
+decided by one opening that lost its first packet and had nothing behind it to
+trigger a fast retransmit — which is exactly what P3′ is for, and the reason it
+matters more on an *opening* than on any other packet. The wire evidence records
+zero drops on all three legs (`rx_dropped: 0`, `drops: {}`), so the packet was
+either never posted or the reply was; that is the next thing to look at.
+
+Two method notes beside it. `capacity_streams` is a **max statistic over ~64
+samples**, so one stalled arrival collapses the whole cell from 8 to 0; that is a
+brittle instrument for an SLO and the ramp should report the count of stalled
+arrivals beside the percentile. And the published record has
+`capacity_streams = 8` for **every** arm — `l3`, `frp`, `rathole`, `nps`, all of
+them — which is `streams_max`, so the ramp never bound for anybody and the metric
+carried no contrast in that run (AGENTS §10: "a metric without contrast is not a
+measurement").
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
