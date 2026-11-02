@@ -4988,6 +4988,29 @@ Two readings of that table matter and one caution:
    percentile of ~150 samples. So the capacity cell is not yet green, and the remaining
    gap is the *ordinary* latency under four bulk streams, not a stall.
 
+**P1′ scored against its own gates, on the current tree (2026-11-02).**
+
+| gate | target | measured | verdict |
+|---|---|---|---|
+| `churn-16` `rtt_p50_ms` | ~3 ms | **2.51** | **met** |
+| `churn-16` `rtt_p99_ms` | same order as TCP | 21.75 against 2.59 (8.4×) | **not met** |
+| `bulk-n` throughput | inside a 15 % floor | 11.49 against a twin's 11.53 | **met** |
+| `just check` | green | green | **met** |
+
+Three of four. The one that is not met is the tail under sixteen *concurrent* fresh
+connections, and this round's fix did not move it — which is worth stating plainly
+because it separates two things this file had been treating as one: the multi-second
+stalls are gone (capacity's worst arrival is 204 ms where it was seconds), and the
+`churn-16` tail is **unchanged at 21.75 ms**, because it was never a stall. It is
+sixteen handshakes contending for four lanes, which is P1′'s own subject and P2′'s
+(pre-warmed authenticated channels would remove it from the arrival path entirely).
+
+So the next target is well defined and it is the last one on the latency axis: make
+sixteen concurrent arrivals cost what one does. P2′ names the mechanism — a channel
+that is already authenticated and waiting — and the one-flight open already halved
+what a fresh channel costs when the path is idle.
+
+
 
 
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
