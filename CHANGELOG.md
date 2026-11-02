@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own path before choosing this carrier; one whose connections are reused has
   nothing to trade.
 
+  Two more numbers bear on it. On a clean path the staged schedule's first stage now
+  reads **46.2 ms** at the 99th percentile — inside the 50 ms bar — and the capacity
+  ramp climbs **all eight levels** where it had never passed the first; both are on
+  this release. Under five per cent loss and above, four stages of that schedule fail,
+  and **what fails there is not this gap**: one of them never reaches the sink at all,
+  and the tool recovers in time for the capacity scenario in the same run. That is
+  recorded as an open attribution rather than as a known cause, because the release
+  review has to see which of the two it is before either is written down as settled.
+
 - **A visitor waiting for a data channel is shed after ten seconds, not
   twenty-five.** Five pairing waits of five seconds each was a patience nobody
   spends: a visitor shed at 25 s has held a queue slot and a socket for the whole
