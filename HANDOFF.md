@@ -3926,6 +3926,38 @@ pinning one per run, same binary, six rounds, each run's own A/A twin):
 every request needs a new one** — and that is the per-stream Noise handshake,
 which is the one item on this cycle's list that no attempt has moved without
 costing the bulk cells.
+
+**The throughput ceiling is the congestion window, and slow start never runs
+(2026-11-02, measured).** A `--scale 0.35` sweep of the timeline with
+`MOLEHILL_MHD_STATS=1` and the mhd module at `DEBUG` now logs each lane's window
+once a second. Across the whole schedule, 2 023 samples:
+
+- **`slow_start` is true in 0 of 2 023.** The latch the doc comment describes —
+  "it latches off at the first loss and never comes back" — is off before the
+  first sample and never returns, so every byte after that is bought additively.
+- **`cwnd` spans 13-60 KiB**, i.e. ten to forty-odd packets, and is **never above
+  60 KiB**; `MAX_CWND`'s 16 MiB is not approached in a single sample.
+- **`flight` never exceeds 0 KiB** (under 1 KiB throughout), so the sender is
+  never bound by what is in flight: `cwnd` itself is the ceiling.
+- The trajectory across the schedule is 13.2 → 42.2 (rising through `clean`) →
+  **19.8** after the first lossy stage → 25.0 → 26.3 → 27.7 → 30.3 → 32.9 → 35.6
+  with occasional excursions to 55-59, and the throughput tracks it: 10.66 Gbit/s
+  in the first `clean`, 4.08 in the repeat.
+
+So throughput is `cwnd × lanes ÷ RTT`, and at this host's ~0.1 ms path a 40 KiB
+window is about 3 Gbit/s per lane — which is exactly the 10-11 Gbit/s cell and
+exactly the 4 Gbit/s repeat. **The carrier is window-bound, not window-ample**, and
+a single loss early in a run costs it the rest of the run's growth. The doc
+comment's premise ("the rate is the pacer's business; this is only the bound") does
+not hold on a path whose bandwidth-delay product is larger than tens of kilobytes,
+which on a real WAN is every path.
+
+**The next change is therefore a slow-start restart**, the mechanism TCP already
+has: after a period with no loss — and after an idle period, which the carrier also
+lacks — re-arm exponential growth instead of paying additive-only for the rest of
+the process's life. It is on the throughput axis, it is local to `conn.rs`'s growth
+path, and the instrument above is how its effect gets measured: `slow_start=true`
+must reappear, and `cwnd` must reach the path's BDP rather than 60 KiB.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:

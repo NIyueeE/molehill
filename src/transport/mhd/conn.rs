@@ -404,6 +404,8 @@ pub(crate) struct Conn {
     /// this is the bound that keeps the flight, and therefore the recovery
     /// table, proportional to the path's bandwidth-delay product.
     cwnd: u64,
+    /// When the periodic stats line last read the window.
+    window_reported_at: Instant,
     /// Whether the window is still looking for the path's capacity.
     ///
     /// True until the path drops something: while it is, every acknowledged byte
@@ -466,6 +468,7 @@ impl Conn {
             written: 0,
             buffered: 0,
             cwnd: INITIAL_CWND,
+            window_reported_at: Instant::now(),
             slow_start: true,
             acked_since_growth: 0,
             closed: None,
@@ -1366,6 +1369,28 @@ impl Conn {
     /// is full, the send buffers are at their ceiling, or none of them is short
     /// and the open is waiting on the wire. Read only when an open is already
     /// late (see `MhdLane::open_stream`), so a healthy run pays nothing.
+    /// When this end last reported its window, so the pump reports once a second
+    /// rather than once a pass.
+    pub(crate) fn window_reported_at(&self) -> Instant {
+        self.window_reported_at
+    }
+
+    /// Record that the window has just been reported.
+    pub(crate) fn note_window_reported(&mut self, at: Instant) {
+        self.window_reported_at = at;
+    }
+
+    /// The congestion window's own state, for the periodic stats line.
+    ///
+    /// `(cwnd, flight, slow_start)` — the three numbers that say whether a lane
+    /// that has fallen behind a clean path is growing its window or sitting on
+    /// one. `slow_start` latches off at the first loss and never returns, so a
+    /// lane measured late in a shaping schedule is in congestion avoidance by
+    /// construction; this is what makes that visible instead of inferred.
+    pub(crate) fn window_state(&self) -> (u64, u64, bool) {
+        (self.cwnd, self.recovery.flight_bytes(), self.slow_start)
+    }
+
     pub(crate) fn budget(&self) -> (u64, u64, u64, usize) {
         (
             self.send_credit.saturating_sub(self.written),
