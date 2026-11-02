@@ -5520,6 +5520,35 @@ is the default four. Either something mints 29 short-lived carrier connections b
 pool, or the server is counting something else as a lane; the next run should name them
 (a lane that ends within a second has no business existing in a pooled design).
 
+**And named from both ends, the anomaly sharpens: client 4, server 33 (2026-11-02).**
+Counting distinct `lane=` ids in each process's own log for the same run:
+
+| side | distinct lanes | which |
+|---|---|---|
+| client | **4** | ids 0-3 only |
+| server | **33** | ids 0-3, plus 29 in the billions |
+
+So it is **not** a client-side pool that grew: the client's pump has exactly the four
+pool lanes and logs nothing else. The 29 are server-side `Conn`s created by the
+listener for packet ids the client's pool never used as a lane. Two facts narrow it
+and neither closes it:
+
+- `data_enable = true` in that arm, so every visitor channel **is** carrying a Noise
+  handshake — the per-stream-handshake premise this whole cycle has reasoned from holds;
+- the client's `pool-stats` prints exactly one line, `established=4`, with no repair and
+  no reap, so its pool never dialled a replacement.
+
+What is left is that something on the client side mints a short-lived carrier
+connection **beside** the pool — one the pool does not count, which is why no repair is
+logged — and that is the shape of a *direct* data channel rather than a pooled stream.
+The discriminator is already in the code and needs only the right log level: the server
+routes a pooled stream through `mhd tunnel stream routed` and a direct one through
+`do_v4_data_channel`'s `Handshaking a data channel`, and `core::server` was not at
+`DEBUG` in this run. **One run with that module at `DEBUG` names them**, and if they are
+direct channels then every arrival is paying a full connection rather than a stream on a
+warm lane — which would be the largest arrival cost found in this cycle and the thing
+`P2′` was really about.
+
 
 
 
