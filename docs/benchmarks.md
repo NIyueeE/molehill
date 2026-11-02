@@ -943,8 +943,12 @@ at the median and at the ninetieth percentile and slower at the ninety-ninth**, 
 first stage after a restart is six times worse at the median than the carrier will be.
 So a deployment is choosing between a carrier that beats TCP once it has been running and
 one that pays a start-up cost for the first minutes of its life; the cost is the
-carrier's own state filling in — its congestion window ramping from its initial ten
-packets to the megabytes it settles at — and not a queue of unopened channels.
+carrier's own state filling in, and not a queue of unopened channels. **Which part of
+that state is still open**: the congestion window is the only start-up quantity this
+schedule measures, and it reaches its 2 MiB slow-start ceiling within the first second of
+traffic, so it cannot account for a median that stays six times worse across a whole
+stage. A reader should take the six-fold difference as the measurement and the mechanism
+as unattributed.
 
 A schedule that measured only the first stage would report the cold number and a schedule
 that measured only the last would report the warm one. This one reports both, in order,

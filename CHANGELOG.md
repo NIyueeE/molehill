@@ -52,8 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   p90 2.27 and p99 15.07 against TCP's 2.24 and 2.58 on the same cell — faster at the
   median and at the ninetieth percentile, slower at the ninety-ninth — while the *first*
   stage of the same run reads p50 **12.13**: six times the median the carrier reaches
-  minutes later, because its congestion window is still ramping from its initial ten
-  packets. A deployment is therefore choosing between a carrier that is quicker than TCP
+  minutes later. **What is cold is not yet attributed**: the only start-up quantity this
+  release measures is the congestion window, which reaches its 2 MiB slow-start ceiling
+  within the first second of traffic and therefore cannot explain a median that is six
+  times worse across a whole stage — so that is a *rejected* explanation, not the
+  explanation. A deployment is therefore choosing between a carrier that is quicker than TCP
   once it has been running and one that is slower for the first minutes of its life.
   Two further numbers: the capacity ramp climbs **all eight levels**, and on a run whose
   first stage happened to land well the first stage read **46.2 ms** at the 99th
