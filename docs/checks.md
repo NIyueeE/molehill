@@ -118,6 +118,24 @@ default-feature pass never compiles. `just check` runs the identical chain.
 Tests run **serially** (`--test-threads=1`): the integration suite spawns real
 server/client pairs on fixed ports; parallel execution races on them.
 
+**These gates run in order and stop at the first failure, so a gate that cannot reach
+the network hides everything after it.** `cargo audit` fetches the RustSec database on
+every run, and when that fetch fails — no route to `github.com`, a proxy, a DNS outage —
+the push stops at gate 10 and gates 11–13 have **not run at all**, which is not the same
+as having passed. Prove it by hand before believing a green tree during an outage:
+
+```bash
+cargo audit  # with --no-fetch, to read the local database offline
+cargo clippy --all-targets -- -D warnings # gate 5, run alone
+cargo test --quiet -- --test-threads=1    # gate 13, run alone
+```
+
+Two more facts worth having in that situation: the duplicate-crate `warning[duplicate]`
+lines `cargo audit` prints are informational (a graph with two versions of `base64` is
+normal here), and running `cargo audit` with the `--no-fetch` flag proves the
+*database's* verdict rather than
+that it is current — so say which of the two you ran.
+
 A push that carries a `v*` tag runs the release review (`githooks/pre-tag`,
 below). A tag-only push stops after the review; a push that also carries a
 branch runs these heavy gates for the branch. The tagged commit's heavy gates
