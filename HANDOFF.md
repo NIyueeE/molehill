@@ -5583,6 +5583,34 @@ rate-limited like a connection attempt. Until then, `lane=` on the server is not
 and the per-lane numbers in this file that came from a server log have to be read with
 that in mind.
 
+**And warming the window faster makes the first stage worse, not better
+(2026-11-02).** The cold-window reading above pointed at an obvious lever:
+`INITIAL_CWND` is ten packets (13 KB), so a lane opens small and grows; starting it at
+32 packets would let it reach its working size sooner. Built and measured at
+`--scale 0.2`, one run each:
+
+| | `INITIAL_CWND = 10` | `= 32` |
+|---|---|---|
+| `clean` p99 | 79.4 ms | **153.9** |
+| `clean#2` p99 | 3.33 | 4.37 |
+| `loss5` p99 | 2 467 | **1 440** |
+
+**The first stage doubles.** So the window's *size* early on is not what makes the first
+stage slow — a bigger initial window only gives the bulk streams a bigger burst to put in
+front of the arrivals. Reverted.
+
+That is the fourth lever this cycle has measured against the first stage and the third
+that moved it the wrong way, and the pattern is now clear enough to state: **every change
+that gives the bulk flight more room makes arrivals worse, and every change that gives it
+less makes bulk worse.** The first stage is the two workloads competing, and no single
+constant resolves that — which is what the `loss5` A/B and the `capacity` results have
+been saying from different directions all along.
+
+Two things are left for the remaining rounds and neither is a constant: the 29 strangers
+(a robustness hardening, bounded today by `MAX_CONNECTIONS`), and the release measurement
+itself — which needs a run in the good mode and now has an `INFO` instrument that says
+which mode a run is in before its numbers are believed.
+
 
 
 
