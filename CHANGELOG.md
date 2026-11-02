@@ -52,7 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   p90 2.27 and p99 15.07 against TCP's 2.24 and 2.58 on the same cell — faster at the
   median and at the ninetieth percentile, slower at the ninety-ninth — while the *first*
   stage of the same run reads p50 **12.13**: six times the median the carrier reaches
-  minutes later. **What is cold is not yet attributed**: the only start-up quantity this
+  minutes later, and *within* that first stage the latency **rises** — its first twenty
+  arrivals sit at 2.14 ms and the rest of it at 72.78 — so "cold start" is the wrong name
+  for it and the mechanism is unattributed. **What is cold is not yet attributed**: the only start-up quantity this
   release measures is the congestion window, which reaches its 2 MiB slow-start ceiling
   within the first second of traffic and therefore cannot explain a median that is six
   times worse across a whole stage — so that is a *rejected* explanation, not the

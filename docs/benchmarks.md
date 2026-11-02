@@ -942,8 +942,13 @@ Read against TCP on the same cell — p50 2.24 ms, p99 2.58 — **the warm carri
 at the median and at the ninetieth percentile and slower at the ninety-ninth**, while the
 first stage after a restart is six times worse at the median than the carrier will be.
 So a deployment is choosing between a carrier that beats TCP once it has been running and
-one that pays a start-up cost for the first minutes of its life; the cost is the
-carrier's own state filling in, and not a queue of unopened channels. **Which part of
+one that is slower for the first stage of a run.
+
+**And that stage's cost is not a start-up cost.** Within it the latency *rises*: the stage's
+first twenty arrivals sit at 2.14 ms — the speed the carrier keeps — and its remaining few
+hundred at 72.78 ms. A start-up cost would do the opposite. So the table's twelve
+milliseconds is an average over a stage that begins fast and slows, and the mechanism is
+**unattributed**. **Which part of
 that state is still open**: the congestion window is the only start-up quantity this
 schedule measures, and it reaches its 2 MiB slow-start ceiling within the first second of
 traffic, so it cannot account for a median that stays six times worse across a whole
