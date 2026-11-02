@@ -77,6 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a twin's 5.29, and `churn-16` (2.49 ms p50, 20.31 p99) and `rr-16` (0.46,
   1.34) are unchanged against their own twins.
 
+- **An opening stream is exempt from the flight's age bound.** The bound that keeps a
+  flight from outliving its retransmission timer had one exception it needed and did
+  not have: a new stream's handshake is not part of that flight. Without the exception
+  a lane behind on acknowledgements — which is every lane on a lossy path — refused to
+  start a stream at all, and the visitor waited for its data channel while the tool sat
+  on the handshake. Measured as an interleaved A/B under a 100 ms, 1 % path: p50
+  identical at 202.05 against 202.06 ms, and the tail **861.7 ms against 1 426.9**, with
+  the A/A twin at 861.5 confirming the difference. Throughput unchanged: 1.68 against
+  1.71 Gbit/s, twin 1.45.
+
 - **A visitor that waited for its data channels says so at `INFO`.** The line exists
   and fires past a tenth of a second, but it was `DEBUG`: a release run keeps the
   default filter, so the one measurement that explains an SLO failure on a clean stage

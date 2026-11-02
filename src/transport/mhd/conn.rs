@@ -577,10 +577,14 @@ impl Conn {
             .recovery
             .oldest_data_age(Instant::now())
             .is_some_and(|age| age >= self.recovery.current_rto());
-        let room = if aged { 0 } else { room };
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
+        // **An opening is exempt**: the bound protects a data flight from outliving
+        // the timer that finds its holes, and a new stream's handshake is not part of
+        // that flight. Applying it here made a lane behind on acknowledgements — which
+        // is every lane on a lossy path — refuse to start a stream at all.
+        let room = if aged && !opening(state) { 0 } else { room };
         // A stream that has already written a reserve's worth stops short of it,
         // so an opening stream always finds room (see `OPEN_RESERVE`).
         let room = if opening(state) {
