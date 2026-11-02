@@ -4374,6 +4374,30 @@ keeping: its `rr-16` A/A twins read 22 104 and 8 506 arrivals/s, a 2.6× disagre
 between two copies of the same binary, so that cell resolved nothing in this run and
 its numbers are not evidence either way.
 
+**And the ladder is not it either, because there is only one retransmission
+(2026-11-02).** The small flight's ladder was made flat — the existing comment says
+"the cheap floor is worth having for the first step; it must not extend the ladder",
+and the cap at `INITIAL_RTO` extended it to a 333 ms step — so a stall became
+`steps × 40 ms` instead of `steps × 333 ms`. Over six rounds: one round came out
+clean at **18 ms max**, and five still failed at 2.1-5.0 s. **Reverted**: one clean
+round out of six is not a win.
+
+That last measurement settles the question the last two rounds were arguing about,
+because the slow-open line prints `retransmits=` and it has read **1** every time.
+A 5 s stall with a single retransmission cannot be a ladder of any step size — a
+333 ms ladder needs fifteen steps and a 40 ms one needs a hundred and twenty-five.
+**One retransmission and five seconds** means the wait is one round trip that
+happened to be five seconds long, plus one recovery.
+
+So the shape of the defect is now: one handshake datagram is re-sent once, and the
+reply takes seconds. Both ends agree on the duration (server `hs_us=5 861 013`
+against client `hs_us=5 428 141`), the server says it spent that time *reading the
+client's message*, and every send-side instrument is silent. What has not been read
+is the **receive side**: whether the server's pump is being fed its datagrams
+promptly, which is a different function from the one that sends them and has no
+instrument on it at all — `mhd listener dropped a datagram` only fires when
+`on_datagram` *fails*, and never fired.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
