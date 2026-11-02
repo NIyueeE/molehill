@@ -5344,6 +5344,37 @@ Until that diagnostic lands, the release picture is: **steady state at parity wi
 trigger is not visible in the record the release publishes.** That is what the gate's two
 SLO failures are, and it is why the release is held rather than explained.
 
+**And the diagnostic timeline names the wait: the pairing, fed by a handshake that
+takes up to 613 ms (2026-11-02).** A `--scale 1.0` timeline with the whole crate at
+`DEBUG` — the run the paragraph above asks for — read `clean: 713.1 ms … clean#2:
+6.063 ms`, the same first-stage-bad, last-stage-good shape a third time. Its logs:
+
+- **845 `visitor waited for its data channels` lines**, with `paired_us` up to
+  **2 043 204** — visitors waited up to two seconds for a channel.
+- **312 slow channel opens on the client**, with `us` = `hs_us` up to **613 889** and
+  **`ack_us=0`** — the handshake, and the acknowledgement instant.
+
+So the chain is: the visitor waits for a channel → the server asks → the client opens
+one → **the client's Noise handshake takes up to 613 ms** → the pairing completes late.
+And 613 ms is not a path latency: this carrier's round trip on that leg is sub-millisecond
+and the one-flight open already made the exchange a single flight.
+
+That puts the handshake's *packet* back in the frame, and it is the same question the age
+bound was built for: the handshake is a stream's first bytes, so it is a data packet, so
+the write path's age bound can refuse it while a bulk flight keeps the lane behind. **The
+opening exemption was built and reverted two rounds ago — and the revert may have been a
+mistake**, because the comparison it rested on was against a baseline run that was itself
+in the degraded mode (`--condition loss5` gave 2.63 ms p50 with a 760 ms p99, which cannot
+both be a 200 ms shaped path; with the exemption the same cell read 202 ms p50 and its A/A
+twin agreed to the hundredth of a millisecond, which is what a 100 ms one-way delay
+*should* read). The throughput comparison was equally polluted: 6.36 against a twin's
+11.22.
+
+**So the next measurement is an interleaved A/B — the exemption against this tree, under
+`--condition loss5` — not another single-arm run.** That is the only form that can tell a
+real 4× regression from a twin that was itself in the bad mode, and it is the difference
+between reverting a fix and shipping one.
+
 
 
 
