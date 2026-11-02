@@ -4520,6 +4520,33 @@ a bulk stream beside it (`bulk-n` at the same time) and compare its p99 with the
 contention rather than the handshake — and it is the first experiment in this whole
 cycle that the timeline data itself has pointed at.
 
+**The controlled comparison says the median is fine under bulk and only the p99 is
+not (2026-11-02).** The timeline already records its **churn** series beside its
+interactive one, so the same probe exists with and without bulk. Restricted to the
+first stage — `clean`, 120 s, with four bulk streams running — and put beside the
+standalone `churn-16` cell, which has no bulk at all:
+
+| | `churn` with 4 bulk streams | `churn-16` alone |
+|---|---|---|
+| samples | 1 218 | 6 400 |
+| p50 | **1.95 ms** | 2.44 ms |
+| p90 | **2.83 ms** | — |
+| p99 | **849.4 ms** | 20.4 ms |
+| max | 4 066.7 ms | — |
+
+**Ninety per cent of arrivals under four bulk streams are under 3 ms, and the median
+is 1.95 ms** — better than the standalone cell, which runs sixteen concurrent
+connections instead of the timeline's sixteen-per-second. So the carrier does *not*
+queue arrivals behind bulk in the ordinary case, and my previous paragraph's "an
+arrival waits behind bulk" was too strong: it holds for the tail only.
+
+What the numbers actually say is narrower and much more useful: **about one arrival
+in a hundred stalls for 0.85-4.1 s, and the other ninety-nine are fine.** That is not
+contention and not a throughput problem — a carrier that queues would show a raised
+p50 and p90, and it does not. It is a rare, severe, discrete stall, and the search
+should be for what makes one specific arrival take seconds while the next one takes
+two milliseconds.
+
 
 The capacity cell did improve sharply on the timer fix before the regression was
 visible on other cells — p99 358, 821, 1 025, 1 715, 1 895, 2 061 ms against
