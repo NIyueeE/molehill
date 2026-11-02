@@ -3746,6 +3746,47 @@ the handshake (session resumption, which `src/protocol.rs`'s selector doc names
 a `0x02` for and no module implements), and fewer pump hand-offs per arrival.
 Both are un-attempted, and both are smaller than the record layer.
 
+**And the one-round-trip open was built, measured, and it is a real win that the
+cell cannot see (2026-11-02).** The handshake now carries one payload each way
+(`NoiseStream::handshake_carrying`): a lane whose slot the server already holds
+sends its tunnel hello in the handshake's *opening* message and reads the
+acknowledgement from the *reply*, so a channel open is one flight instead of
+two. The lane's first stream still pays two flights, because the server has to
+reserve before it can answer; the two shapes are told apart by the payload's
+presence, so neither end has to agree in advance and a disagreement is a
+fallback rather than a deadlock. `just check` green, 331 lib tests, 22
+integration.
+
+The measurement, with `MOLEHILL_MHD_STATS` off and the open's own debug line
+counted per sample (churn-16, one round, mhd forced):
+
+| | baseline (`891129d`) | one-round-trip |
+|---|---|---|
+| first 500 opens, p50 | **3 313 µs** | **927 µs** |
+| first 500 opens, p90 | 6 703 µs | 1 098 µs |
+| first 500 opens under 1.5 ms | 87 of 500 | **494 of 500** |
+| whole run, p50 | 3 168 µs | 3 420 µs |
+
+So the mechanism works — a 3.6× cheaper open when the path is idle — and the
+cell still reads no difference, because the steady state is queueing: sixteen
+concurrent arrivals on four lanes put three to five opens in flight per lane,
+and the wait for the pump's turn is larger than the flight it saves. The
+instrument's own numbers say so: in the slow regime `hs_us` is 0-1 µs (the
+handshake itself is free) and `ack_us` carries the whole open, which is the
+round trip *plus* the queue.
+
+**Two other things this round established.** First, a run whose `--binary-b`
+names a missing file does not fail: the bench reported ten `not ready` samples
+for the baseline arm and produced a table anyway. Rebuilding the baseline from
+a worktree at `891129d` (`git worktree add`) fixed it — and note that
+`cargo build --target-dir` in the *main* tree still stamps the worktree's HEAD,
+because vergen reads the git directory, not the target directory. Second, the
+`churn-16` cell read `6400 of 6400 replies did not match` on every sample of
+every arm, which is the payload echo in `handshake_carrying` answering the
+initiator with the responder's own payload; that is fixed, but the cell's
+mismatch verdict is what a correctness break looks like and it is worth
+remembering that it appears as a *latency* cell's failure line.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
