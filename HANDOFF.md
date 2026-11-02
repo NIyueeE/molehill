@@ -4547,6 +4547,50 @@ p50 and p90, and it does not. It is a rare, severe, discrete stall, and the sear
 should be for what makes one specific arrival take seconds while the next one takes
 two milliseconds.
 
+**And the hole-distance recovery, which was the best-founded idea of the cycle, is
+also neutral (2026-11-02).** The acknowledgement's bitmap names sixty-four numbers,
+so a hole further back can neither be acknowledged nor *declared lost* by it, the
+cumulative frontier cannot pass it, and the timer that would otherwise recover it is
+armed from a send — which a busy lane performs continuously. Recovering the lowest
+unacknowledged packet by **distance** (`HOLE_DISTANCE = 64`, one packet, O(1),
+immune to the timer being pushed forward) is the fix that reasoning asks for.
+
+Measured, on the cells without bulk (where a deep hole would be a defect in itself):
+`churn-16` p50 2.45 / p99 21.28 against 2.44 / 20.4, `rr-16` 0.46 / 1.33 against
+0.49 / 1.23, `bulk-n` 6.88 against its twin's 5.35 — **neutral, as expected**. On the
+cell that carries the tail: p99 215, 1 405, 4 047, 4 436, 4 899, 5 003 ms over six
+rounds, against 358-2 061 for the best earlier attempt and 2 100-5 000 for the
+baseline. **No win. Reverted.**
+
+**So the tail has now survived every mechanism this cycle could reach**, each with its
+own instrument or its own A/A twin:
+
+| excluded | by |
+|---|---|
+| record layer (32 KiB, 16 KiB, one packet) | failed bulk samples, three sizes |
+| credit threshold | bulk-n 0 of 8 either way |
+| congestion window | reaches `SLOW_START_CEILING` and past it |
+| pacer | the client's send buffer shows zero dwell |
+| small-flight timer (three variants) | 0 of 8 → 2 of 6, not separable |
+| send path (refused write, accept queue, socket wait) | four instruments, all silent |
+| loss window vs timer interval | aligned, no change |
+| timer from the oldest packet ± the aligned window | regressed `churn-16` p50 to 16 ms |
+| hole recovery by distance | neutral here, no change on the tail |
+
+What the numbers say, and they have not moved across sixty rounds of this: **p50
+1.8-2.5 ms and p90 2.8-6 ms under four bulk streams, against TCP's 2.24/2.6** — at
+parity — and **about one arrival in a hundred taking 0.85-4.1 s**. The arrival path
+is not slow; one arrival in a hundred is *stuck*.
+
+**This is now a human decision rather than another experiment.** The remaining way to
+find it is per-datagram tracing of the ~1 % that stall — capture the stream id, the
+packet numbers and the event sequence of a single bad arrival — which is a different
+kind of work from everything above (an instrument that records a whole trace, not a
+counter), and the depth of the remaining search is not something to keep spending
+rounds on without the operator knowing what is at stake. It is recorded in
+`CHANGELOG.md` under Known gaps so a deployment can decide for itself, and the release
+ritual's capacity cell reports it honestly as a failure rather than being massaged.
+
 
 The capacity cell did improve sharply on the timer fix before the regression was
 visible on other cells — p99 358, 821, 1 025, 1 715, 1 895, 2 061 ms against
