@@ -3883,6 +3883,49 @@ floor **from its own run**, and a run whose floor exceeds the threshold is
 reported as unable to answer rather than as a small difference. Reading a
 percentage from a run whose floor was never quoted is the mistake that produced
 both the "record layer costs 15 % of bulk" and the "+39.55 %" readings.
+
+**And the release blocker is gone (2026-11-02, `c8c5267`).** A full `--scale 1.0`
+sweep of the `timeline` over the current tree completes **all eight stages**, where
+the same scenario previously failed four of them outright:
+
+| stage | before the port fix | now |
+|---|---|---|
+| clean | 125.0 ms | **42.1 ms** |
+| rtt100 | 421.5 | 402.3 |
+| loss1 | 1 087.2 | 1 082.6 |
+| loss5 | **FAILED** (0.0 Gbit/s for all 118 s) | **2 459.7 ms**, 0.46 Gbit/s |
+| rate100 | **FAILED** | **96.4 ms** |
+| rate20 | 191.6 | 189.8 |
+| jitter | **FAILED** | **243.5 ms** |
+| clean#2 | **FAILED** | **5.9 ms** |
+
+The capacity ramp is still unmeasured in that run (`--scenarios timeline`), so the
+gate's ramp half is open, but the timeline half is green and that half is what
+failed. **What cleared it was the visitor's port exhaustion**, not the arrival
+work: the churn probe inside every stage was hitting it, and four stages died on
+it.
+
+Two things the run also shows, both worth a later round. `rtt100`'s 1.70 Gbit/s
+is the 16 MiB window divided by the 400 ms round trip over four lanes — the
+memory-for-throughput trade the CHANGELOG already states, visible here as a
+number. And `clean#2` at 4.08 Gbit/s against `clean`'s 9.21 on the same condition
+is a 2.2× difference between two identical stages of one run, which the host's
+own variance does not explain; it is the next thing to look at before the sweep is
+trusted as a whole.
+
+**The carrier comparison, on the repaired instrument** (`MOLEHILL_DATA_CARRIER`
+pinning one per run, same binary, six rounds, each run's own A/A twin):
+
+| | `churn-16` mhd | `churn-16` tcp | `rr-16` mhd | `rr-16` tcp |
+|---|---|---|---|---|
+| p50 | 2.42 ms | 2.24 | 0.46 | 0.44 |
+| p99 | **20.51** | **2.58** | 1.35 | 1.34 |
+| rate/s | 3 612 | 6 728 | 29 949 | 31 545 |
+
+**At parity wherever a connection is reused, eight times worse on the tail where
+every request needs a new one** — and that is the per-stream Noise handshake,
+which is the one item on this cycle's list that no attempt has moved without
+costing the bulk cells.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
