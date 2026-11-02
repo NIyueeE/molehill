@@ -4846,6 +4846,36 @@ readers' `tx.send` (a `send` without a matching wake), and whatever wakes the ta
 above `recv_loop`. Finding it means auditing the wake path from `stripe_reader`'s
 `tx.send` outward, which is a bounded, concrete search rather than another theory.
 
+**And the destination is not where it blocks (2026-11-02).** `recv_loop` has exactly
+two places it can wait: its channel, and `write_dest` — the write to the visitor (or to
+the iperf3 sink on the client). Timing that write and logging anything at or past
+100 ms, over five capacity rounds: **zero lines, in every arm, every round**. So the
+loop is not blocked handing bytes on, and by elimination it is waiting on its channel.
+
+That is worth having because it separates the two shapes the same symptom produces: a
+loop stuck *writing* would leave the reorder allowance full and the readers blocked,
+and a periodic kick could never reach a task inside that await — whereas a loop stuck
+*reading* is exactly what a kick can nudge. The measurement says the second, which is
+also why the kick moved the distribution last round.
+
+The instrument itself is **not kept**: it costs two clock reads on every write in the
+hottest copy loop in the product, and it has already answered its question. A
+diagnostic that has served its purpose does not get to stay in the hot path, and that
+is the same rule as a change with no measured win.
+
+**So the chain is now: `recv_loop` waits on its channel → `stripe_reader` is not
+producing frames → either it is blocked on `tx.send` or it is not reading its carrier
+stream, and the carrier has already been measured as idle-but-full.** The next
+instrument is one line in `stripe_reader`'s send: log when `tx.send` waits at or past
+100 ms (the channel full, so the consumer is behind) — and if that log is silent too,
+the frame production itself is the stall and the carrier stream's read is where it
+sits.
+
+One caveat to carry, because it has bitten this cycle four times: `recv_loop`'s 2 s
+deadline only arms **while `pending` is non-empty**, so its silence across these rounds
+proves only that no frame arrived out of order — it says nothing about a frame that
+never arrived at all, which is the shape this measurement now points to.
+
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
