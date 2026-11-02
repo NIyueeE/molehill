@@ -967,6 +967,49 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
     }
 }
 
+/// The listener's own cadence, for the switch that reports the carrier's cost.
+///
+/// The receive side had no instrument at all: a datagram the dispatcher has not
+/// taken yet is invisible to every counter the connection keeps, so a stall
+/// measured on the *sender's* side could sit unexplained while the receiver was
+/// the one not being fed. One line a second, and the number that matters is the
+/// longest gap between batches — that is the whole of what a waiting reader pays.
+#[derive(Default)]
+struct Cadence {
+    batches: u64,
+    last: Option<Instant>,
+    max_gap: std::time::Duration,
+    reported_at: Option<Instant>,
+}
+
+/// Fold one batch into the listener's cadence, printing once a second.
+fn report_dispatch(cadence: &mut Cadence) {
+    let now = Instant::now();
+    if let Some(last) = cadence.last {
+        let gap = now.saturating_duration_since(last);
+        if gap > cadence.max_gap {
+            cadence.max_gap = gap;
+        }
+    }
+    cadence.last = Some(now);
+    cadence.batches += 1;
+    // The clock starts on the first batch that ever arrives, not on the first one
+    // that prints: initialising it inside the print branch leaves it `None` for
+    // ever, `since == now`, and the line never appears.
+    let since = *cadence.reported_at.get_or_insert(now);
+    if !crate::transport::stats::enabled() || now.duration_since(since).as_secs() < 1 {
+        return;
+    }
+    cadence.reported_at = Some(now);
+    tracing::debug!(
+        batches = cadence.batches,
+        max_gap_us = u64::try_from(cadence.max_gap.as_micros()).unwrap_or(u64::MAX),
+        "mhd listener cadence"
+    );
+    cadence.batches = 0;
+    cadence.max_gap = std::time::Duration::ZERO;
+}
+
 /// The listener's cap on live connections: see [`MAX_CONNECTIONS`].
 ///
 /// A refused datagram is dropped without a reply: the carrier must not become
@@ -1065,6 +1108,7 @@ fn spawn_dispatcher(
     #[cfg(not(target_os = "linux"))]
     let mut batch = ();
     tokio::spawn(async move {
+        let mut cadence = Cadence::default();
         loop {
             // One wake per connection per batch. Waking inside the per-datagram
             // path would schedule the same reader and the same sender once per
@@ -1132,6 +1176,13 @@ fn spawn_dispatcher(
             if read.is_err() {
                 return;
             }
+            // The receive side had no instrument at all, which is why a stall
+            // measured entirely on the *sender's* side could sit unexplained: a
+            // datagram the dispatcher has not taken yet is invisible to every
+            // counter the connection keeps. One line a second says whether this
+            // task is being fed — the gap between batches is the whole of what a
+            // waiting reader can be paying.
+            report_dispatch(&mut cadence);
             for shared in touched.drain(..) {
                 shared.wake_readers();
                 shared.wake_writers();

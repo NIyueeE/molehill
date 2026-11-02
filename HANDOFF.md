@@ -4398,6 +4398,33 @@ promptly, which is a different function from the one that sends them and has no
 instrument on it at all — `mhd listener dropped a datagram` only fires when
 `on_datagram` *fails*, and never fired.
 
+**The receive side now has an instrument, and building it cost two bugs of my own
+(2026-11-02).** `spawn_dispatcher` — the listener's per-socket loop — reports its
+batch cadence once a second under the stats switch: batches completed and the
+longest gap between them. The first version never printed, because `reported_at`
+was initialised *inside* the print branch: `since == now` for ever, `elapsed == 0`,
+no line. Fixed by initialising it on the first batch.
+
+What it shows on the capacity cell:
+
+`batches=2 max_gap_us=2000461`, `batches=31 max_gap_us=2000101`,
+`batches=30 max_gap_us=2000146`, and a worst case of 2 000 711 µs.
+
+**Two-second gaps, repeated, and almost exactly two seconds** — which is either a
+blocking operation of that duration somewhere in the task, or simply a quiet lane
+between bursts. This instrument cannot tell those apart, because a gap between batch
+*completions* includes idle time: a dispatcher waiting in `receive` with no traffic
+reports exactly the same gap as one that was starved with traffic waiting. **So this
+is not yet evidence**, and the next version has to mark the gap with whether the
+socket was ready meanwhile (a `poll` on the fd, or a datagram count from the socket's
+own `SO_RXQ_OVFL`).
+
+Two things it does establish. The server's mhd receive path is `spawn_dispatcher`
+(not the `spawn_listener` name I first grepped for, which does not exist — my edit
+had landed in the right function by luck and I misread the grep as "dead code").
+And the 2 s figure is worth chasing precisely because it is so round: nothing in the
+carrier's constants is 2 s, so if it is a block it is not one this file declares.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
