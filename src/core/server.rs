@@ -4103,7 +4103,13 @@ where
         }
         let paired = pairing_started.elapsed();
         if paired >= std::time::Duration::from_millis(100) {
-            debug!(
+            // **`info!`, like a slow opening**, and for the same reason: a visitor
+            // that waited a tenth of a second for its channel is an SLO breach on
+            // the clean stages, and a line nobody captures cannot explain the gate
+            // that reports it. A healthy pairing here is ~2.6 ms, so this fires
+            // only when something is wrong, and `note_slow_opening` already made
+            // the same choice for the server's half of the same wait.
+            info!(
                 group,
                 stripes = stripe_count,
                 attempts,

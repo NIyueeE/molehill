@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a twin's 5.29, and `churn-16` (2.49 ms p50, 20.31 p99) and `rr-16` (0.46,
   1.34) are unchanged against their own twins.
 
+- **A visitor that waited for its data channels says so at `INFO`.** The line exists
+  and fires past a tenth of a second, but it was `DEBUG`: a release run keeps the
+  default filter, so the one measurement that explains an SLO failure on a clean stage
+  was absent from the record that reports the failure. It is `INFO` now, matching the
+  server's own slow-open line, and it costs nothing on a healthy path — a healthy
+  pairing waits about 2.6 ms, so the line never fires.
+
 - **A forwarding loop wakes itself when it has nothing to do, and a parked
   reorder buffer now has a deadline.** The stripe layer's receive loop wrote only
   when the next sequence number arrived and waited on its channel with no deadline,
