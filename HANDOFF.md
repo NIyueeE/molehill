@@ -5010,6 +5010,40 @@ sixteen concurrent arrivals cost what one does. P2′ names the mechanism — a 
 that is already authenticated and waiting — and the one-flight open already halved
 what a fresh channel costs when the path is idle.
 
+**And the `churn-16` tail is queueing, not a slow step — which is what justifies
+P2′ (2026-11-02).** Two rounds with the whole crate at `DEBUG`, and *nothing* is slow:
+zero client-side openings past 100 ms, zero server-side openings past 100 ms, zero
+pairing budgets expired. So the 21.75 ms p99 is not one expensive step hiding
+somewhere; it is the sum of many small ones.
+
+The arithmetic says why, and it is the mechanism P2′ exists for:
+
+- one channel open costs **~2.5 ms**, which is the cell's *median* — every arrival
+  pays it at least once;
+- sixteen arrivals at once share **four lanes**, so the last waits for the others
+  ahead of it: 16 × 2.5 ms ÷ 4 ≈ **10 ms of queueing before it starts**;
+- a tail on top of that queue lands at the measured 21.75 ms.
+
+TCP has no such queue because its data channels are **multiplexed over long-lived
+connections** — one handshake, every visitor a stream. This carrier gives every
+visitor its own channel and therefore its own handshake, and the only way to remove
+the queue without giving up per-stream keys is to **open the channels before anyone
+asks**: a pre-authenticated channel with its tunnel hello and prologue already sent
+costs a visitor nothing at all, so sixteen concurrent arrivals stop serialising on
+four lanes.
+
+That is P2′ exactly as the plan states it, now justified by a measurement rather than
+by the plan's wording: the target is `churn-16` at TCP's 2.59 ms, the current cost is
+16 × 2.5 ms ÷ 4 lanes of queueing, and pre-warming is the only mechanism that removes
+a cost inherent to per-stream handshakes.
+
+**What such a change must get right**, written down before it is built: a warm channel
+nobody uses must cost nothing beyond its `WINDOW` of buffers and must be reaped on a
+TTL; the client must replenish it without a round trip of its own, so the
+replenishment does not become the new arrival cost; and the server's queue already has
+the shape for it — `ChannelQueue` is bounded at `CHAN_SIZE * 2` and `take_channel`
+takes whatever is there — so the work is on the client side, not in the pairing.
+
 
 
 
