@@ -4813,6 +4813,39 @@ frame boundary, a `Broken` that never propagated) or the group is not running at
 `stripes = 1` when it stalls. That is one instrument in `stripe_reader`, not in the
 carrier.
 
+**And built, the deadline never fired — but the wake it brought does help
+(2026-11-02, `1670d38`).** Both bounds are in: the receive loop wakes every 40 ms
+unconditionally (`STRIPE_REORDER_KICK`), and a buffer parked behind a missing
+sequence for two seconds fails the group with a named reason
+(`STRIPE_REORDER_DEADLINE`). Six capacity rounds:
+
+| p99 per round | outcome |
+|---|---|
+| 7.7, 9.5, 49.2 ms | **healthy**, and the 7.7 round climbs the ramp to **level five** — the first `capacity_streams` above one this cycle |
+| 1 275, 3 020, 4 291, 5 002, 5 002 ms | still stalling |
+
+Two things that follow, and the first is a correction:
+
+1. **The reorder-buffer hypothesis is not confirmed.** The deadline never fired —
+   zero errors in every series — so a missing sequence number was not what stalled
+   those runs. The improvement came from the *wake*, not from the deadline.
+2. **The periodic wake moves the outcome distribution a lot.** Before it, no capacity
+   round had a healthy tail; after it, half do, and one reaches a level the ramp had
+   never reached. A loop woken only by its channel cannot tell "the frame is late"
+   from "I was never polled again" — and the evidence now says the second happens.
+
+No regression on `churn-16` (2.56/20.21 against a 3.23/21.53 twin), `rr-16`
+(0.46/1.33 against an identical twin) or `bulk-n` (6.42 against 6.83). So both bounds
+are kept as liveness guards with a measured effect on the outcome distribution, and
+explicitly **not** as the fix: four runs in six still stall.
+
+**That points the next round at the missed wake-up itself.** If a 40 ms kick makes
+half the stalls disappear, then the notification that should have woken the loop is
+being lost or never sent — and there are only two places it can come from: the
+readers' `tx.send` (a `send` without a matching wake), and whatever wakes the task
+above `recv_loop`. Finding it means auditing the wake path from `stripe_reader`'s
+`tx.send` outward, which is a bounded, concrete search rather than another theory.
+
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
