@@ -3959,23 +3959,30 @@ the process's life. It is on the throughput axis, it is local to `conn.rs`'s gro
 path, and the instrument above is how its effect gets measured: `slow_start=true`
 must reappear, and `cwnd` must reach the path's BDP rather than 60 KiB.
 
-**The instrument was wrong first, and the corrected one contradicts the code
-(2026-11-02).** The line originally carried no lane id, so four connections
-reported into one stream and the first reading — "13 → 42 → 19.8 → 26.3 KiB" — was
-four interleaved series read as one. With `lane=` added, `bulk-n` (three client
-runs, 84 samples) reads:
+**That paragraph was wrong twice, and the second error was the interesting one
+(2026-11-02).** The first version of the window line carried no lane id, so four
+connections reported into one stream and "13 → 42 → 19.8 → 26.3 KiB" was four
+interleaved series read as one; that is fixed. The second error is worse: **the
+line was read on the wrong side of the tunnel.** `bulk-n`'s visitor sends, so the
+*server* is the bulk sender and the *client* only sends acknowledgements — and the
+client's lanes therefore read `cwnd` = 13 490 B with `slow_start` false and
+`acked_since_growth` frozen, which says nothing about throughput at all. Read on
+the sender, the same run says:
 
-**`cwnd` = 13 490 bytes in every one of the 84 samples, and `slow_start` false in
-every one.** Not "grows slowly": does not grow by a byte, on the product's primary
-workload, while the cell carries 11.5 Gbit/s.
+| side | `cwnd` | `slow_start` |
+|---|---|---|
+| server (sender) | **2 MiB = `SLOW_START_CEILING`**, every lane, every sample | **true** in all |
+| client (receiver) | 13 KiB, the initial value | false |
 
-That contradicts `on_ack`'s own comment, which says the cumulative retirement path
-feeds the round-trip sample precisely so that "the congestion window would never
-grow" cannot happen, and the growth branch under it. Two readings are possible and
-they are cheap to separate: either the growth branch is not reached (`acked.progress`
-false, or `bytes` zero on this path), or `cwnd` is being read from a different
-`Conn` than the one growing. The next instrument is a counter of growth attempts
-per lane, not another minute of the timeline.
+So on a clean path the window does what it was designed to do: it doubles to its
+ceiling and stays in slow start. The alarm that `bulk-n`'s window "never grows by a
+byte" was an artefact of sampling the acknowledgement-only side, and the lesson is
+the one this file keeps relearning — **the workload decides which end is the
+sender, and a per-end instrument read on the wrong end is not a measurement.**
+
+This leaves the original question untouched: whether the *sender's* window is what
+fails to recover across a shaping schedule. That is what the timeline run below
+measures, on the server side.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
