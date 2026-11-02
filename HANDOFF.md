@@ -4453,6 +4453,44 @@ packet **and** the loss window must be at least the interval that armed it. Land
 either alone is worse than neither — which is now measured in both directions, and is
 the next thing to build.
 
+**Landed together, and it storms anyway — so the root is elsewhere (2026-11-02).**
+Both halves were implemented as one change (timer from the oldest packet, loss window
+floored at the interval that armed it, boundary inclusive) and `just check` is green
+with 333 tests. Measured:
+
+| cell | before | combined change |
+|---|---|---|
+| `churn-16` p50 | 2.44 ms | **16.07 ms** (A/A twin 14.33) |
+| `churn-16` p99 | 20.4 ms | 395 ms (twin 429) |
+| `rr-16` p99 | 1.23 ms | **6.48 ms** (twin 5.83) |
+| `bulk-n` | 6.5-8.8 Gbit/s | 8.62 (twin 8.79) |
+
+The A/A twin agrees with the arm, so it is the change and not scatter. **Reverted.**
+
+The reason is structural and worth writing down, because it says the fix was aimed at
+the wrong layer: **on this carrier the oldest packet in flight is legitimately older
+than the RTO.** The window is 16 MiB and a lane on this host carries about
+1.25 Gbit/s, so the flight spans roughly 128 ms of data — within a factor of two of
+`MIN_RTO`'s 200 ms, and past it whenever the lane is busier or the window is fuller.
+Arming a 200 ms timer from the oldest packet therefore fires on a *healthy* full
+lane, and past that it fires on every pass. A transport whose flight can outlive its
+own retransmission timeout cannot detect loss by time at all.
+
+Which finally names the root rather than a symptom: **the carrier's round-trip
+samples exclude its own queue.** `loss_delay` and `rto` are both computed from
+`smoothed`/`latest`, and those are sampled from the *newest* acknowledged packet —
+the one that waited least — so they measure the path (tenths of a millisecond) and
+never the queue (tens to hundreds). Every rule built on them then treats a queued
+packet as lost, and the only reason the current tree works at all is that the timer
+is armed from the newest send, which accidentally keeps it quiet.
+
+**So the next change is not in the timer at all: it is to take round-trip samples
+from a packet that waited, or to add the send-buffer dwell to the estimate.** The
+dwell is already measured (`mhd stream byte waited in the send buffer`, and
+`queued_at` on every stream) — which makes it the one input this problem needs that
+already exists.
+
+
 The capacity cell did improve sharply on the timer fix before the regression was
 visible on other cells — p99 358, 821, 1 025, 1 715, 1 895, 2 061 ms against
 2 100-5 000 before — so the mechanism is confirmed even though the change cannot
