@@ -4771,6 +4771,48 @@ direction of a backlog from the process that logs it — the megabyte above is o
 **client**, whose `recv_loop` writes to the iperf3 sink, and the stalls that matter are
 the **server**'s readers.
 
+**And read, `recv_loop` has no timeout: it parks a whole group behind one missing
+sequence number (2026-11-02).** The loop is a reorder buffer:
+
+```rust
+let mut next = 0u64;
+let mut pending: BTreeMap<u64, Bytes> = BTreeMap::new();
+while let Some(event) = rx.recv().await {
+    if seq == next { write_dest(&mut dest, &bytes).await?; next += 1; … }
+    else if seq > next { pending.insert(seq, bytes); }
+}
+```
+
+It writes only when `seq == next`, and **waits in `rx.recv().await` with no deadline**.
+One frame that never arrives therefore stops the destination for as long as the stripes
+stay open — which, in a bulk transfer, is the whole transfer — and everything after it
+piles into `pending`. Then the bounded channel to the readers fills
+(`STRIPE_REORDER_QUEUE`), the `stripe_reader` tasks block on `tx.send`, they stop
+reading their carrier streams, and **the carrier's receive buffers fill and its readers
+park**.
+
+That closes the loop on the observation that started this: `unsent_ms=0` and a megabyte
+of `recv.held()` on a stream whose reader is parked. **The carrier was idle because the
+layer above it had stopped reading it**, and every instrument this cycle built measured
+the idle party. The carrier's own counters were telling the truth the whole time.
+
+The only trace of it today is emitted at the *end*: `"stripe receive ended with N frames
+parked behind sequence X"` — which a stalled-but-alive group never reaches, because the
+stripes never end. That is why sixty rounds of carrier instrumentation found nothing: the
+stall is a missing sequence number in a reorder buffer one layer up, with no timeout and
+no diagnostic while it is happening.
+
+**The next change has two parts and both are small.** Give the reorder buffer a
+deadline: when `pending` is non-empty and nothing has arrived for a few hundred
+milliseconds, that is a stall worth one line (stream, `next`, `pending.len()`) — and
+worth reviving the group, since a sequence that has not arrived cannot arrive later if
+the stripe that owed it has failed. And answer the question the shape raises: with
+`stripes = 1` the carrier guarantees ordered delivery on one stream, so `seq` cannot
+skip — which means either `stripe_reader` is dropping a frame (a partial read at a
+frame boundary, a `Broken` that never propagated) or the group is not running at
+`stripes = 1` when it stalls. That is one instrument in `stripe_reader`, not in the
+carrier.
+
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
