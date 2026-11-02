@@ -4992,6 +4992,27 @@ So the honest summary of the sweep is: **coverage is now good enough to compare 
 cold first stage is a hundred times a peer's, and the harness still loses cells to an
 intermittent failure that moves.**
 
+**And the cold start is not the tool's age, which rules out the experiment this file
+recommended (2026-11-02).** Two rounds in one bench invocation: `topology up` appears
+**once** and both rounds run against the same processes, so the tools had been serving for
+about six minutes when round 1 began. Its first stage still read **516.0 ms** where round
+0's last stage read **2.654** — the same shape as every run in this file, with a carrier
+that had not been restarted.
+
+**So `warmup_rounds` cannot fix it**, and the advice to try that first was wrong: a warm-up
+round discards one round and the next round's first stage is cold again, because whatever
+is cold resets with the round rather than with the process.
+
+What resets with a round is the **probes** — the series writers and the churn generator are
+torn down and restarted per round, while the tools are not — so every round's first stage
+is measured by processes that are themselves new. That is the leading candidate and the
+next cycle's first measurement: time the probe's own first request against its last, inside
+one stage, before touching the carrier again.
+
+Everything measured against the first stage this cycle — the window, the lanes, the
+pairings, the timers, the worker threads — was measured on the carrier and came back
+negative. **The one thing nobody has measured is the instrument.**
+
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
 repair for "the timer follows the newest packet" is to follow the oldest **data**
 packet instead — a packet with no range has nothing to re-send, so letting its age
