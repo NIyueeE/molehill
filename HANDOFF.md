@@ -5611,6 +5611,32 @@ Two things are left for the remaining rounds and neither is a constant: the 29 s
 itself — which needs a run in the good mode and now has an `INFO` instrument that says
 which mode a run is in before its numbers are believed.
 
+**The strangers are fixed, and the fix is proved by a test rather than by a run
+(2026-11-02, `b6a71e0`).** The listener now creates a lane only for a datagram that
+*opens a stream* — a `Frame::Stream` at offset zero carrying bytes, which is what a real
+client's first datagram is (the selector byte) and what a stray is not. Everything else
+is dropped before anything is allocated, so the `Shared`, the `Conn`, the sender task and
+the window are never created for a stranger.
+
+The negative case has its own test: `a_datagram_that_is_not_opening_a_stream_creates_no_lane`
+sends a decodable packet with an unused id and `Frame::None` at a live listener and
+asserts nothing is accepted. That is the evidence this round can offer, and it is the
+right kind — the field count needs a `DEBUG` run to read `lane=`, and the run that
+followed this change landed in the degraded mode (`clean: 510.8 ms`, 270 slow pairings)
+with debug off, so it neither confirms nor denies anything.
+
+Which is itself the useful observation: **the mode swings run to run on the same binary,
+and two consecutive scale-0.2 runs read `clean` 153.9 and 510.8 ms.** Whatever produces
+the mode is not the tree — the tree changed by one admission condition between them — and
+it is the single largest variance in this cycle's measurements. Until it is understood, a
+release measurement is a lottery, and the honest thing to publish is the distribution
+rather than a run.
+
+The remaining rounds go to two things in this order: name the mode with the instruments
+that now exist (the pairing count says *which* run, the window says what it was doing),
+and leave the tree with every gate green and the release held on a documented gap.
+
+
 
 
 
