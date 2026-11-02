@@ -5754,6 +5754,34 @@ stalls are gone, and one Noise handshake in forty occasionally pays five millise
 instead of one-tenth** — which is what the two clean-stage SLO failures are, and what a
 reviewer now has a number and a stage for.
 
+**And three more candidates are excluded by measurement (2026-11-02).** Each was cheap
+because `churn-16` is a two-minute cell:
+
+| candidate | test | result |
+|---|---|---|
+| the small-flight floor (`MIN_RTO_SMALL_FLIGHT`, 20 ms) | 20 → 5 ms | p99 **22.6**, twin **22.3** — no change |
+| the small-flight *initial* RTO (`SMALL_FLIGHT_INITIAL_RTO`, 20 ms) | 20 → 5 ms | p99 **22.1**, twin **20.3** — no change |
+| worker starvation (`TOKIO_WORKER_THREADS`) | 4 against 16 | 20.4 / 22.3 against 21.6 / 18.3 — the twins' spread covers both |
+
+Both timer constants were worth testing because 20 ms is the p99 to the millisecond and
+this file has been fooled six times by a number that matched a constant. **Both are
+refuted, and so is the scheduler-starvation story**: more workers change nothing, so the
+wait is not the process competing for cores.
+
+What is left is narrow and stated as such: one handshake in forty sees its two-datagram
+exchange take ~6 ms (worst 23.6) where the path's own round trip is a tenth of one, on a
+cell with no concurrency, no bulk, healthy lanes, a cold-free window and no timer
+involved. That is **two userspace wakeups that occasionally cost milliseconds each**, and
+the candidate space is now down to the reactor's wake path — the one place this cycle has
+not instrumented, because the receive batch (`RecvBatch`, `recvmmsg`) has no timing on it
+at all.
+
+The remaining rounds go there or nowhere: `RecvBatch`'s wait-to-first-datagram is the
+last stage in the chain without a number, and the honest alternative — if it is not
+measurable in the time left — is to publish the distribution, which the CHANGELOG's Known
+gaps already does.
+
+
 
 
 
