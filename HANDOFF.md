@@ -5912,6 +5912,31 @@ its cold state is six times worse at the median for the first minutes; and the t
 stages the gate refuses are that cold state, on a host whose throughput swings by four
 times between measurement windows.
 
+**And in a good window the run reads 7 of 8 stages green with capacity 8 of 8
+(2026-11-02).** Taken straight after the A/B above, with the host back at eleven
+gigabits: `clean: 179.913; rtt100: 409.024; loss1: 1 087.665; loss5: 1 745.850; rate100:
+96.794; rate20: 395.046; jitter: FAILED (control socket); clean#2: 3.930`, and
+**`capacity: ramp 8`** — every level, `streams_max`.
+
+So the best-window picture is now complete and consistent with everything above:
+
+- **capacity is a full pass**, which is the `capacity_streams 不降` half of P2′ met with
+  room (8 of 8 is the ceiling, not a clearing of a lower bar);
+- **the last clean stage is 3.93 ms** at the 99th percentile — the carrier at its warm
+  best, against TCP's 2.58;
+- **the first clean stage is 179.9 ms** — 3.6× the bar even in a good window, which is
+  the cold start and the one thing left;
+- and `jitter` failed its bulk sample with the same `control socket` that has appeared in
+  every run this cycle, which the group-lifetime instrument showed is the *stage* ending
+  and not the carrier closing a stream.
+
+So the gate's two SLO failures reduce, in a good window, to **one** — the first stage —
+plus one failed bulk sample that is a harness lifetime question. That is a materially
+better statement than the one the release started with, and it is the last one this cycle
+can make with evidence: **six measurement rounds remain, and they go to leaving the tree
+green and the record honest rather than to a seventh hypothesis.**
+
+
 
 
 
