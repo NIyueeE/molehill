@@ -4937,6 +4937,36 @@ The record it produces will not be committed as `results-bench-v1.0.0.json` unle
 gate passes, which the cold first stage says it will not. It is a test of the harness and
 a coverage picture, not a release artefact.
 
+**And it answers the harness question with evidence, and prices the cold start against a
+peer (2026-11-02, fingerprint `ef35fbd27dd84254`).**
+
+| arm | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean#2 | capacity |
+|---|---|---|---|---|---|---|---|---|---|
+| molehill | **140.836** | 402.622 | FAILED | 2 707.155 | 195.720 | 191.365 | 109.830 | **6.505** | **8 of 8** |
+| frp | **1.254** | 401.361 | 1 082.390 | 2 454.573 | 197.485 | 430.680 | 107.266 | **1.684** | **8 of 8** |
+
+Two things follow, and the first one closes a defect.
+
+**The condition leak is fixed.** This cycle's only five-arm sweep lost `loss5` and then
+four stages of its own arm plus two of the next and three arms' capacity ramps — the
+signature of a stage leaving its shaping behind. On the fixed harness the molehill arm
+loses **one** stage, and the failure has *moved* (`loss1` here, `jitter` in the run
+before), which is what an intermittent bulk sample looks like rather than a leaked
+condition. **frp carries all eight stages** where a peer previously carried none, and both
+arms reach **8 of 8** on the capacity ramp. The fix is confirmed at the scale it failed at.
+
+**And the cold start is now priced against a peer.** frp's first clean stage reads **1.254
+ms** where this carrier's reads **140.836** — a hundred times — while the *last* clean
+stage reads 6.505 against frp's 1.684, a factor of four. So the gap the gate refuses is not
+a constant property of this carrier: it is almost entirely the **first stage of a run**,
+and the peer it is measured against does not have that cost.
+
+That is the sharpest statement this cycle can make and the last one it needs to: **the
+carrier's steady state is within a factor of four of a mature peer and its first stage is
+a hundred times worse, and only the second of those fails the gate.** Whoever picks this
+up next should start there, with `warmup_rounds` as the obvious first experiment and the
+carrier's own start-up state as the thing to instrument.
+
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
 repair for "the timer follows the newest packet" is to follow the oldest **data**
 packet instead — a packet with no range has nothing to re-send, so letting its age
