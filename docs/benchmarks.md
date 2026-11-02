@@ -917,9 +917,10 @@ across many requests):
 
 So the carriers are **at parity wherever a connection is reused** — `rr-16` agrees
 to within 2 % on the tail and 5 % on the rate — and they separate by a factor of eight
-on the tail when every request needs a new connection and sixteen arrive at once.
-That is *contention* for the per-stream handshake, not a stall: the cell's median is
-level with TCP's and its multi-second outliers were a separate defect, fixed. The cause is
+on the tail when every request needs a new connection. The cell's rate is sixteen
+connections **a second**, so this is not contention: about one request in a hundred pays
+twenty milliseconds where TCP's worst hundredth pays two and a half. The median is level
+with TCP's, and the cell's multi-second outliers were a separate defect, fixed. The cause is
 structural rather than a tuning error: every visitor channel runs its **own Noise
 handshake** before its first byte can move, while a TCP tunnel runs one handshake
 and multiplexes every stream inside it. A visitor's channel open costs 2 648 µs,

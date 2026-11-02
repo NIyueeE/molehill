@@ -18,10 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `churn-16` (a fresh connection per request, sixteen at once, six rounds) puts the
   round trip's p99 at
   **21.04 ms against TCP's 2.58**, with the medians level (2.47 against 2.25) and
-  the arrival rate at 3 469 against 6 705 per second. Sixteen *concurrent* arrivals
-  on four lanes contend for the per-stream handshake, and that is what the tail is:
-  not a stall — the multi-second ones are gone — but the cost of sixteen handshakes
-  at once. Where a connection is
+  the arrival rate at 3 469 against 6 705 per second. The cell asks for sixteen fresh
+  connections **a second** — not sixteen at once, the harness's rate is per second and
+  each request is over in a couple of milliseconds — and about one in a hundred of them
+  pays twenty milliseconds. That is the tail: not a stall (the multi-second ones are
+  gone) and not contention, but the cost of one per-stream handshake that has to be
+  repeated or waited for. Where a connection is
   *reused* the carriers are indistinguishable: `rr-16` agrees to within 1 % on the
   tail and 5 % on the rate. The cause is structural rather than a tuning error —
   every visitor channel runs its own Noise handshake before its first byte can
