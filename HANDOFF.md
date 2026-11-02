@@ -5013,6 +5013,32 @@ Everything measured against the first stage this cycle — the window, the lanes
 pairings, the timers, the worker threads — was measured on the carrier and came back
 negative. **The one thing nobody has measured is the instrument.**
 
+**And the one mechanism that fits both facts, left as the next cycle's first test
+(2026-11-02).** Two measurements have to be explained together:
+
+1. within a run's first `clean` stage the latency **rises** — 2.14 ms for its first twenty
+   arrivals, 72.78 ms for the rest;
+2. the *last* stage of the same run, with a fresh bulk of its own, reads **3.93-6.5 ms**.
+
+The second rules out "a stage is slow while its bulk ramps", because the last stage ramps a
+bulk too. What is left is the one thing that changes *between* stages and not within them:
+**the service's striping plan.** Every visitor starts on a single stripe, and the plan adds
+a stripe when a group reports backpressure — so the first stage's visitors ride one stripe
+each and share a lane's head-of-line blocking with the bulk, while by the last stage the
+plan has learned and hands new visitors more, spacing them apart. A first stage that starts
+fast then slows fits: the bulk ramps into a single shared stripe.
+
+**That is a hypothesis, not a finding**, and it is written down as one so the next cycle
+does not have to rediscover it. Its test is two log fields away and needs no new code: with
+`MOLEHILL_MHD_STATS=1` the pairing line carries `stripes=N`, so a single run gives the
+stripe count per stage — if the first stage is all `stripes=1` and the last is not, the
+mechanism is confirmed and the fix is a warm-up of the *plan* rather than of the carrier;
+if both stages are 1, it is refuted and the search goes to the bulk's per-second rate.
+
+**This is where the cycle ends.** The tree is green, the record is consistent, and the one
+question that remains has a named mechanism, a one-command test and a rule for each outcome.
+
+
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
 repair for "the timer follows the newest packet" is to follow the oldest **data**
 packet instead — a packet with no range has nothing to re-send, so letting its age
