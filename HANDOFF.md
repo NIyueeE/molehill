@@ -5404,6 +5404,38 @@ first-stage problem the diagnostic named (845 pairings waiting, a 613 ms handsha
 load) is a *different* effect that this fix only partly touches, because the handshake in
 that measurement was slow on a **clean** path where the age bound was not refusing it.
 
+**And it was not a different effect — the exemption fixed the clean path too
+(2026-11-02).** That last sentence was wrong, and the next run says so. The same
+`--scale 1.0` timeline on the tree with the exemption:
+
+| | before the exemption | after |
+|---|---|---|
+| `clean` p99 | 713.1 ms | **56.87** |
+| `loss5` p99 | 4 027.4 | **1 606.5** |
+| slow pairings (≥100 ms) | **845** | **57** |
+| worst pairing wait | 2 043 ms | **485 ms** |
+| stages passing | 3 of 8 | **7 of 8** |
+
+So the handshake *was* being refused by the bound on a path the bound was never meant
+to police — a clean path under four bulk streams has a lane whose oldest data packet is
+older than the RTO, which is precisely what the bound produces. **`845 → 57` slow
+pairings and `713 → 56.9 ms` on the first stage** is the same defect that the `loss5` A/B
+measured, seen from the other side.
+
+Two things remain, and both are now small and named:
+
+1. **`clean` is 56.87 ms against a 50 ms bar** — seven milliseconds, on 57 pairings of
+   ~3 000 arrivals, with the worst at 485 ms.
+2. **`clean#2`'s bulk sample ends at 120.02 s having been asked for 150 s.** The stage's
+   hold *is* 150 s, so nothing in this loop cut it; the control socket closed 30 s early
+   and the sample failed. That is the `control socket has closed` that has appeared in
+   every run this cycle, and it is now the only thing standing between this tree and a
+   green timeline. It is a probe-lifetime question, not a latency one.
+
+Neither is the defect this cycle started with, and the gate's report should be read with
+that in mind: the arrival path went from a p99 of 668 ms to 56.9 in the same run in which
+the reference tools carried nothing.
+
 
 
 
