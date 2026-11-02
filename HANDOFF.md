@@ -4967,6 +4967,31 @@ a hundred times worse, and only the second of those fails the gate.** Whoever pi
 up next should start there, with `warmup_rounds` as the obvious first experiment and the
 carrier's own start-up state as the thing to instrument.
 
+**And the third arm keeps that from being a clean bill of health (2026-11-02).**
+
+| arm | stages failed | capacity |
+|---|---|---|
+| molehill | 1 (`loss1`) | 8 of 8 |
+| frp | **0** | 8 of 8 |
+| rathole | **2** (`loss1`, `jitter`) plus `clean#2` with no data | **0** — the run aborted after 7.83 s |
+
+So the previous paragraph's "the condition leak is fixed" needs its own qualification:
+**the leak is fixed — failures no longer follow the stage that installed a condition, and
+they move between stages and arms — but failures still happen on two of three arms, and
+`rathole` lost its whole capacity cell in an 7.83-second abort.** A leaked condition would
+have hit every arm after the one that leaked it, in order; this does not.
+
+What is left is the intermittent bulk-sample failure, which is arm-independent and costs
+between zero and three stages per run, plus the capacity abort that `rathole` hit. Neither
+is the carrier, and neither is the condition leak; both are in the harness's sink lifetime
+or its capacity ramp, and both are what a release needs fixed before its coverage gate can
+be green.
+
+So the honest summary of the sweep is: **coverage is now good enough to compare tools
+(which it was not), the capacity ramp reaches 8 of 8 for two of three arms, the carrier's
+cold first stage is a hundred times a peer's, and the harness still loses cells to an
+intermittent failure that moves.**
+
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
 repair for "the timer follows the newest packet" is to follow the oldest **data**
 packet instead — a packet with no range has nothing to re-send, so letting its age
