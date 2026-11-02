@@ -5809,6 +5809,40 @@ every mechanism reachable from the code has been measured; the tree is green and
 record is complete. The remaining rounds go to keeping it that way and to the end-of-session
 ritual, not to a twelfth hypothesis.
 
+**And the direction is systematic even though the magnitude is not — five runs, five
+times the same way round (2026-11-02).** The soak schedule at `--scale 0.2` completes all
+eight stages with `clean: 552.25 ms … clean#2: 50.782 ms`. Putting every staged run this
+cycle has produced side by side, first clean against last clean:
+
+| run | first `clean` | last `clean#2` |
+|---|---|---|
+| sweep timeline 1.0 | 668.1 | 375.7 |
+| sweep timeline 1.0 (after the age bound) | 93.0 | 93.6 |
+| timeline 1.0 (after the exemption) | **56.9** | 3.6 (bulk failed) |
+| timeline 1.0 | 713.1 | 6.1 |
+| timeline 1.0 | 800.9 | 3.3 |
+| timeline 0.2 ×3 | 79.4 / 153.9 / 510.8 | 3.3 / 4.4 / 12.8 |
+| **soak 0.2** | **552.3** | **50.8** |
+
+**The first stage is worse than the last in every single one, and that is not
+bimodality** — a correction to what this file said two rounds ago. A bimodal process
+would put a good first stage next to a bad one sometimes; it never does. What varies is
+the *size* of the gap, from 1.0× to 240×, and the two runs where it was smallest are the
+two whose first stage was already at or near the SLO.
+
+So the defect the gate reports has a consistent shape: **a run's first stage carries a
+cost its last stage does not.** That is a cold start, measured three ways in this file —
+the window ramps from 13 KB to 4.2 MB over the run, the pool is established and never
+repairs, and one handshake in forty pays six milliseconds throughout. What the SLO
+catches is the first of those arriving before the carrier has warmed.
+
+That reopens P2′ in a way the earlier rounds closed too quickly: **pre-warming is the
+right idea for the first stage even though a stock of channels was the wrong mechanism**,
+because what is cold is the carrier's own state and not a queue of channels. The honest
+next measurement, if there were rounds for it, is a warm-up round in the profile — which
+the model already supports (`warmup_rounds`) and the sweep sets to zero.
+
+
 
 
 
