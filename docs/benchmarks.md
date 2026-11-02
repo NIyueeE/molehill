@@ -270,6 +270,7 @@ Two conventions the table cannot state, because they belong to the workload:
 | `rr-16` | `rr` | the same, 16 flows at once: aggregate rate and tail latency | `rate_per_s` |
 | `churn-16` | `rr` | a fresh connection per request: what a visitor pays to arrive, as the first request's round trip on each new connection | `rtt_p99_ms` |
 | `udp-pace` | `udp` | a paced UDP session: what fraction arrives, and how it is spaced | `udp_loss_pct` |
+
 | `udp-ladder` | `udp-ladder` | where a UDP path starts shedding, per offered rate | `udp_loss_pct` |
 | `timeline` | `staged` | how the tool behaves as the path degrades and recovers: one interactive stream, N bulk streams, a churn stream and a UDP session, over a scripted schedule of conditions, in place | `rtt_p99_ms` |
 | `soak` | `staged` | over a long run on a rotating path: does anything leak, drift or degrade | `rtt_p99_ms` |
@@ -277,6 +278,20 @@ Two conventions the table cannot state, because they belong to the workload:
 | `capacity` | `capacity` | how much bulk load the tool carries while a fresh interactive connection still meets the SLO | `capacity_streams` |
 | `reconnect` | `reconnect` | what a visitor pays after a restart: time from process start to answering | `startup_s` |
 | `udp-blast` | `udp` | the datagram ceiling when the probe offers as fast as it can | `udp_recv_mbit` |
+
+A cell's **floor is a property of the run, not of the cell.** Four runs of
+`bulk-n` on the same host, same binary pair, same arm count, gave A/A twin
+spreads of 5.4 %, 3.9 %, 14.9 % and 52 % — and the 52 % run is the one whose
+numbers look like a product difference (its baseline read 3.1-3.2 Gbit/s against
+its usual 11.5). Nothing about the cell changed between them: the same
+twenty-four samples sit either side of the swing. So a bulk comparison quotes the
+twin's own floor from *its own run*, which the tables do, and a run whose floor
+exceeds the threshold is reported as unable to answer rather than as a small
+difference — the model prints exactly that ("the run resolves 27 % against a 10 %
+floor — about 28 rounds would reach it"). A hypothesis that lengthening the
+transfer would lower the floor was measured and **refuted**: at four seconds of
+measurement the twin spans 5.4 % and at eighteen seconds 14.9 %, so the window is
+not what moves it, and the cell kept its window.
 
 ### The profiles
 
