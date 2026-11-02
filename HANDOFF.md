@@ -5207,6 +5207,40 @@ the only variable. Already ruled out: the sink (fresh per stage), the readiness 
 (`Bad file descriptor` is normal), and the arrival tail (46.2 ms on the clean stage,
 inside the SLO).
 
+**And the first hypothesis about it — my own age bound blocking openings — was built,
+measured and reverted (2026-11-02).** The reasoning was sound: the write path applies
+the age bound *before* the opening exemption, so on a lane whose oldest data packet is
+older than the RTO (which is what a 5 % loss path produces) a new stream's handshake
+can write nothing at all. That would look exactly like the measured intermittency: the
+same binary reading `churn-16` p99 760 ms in one copy and 20.6 ms in its A/A twin under
+`--condition loss5`.
+
+Built — openings exempt from the age bound — and measured under the same condition:
+
+| | before | openings exempt |
+|---|---|---|
+| `churn-16` p50 | 2.63 ms | **202.05** (both arms identical) |
+| `churn-16` p99 | 760 ms (twin 20.6) | 861 (both arms identical) |
+| `bulk-n` | 6.36 (twin 11.22) | **1.51** (twin 1.42) |
+
+**Worse on every axis, and worse in a more worrying way: the A/A twins now agree
+exactly.** Before, the two copies of one binary disagreed by 37× — intermittency.
+After, they agree to the hundredth of a millisecond — a uniformly bad deterministic
+path. So the exemption did not fix the intermittency; it removed the variance by
+making the degradation total. Reverted.
+
+Two things are established and one is not. The exemption is wrong in this form (it lets
+every new stream past a bound whose whole purpose is to keep the flight young, and the
+bulk cell pays 4× for it). The intermittency under 5 % loss is real — 760 against 20.6
+in one run of one binary — and it is now the last unexplained thing in the release
+picture. What is **not** established is that the age bound causes it: the exemption
+changed the symptoms without removing them, which is evidence against that reading.
+
+The next measurement should therefore be the one that does not presuppose a cause: run
+the same arm twice under `--condition loss5` and compare its *own* two copies' full
+metric sets, because a defect that makes two identical copies disagree is a race, and a
+race is found by its timing, not by its averages.
+
 
 
 
