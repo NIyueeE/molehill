@@ -3787,6 +3787,31 @@ initiator with the responder's own payload; that is fixed, but the cell's
 mismatch verdict is what a correctness break looks like and it is worth
 remembering that it appears as a *latency* cell's failure line.
 
+**The one-flight open landed (`f02ba51`), with two bugs the suite caught and one
+number the cell does show.** The shape is in `NoiseStream::handshake_carrying`: one
+payload each way, produced by a closure because the responder has to read the
+initiator's message before it can decide what to answer. The bugs, both of which
+would have shipped a dead data path:
+
+1. **The acknowledgement was written twice.** The reply carried it and then the
+   tunnel-hello arm wrote it again after reserving, so the client read a second
+   ack as its first bytes of service data. `hot_reload_test` caught it as "did not
+   answer AAAA within 15 s" — a *forwarding* test catching a *wire* defect. The arm
+   now asks the handshake whether the reply already answered and skips the write.
+2. **The plain data plane has no carrying shape.** A service with
+   `data_enable = false` writes a selector byte and no handshake at all, so there
+   is no first message to put a hello in; gating the branch on the lane's flag
+   alone made every open on such a lane return `Closed` and killed the lane, which
+   `mixed_transports` and `per_service_transport` saw as a pool that repaired and
+   reaped in a loop. The branch is now gated on the lane being encrypted as well.
+
+The number the cell *does* resolve is the wire ratio: **-15.22 % on
+`wire_per_visitor_byte`** (CI `[-0.747..-0.649]`, so the interval does not cross
+zero), because two records that used to cross the wire now ride the handshake's
+own messages. The model marks it directional rather than a claim only because it
+was not pre-registered as this run's endpoint. The terminal latency stays flat, and
+that is the honest reading: on this cell the queue is longer than the flight.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
