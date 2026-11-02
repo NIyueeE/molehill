@@ -5466,6 +5466,31 @@ tool's stream teardown path, which is a two-line change and the next thing to wr
 because until it exists, every run reports "control socket has closed" with no side of
 the connection named.
 
+**And the instrument answers both questions at once (2026-11-02).** The next timeline on
+the tree with it — a run that landed in the degraded mode, `clean: 800.97 ms` — produced:
+
+- **923 slow pairings**, worst **1 486 ms**, against **57** and 485 ms in the good run
+  two rounds earlier. So **the pairing is the discriminator between the two modes**, and
+  the bimodality this file has been circling for ten rounds lives in one place: a
+  visitor's wait for its data channel.
+- **Every long-lived group ends with `lived_s` equal to its stage's length** — 152 for
+  the first stage, then 122, 128, 130 for the ones after it, in five groups of four (the
+  bulk streams), one group per stage. **The tool names its own end and never ends one
+  early.**
+
+So the 30-second cut is *not* the carrier: the group that carried `clean#2`'s bulk lived
+**120 s** while the same stage definition one run earlier produced **152 s**, and the
+stage is defined as 150. The tool reports the duration it actually lived, which means the
+stage was cut at 120 — by whatever ends the *last* stage of a sweep early, not by anything
+that closed a connection.
+
+That is a harness question and it is now a narrow one: the last stage of the sweep dies
+30 s short, the group's own `lived_s` proves it, and the carrier never closed a stream.
+The pairing number is the other half: **57 slow pairings is a passing run and 923 is a
+failing one**, on the same binary in the same afternoon, so the next investigation is what
+puts the pairing path into the slow mode — and unlike everything before it, that question
+now has a single instrument and a binary outcome.
+
 
 
 
