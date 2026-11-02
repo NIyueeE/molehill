@@ -4189,6 +4189,40 @@ and a test, and it has a gate that is already measured: the capacity level-1 sta
 should fall from ~279 ms toward the 20-40 ms the cheap timer costs, `churn-16`'s p99
 should fall with it, and `bulk-n` must not move — the last one because a bulk lane's
 retransmissions are not openings and must keep the wide timer.
+
+**It was built, measured, produced nothing, and is reverted — because the stalls
+are not losses at all: they are exactly 5.00 s (2026-11-02).**
+
+The change was made twice. First with `opening = offset == 0`, which left the
+stalls at 216-3 061 ms — the handshake is several datagrams (a selector byte, then
+the message), so a lost *second* packet was not covered. Then with the precise rule
+the design actually wants — `opening = !state.acknowledged`, every packet of a
+stream before its first acknowledgement, with two tests pinning it against the
+contrast case (a lost burst packet must keep the wide floor) — and the stalls read:
+
+| round | p50 | p99 | max |
+|---|---|---|---|
+| 1 | 2.19 ms | 5 002.26 ms | 5 002.26 ms |
+| 2 | 2.23 ms | 2 093.57 ms | 2 093.57 ms |
+| 3 | 1.87 ms | 5 002.62 ms | 5 002.62 ms |
+
+**5 002 ms is not an RTO and not a doubling of anything.** It is
+`PAIR_WAIT_BUDGET` — `Duration::from_secs(5)`, the wait one visitor gets for a data
+channel before the server sheds it — and it appears in two rounds out of three, at
+the same value twice. The cheap timer changed nothing because there was no loss to
+recover from: the visitor was waiting for a **channel to be paired**, not for a
+packet to be retransmitted.
+
+So the change is **reverted** — it had no measured win, which is the rule — and the
+finding that matters is the redirection: the arrival stall that breaks the capacity
+SLO is in the **pairing path**, which is P2′'s subject (pre-warmed authenticated
+channels) and the reason P4′ names the 25 s patience at all. The 279 ms samples from
+the previous round are a different, smaller effect that sits on top of this one.
+
+Hypotheses now measured and retired on this cell: the window, the credit threshold,
+the pacer, the record layer at three sizes, the small-flight timer. The one that has
+never been tested is the one the constant names.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
