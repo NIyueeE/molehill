@@ -5173,6 +5173,40 @@ fails the release sweep" now has a competing explanation for four of those five
 failures — the same cascade — which means **the `clean` and `capacity` numbers above,
 not the failure list, are the part of this run to trust**.
 
+**And followed up, the cascade has two shapes and neither is the sink (2026-11-02).**
+The `Bad file descriptor` line is **normal** — it appears on every stage's sink at test
+#1, and `loss1`, which *passed*, has it too: it is the readiness probe hitting the port
+before the sink is listening, and it is not the cause. Counting the sink's accepted
+connections per stage gives the real picture:
+
+| stage | sink accepted | reported |
+|---|---|---|
+| `clean` | 1 | pass, 46.2 ms |
+| `loss1` | 1 | pass, 1 101 ms |
+| **`loss5`** | **0** | FAILED |
+| **`clean#2`** | **1** | FAILED |
+
+So `loss5` never reached the sink at all — the tool did not forward the visitor's
+connection — while `clean#2` reached it and then failed mid-test. Two shapes, both
+consistent with the tool's **data path being unhealthy after the lossy stages**, and
+both *before* `capacity`, which then climbed all eight levels in the same arm. So the
+tool recovered between the end of the timeline and the capacity scenario.
+
+**That revises the cycle's opening conclusion for the second time.** The sweep that
+started this work failed `loss5`, `rate100`, `jitter` and `clean#2` — the same four
+stages — and that was read as "the arrival gap fails the release sweep" and became a
+`CHANGELOG` Known gap. It is now at least as likely that the cause is **a post-loss
+data-path failure that persists for stages and then clears**, which is a more serious
+defect than a latency tail and a completely different one. The honest status of that
+Known gap is "the observation is real, the attribution is open", and it should say so
+until the two are separated.
+
+Separating them is the next measurement and it is cheap: a **clean-only** schedule
+(`--condition clean`) beside one that goes through `loss5`, so the post-loss state is
+the only variable. Already ruled out: the sink (fresh per stage), the readiness probe
+(`Bad file descriptor` is normal), and the arrival tail (46.2 ms on the clean stage,
+inside the SLO).
+
 
 
 
