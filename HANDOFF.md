@@ -4223,6 +4223,32 @@ Hypotheses now measured and retired on this cell: the window, the credit thresho
 the pacer, the record layer at three sizes, the small-flight timer. The one that has
 never been tested is the one the constant names.
 
+**And then the split was wrong, and correcting it inverted the conclusion
+(2026-11-02).** `hs_at` had been stamped *before* the branch that opens the stream,
+so `hs_us` measured the preparation — a flat `1` on every line — and `ack_us`
+carried the handshake, the hello and the acknowledgement together. With the two
+stamps moved to where they belong (after the channel is open, before the hello goes
+out), the same cell reads:
+
+`us=5428141 hs_us=5428141 ack_us=0` and `us=2784474 hs_us=2784474 ack_us=0`
+
+**The whole wait is the handshake and the acknowledgement is instant** — the exact
+opposite of what the broken split said. So `PAIR_WAIT_BUDGET` was *also* the wrong
+attribution: the one pairing-budget expiry in eight rounds is a rarer, separate
+event, and 5 428 ms is not 5 000 ms. The server's own line for the same events
+(`hs_us=2 927 432` to `5 861 013`, `hello_us=1`) agrees to within a few hundred
+microseconds, so both ends are waiting on the same thing: **the handshake's reply
+leg, sometimes for five seconds.**
+
+Five seconds is the RTO ladder, and this is why the reverted change did nothing:
+`arm` was given the opening hint on the *acknowledgement* path, but a lone opening
+packet has nothing behind it, so no SACK can name it lost — it is declared lost by
+`on_timeout`, and that call site kept `arm(now)` with no hint. **The change was
+inoperative for exactly the case it was written for.** The fix is one word at that
+call site (pass whether any timed-out packet was an opening, the same way the ack
+path does), and the tests written for it — the busy lane takes the cheap floor, a
+burst packet keeps the wide one — already pin both sides.
+
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:

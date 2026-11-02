@@ -872,19 +872,27 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // rides the reply. The lane's first stream cannot, because the server
         // has to reserve before it can answer — so it pays the two flights, and
         // this end learns from it that the slot is held.
-        let hs_at = Instant::now();
         // Only the encrypted data plane has a carrying handshake: a plain opening
         // writes its selector byte and nothing else, so there is no first message
         // to put a hello in and the two flights are the only shape it has.
         let carries =
             self.noise.is_some() && self.registered.load(std::sync::atomic::Ordering::Relaxed);
-        let (stream_id, stream, ack) = if carries {
+        // `hs_at` is stamped **after** the channel is open and **before** the
+        // hello goes out, so the two numbers below are the two waits a visitor
+        // can pay and not the three they look like: `hs_us` is the handshake
+        // (which, in the carrying shape, already contains the hello) and `ack_us`
+        // is the acknowledgement. Stamped before the branch instead — as this was
+        // first written — `hs_us` measured the preparation and read a flat `1`,
+        // which cost a round of believing the handshake was free.
+        let (stream_id, stream, ack, hs_us) = if carries {
             let (id, stream, theirs) = self.open_channel_carrying(&hello).await?;
+            let hs = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
             let ack = postcard::from_bytes::<crate::protocol::Ack>(&theirs)
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-            (id, stream, ack)
+            (id, stream, ack, hs)
         } else {
             let (id, mut stream) = self.open_channel_with_id().await?;
+            let hs = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
             stream
                 .write_all(&hello)
                 .await
@@ -896,14 +904,13 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
             let ack = crate::protocol::read_ack(&mut stream)
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-            (id, stream, ack)
+            (id, stream, ack, hs)
         };
-        let ack_us = u64::try_from(hs_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        // The handshake's own cost, kept for the slow-open line: `hs_at` is
-        // stamped before the branch that opens the stream, so this is the
-        // handshake and everything the wait for a stream slot cost, and
-        // `ack_us` is the acknowledgement after it.
-        let hs_us = u64::try_from(hs_at.duration_since(opening).as_micros()).unwrap_or(u64::MAX);
+        let ack_at = Instant::now();
+        // The acknowledgement's wait: from the hello going out to its answer —
+        // or, in the carrying shape, from the handshake returning to the reply's
+        // payload being parsed.
+        let ack_us = u64::try_from(ack_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         // The server reserved this lane's slot on this open, so the next one can
         // carry its hello in the handshake's opening message and be answered in
         // the reply: one round trip instead of two.
@@ -917,8 +924,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 tracing::debug!(
                     lane = self.id,
                     us,
-                    hs_us = u64::try_from(hs_at.duration_since(opening).as_micros())
-                        .unwrap_or(u64::MAX),
+                    hs_us,
                     ack_us,
                     "mhd stream opened and acknowledged"
                 );
