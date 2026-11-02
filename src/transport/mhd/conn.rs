@@ -1393,8 +1393,13 @@ impl Conn {
     /// one. `slow_start` latches off at the first loss and never returns, so a
     /// lane measured late in a shaping schedule is in congestion avoidance by
     /// construction; this is what makes that visible instead of inferred.
-    pub(crate) fn window_state(&self) -> (u64, u64, bool) {
-        (self.cwnd, self.recovery.flight_bytes(), self.slow_start)
+    pub(crate) fn window_state(&self) -> (u64, u64, bool, u64) {
+        (
+            self.cwnd,
+            self.recovery.flight_bytes(),
+            self.slow_start,
+            self.acked_since_growth,
+        )
     }
 
     pub(crate) fn budget(&self) -> (u64, u64, u64, usize) {

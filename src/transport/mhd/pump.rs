@@ -189,12 +189,13 @@ fn report_window(shared: &Arc<Shared>) {
             return;
         }
         conn.note_window_reported(now);
-        let (cwnd, flight, slow_start) = conn.window_state();
+        let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
         tracing::debug!(
             lane = conn.wire_id(),
             cwnd,
             flight,
             slow_start,
+            acked_since_growth,
             "mhd window"
         );
     });
