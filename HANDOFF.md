@@ -5636,6 +5636,46 @@ The remaining rounds go to two things in this order: name the mode with the inst
 that now exist (the pairing count says *which* run, the window says what it was doing),
 and leave the tree with every gate green and the release held on a documented gap.
 
+**Release status, consolidated for a reviewer (2026-11-02).** Everything below is on the
+current tree, green under `just check`, with
+`benches/records/results-bench-v1.0.0.json` **absent on purpose** — no record was
+committed that its own gate refuses.
+
+**Landed this cycle, each with its own measurement:**
+
+| change | evidence |
+|---|---|
+| one-flight open (hello and ack inside the handshake) | open 3 313 → **927 µs** idle; wire/visitor byte −15 % |
+| the flight may not outlive its timer, openings exempt | capacity worst arrival **3 000-5 000 → ≤ 204 ms**; `loss5` tail 1 427 → **862 ms** in an interleaved A/B |
+| visitor port exhaustion fixed in the harness | `connect_errors` 3 773 → **0**; six rounds back to 1.76-2.12 s |
+| a stage restores its condition | a cascade that cost five stages now costs none |
+| reorder loop wakes itself; a parked buffer has a deadline | three runs in six read p99 7.7-49 ms where none did |
+| a lane needs an opening datagram | 29 stray lanes → 0 by test |
+| pairing patience 25 s → 10 s | no regression on three cells |
+| slow pairing and long group end at `INFO` | a release record can explain its own SLO failure |
+
+**What the release is held on.** `just bench gate` on the timeline alone reports four of
+five axes green and two SLO failures: `timeline[clean]` and `timeline[clean#2]` p99 above
+50 ms. Those numbers have moved an order of magnitude this cycle (668 → 46.2 in the best
+run; 56.9, 79.4, 153.9, 251.4, 510.8, 713.1, 800.9 and 1 133 in others) **on the same
+binary**, and the run-to-run spread is now the largest term in every reading. The steady
+state is not the problem: `clean#2` reads p50 **2.2 ms and p99 3.6** in the best run and
+3.3-12.8 ms across the rest, against TCP's 2.24 and 2.59.
+
+**What is therefore not established.** Which of the two modes a run lands in, and why.
+Excluded by measurement: the lane count (flat at 4/8/16), the initial window (bigger is
+worse), the pool (one `established=4`, no repair), the pairings alone (44 slow pairings
+with a 251 ms `clean`, 27 with 79 ms), the record layer (three sizes), the credit
+threshold, the pacer, the small-flight timer, and the send path. **Every individual
+mechanism this cycle could reach is measured; what is left is a variance that behaves
+like an environmental or scheduling state and has no instrument of its own.**
+
+**A human decision is required for exactly one thing**: whether to tag 1.0.0 with that
+variance documented in the Known gaps (it is), or to hold the release until the variance
+is attributed. Everything a tag needs is in place except a gate that passes every time,
+and no tag has been or will be created by me.
+
+
 
 
 
