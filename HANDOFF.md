@@ -3849,6 +3849,40 @@ the baseline's own samples contain two rounds at ~3.1 Gbit/s against its usual
 6.5, which is a bimodality on *that* cell that has not been explained. **Do not
 build on it**: the honest status is "unresolved, needs ~28 rounds".
 
+**And that `bulk-n` claim is refuted, along with the window hypothesis that was
+supposed to explain it (2026-11-02).** Five runs of the cell, same host, same
+binaries, within forty minutes:
+
+| run | shape | `l4` (A) | twin / B | spread |
+|---|---|---|---|---|
+| `p39` | three arms, `-t 5` | 6.53 | 6.71 (A/A) | **52 %** |
+| `p40` | two arms, `-t 5` | 11.52 | 11.67 (A/A) | 7.4 % |
+| `p42` | two arms, `-t 20` | 11.04 | 10.62 (A/A) | 14.9 % |
+| `p43` | two arms, `-t 5` | 11.45 | 11.69 (A/A) | 5.4 % |
+| `p44` | three arms, `-t 5` | 11.83 | 11.55 (B) | **3.9 %** |
+
+Two conclusions, and one of them kills the other:
+
+1. **The `+39.55 %` `bulk-n` claim and the "6.5 vs 11.5" reading were the run,
+   not the code.** `p44` runs the *same* A/B as `p39` — three arms, `-t 5`, the
+   baseline binary beside the current one — and reads A **11.83**, B **11.55**, a
+   2.4 % difference inside a 3.9 % floor; `p39` read 6.53 and 5.02 inside a 52 %
+   one. So the one-flight open does not move bulk throughput, and nothing in this
+   file's earlier `bulk-n` percentages that came from a wide-floor run is
+   trustworthy.
+2. **The window hypothesis is wrong and is reverted.** `p42` and `p43` hold
+   everything else fixed and vary only the transfer length: four seconds of
+   measurement gives a 5.4 % twin, eighteen seconds gives 14.9 %. `secs` went back
+   to 5 (dev) and 10 (full), and the docs paragraph that had claimed a 52 %→7.4 %
+   improvement from the window was replaced with what the runs actually show.
+
+**What separates a 4 % run from a 52 % run is host state, and it is not
+controlled.** All five are the same binary pair on the same machine within forty
+minutes. The rule, now on the benchmarks page: a bulk comparison quotes the twin's
+floor **from its own run**, and a run whose floor exceeds the threshold is
+reported as unable to answer rather than as a small difference. Reading a
+percentage from a run whose floor was never quoted is the mistake that produced
+both the "record layer costs 15 % of bulk" and the "+39.55 %" readings.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
