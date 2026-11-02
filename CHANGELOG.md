@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own path before choosing this carrier; one whose connections are reused has
   nothing to trade.
 
+- **The carrier loses throughput across a shaping schedule and does not recover
+  from it.** It is the one arm in the published record that does: from the staged
+  schedule's first `clean` stage to its repeat, `molehill` (L4) falls **8.64 →
+  7.07 Gbit/s** while `l3`, `frp`, `rathole` and `nps` are flat to within 0.4 %.
+  On the current tree the same stages read **9.21 → 4.08** and, in a second run at
+  a shorter scale, **10.66 → 4.08** — the repeat lands on the same number twice,
+  which reads as a ceiling rather than as a gradual loss, and the loss is uniform
+  across the whole stage rather than a slow start. The tunnel pool is at its full
+  width of four lanes in both stages and reports no repair or reap, so the deficit
+  is per stream, not a lost lane. What is not yet established is *which* per-stream
+  state persists: the sender's congestion window and recovery table are the
+  candidates, and the measurement that would separate them — the carrier's own
+  window across the schedule — is not in this build. Treat the `clean (repeat)`
+  column of any run against this carrier as measuring recovery rather than a
+  repeated control, and do not compare it with the first `clean` column.
+
 ### Added
 
 - **A data channel opens in one round trip instead of two.** The Noise handshake
