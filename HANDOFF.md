@@ -5316,6 +5316,34 @@ The next measurement is therefore about (2) alone: what makes the tool slow for 
 first two minutes after it starts, when twenty minutes later it is at parity. Everything
 else in the release picture is either measured good or already attributed.
 
+**And the degraded mode is not the pool and not the opening — it is invisible at the
+level a release run captures (2026-11-02).** That run's own artefacts, in the stage that
+read p50 137.9 ms:
+
+- **one `pool-stats` line, `established=4`**, and no `repaired` or `reaped` at all — the
+  four lanes were healthy for the whole run;
+- **zero `slow stream opening on the server` lines** — and that line fires at 100 ms, so
+  if *half* the arrivals were taking 137 ms, many should have tripped it.
+
+So the wait is neither the pool nor the stream open. It is before the open (the visitor's
+accept→pairing wait) or after it (the first byte to the visitor's socket), and **both of
+those are `DEBUG`** — `pairing budget expired` and the client's own slow-open line —
+which a release run does not capture.
+
+Two things follow. First, a correction to the paragraph above: across three runs the
+first-to-last `clean` ratio is **1.0, 1.8 and 315**, so this is **not** a warm-up trend —
+it is a *bimodal state*, and a stage lands in the good mode (p50 ~2 ms) or the degraded
+one (p50 100+ ms) without a systematic reason visible in the artefacts a release run
+keeps. Second, the next diagnostic run must be a **timeline with the crate at `DEBUG`**,
+which is a dev-profile thing and not a release record: the release record keeps the
+default filter, and the diagnosis is made beside it. That is the shape §10 asks for —
+an instrument parameter is part of the method, so the two runs are not the same run.
+
+Until that diagnostic lands, the release picture is: **steady state at parity with TCP,
+`capacity_streams` 8 of 8, coverage mostly green — and a bimodal latency state whose
+trigger is not visible in the record the release publishes.** That is what the gate's two
+SLO failures are, and it is why the release is held rather than explained.
+
 
 
 
