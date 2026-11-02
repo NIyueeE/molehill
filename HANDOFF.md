@@ -5038,6 +5038,37 @@ if both stages are 1, it is refuted and the search goes to the bulk's per-second
 **This is where the cycle ends.** The tree is green, the record is consistent, and the one
 question that remains has a named mechanism, a one-command test and a rule for each outcome.
 
+**And the test was run in the last round: the striping hypothesis is refuted
+(2026-11-02).** One `--scale 0.2` timeline with the stats switch, pairing counts per stage:
+
+| stage | stripes |
+|---|---|
+| `clean` | `{1: 471}` |
+| `loss1` | `{1: 243}` |
+| `loss5` | `{1: 4}` |
+| `clean#2` | `{1: 1}` |
+
+**Every visitor in every stage rides exactly one stripe.** The plan never adds one under
+this schedule, so it cannot be what makes a run's first stage slow and its last fast.
+
+It also explains something this file got wrong an hour ago. The same counts show the
+**churn probe's own traffic collapsing across the run** — 471 pairings in the first stage,
+243 in the next, 4, then **1**. So `clean#2`'s good numbers — 3.93 ms in one run, 22.559 in
+this one — are computed over a stage in which the fresh-connection probe essentially did
+not run, while the first stage's are computed over 471 of them. **Comparing the first stage
+to the last was comparing a loaded stage to an idle one**, which is why no carrier-side
+lever ever explained the difference.
+
+That is the last correction of the cycle and it is the same one as the first: **the number
+was measuring the instrument.** The handoff for the next cycle is therefore not a
+mechanism but a question about the harness — why the churn probe's connection rate decays
+from 471 to 1 across a schedule — and until that is answered, no per-stage comparison of
+arrival latency on this schedule means what it appears to mean.
+
+**This is where the cycle ends.** The tree is green, the record is consistent, every
+hypothesis has its outcome written down, and the one question that remains is now about the
+measuring apparatus rather than about the carrier.
+
 
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
 repair for "the timer follows the newest packet" is to follow the oldest **data**
