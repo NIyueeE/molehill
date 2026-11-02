@@ -4075,6 +4075,38 @@ arrivals beside the percentile. And the published record has
 them — which is `streams_max`, so the ramp never bound for anybody and the metric
 carried no contrast in that run (AGENTS §10: "a metric without contrast is not a
 measurement").
+
+**The stall is an RTO ladder behind a lane whose window never grew, and two of my
+readings on the way there were wrong (2026-11-02).** Reproducing the capacity cell
+three times gave `0, 1, 0` carried streams, so it is intermittent but common. In the
+round that failed, the **client's** log has the answer in one line:
+
+`mhd slow stream open: lane=2 us=6405892 credit=16776190 window=13490
+buffer=33554432 queued_streams=0 retransmits=1`
+
+- `window=13 490` is `INITIAL_CWND` — ten packets. The lane never grew its window
+  because it is a *small sender*: it mostly acknowledges bulk arriving the other
+  way, so slow start never had bytes to grow on.
+- `credit=16 776 190` and `buffer=33 554 432` are the **room left**, not the amount
+  held: 16 MiB of credit, a completely empty send buffer. (I first read `buffer` as
+  a full buffer — that was the second wrong reading of the round.)
+- `retransmits=1` and `us=6 405 892`. Six seconds is the RTO ladder: 0.2 + 0.4 +
+  0.8 + 1.6 + 3.2 = 6.2 s, five consecutive losses each waiting the next step.
+
+**So the mechanism is a two-part defect, and both parts are on the plan already.**
+A lane that carries little keeps a ten-packet window; with ten packets in flight a
+loss cannot be detected by SACK, because there is nothing behind the hole to
+acknowledge past it, so every loss waits the full RTO ladder; and the ladder
+compounds geometrically. That is P3′'s subject (fast retransmit from SACK instead of
+RTO-only) with a sharper edge than expected — it matters most on exactly the lanes
+that send least, which are the ones a new visitor's opening rides.
+
+Two side findings from the same reproduction, both worth keeping. The server logged
+its own slow opening in one round at `hs_us=279 144` — a handshake waiting 279 ms,
+which is one RTO on the opening message, so the one-flight shape did not eliminate
+the loss path, only a flight. And the rate the cell fails at (`0, 1, 0`) means
+`capacity_streams` cannot be used as a release gate until either the ladder or the
+statistic changes.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
