@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MOLEHILL_DATA_CARRIER` pinning a carrier per run over the same binary,
   `churn-16` (a fresh connection per request, sixteen at once, six rounds) puts the
   round trip's p99 at
-  **21.75 ms against TCP's 2.59**, with the medians level (2.51 against 2.24) and
+  **21.04 ms against TCP's 2.58**, with the medians level (2.47 against 2.25) and
   the arrival rate at 3 469 against 6 705 per second. Sixteen *concurrent* arrivals
   on four lanes contend for the per-stream handshake, and that is what the tail is:
   not a stall — the multi-second ones are gone — but the cost of sixteen handshakes

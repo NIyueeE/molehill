@@ -911,8 +911,8 @@ across many requests):
 
 | | `churn-16` `mhd` | `churn-16` TCP | `rr-16` `mhd` | `rr-16` TCP |
 |---|---|---|---|---|
-| round trip, p50 | 2.51 ms | 2.24 ms | 0.47 ms | 0.44 ms |
-| round trip, p99 | **21.75 ms** | **2.59 ms** | 1.32 ms | 1.34 ms |
+| round trip, p50 | 2.47 ms | 2.25 ms | 0.46 ms | 0.44 ms |
+| round trip, p99 | **21.04 ms** | **2.58 ms** | 1.32 ms | 1.34 ms |
 | completed per second | 3 469 | 6 705 | 29 820 | 31 520 |
 
 So the carriers are **at parity wherever a connection is reused** — `rr-16` agrees
