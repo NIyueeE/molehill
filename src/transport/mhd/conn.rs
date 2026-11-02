@@ -586,6 +586,22 @@ impl Conn {
             });
         }
         if take == 0 {
+            // An opening that cannot write a byte is the arrival path's whole
+            // latency, so it says which bound held it and for how long the lane
+            // has been waiting. The three are one line because they are read
+            // together and a reader that has to correlate them will not.
+            if crate::transport::stats::enabled() && opening(state) {
+                tracing::debug!(
+                    stream,
+                    credit,
+                    window,
+                    held,
+                    flight = self.recovery.flight_bytes(),
+                    cwnd = self.cwnd,
+                    offered = bytes.len(),
+                    "mhd opening refused: which bound had no room"
+                );
+            }
             return 0;
         }
         state.send.write(&bytes[..take]);

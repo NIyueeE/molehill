@@ -4136,6 +4136,35 @@ pass.
 One correction to the paragraph above: the 6.4 s opening was an outlier from one
 round; the reproducible shape is **~279 ms, one RTO**, and it is enough on its own to
 break a 50 ms SLO at the 99th percentile of a 64-sample level.
+
+**The opening is never refused, so the refusal theory is dead too (2026-11-02).**
+`Conn::write` now logs which bound had no room when an *opening* stream cannot take
+a byte. Three capacity rounds, all failing level 1, produced **zero such lines**: the
+handshake message was always accepted into the send buffer immediately, which is
+consistent with `hs_us=1`.
+
+So the wait is after the buffer, and the two remaining candidates are both about
+what happens between the buffer and the peer's reply:
+
+1. **An empty stream frame may be announcing the stream.** `open()` only inserts
+   state, but the caller then calls `wake_pump()`, and `transmit_stream` has an
+   explicit "range is empty" refusal — which means a stream can be visited with
+   nothing to send. If such a frame is what creates the stream on the server, the
+   server's task starts *before* msg1 exists, and the 279 ms the server reports is
+   mostly waiting for a message that was not written yet. That would make the
+   measured latency an artefact of the order of two writes rather than a loss.
+2. **msg1's own packet is lost and only the RTO recovers it.** `retransmits=1` on the
+   opened stream supports this, and it is P3′'s subject.
+
+The two are separable with one more line: log when `transmit_stream` refuses a
+stream with an empty range and that stream has never carried a byte. That single
+line decides whether the arrival path wastes a frame per open, and it is the next
+thing to write rather than another capacity run.
+
+One measurement note: this run failed level 1 in **3 of 3** rounds where the earlier
+one gave `0, 1, 0`. Either the added logging costs enough to matter at this margin or
+the cell is more variable than three samples can say; treated as the latter until
+measured, because the logging is off unless the stats switch is set.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
