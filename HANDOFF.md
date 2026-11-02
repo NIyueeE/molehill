@@ -4019,6 +4019,30 @@ each recover from the lossy stages on their own schedule. The next measurement
 separates them without a new instrument: compare the tunnel's own carried bytes
 per second across the two clean stages with the visitor's, since equal tunnel bytes
 and unequal visitor bytes puts the deficit outside the carrier.
+
+**It is outside the carrier, and `backlog_bytes` is what proves it
+(2026-11-02).** The stall reporter already logs what is waiting. Across the whole
+`--scale 0.35` timeline — every stage, including the two `clean` ones — the
+**largest `backlog_bytes` in 807 stall lines is 92 bytes**, and the sender's
+`flight` sits at 0-33 KiB while its window is 5.6-11.7 MiB. So during the stage
+that reads 4.08 Gbit/s the carrier had, at every sampled instant, essentially
+nothing to send and an eleven-megabyte window it could not use.
+
+The tunnel cannot be the limiter of a transfer it is not holding. The deficit is
+**upstream of it**, in the visitor's own four TCP connections, and the mechanism is
+visible from the other side: while the tunnel is slow during `loss1`/`loss5` the
+server's per-stream buffer fills, it stops draining the visitor's socket, the
+visitor's TCP backs off, and its congestion window does not recover before the next
+stage begins. The carrier's own backpressure creates that state, so it is
+carrier-adjacent rather than foreign — but the limiter measured in `clean#2` is the
+visitor's TCP, not `mhd`'s pacer and not its window.
+
+That closes the thread with a negative result on three hypotheses in a row (the
+window, the credit threshold, the pacer) and one live question that is worth a
+round of its own: **whether draining the visitor socket sooner after a slow stage
+would let its TCP recover.** The instrument for it is the same stall line, read the
+other way: `backlog_bytes` should stay near zero *and* the server should not be
+sitting on a full per-stream buffer while it refuses to read.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
