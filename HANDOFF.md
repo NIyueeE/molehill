@@ -5842,6 +5842,37 @@ because what is cold is the carrier's own state and not a queue of channels. The
 next measurement, if there were rounds for it, is a warm-up round in the profile — which
 the model already supports (`warmup_rounds`) and the sweep sets to zero.
 
+**And it is the median, not the tail — which makes the steady state the best number this
+cycle has (2026-11-02).** One `--scale 0.2` timeline, per-stage distributions read from
+its own series rather than from its summary line:
+
+| stage | n | p50 | p90 | p99 |
+|---|---|---|---|---|
+| `clean` (first) | 621 | **12.13** | 51.65 | 103.70 |
+| `rtt100` | 76 | 401.87 | 402.38 | 403.39 |
+| `loss1` | 1 002 | 42.29 | 99.29 | 1 082.95 |
+| `loss5` | 127 | 402.53 | 1 059.05 | 2 064.79 |
+| `rate100` | 433 | 83.56 | 94.10 | 137.18 |
+| `rate20` | 529 | 162.64 | 168.64 | 183.78 |
+| `jitter` | 1 053 | 81.82 | 96.82 | 110.51 |
+| **`clean#2` (last)** | **850** | **1.87** | **2.27** | **15.07** |
+
+**The first stage's median is 6.5× the last stage's** — 12.13 ms against 1.87 — so the
+cold start shifts the whole distribution and not just its tail. That answers the question
+this round opened: the gate is failing on a real cold-start cost, not on a handful of
+outliers.
+
+And the warm state is the best measurement this cycle has produced: **p50 1.87 ms and p90
+2.27 against TCP's 2.24 and 2.58 on the same cell** — better at the median and at the
+ninetieth percentile, worse only at the ninety-ninth (15.07 against 2.58). All eight
+stages completed, no bulk sample failed in this run.
+
+So the release decision is sharp in a way it was not an hour ago: **the carrier is faster
+than TCP in the warm state and slower for its first stage after a restart**, and the SLO
+the gate applies does not distinguish the two. A reviewer can hold the release on the cold
+start or accept it, but no longer on "a tail nobody can attribute" — the distribution says
+where the cost is.
+
 
 
 
