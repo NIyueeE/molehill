@@ -5436,6 +5436,37 @@ Neither is the defect this cycle started with, and the gate's report should be r
 that in mind: the arrival path went from a p99 of 668 ms to 56.9 in the same run in which
 the reference tools carried nothing.
 
+**And the `control socket` cut is exactly 30 s, on the last stage only (2026-11-02).**
+Three stages of one run, asked versus actual:
+
+| stage | `-t` asked | wall |
+|---|---|---|
+| `clean` (first) | 150 s | 152.11 |
+| `jitter` | 120 s | 122.42 |
+| **`clean#2` (last)** | **150 s** | **120.02** |
+
+The first two overshoot their own duration by the connect-and-omit overhead, which is
+what a sample that finishes looks like. The last one is cut **30 seconds early** — and
+120 is not a hold in the sweep timeline (`("clean", 150.0)` closes it), not a constant
+in the carrier (`KEEPALIVE` 2 s, `DEAD_AFTER` 20 s, `PAIR_WAIT_BUDGET` 5 s, `MAX_RTO`
+30 s, `LOST_HOLD` 3 s), and not the iperf timeout (170 s). `stderr.txt` is empty and
+`exit` is 1, so iperf3 reported the close rather than causing it.
+
+The tool's own logs say nothing at that moment: the only `INFO` line in either process
+after startup is a control-session retry at 14:57:19, which is *before* the stages. So
+whatever closes the visitor's control connection at 120 s leaves no trace at the level
+the run captures — **the same blind spot this round already paid for once on the pairing
+line.**
+
+Two candidates and both are cheap to separate: something in the harness holds a
+120-second budget for the *last* stage (§10 says the client timeout must scale with the
+test length, and 120 is a suspiciously round number next to a 150-second hold), or the
+tool closes a stream it considers idle. The discriminator is one `INFO` line on the
+tool's stream teardown path, which is a two-line change and the next thing to write —
+because until it exists, every run reports "control socket has closed" with no side of
+the connection named.
+
+
 
 
 
