@@ -1123,6 +1123,24 @@ fn spawn_dispatcher(
                     let Ok(packet) = crate::transport::mhd::wire::decode(datagram) else {
                         return;
                     };
+                    // **A lane is only created by a datagram that could be opening
+                    // one.** The wire format carries no binding before the handshake, so
+                    // "a packet whose id it has never seen starts a connection" admits
+                    // whatever happens to decode: a stray datagram gets a `Shared`, a
+                    // `Conn`, a sender task and a window, unauthenticated, bounded only
+                    // by `MAX_CONNECTIONS`. Measured as 29 such lanes in one
+                    // seven-minute run — ids scattered across the whole `u32` range
+                    // where the client's own minter is sequential — and they show up in
+                    // every per-lane instrument as lanes that are not lanes.
+                    //
+                    // A real client's first datagram is a stream at offset zero carrying
+                    // its selector byte, so requiring exactly that costs a real
+                    // connection nothing and makes a stray one free to drop.
+                    let opening = matches!(
+                        packet.frame,
+                        crate::transport::mhd::wire::Frame::Stream { offset: 0, data, .. }
+                            if !data.is_empty()
+                    );
                     let now = Instant::now();
                     {
                         let existing = registry.lock().get(&packet.id).cloned();
@@ -1136,6 +1154,9 @@ fn spawn_dispatcher(
                             }
                             return;
                         }
+                    }
+                    if !opening {
+                        return;
                     }
                     {
                         let mut table = registry.lock();
@@ -1287,6 +1308,44 @@ mod lane_tests {
     /// The stream here is a bare channel, not a pool open: a pool open carries
     /// the tunnel hello and waits for the server's ack, which only the server
     /// speaks (the integration suite covers that path).
+    /// A datagram that is not opening a stream does not create a lane.
+    ///
+    /// The listener's rule used to be "a decodable packet with an unseen id starts a
+    /// connection", which admits whatever happens to decode: measured as 29 stray lanes
+    /// in one seven-minute run, with ids scattered across the whole `u32` range where the
+    /// client's own minter is sequential. They cost a `Shared`, a `Conn`, a sender task
+    /// and a window each, unauthenticated, and they appear in every per-lane instrument as
+    /// lanes that are not lanes.
+    #[tokio::test]
+    async fn a_datagram_that_is_not_opening_a_stream_creates_no_lane() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut listener = MhdListener::bind(addr).unwrap();
+        let bound = listener.local_addr();
+        let from: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind(from).await.unwrap());
+        socket.connect(bound).await.unwrap();
+
+        // A decodable packet with an id nobody has used, carrying no stream bytes: the
+        // shape a stray datagram takes.
+        let mut out = Vec::new();
+        let written = crate::transport::mhd::wire::encode_control(
+            &mut out,
+            0xDEAD_BEEF,
+            0,
+            Some(crate::transport::mhd::wire::Ack::default()),
+            crate::transport::mhd::wire::Frame::None,
+        );
+        assert!(written.is_some(), "the stray packet must be encodable");
+        socket.send(&out).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "a datagram that opens nothing must not become a connection"
+        );
+    }
+
     #[tokio::test]
     async fn a_lane_opens_a_stream_the_listener_accepts() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

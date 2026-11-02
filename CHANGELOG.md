@@ -101,6 +101,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server's own slow-open line, and it costs nothing on a healthy path — a healthy
   pairing waits about 2.6 ms, so the line never fires.
 
+- **A datagram that is not opening a stream no longer creates a connection.** The
+  listener's rule was "a decodable packet whose id it has never seen starts a
+  connection", and the wire format carries no binding before the handshake — so any
+  datagram that happened to decode got a `Shared`, a `Conn`, a sender task and a
+  congestion window, unauthenticated, bounded only by `MAX_CONNECTIONS`. Measured: 29
+  such lanes in one seven-minute run, their ids scattered across the whole `u32` range
+  where the client's own minter is sequential. A real client's first datagram is a
+  stream at offset zero carrying its selector byte, so a lane is now created only by
+  one of those, and the strays are dropped for free.
+
 - **A forwarding loop wakes itself when it has nothing to do, and a parked
   reorder buffer now has a deadline.** The stripe layer's receive loop wrote only
   when the next sequence number arrived and waited on its channel with no deadline,
