@@ -4714,6 +4714,40 @@ had bytes waiting for 200 ms with a megabyte queued. On a stall, that line answe
 "nothing waiting" convicts the receiver, and answering "these bytes waiting" convicts
 the sender. **That is the measurement to take next**, and it needs no new code — only
 a run that captures those lines across a stall.
+
+**And captured, it redirects the search out of the carrier (2026-11-02).** Four
+capacity rounds with the crate at `DEBUG` produced 19 stall lines on the server and
+780 on the client, and the client's say one thing over and over:
+
+`unsent_ms=0 unacked_ms=0 credit_blocked=false backlog_streams=1
+backlog_worst_stream=87 backlog_worst_bytes=1077877 worst_stream_unsent=0`
+
+Read against what those fields actually are — and this is the part I had to check,
+because `backlog` is `state.recv.held()`, the **receive** buffer, not the send one:
+
+- **`unsent_ms=0` and `worst_stream_unsent=0`**: the carrier has nothing waiting to
+  go out. Its send path is idle.
+- **`unacked_ms=0`**: nothing of its own is outstanding for long.
+- **`backlog_worst_bytes=1 077 877` on one stream**: a megabyte has been **received
+  and not read**. The application above the carrier has stopped draining.
+
+So during a stall the carrier is not holding anything back — it is *not being asked*.
+The megabyte sits in a stream's receive buffer while that stream's reader is parked,
+and the reader is parked waiting for a byte in a hole **while owning a megabyte it
+could hand out**. Both cannot be true unless the reader is never being run.
+
+That is no longer a carrier question. It says the forwarding loop above `mhd` — the
+task that moves bytes between a tunnel stream and the visitor — is not being
+scheduled, or is blocked on something, and the carrier's own counters are the innocent
+party. **Every instrument built in the last ten rounds was built to measure the
+carrier, and the carrier keeps answering that it is idle.**
+
+The next measurement needs no carrier code at all: log when a stream's reader is
+parked with `held() > 0` — a reader with data it could take and is not taking —
+together with what its forwarding task is waiting on. That is one line in the copy
+loop of `route_mhd_stream`, and it is the first instrument this cycle that sits
+*above* the carrier rather than inside it.
+
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
