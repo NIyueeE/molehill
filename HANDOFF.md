@@ -4914,6 +4914,29 @@ fix for the first is blocked by the second. It is recorded in `CHANGELOG.md` as 
 known gap with its numbers, the gate reports it as two named SLO failures, and the
 next move is a human's — not another instrument.
 
+**Ritual status as of the last round (2026-11-02).** Re-verified on the current tree:
+
+| step | state |
+|---|---|
+| 1. `just interop` | **3 of 3** — a 1.0.0 client and the v0.11.2 binary refuse each other on the connection it happens on, and each keeps serving its own version |
+| 2. `just bench peers fetch` | **frp 0.71.1, rathole 0.5.0, nps 0.26.10**, cached and ready |
+| 4. charts and README tables | not produced — they belong to the release commit, and there is no release |
+| 5. `just bench gate` | **fails**, on the cold first stage |
+| — `just check` | **exit 0**, the whole chain including `cargo audit` once the network returned |
+| — `Cargo.lock` | records **1.0.0**, and a release build now leaves the tree clean |
+
+And a three-arm sweep (molehill, frp, rathole) is running on fingerprint
+`ef35fbd27dd84254`, for a reason that is easy to miss: **the only five-arm sweep this
+cycle ran before `869ceff`, the fix that makes a stage restore its own condition.** No
+sweep has ever run on a harness that does not leak a condition, so the cascade that
+invalidated that run has never been exercised against its fix. If this one comes back
+with the peer arms intact, that defect is closed with evidence; if the peers fail again,
+the fix was not the cause — which is worth knowing before another release is attempted.
+
+The record it produces will not be committed as `results-bench-v1.0.0.json` unless its
+gate passes, which the cold first stage says it will not. It is a test of the harness and
+a coverage picture, not a release artefact.
+
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
 repair for "the timer follows the newest packet" is to follow the oldest **data**
 packet instead — a packet with no range has nothing to re-send, so letting its age
