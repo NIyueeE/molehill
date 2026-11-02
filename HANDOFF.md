@@ -4490,6 +4490,36 @@ dwell is already measured (`mhd stream byte waited in the send buffer`, and
 `queued_at` on every stream) — which makes it the one input this problem needs that
 already exists.
 
+**And the tail scales with bulk load, which is the cleanest characterisation yet
+(2026-11-02).** A full `--scale 1.0` timeline on the current tree completes **all
+eight stages with no failures**, and its per-stage detail says something the shorter
+cells could not:
+
+| stage | `rtt_p99_ms` | `rtt_max_ms` | samples |
+|---|---|---|---|
+| clean | **668.1** | **4 157.3** | 1 961 |
+| clean#2 | 375.7 | 3 222.6 | 2 178 |
+| loss5 | 3 294.7 | 4 088.1 | 197 |
+
+Put beside `churn-16`, which runs the same *kind* of probe (a fresh connection per
+request) with **no bulk** and reads p99 ≈ 20 ms over 6 400 arrivals, the difference is
+not the probe and not the path: the timeline's interactive stream shares the tunnel
+with **four bulk streams**, and `churn-16` does not. So **an arrival waits behind
+bulk**, and with 1 961 samples in the `clean` stage roughly one in a hundred exceeds
+668 ms — this is a heavy tail with a body of ordinary arrivals, not a single stall
+inflating a percentile.
+
+That also retires an earlier reading of mine: the `clean` stage's p99 is **not a
+stable number** across runs (42.1 ms in one, 668.1 in another, same tree family) and
+should not be quoted as if it were. It is a lottery over whether the stall lands in
+that stage, on top of a tail that bulk makes heavier.
+
+The measurement that follows from this is now obvious and cheap: run `churn-16` with
+a bulk stream beside it (`bulk-n` at the same time) and compare its p99 with the
+20 ms it reads alone. That single number says how much of the arrival cost is
+contention rather than the handshake — and it is the first experiment in this whole
+cycle that the timeline data itself has pointed at.
+
 
 The capacity cell did improve sharply on the timer fix before the regression was
 visible on other cells — p99 358, 821, 1 025, 1 715, 1 895, 2 061 ms against
