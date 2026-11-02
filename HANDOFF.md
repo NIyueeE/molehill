@@ -5077,6 +5077,40 @@ What the numbers *do* support is the diagnosis behind it: the arrival cost is
 open cost (already halved by the one-flight open, and the rest needs the record layer
 that bulk rejected). Neither is pre-warming.
 
+**And the lane count does not move it either, which refutes my own arithmetic
+(2026-11-02).** The paragraph above attributes the `churn-16` tail to
+`16 × 2.5 ms ÷ 4 lanes`. The bench can set the pool width without a code change, so
+that is directly testable — `--arm id=l4,pool_cap=N`, four rounds each:
+
+| lanes | `l4` p99 | its A/A twin | rate |
+|---|---|---|---|
+| 4 | 18.83 ms | 17.42 ms | 3 793 |
+| 8 | 17.06 ms | 19.11 ms | 3 907 |
+| 16 | 17.55 ms | 17.45 ms | 4 042 |
+
+**The within-configuration scatter (17.06-19.11) is as large as the whole
+between-configuration range (17.1-18.8).** Quadrupling the pool changes nothing. So
+the tail is not lane queueing, and the `16 × 2.5 ÷ 4` explanation is **withdrawn** —
+it was arithmetic that fitted a number, which is the fifth time this cycle has
+recorded that failure mode.
+
+What is left is a precise negative characterisation, and it is worth stating because
+it is now narrow: under sixteen concurrent fresh connections the tail is **15-20 ms**
+and it is not lanes, not a slow opening (zero past 100 ms on either side), not the
+pairing (zero budgets expired), not a multi-second stall (those are fixed), and not
+the carrier's timer or window (both measured at parity on `rr-16`). It is a
+distributed tail that no single structural lever moves.
+
+The honest reading is that this is the cost of **one handshake per arrival under
+concurrency** — the thing TCP does not pay, because it multiplexes — and that the two
+levers named two paragraphs ago are the only ones left: the number of lanes (measured,
+flat) and the cost of an open (halved once by the one-flight open; the rest needs the
+record layer that the bulk cell rejected three times). **P1′'s p99 gate and P2′'s
+"level with TCP" gate are therefore open, and they are open because of a structural
+choice this release does not reverse**, which is exactly what `CHANGELOG.md`'s Known
+gaps says in the release notes.
+
+
 
 
 
