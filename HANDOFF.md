@@ -4953,6 +4953,42 @@ match the flight — and both change the throughput/latency trade the CHANGELOG 
 documents for the 32 → 16 MiB window. That is the decision, stated with the numbers a
 decider needs.
 
+**The decision was made in favour of latency, and it cost nothing measurable
+(2026-11-02, `444868c`).** The priority order the objective states is latency >
+throughput > memory > processor, so the design decision was taken as "bound the
+flight by time", and it is two lines that only work together: the write path stops
+admitting bytes once the oldest packet carrying data is `FLIGHT_AGE_LIMIT` (100 ms,
+half `MIN_RTO`) old, and `arm` follows that packet instead of the newest one. Below
+the bound the oldest data packet is always younger than `MIN_RTO`, so a timer firing
+means a hole rather than a deep queue — which is what made the previous three attempts
+fail in opposite directions.
+
+Measured, and this is the first mechanism in twenty-two rounds to move the tail:
+
+| cell | before | after |
+|---|---|---|
+| capacity, worst arrival over 16 level-series | **3 000-5 000 ms** | **≤ 204 ms** |
+| capacity ramp | level 1 (five rounds of six never passed it) | **level 5**, and four rounds pass level 1 |
+| `bulk-n` (9 rounds, A/A twin) | 6.5-11.5 Gbit/s | **11.49** against a twin's 11.53 |
+| `churn-16` p50 / p99 | 2.44 / 20.4 ms | 2.49 / 20.31 (twin 2.46 / 20.75) |
+| `rr-16` p50 / p99 | 0.49 / 1.23 ms | 0.46 / 1.34 (twin 0.46 / 1.33) |
+
+Two readings of that table matter and one caution:
+
+1. **The tail is gone as a multi-second event.** Every one of the sixteen capacity
+   level-series in the run has a maximum at or below 204 ms. There is no round in which
+   a connection waits seconds any more.
+2. **The cost is zero where it was expected.** The bulk cell was measured at 3.9
+   Gbit/s in the first pass and 11.49 over nine proper rounds with an A/A twin at
+   11.53 — the 3.9 was host state, not the change. This is exactly the trap this file
+   has recorded four times (a number matching a constant, or a run matching nothing);
+   the nine-round A/A is what makes it a reading.
+3. **Caution: the ramp still reads 0 at level one in two rounds of six.** The tail is
+   no longer seconds, but a ≤ 204 ms arrival still breaks a 50 ms SLO at the 99th
+   percentile of ~150 samples. So the capacity cell is not yet green, and the remaining
+   gap is the *ordinary* latency under four bulk streams, not a stall.
+
+
 
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
