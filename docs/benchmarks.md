@@ -366,6 +366,29 @@ carried" are different findings.
 
 ## The conditions and the stage schedule
 
+### The load generator's own limits
+
+The visitor is a client under load, and a client has limits that are not the
+tool's. One of them changes a reading enough to be worth stating: the churn
+cells open a **fresh connection per request**, about 2 900 a second, so the
+visitor namespace accumulates roughly 174 000 sockets in `TIME_WAIT` against a
+28 231-port default range. When it runs dry the probe's connect is refused, it
+backs off 50 ms, and those waits land inside the measured window — a round that
+posts 2 900 arrivals a second becomes one that posts 183, and the raw sample says
+so: `connect_errors=3773` of 6 400 attempts. It happened to the A/A twin as
+readily as to the arm under test, which is exactly what made it look like an
+intermittent collapse of the tool.
+
+The topology therefore sets two switches **in the visitor namespace only**:
+`net.ipv4.tcp_tw_reuse=1` (a `TIME_WAIT` 4-tuple may be reused for a new
+*outbound* connection; the kernel default of 2 is loopback-only and the visitor
+dials over the veth) and `net.ipv4.ip_local_port_range=1024 65535`. Both are the
+load generator's hygiene and neither changes what is measured. As a second line,
+a round in which more than one connect in twenty was refused is reported as a
+failed cell naming port exhaustion rather than as a throughput number, so a
+starved round can never be read as a slow tool — the failure and the count live in
+the raw per-sample artifacts.
+
 ### The timeline
 
 The **staged scenarios** (`timeline`, `soak`, `cost`) walk a *timeline*: an

@@ -621,6 +621,28 @@ def run_rr(ctx: Ctx, params: dict) -> list:
     cell = f"c{params['connections']}"
     if not result:
         return [Cell(cell, False, reason=f"the probe produced no result (exit {rc})")]
+    # A round that ran out of visitor ports is not a reading of the tool: the
+    # probe backs off 50 ms per refused connect, so `wall_s` grows by the wait
+    # and `rate_per_s` falls by however much of the round starved. It happened on
+    # the A/A twin as readily as on the arm under test, which is what made it look
+    # like an intermittent 16x collapse instead of an instrument limit. The
+    # namespace's own settings now prevent it (`Topology.up` sets
+    # `tcp_tw_reuse` and widens the port range); this guard is what stops a
+    # starved round being read as a slow tool if it ever happens again.
+    connect_errors = result.get("connect_errors", 0)
+    attempts = result.get("ok", 0) + result.get("failed", 0) + connect_errors
+    if attempts and connect_errors * 20 > attempts:
+        return [
+            Cell(
+                cell,
+                False,
+                reason=(
+                    f"the visitor ran out of ephemeral ports: {connect_errors} of "
+                    f"{attempts} connects were refused, so this round measured the "
+                    "probe's backoff rather than the tool"
+                ),
+            )
+        ]
     ok = result.get("ok", 0)
     metrics = {
         "rate_per_s": round(ok / result["wall_s"], 1) if result.get("wall_s") else None,

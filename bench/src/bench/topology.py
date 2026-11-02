@@ -251,6 +251,29 @@ class Topology:
             self._ip("link", "set", dev, "up", "mtu", str(self.link_mtu), ns=ns)
         self._ip("route", "add", "default", "via", model.TOPO_SRV_IP, ns=VIS_NS)
 
+        # The visitor is a **load generator**: the churn cells open a fresh
+        # connection per request, ~2 900 of them a second, so the namespace
+        # accumulates ~174 000 sockets in TIME_WAIT against a 28 231-port default
+        # range and runs dry. That surfaced as `connect_errors=3773` of 6 400
+        # attempts, the probe's 50 ms backoff for each, and a `rate_per_s` of 183
+        # against the 2 900 the same code posts on a round that does not starve —
+        # a 16x understatement read as a slow tool, on the A/A twin as readily as
+        # on the arm under test.
+        #
+        # Both switches are the load generator's own hygiene and change nothing
+        # about what is measured: `tcp_tw_reuse` only reuses a TIME_WAIT 4-tuple
+        # for a *new outbound* connection whose timestamp is strictly newer (the
+        # default 2 is loopback-only, and the visitor dials over the veth), and
+        # the range is widened to the largest the kernel accepts.
+        for key, value in (
+            ("net.ipv4.tcp_tw_reuse", "1"),
+            ("net.ipv4.ip_local_port_range", "1024 65535"),
+        ):
+            run(
+                ["ip", "netns", "exec", VIS_NS, "sysctl", "-wq", f"{key}={value}"],
+                check=False,
+            )
+
         # The bench configs leave the device to the operator: the TUN devices
         # exist before the daemons start, so the daemons attach to them.
         self._ip("tuntap", "add", "dev", TUN_SRV, "mode", "tun", ns=SRV_NS)
