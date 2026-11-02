@@ -4914,6 +4914,46 @@ fix for the first is blocked by the second. It is recorded in `CHANGELOG.md` as 
 known gap with its numbers, the gate reports it as two named SLO failures, and the
 next move is a human's — not another instrument.
 
+**And the third part is now measured rather than argued (2026-11-02).** The obvious
+repair for "the timer follows the newest packet" is to follow the oldest **data**
+packet instead — a packet with no range has nothing to re-send, so letting its age
+drive the timer was what cost `churn-16` its median in the earlier attempt. Built and
+measured:
+
+| cell | before | oldest **data** packet |
+|---|---|---|
+| `churn-16` p50 / p99 | 2.44 / 20.4 ms | **2.46 / 20.48** (twin 2.51 / 21.41) |
+| `rr-16` p50 / p99 | 0.49 / 1.23 ms | **0.46 / 1.32** (twin 0.47 / 1.35) |
+| `bulk-n` | 6.5-8.8 Gbit/s | **2.52** (twin 2.66) |
+
+**The data filter fixed the latency cells exactly as predicted, and `bulk-n` fell by
+60 %** — both arms equally, so it is the change. The only way a bulk lane loses 60 %
+of its throughput from a timer change is that the timer now fires while the transfer is
+healthy: the oldest data packet is older than `MIN_RTO` as a matter of course on a lane
+carrying gigabytes, and every firing re-sends a flight that had nothing wrong with it.
+
+That is the third piece, measured instead of inferred. My earlier arithmetic — 16 MiB
+over ~1.25 Gbit/s is about 107 ms, inside a 200 ms RTO — was wrong somewhere, and the
+60 % is the correction: **on this host the flight does outlive the RTO**, which is why
+every attempt to time-out an old hole storms.
+
+So the three parts are now all measured:
+
+1. the timer follows the newest packet, so an old hole never expires (`retransmits=1`
+   beside a seven-second parked reader);
+2. following the oldest packet of any kind costs the latency cells (p50 2.44 → 16.07);
+3. following the oldest **data** packet costs the throughput cell (−60 %) — because the
+   flight outlives the RTO.
+
+**A fix therefore has to bound the flight as well**, and that is a design decision: a
+carrier that lets a gigabyte sit in flight and then wants a 200 ms loss timer is asking
+for two contradictory things. The honest options are to bound the window by time (so a
+packet cannot be older than the RTO when it is sent) or to raise the loss window to
+match the flight — and both change the throughput/latency trade the CHANGELOG already
+documents for the 32 → 16 MiB window. That is the decision, stated with the numbers a
+decider needs.
+
+
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
