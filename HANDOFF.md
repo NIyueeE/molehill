@@ -5549,6 +5549,40 @@ direct channels then every arrival is paying a full connection rather than a str
 warm lane — which would be the largest arrival cost found in this cycle and the thing
 `P2′` was really about.
 
+**And the answer is neither pooled nor direct: every stream is pooled, and the 29 lanes
+are strangers (2026-11-02).** The run with `core::server` at `DEBUG`:
+
+```
+direct (Handshaking a data channel):  0
+pooled (mhd tunnel stream routed): 7 200
+```
+
+**Every one of the 7 200 streams took the pool** — so the pooled design is doing what it
+says, the per-stream Noise handshake is real and on the arrival path, and the 29 extra
+`Conn`s are not direct data channels. Their ids give them away: `3824123932`,
+`3959218201`, `3959422976` are scattered across the whole `u32` range, while
+`next_tunnel_id()` is sequential and the pool's four are `0..3`.
+
+**A sequential minter cannot produce those numbers, so nothing in the client minted
+them.** The listener's rule is "a decodable packet whose id it has never seen starts a
+connection" — and the wire format carries no binding before the handshake — so **any
+datagram that happens to decode as a packet creates a lane**: a `Shared`, a `Conn`, a
+sender task and a 13 KB window, admitted without authentication and only bounded by
+`MAX_CONNECTIONS` (4 096).
+
+That is a robustness defect first and a measurement defect second. Robustness: an
+unauthenticated peer can make the server allocate a connection per datagram, which is a
+free amplifier and is exactly the class of thing `[server.data].max_tunnels` exists to
+stop — except that valve counts *reserved tunnel slots*, and these never get that far.
+Measurement: those strangers are counted as lanes in every per-lane instrument, which is
+why a per-lane reading on the server has 33 rows where the client has 4.
+
+The next change is small and both halves matter: a lane the server cannot attribute to a
+session should be admitted only once its first stream proves a hello, or be counted and
+rate-limited like a connection attempt. Until then, `lane=` on the server is not a lane,
+and the per-lane numbers in this file that came from a server log have to be read with
+that in mind.
+
 
 
 
