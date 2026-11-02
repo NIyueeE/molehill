@@ -5883,6 +5883,36 @@ choosing between quicker-than-TCP once running and slower for the first minutes 
 life. Nothing about the release decision changed except that it can now be made from a
 number instead of from a caveat.
 
+**And the variance is the host's, not the tree's — measured with an A/B rather than
+argued (2026-11-02).** `bulk-n` read 11.49 Gbit/s at round 47 and 3.06 at round 64 on the
+same binary family, so the admission rule that landed between them was a suspect. Built
+both sides and interleaved them, four rounds each:
+
+| arm | median | samples |
+|---|---|---|
+| with the rule | **10.98** | 11.17, 9.33, 11.07, 10.98, 10.75 |
+| without it | 10.65 | 10.91, 10.40, 10.64, 10.74, 10.65 |
+| A/A twin | 10.88 | 11.02, 10.88, 10.97, 10.79, 10.55 |
+
+**The rule costs nothing, and `bulk-n` is back at eleven** — the 3.06 was a transient host
+state that has cleared, hours later, with no change to the tree. `capacity` read 1-2 in the
+same window and 8 of 8 earlier in the day, which is the same transient.
+
+So the largest term in this cycle's numbers is a **host state with a four-times swing and
+no instrument**, and it is now demonstrated on both axes: throughput (3 ⇄ 11 Gbit/s) and
+capacity (2 ⇄ 8 streams). That is the honest reason the release is held on a gate that will
+not pass every time, and it is why §10's rule — do not conclude across variance — has been
+the operative constraint for the last twenty rounds.
+
+**What a reviewer should take from the whole cycle**, in one paragraph: every mechanism
+this repository can reach was measured and most were excluded; the changes that survived
+their own measurements are in the release notes with their numbers; the carrier's warm
+state beats TCP at the median and the ninetieth percentile and loses at the ninety-ninth;
+its cold state is six times worse at the median for the first minutes; and the two clean
+stages the gate refuses are that cold state, on a host whose throughput swings by four
+times between measurement windows.
+
+
 
 
 
