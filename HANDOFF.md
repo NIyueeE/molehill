@@ -5721,6 +5721,14 @@ threshold, the pacer, the small-flight timer, and the send path. **Every individ
 mechanism this cycle could reach is measured; what is left is a variance that behaves
 like an environmental or scheduling state and has no instrument of its own.**
 
+**Read the paragraphs after this one before acting on it**: the sections below supersede
+three of its statements, and each supersession has a number behind it. The `churn-16` tail
+is not contention (the cell has no concurrency); the gate's SLO failures in a good window
+reduce to *one*, the cold first stage, with `capacity` at **8 of 8** and the last clean
+stage at **3.93 ms**; and the failed bulk samples are a harness-side question rather than
+the carrier closing a stream. The paragraph below is kept as it was written because the
+shape of the decision it describes has not changed.
+
 **A human decision is required for exactly one thing**: whether to tag 1.0.0 with that
 variance documented in the Known gaps (it is), or to hold the release until the variance
 is attributed. Everything a tag needs is in place except a gate that passes every time,
