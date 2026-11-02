@@ -4876,6 +4876,44 @@ deadline only arms **while `pending` is non-empty**, so its silence across these
 proves only that no frame arrived out of order — it says nothing about a frame that
 never arrived at all, which is the shape this measurement now points to.
 
+**And the reader's hand-off is silent too, which closes the chain (2026-11-02).**
+Timing `stripe_reader`'s `tx.send` and logging anything at or past 100 ms, over five
+capacity rounds: **zero lines**, same as the destination write. So on this symptom the
+chain reads, from the block outward:
+
+| step | measured | conclusion |
+|---|---|---|
+| `recv_loop`'s write to the destination | 0 waits ≥ 100 ms | not blocked handing bytes on |
+| `recv_loop`'s channel | 2 s deadline never fires | nothing arrives out of order |
+| `stripe_reader`'s `tx.send` | 0 waits ≥ 100 ms | the consumer is not behind |
+| **the carrier stream's read** | — | **this is where every task sits** |
+
+And the carrier's own view of that read is the datum from earlier in this file:
+`hole=Some((229, 229, 0, None))` — waiting for byte 229 with **nothing contiguous
+behind it** — while `held()` on the same stream reads a megabyte. `held()` sums every
+piece, including the pieces *past* the hole, so "a megabyte held" and "blocked at a
+hole" are the same state: the byte at 229 never arrived.
+
+Put beside the sender's own testimony — `unsent_ms=0` (nothing waiting to go out) and
+`unacked_ms=0` (nothing outstanding for long) — the two ends agree on the shape and
+disagree on the conclusion: **the peer believes it sent everything, we never received
+byte 229, and nothing repaired it.**
+
+That is the same defect the timer analysis found, seen from the other end, and the two
+now join into one statement: *a hole is not repaired because the retransmission timer
+is armed from the newest packet, and a busy lane therefore never lets it fire for an
+old hole — while arming it from the oldest packet storms, because this carrier's flight
+can legitimately outlive its own RTO.* Both halves are measured; neither can ship
+alone; together they need the flight bounded as well, which is a design decision and
+not a parameter.
+
+**This is where the arrival tail investigation stops.** Twenty rounds, thirteen
+excluded mechanisms, and a single, measured, three-part finding instead of a fix:
+the timer is armed from the wrong packet, the flight can outlive the timer, and the
+fix for the first is blocked by the second. It is recorded in `CHANGELOG.md` as a
+known gap with its numbers, the gate reports it as two named SLO failures, and the
+next move is a human's — not another instrument.
+
 3. **The tail follows the *shape*, not the tool's health**: `clean` and `clean#2` carry
    the multi-second maxima (4 157 and 3 223) with p50 1.9 and 1.1, while `rtt100` —
    the same clean path with 400 ms of delay — has a maximum of 506 ms. Delay
