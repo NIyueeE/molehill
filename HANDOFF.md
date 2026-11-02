@@ -5241,6 +5241,40 @@ the same arm twice under `--condition loss5` and compare its *own* two copies' f
 metric sets, because a defect that makes two identical copies disagree is a race, and a
 race is found by its timing, not by its averages.
 
+**And the five-arm record itself is unusable, for a reason that is not the product
+(2026-11-02).** The sweep finished and the gate on the full record reports **69
+failures**, which reads like a catastrophe until the summary lines are read:
+
+```
+capacity: molehill sustained 8 stream(s)
+capacity: l3      sustained 0 stream(s)
+capacity: frp     sustained 0 stream(s)
+coverage: nps / timeline / …  produced no measured round (all cells)
+```
+
+**Every arm failed, and the three peers have nothing to do with this carrier.** `l3`
+lost `jitter` and `clean#2` as well as all eight capacity levels; `frp` sustained zero
+streams; `nps` produced no measured round at all. A run in which the reference tools
+cannot carry a single stream is a statement about the machine, not about `molehill`.
+
+The leading explanation is a **blasted condition**. `_one_stage` installs a condition
+per stage and never restores it; `run_staged`'s `finally` restores `ctx.condition`,
+which is `None` for a staged run, so it restores nothing. The last stage of the
+timeline is `clean#2`, whose condition *is* clean and therefore benign — but a stage
+that dies early (as `loss5` did) leaves whatever it installed in place, and every
+stage and every arm after it runs on that path. That would explain the whole shape:
+one arm loses `loss5`, and four of its stages, two stages of the next arm and three
+arms' capacity ramps follow it down.
+
+**So the record is not committed.** A results file whose reference tools carried zero
+streams cannot become `benches/records/results-bench-v1.0.0.json`, and nothing about
+`molehill` should be concluded from it. What it does establish is a harness defect with
+a blast radius of one whole sweep: **a stage's condition must be restored in a `finally`
+of its own**, not by a cleanup that only fires for single-condition runs. That lands
+before any further sweep, because until it does, one bad stage costs every measurement
+after it — which is exactly how this cycle's first sweep came to be read as a product
+failure.
+
 
 
 
