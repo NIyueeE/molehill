@@ -485,6 +485,22 @@ exists at all: `lo` is MTU 65536, so without it every datagram fits in one
 fragment and the cost of a lost fragment is unmeasurable. Read the two classes
 together with the `carrier` rows below.
 
+### A stage owns its condition
+
+Each stage of a timeline **imposes its own condition and puts the leg back to clean
+when the stage ends, whether it succeeded or failed.** That is not tidiness: a stage
+that dies mid-way (a tool that stops answering, a sink that never starts) used to
+leave its condition installed, and every stage and every *arm* after it then ran on a
+path nobody had asked for. Measured, and it cost a whole five-arm sweep — one arm lost
+`loss5`, four of its stages followed, the next arm lost two of its own plus all eight
+capacity levels, and the two arms after it carried nothing at all, so the gate reported
+69 failures in which the *reference tools* were the ones with zero streams.
+
+So if a cell is missing or unreadable, read it against the stage before it before
+concluding anything about the tool: a run in which the peers also fail is a statement
+about the run. This is [AGENTS](../AGENTS.md) §10's rule about one failure not
+poisoning the next sample, applied to a condition instead of a process.
+
 ### The shaping scope
 
 **A condition is applied to one leg of the topology**: `--condition-leg visitor`
