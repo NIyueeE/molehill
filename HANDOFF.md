@@ -5995,6 +5995,22 @@ carrier defect**, and the one thing the gate reports against this carrier remain
 first stage: 179.9 ms against a 50 ms bar in a good window, 12.13 ms at the median against
 the 1.87 the same run reaches at its end.
 
+**And the cold start's mechanism is withdrawn too (2026-11-02, `e3ed8a6`).** Three pages
+said the first stage is worse *because its congestion window is still ramping from ten
+packets*. That is an explanation this release has not measured, and the measurement it
+would need contradicts it: the window reaches its 2 MiB slow-start ceiling within the
+first second of traffic (the samples are one second apart and the first already reads
+between 13 KB and 2 048 KB), so it cannot account for a median that stays **six times
+worse across a whole 150-second stage**.
+
+The pages now say what is true: the six-fold difference is the measurement, the mechanism
+is unattributed, and the window is recorded as a **rejected** explanation so that the next
+cycle does not spend its first round on it. That is the seventh time this cycle has had to
+separate a number from the story told about it, and it is the same discipline that caught
+the 41.3 ms turnaround, the "6.4 s RTO ladder", the 23 % four-process claim and the
+`churn-16` concurrency — a claim must be a measurement, not a mechanism that would explain
+one.
+
 
 
 
