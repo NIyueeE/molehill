@@ -5968,6 +5968,25 @@ on two named SLO failures (one of them, in a good window, the cold start alone),
 excluded — the stage boundary, the group lifetime, the carrier's own close, and now the
 idle watchdog.
 
+**And a correction to the paragraph above: the tool did not close it either
+(2026-11-02).** The arithmetic is against the earlier reading. That `jitter` sample's
+control connection reports failure at **120.38 s**, and the group carrying it ended at
+`lived_s` **130** — so the group **outlived the client's own exit by ten seconds**. A
+connection the tool had closed cannot be reported closed by a client that has already
+stopped, and a group still alive ten seconds later is the tool *holding* it open.
+
+So the honest state of that failure is: **at end-of-test the client reports its control
+socket closed while the tool is still holding the group open**, which puts the close on
+the sink's side of the forwarded stream or in iperf3's own end-of-test handling, and not
+on this carrier. That is the opposite of what the previous paragraph concluded, and it is
+the fourth time this cycle a plausible reading of the same numbers has reversed on
+arithmetic — which is why the arithmetic is in the record.
+
+**The release gate's missing cells are therefore a harness-side open question, not a
+carrier defect**, and the one thing the gate reports against this carrier remains the cold
+first stage: 179.9 ms against a 50 ms bar in a good window, 12.13 ms at the median against
+the 1.87 the same run reaches at its end.
+
 
 
 
