@@ -11,12 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known gaps
 
-- **A fresh connection arrives eight times slower than TCP's, and the cause is
-  one handshake.** Measured with `MOLEHILL_DATA_CARRIER` pinning a carrier per
-  run over the same binary, `churn-16` (a fresh connection per request, sixteen at
-  once, six rounds, each run's own A/A twin) puts the round trip's p99 at
-  **20.51 ms against TCP's 2.58**, with the medians level (2.42 against 2.24) and
-  the arrival rate at 3 612 against 6 728 per second. Where a connection is
+- **A fresh connection's tail is eight times TCP's, and the cause is one handshake.**
+  The multi-second stalls are a *different* defect and are fixed — see the entry
+  about the flight outliving its timer. This one remains. Measured with
+  `MOLEHILL_DATA_CARRIER` pinning a carrier per run over the same binary,
+  `churn-16` (a fresh connection per request, sixteen at once, six rounds) puts the
+  round trip's p99 at
+  **21.75 ms against TCP's 2.59**, with the medians level (2.51 against 2.24) and
+  the arrival rate at 3 469 against 6 705 per second. Sixteen *concurrent* arrivals
+  on four lanes contend for the per-stream handshake, and that is what the tail is:
+  not a stall — the multi-second ones are gone — but the cost of sixteen handshakes
+  at once. Where a connection is
   *reused* the carriers are indistinguishable: `rr-16` agrees to within 1 % on the
   tail and 5 % on the rate. The cause is structural rather than a tuning error —
   every visitor channel runs its own Noise handshake before its first byte can
