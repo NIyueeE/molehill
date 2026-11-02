@@ -4111,6 +4111,31 @@ opening in one round at `hs_us=279 144` — a handshake waiting 279 ms, which is
 RTO on the opening message, so the one-flight shape removed a flight but not the
 loss path. And a cell that reads `0, 1, 0` across three rounds cannot be a release
 gate until either the opening stall or the max-statistic changes.
+
+**With the split instrumented, the answer is one RTO on the opening packet
+(2026-11-02).** The client's slow-open line now carries `hs_us`/`ack_us` beside the
+budgets, and three consecutive capacity rounds all fail level 1 the same way:
+
+`lane=0 us=278712 hs_us=1 ack_us=278710 credit=16773650 window=13490
+buffer=33554432 queued_streams=0 retransmits=1`
+
+**`hs_us=1`** — the Noise handshake is not the cost on this path at all. **`ack_us=278 710`** — the wait is entirely the acknowledgement, and 278 ms is one step of
+`MIN_RTO`. The server's own line from the same event reads `hs_us=279 144`: *the
+server* waited 279 ms for the client's handshake message. So the client's opening
+message — msg 1 of the handshake, the one the one-flight shape put the hello in —
+**did not reach the server on its first attempt**, and only the RTO resent it.
+
+No leg recorded a dropped packet (`rx_dropped: 0`, `drops: {}`), so this is very
+likely not a path loss but a **post the carrier refused**: `transmit_stream` has
+refusal paths ("range is empty", "no eligible stream") and a refused opening that is
+only retried by the timer looks exactly like this. That is the next thing to read,
+and the instrument is already there — the refusal paths are logged and
+`retransmits=1` says the recovery was a retransmit, not a second attempt in the same
+pass.
+
+One correction to the paragraph above: the 6.4 s opening was an outlier from one
+round; the reproducible shape is **~279 ms, one RTO**, and it is enough on its own to
+break a 50 ms SLO at the 99th percentile of a 64-sample level.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:

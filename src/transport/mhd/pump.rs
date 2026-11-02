@@ -899,6 +899,11 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
             (id, stream, ack)
         };
         let ack_us = u64::try_from(hs_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // The handshake's own cost, kept for the slow-open line: `hs_at` is
+        // stamped before the branch that opens the stream, so this is the
+        // handshake and everything the wait for a stream slot cost, and
+        // `ack_us` is the acknowledgement after it.
+        let hs_us = u64::try_from(hs_at.duration_since(opening).as_micros()).unwrap_or(u64::MAX);
         // The server reserved this lane's slot on this open, so the next one can
         // carry its hello in the handshake's opening message and be answered in
         // the reply: one round trip instead of two.
@@ -931,9 +936,16 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                             conn.stream_retransmits(stream_id),
                         )
                     });
+                    // The split matters as much as the total: a wait in the
+                    // handshake, a wait for the acknowledgement and a wait on the
+                    // budgets are three different defects, and the line below only
+                    // says which *budget* was short — which is the answer to a
+                    // question this line assumed had already been asked.
                     tracing::debug!(
                         lane = self.id,
                         us,
+                        hs_us = hs_us,
+                        ack_us = ack_us,
                         credit,
                         window,
                         buffer,
