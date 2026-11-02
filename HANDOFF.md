@@ -5491,6 +5491,36 @@ failing one**, on the same binary in the same afternoon, so the next investigati
 puts the pairing path into the slow mode — and unlike everything before it, that question
 now has a single instrument and a binary outcome.
 
+**And the cheap reproduction gives the first-stage mechanism and a new anomaly
+(2026-11-02).** `--scale 0.2` (7 minutes) reproduces both: `clean: 79.411 ms` against
+`clean#2: 3.325`, with 27 slow pairings and all eight stages passing. Reading the
+sender's window across that run, the four pool lanes:
+
+| lane | first sample | mid | last |
+|---|---|---|---|
+| 0 | 2 048 K | 4 709 K | 4 709 K |
+| 1 | **100 K** | 4 188 K | 4 246 K |
+| 2 | **13 K** | 3 725 K | 3 725 K |
+| 3 | 2 048 K | 4 232 K | 4 232 K |
+
+**The congestion window is cold at the start and takes the run to grow.** A lane opens
+somewhere between its 13 KB initial value and the 2 MiB slow-start ceiling and reaches
+~4.2 MB only later, so for the whole first stage the carrier is running a window eight
+times smaller than the one it will settle on — and a small window on a lane carrying
+four bulk streams is a queue that an arrival must wait behind. That is the first-stage
+slowness, and it is exactly what `P2′` (pre-warmed authenticated channels) was reaching
+for, one layer down: what needs warming is not the channel but the **window**.
+
+And an anomaly that is not explained: **the server reports 33 distinct lanes while the
+client's pool established 4 and repaired none** (`pool-stats` prints exactly one line,
+`established=4`). The 29 extra ids each have nine window samples and a permanent 13 KB —
+short-lived connections that opened, carried a little, and ended. Nothing in the client's
+pool accounts for them, and `[client.data]` is empty in that arm's config, so `tunnels`
+is the default four. Either something mints 29 short-lived carrier connections beside the
+pool, or the server is counting something else as a lane; the next run should name them
+(a lane that ends within a second has no business existing in a pooled design).
+
+
 
 
 
