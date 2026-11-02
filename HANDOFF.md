@@ -3983,6 +3983,42 @@ sender, and a per-end instrument read on the wrong end is not a measurement.**
 This leaves the original question untouched: whether the *sender's* window is what
 fails to recover across a shaping schedule. That is what the timeline run below
 measures, on the server side.
+
+**Read on the sender across a whole schedule, the window recovers and is not the
+limit (2026-11-02).** A `--scale 0.35` timeline with the sender's window logged
+once a second, the four tunnel lanes only:
+
+| lane | first | `slow_start` true | max | `flight` median |
+|---|---|---|---|---|
+| 0 | 2 MiB | 15 of 443 samples | **8 919 K** | 0 K |
+| 1 | 2 MiB | 109 of 421 | 6 228 K | 0 K |
+| 2 | 2 MiB | 36 of 485 | **11 721 K** | 33 K |
+| 3 | 2 MiB | 17 of 350 | 5 582 K | 0 K |
+
+Three things, and the third retires this hypothesis:
+
+1. **A clean path does reach the ceiling.** Every lane opens at 2 MiB —
+   `SLOW_START_CEILING` — with slow start still on, which is the mechanism working
+   as designed.
+2. **`slow_start` does latch off at the lossy stages and never returns.** The
+   samples where it is true are the early ones; after `loss1`/`loss5` every lane
+   is in additive growth for the rest of the run. That is the design wart the code
+   comment admits to ("never comes back"), and it is worth fixing for its own sake.
+3. **It does not explain the throughput.** Additive growth still carried the
+   window from 2 MiB to **5.6-11.7 MiB** by the end, and `flight` is 0-33 KiB at
+   the median — the sender is never window-blocked. So the `clean#2` stage's
+   4.08 Gbit/s is not a window problem, and this instrument has now ruled out the
+   hypothesis it was built for.
+
+The limiter is therefore somewhere the window does not reach. Two candidates are
+left and both are cheap to read with what is already logged: **the pacer** — the
+code says in as many words that the rate is the pacer's business and the window is
+only the bound, so a paced send rate that does not recover from a shaping schedule
+would produce exactly this — and **the visitor's own TCP**, whose four connections
+each recover from the lossy stages on their own schedule. The next measurement
+separates them without a new instrument: compare the tunnel's own carried bytes
+per second across the two clean stages with the visitor's, since equal tunnel bytes
+and unequal visitor bytes puts the deficit outside the carrier.
 **And the tail is not worker starvation — measured, three settings (2026-11-01).**
 The process starts `min(cores, 4)` workers, so the obvious escape hatch is more.
 `churn-16`, four rounds each, `TOKIO_WORKER_THREADS` set explicitly, mhd forced:
