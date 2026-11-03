@@ -414,6 +414,19 @@ pub(crate) fn note_shared() {
     SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Streams whose unread bytes have been waiting for over a second.
+///
+/// Sampled by the pump rather than counted by the reader: a reader that is never
+/// polled cannot report its own starvation, and that is exactly the state a stage
+/// which carries nothing is in.
+static STARVED_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record the worst starvation seen in this second.
+pub(crate) fn note_starved_streams(n: usize) {
+    let n = u64::try_from(n).unwrap_or(u64::MAX);
+    STARVED_STREAMS.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How many times a pairing parked waiting for its channel.
 ///
 /// The counter that says whether the wait is a park at all. If pairings park and
@@ -557,8 +570,23 @@ fn report_phases() {
 }
 
 /// Drain every per-second window and print the ones that saw traffic.
+/// Streams starved of a reader, and reads that parked with bytes waiting.
+///
+/// Its own function because it answers one question and `report` is already at the
+/// length the lint allows.
+fn report_starvation() {
+    let starved = STARVED_STREAMS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if starved > 0 {
+        info!(
+            starved,
+            "mhd-stats: streams whose reader is not being polled"
+        );
+    }
+}
+
 fn report() {
     report_phases();
+    report_starvation();
     let dwell = take_dwell();
     if !dwell.is_empty() {
         let n = dwell.len();

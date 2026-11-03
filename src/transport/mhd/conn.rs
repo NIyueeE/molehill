@@ -1404,6 +1404,23 @@ impl Conn {
             .and_then(|s| s.recv.ready_for(now))
     }
 
+    /// How many streams have had unread bytes for longer than `threshold`.
+    ///
+    /// The observation a reader cannot make about itself: a stream whose reader
+    /// task was never polled never runs a line of code, so every counter inside
+    /// `poll_read` reads zero exactly when the defect is worst. The pump can see
+    /// it, because the buffer and the clock are both its business. A sender sees
+    /// the same condition as a shut receive window for the whole stage.
+    pub(crate) fn starved_streams(&self, now: Instant, threshold: std::time::Duration) -> usize {
+        self.streams
+            .keys()
+            .filter(|id| {
+                self.ready_for(**id, now)
+                    .is_some_and(|ready| ready > threshold)
+            })
+            .count()
+    }
+
     /// How many times that stream's ranges were declared lost.
     pub(crate) fn stream_retransmits(&self, stream: u32) -> u32 {
         self.streams

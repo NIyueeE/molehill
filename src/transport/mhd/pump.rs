@@ -467,8 +467,18 @@ pub(crate) fn spawn(
         #[cfg(not(target_os = "linux"))]
         let mut batch = ();
         let mut staging = Staging::new();
+        // Once a second the pump asks the question a reader cannot answer about
+        // itself: are there streams with bytes waiting and nobody polling them?
+        let mut starve_check = std::time::Instant::now();
         loop {
             staging.clear();
+            if starve_check.elapsed() >= std::time::Duration::from_secs(1) {
+                starve_check = std::time::Instant::now();
+                let now = std::time::Instant::now();
+                let n = shared
+                    .with(|conn| conn.starved_streams(now, std::time::Duration::from_secs(1)));
+                crate::transport::stats::note_starved_streams(n);
+            }
             let sent = match flush(&socket, peer, &shared, &mut staging).await {
                 Ok(sent) => sent,
                 Err(e) => {
