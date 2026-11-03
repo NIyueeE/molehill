@@ -461,11 +461,20 @@ something it did not before.
 | the pairing's p99 | 19–23 ms | **7.6 ms** |
 | `churn-16` p99 | 21.95 | **10.27** |
 | `churn-16` p50 | 2.93 | 3.71 |
-| wakes per arrival | ~10 | to be re-read |
+| wakes per arrival | ~10 | **1.0** |
 
-The four instruments from the previous stage still apply, and the next reading
-should confirm the wake count fell: if it is still ten, the claim is not being
-hit for most channels and `claimed`/`shared` in the per-second line will say so.
+The claim is hit for essentially every channel (`claimed=3581 shared=0` in a
+second), and removing the blanket notify that still fired on a claimed delivery
+took the wakes per arrival from ten to one. **That change bought no latency** —
+a paired A/B reads p99 9.74 against 9.65 and p50 3.73 against 3.73 — so it is
+kept for the work it removes, not as a latency claim.
+
+**The median is now the target.** It is the true cost of one channel: 2.1 ms of
+client-side work (the per-stream Noise handshake and the prologue) plus transit,
+and it is what Stage 3 attacks. The tail that remains — p99 9.7 against a p50 of
+3.7 — is the same shape as before on a quarter of the base, and the next
+instrument for it is the one already built: `cmd_us` and `open_us` per window,
+now read against a pairing that no longer waits for a lottery.
 
 ### Stage 3 — no per-visitor Noise handshake (latency)
 
