@@ -45,6 +45,13 @@
 //! one, so the guard against an unauthenticated flood is a separate budget
 //! (see [`pump`]), not a handshake.
 
+// The per-stream key the lane's handshake makes possible. Compiled for the
+// tests that pin its properties and not yet for the daemons: the wire that says
+// "this stream is sealed" is the next change, and a cipher with no caller is a
+// shape the lints refuse — rightly, because it would be a key schedule nothing
+// uses.
+#[cfg(test)]
+pub(crate) mod cipher;
 pub(crate) mod conn;
 pub(crate) mod lane;
 pub(crate) mod pump;
