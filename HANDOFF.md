@@ -683,24 +683,33 @@ first one that is not a trade against itself.**
 per bit, with *fewer* cores busy — the signature of a stall on top of a per-byte
 cost, not of crypto alone. Both are named below.
 
-### What is left before this can land
+### What is left before this can land (2026-11-03)
 
-1. **The striped 8 MiB echo still ends early**, and its growth heuristic reports
-   1.3–3.4 s stalls before it does. The most likely cause is now visible in the
-   arithmetic: the stripe layer hands a stream a record of up to
-   `MAX_STREAM_PAYLOAD` (1 400) bytes, and a sealed packet carries
-   `MAX_SEALED_PAYLOAD` (1 384) — so a full frame needs **two** packets, and if
-   the second is not emitted the frame never completes and the writer parks.
-   Check: count packets whose payload equals `MAX_SEALED_PAYLOAD` against packets
-   smaller than it; a stream that only ever sends the first kind is a stream whose
-   tail never goes out.
-2. **The stall that halves the bulk** is very probably the same one.
-3. **One copy per received packet** (`Cow::Owned`) is still there. Removing it is
-   worth doing but cannot explain a two-thirds loss on its own.
+The patch is v9 (`~/tmp/stage3-wiring-v9.patch`, 937 lines) and it now carries two
+tests that refute the arithmetic hypotheses this file proposed:
 
-**Verdict so far: the design is right and the implementation is not finished.**
-The next round attacks the striped stall; the measurement above is what makes it
-worth the round.
+- `a_sealed_stream_sends_the_tail_of_an_oversized_payload` — a 1 400-byte record
+  on a sealed stream **does** go out as two packets, tail included.
+- `a_sealed_stream_carries_eight_mebibytes` — 8 MiB crosses one sealed stream,
+  byte for byte, in process, with no stripes and no sockets. **It passes.**
+
+So neither the "tail never emitted" theory nor "the volume itself stalls" is true.
+Whatever kills the striped echo needs the real topology: the striped 8 MiB echo
+still ends early, and its own trace says **the visitor→backend direction
+finished after 257 frames** while the reader side closed at a frame boundary.
+
+That sentence is the next instrument's target: 257 frames is far short of the
+transfer, so the client's *send* direction stopped reading the visitor, and the
+question is why — a stalled write into the sealed stream would do it, and the
+`mhd stalled` line (credit-blocked, `unsent_ms`) is the one that would say so. It
+has not been seen yet in any run of this patch, which itself is information: if
+the writer is not blocked, the client stopped reading for another reason and the
+forwarding loop's own end conditions are where to look.
+
+**Do not re-derive the crypto.** It is correct under load (`unsealed_tags = 0` at
+~200 000 sealed packets a second) and it delivers the arrival (p50 −38 %, p99
+−63 %, rate +82 %, the handshake 1 771 µs → 14). What stands between this and a
+landable change is one striped transfer, and the two failures below.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
