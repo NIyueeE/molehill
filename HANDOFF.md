@@ -711,33 +711,40 @@ forwarding loop's own end conditions are where to look.
 −63 %, rate +82 %, the handshake 1 771 µs → 14). What stands between this and a
 landable change is one striped transfer, and the two failures below.
 
-### The striped failure is a race, not a limit (2026-11-03, round 14)
+### Two switches isolate the striped defect to "sealing **and** stripes" (2026-11-03)
 
-Patch v10 is outside the tree. One measurement this round, and it changes the
-shape of the problem: the striped 8 MiB echo's failure point **moves** — 0.36 MB,
-2.2 MB, 3.6 MB, 4.5 MB and **7.8 MB** across runs of one build. It is not a size
-the carrier cannot pass; it is a race that usually loses.
+Two one-line experiments on the patched tree, each a single test run:
 
-Everything around it stays clean in every one of those runs: `unsealed_tags = 0`,
-`no_key = 0`, no refused datagrams, no `mhd stalled` line, and the close is a
-clean EOF rather than a reset. The stripe trace adds the one asymmetry worth
-following: the plan **grows to seven stripes** mid-transfer, on stalls of 1.3–3.4
-seconds, and the growth path is the only part of the striped design that adds and
-removes members *while* a transfer runs.
+| experiment | result |
+|---|---|
+| **growth frozen** (`STRIPE_BACKPRESSURE` = 1 h, so the plan never grows) | still fails, at 465 920 of 8 388 608 |
+| **sealing off** (`set_lane_root` a no-op, every other change in place) | **passes** |
 
-So the next round's target is the growth path, and the instrument is the one this
-round added and did not get to read: a byte total beside the frame count in
-`stripe send direction finished`. A direction that finishes at 900 000 bytes while
-the peer saw 8 MiB is a lost tail; one that finishes at 8 MiB is a loss on the
-reader side.
+So the growth path — the only part of the striped design that adds and removes
+members mid-transfer, and the previous round's prime suspect — is **not** the
+cause. Sealing is, and it needs the stripe layer to show: an in-process 8 MiB
+transfer over **one** sealed stream passes, and `bulk-1` over real sockets (one
+stream per visitor) runs at 2.1 Gbit/s without closing. The defect appears only
+when a **group of several sealed streams** carries one transfer.
 
-Two smaller items are recorded in the patch and worth keeping:
+That is as narrow as the problem has ever been stated, and it names the next
+instrument: a stripe group of **two** sealed streams in process — the layer's own
+`spawn_group` test, with `Conn`s behind the duplexes instead of bare streams. If
+it reproduces there, the cause is inside the layer's frame distribution across
+sealed streams and can be bisected without sockets; if it does not, the sockets
+are part of it and the next step is the run builder's segmentation of
+differently-sized packets.
 
-- an in-process test for 8 MiB on **one** sealed stream, which passes — so the
-  carrier's sealed path carries the volume, and the defect needs the stripe layer;
-- a `#[expect(clippy::too_many_lines)]` on `transmit_stream` with the reason
-  stated: its decision (which stream, how much, sealed or not) must stay one
-  sequence because the length and the seal have to agree.
+**Where the whole stage stands**, since five rounds have gone into it:
+
+- the cipher is correct under load, with a proof in tests and `unsealed_tags = 0`
+  at ~200 000 sealed packets a second;
+- it delivers the arrival: `churn-16` p50 2.30 ms (from 3.71), p99 3.59 (from
+  9.74), rate 6 463/s (from 3 545), handshake 14 µs (from 1 771);
+- it costs two thirds of `bulk-1`, of which **one copy per received packet is
+  removable** and the rest is the seal itself;
+- and one striped transfer still dies, isolated this round to "sealing **and**
+  stripes together".
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
