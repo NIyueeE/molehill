@@ -367,6 +367,8 @@ fn take_open_handshake() -> Vec<u32> {
 /// only say "the visitor was not served". One counter per reason turns that into
 /// a sentence — and this is what a sealed-stream defect needed and did not have.
 static REJECT_MALFORMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REJECT_MALFORMED_DECODE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REJECT_MALFORMED_LANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REJECT_OVER_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REJECT_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -374,6 +376,8 @@ static REJECT_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub(crate) fn note_rejected(reason: &str) {
     let counter = match reason {
         "malformed" => &REJECT_MALFORMED,
+        "malformed_decode" => &REJECT_MALFORMED_DECODE,
+        "malformed_lane" => &REJECT_MALFORMED_LANE,
         "over_window" => &REJECT_OVER_WINDOW,
         _ => &REJECT_UNKNOWN,
     };
@@ -577,12 +581,18 @@ fn report() {
         );
     }
     let malformed = REJECT_MALFORMED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let malformed_decode = REJECT_MALFORMED_DECODE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let malformed_lane = REJECT_MALFORMED_LANE.swap(0, std::sync::atomic::Ordering::Relaxed);
     let over_window = REJECT_OVER_WINDOW.swap(0, std::sync::atomic::Ordering::Relaxed);
     let unknown = REJECT_UNKNOWN.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if malformed + over_window + unknown > 0 {
+    if malformed + malformed_decode + malformed_lane + over_window + unknown > 0 {
         info!(
             malformed,
-            over_window, unknown, "mhd-stats: datagrams refused, by reason"
+            malformed_decode,
+            malformed_lane,
+            over_window,
+            unknown,
+            "mhd-stats: datagrams refused, by reason"
         );
     }
     let claimed = CLAIMED.swap(0, std::sync::atomic::Ordering::Relaxed);

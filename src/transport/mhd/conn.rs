@@ -1487,9 +1487,17 @@ impl Conn {
     /// The body of [`Conn::on_datagram`], with this datagram's sampling decision.
     fn apply_datagram(&mut self, now: Instant, buf: &[u8], sampled: bool) -> Result<(), Rejected> {
         let decode = stats::Timing::start(sampled);
-        let packet = wire::decode(buf).map_err(|_| Rejected::Malformed)?;
+        // Two different defects hide behind one word, so they are counted apart:
+        // a datagram this end cannot frame at all, and one framed for another
+        // lane. A run that logs a couple of either every second is not healthy,
+        // and which of the two it is decides where to look.
+        let packet = wire::decode(buf).map_err(|_| {
+            stats::note_rejected("malformed_decode");
+            Rejected::Malformed
+        })?;
         decode.stop(&stats::PHASES.decode);
         if packet.id != self.id {
+            stats::note_rejected("malformed_lane");
             return Err(Rejected::Malformed);
         }
         if self.closed.is_some() {

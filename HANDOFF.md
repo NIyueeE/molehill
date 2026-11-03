@@ -904,52 +904,41 @@ across the `loss5 → rate100` boundary. If `cwnd` is pinned at a few kilobytes 
 `slow_start` is false, Stage 5's first half (re-arm growth after an idle or
 loss-free period) is the fix and it is local to `recovery.rs`/`conn.rs`.
 
-### The lost cells are a drain that expired, and nothing acted on it (2026-11-03)
+### Retraction: the drain expired on the churn probe's sockets, not on a backlog (2026-11-03)
 
-The stage-level retry (added this round, `_one_stage`) fired on all four missing
-cells and **all four failed again**, which settles the question the last round left
-open: it is not an intermittent instrument. The retry's own evidence then named the
-cause, and it is in the schedule rather than in any one stage:
+The previous entry read `drain_expired` as "the carrier left a backlog the drain
+could not clear". **That was wrong**, and the code says so plainly: `drain`'s
+predicate is a small queue **and no send-capable socket**, and the timeline runs
+the churn probe for the whole schedule. There are therefore always `ESTAB` sockets
+on a service port while churn runs, so `drain_expired` is *structural* in the
+timeline and says nothing about the arm. `drain_final_backlog` also reads ~500
+packets on stages that passed, so that number is the ordinary state of a busy leg,
+not a tail.
 
-| stage | condition | `drain_s` | `drain_expired` | backlog after the drain | outcome |
-|---|---|---|---|---|---|
-| `clean` | clean | 0.44 | no | 0 | measured, 4 Gbit/s |
-| `rtt100` | rtt100 | 2.05 | no | 498 | measured |
-| `loss1` | loss1 | **60.26** | **yes** | **106** | measured |
-| `loss5` | loss5 | 29.05 | no | 498 | measured |
-| `rate100` | rate100 | 48.84 | no | 524 | **failed, twice** |
-| `rate20` | rate20 | 35.71 | **yes** | 392 | **failed, twice** |
-| `jitter` | jitter | 32.85 | no | 402 | **failed, twice** |
-| `clean#2` | **clean** | **0.46** | no | **0** | **failed, twice** |
+What survives from that round, and matters: the **retry fired on all four missing
+cells and all four failed again**, so the loss is deterministic within a run. And
+the sink of `clean#2` shows it directly — on a **clean** leg, four streams
+established and **zero bytes for the whole stage**, in a run whose first `clean`
+stage carried 4 Gbit/s.
 
-Two facts in that table cannot both be about the stages that failed:
+### `malformed` was real, and it is the UDP probe crossing the lane (2026-11-03)
 
-1. **`clean#2` failed on a clean leg with a 0.46 s drain and an empty backlog.** A
-   stage whose path is clean and whose drain is instant cannot be a carrier stall:
-   the *first* `clean` stage on the same path, in the same run, carried 4 Gbit/s.
-2. Every stage after `loss1` began after a **30–60 s** drain, one of which
-   **expired** — `loss1` left 106 packets queued and the harness gave up waiting
-   and measured the next stage anyway.
+The refusal counter, which this file has twice said reads zero on a healthy run,
+reads **2–6 per second** through a whole timeline. It was one number for two
+different checks, so it was split this round — and the split answers it:
 
-So the mechanism is: `loss1` leaves a backlog the drain cannot clear in its budget,
-`drain_expired` records that the harness gave up, **and nothing acts on it**. Every
-later stage then begins against a leg still carrying the previous stage's tail, and
-its `iperf3` client dies waiting for a flow that cannot get through. The summary
-reports those as failures of the *arm*.
+| run | `malformed_decode` | `malformed_lane` |
+|---|---|---|
+| `churn-16` (no UDP probe) | **0** | 0 |
+| `timeline` (UDP probe running) | 2–6 /s | rare, 1 in one window |
 
-**Two real defects, one in each layer:**
+A datagram on a lane's own socket that cannot be framed, only while the UDP probe
+runs, is the UDP probe's traffic arriving where the lane's decoder reads it. The
+counter is telling the truth about a shared port, not about a broken lane.
 
-- **The carrier's**, and it is the interesting one: after a 1 % loss stage the send
-  buffer still held a backlog past a 60-second drain. That is the same ground as
-  Stage 3 (RACK/PTO) and Stage 5 (a window that only grows): a tail that never
-  clears is a recovery defect, not a harness one.
-- **The harness's**: `drain_expired` is recorded and unused. A stage measured
-  against a leg whose drain expired is not a measurement of that stage, and the gate
-  should refuse to judge it rather than count it as the arm's failure — while the
-  *expiry itself* is a finding about the arm and must be reported as one.
-
-**Do not** simply lengthen the drain budget: 60 s is already longer than the stage
-it precedes, and a longer budget hides the carrier defect behind a slower schedule.
+**So the counter needs a third home**: traffic that is not ours must not be counted
+as a refusal of ours, or every future run reads a defect that is not there. Until
+it has one, a run's `malformed_decode` is evidence only when the UDP probe is off.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
