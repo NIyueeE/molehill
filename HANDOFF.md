@@ -400,15 +400,47 @@ client's `ready_us` starts when that task is first polled, so a command that
 waited in the control loop's own queue is invisible — and the loop is a single
 task that reads, decodes, places and spawns, at four thousand commands a second.
 
-### What this changes about the plan
+### The mechanism: a lottery over a shared queue (2026-11-03)
 
-The arrival is one serial loop away from being understood: stamp the dequeue and
-carry the instant into the open, then `ready_us` becomes `cmd_us` and the last
-gap closes. If the control loop is the bottleneck, the fix is structural and
-worth naming now: **a control command must not be handled by the same task that
-reads the next one** — either a second task that owns the command dispatch, or
-(depending on what the number says) placing the channel without the placement
-lock the loop currently takes.
+The last interval is now measured too. On the client, from the control command
+leaving the loop to the tunnel prologue being written — the whole client-side
+path, including the open — is **2.1 ms at the median, 5.3 at p99 and 7.3 at
+worst** across a second. Add the control trip (132 µs), the server's accept
+(16 µs), its routing, the reader park (0.75 ms at p99) and the command write
+(2 µs), and the *entire* path from a visitor's accept to a channel sitting in the
+queue is **under eight milliseconds even at its worst**.
+
+The pairing it feeds reports 23 ms at p99. **The wait is larger than everything
+in the path it is waiting for**, which leaves one explanation, and the counters
+say so directly: a pairing parks ~37 000 times a second against ~3 600 arrivals —
+**ten wakes per arrival**. `ChannelQueue::push` calls `notify_waiters`, so every
+channel wakes every parked pairing and exactly one of them wins. A visitor's wait
+is therefore the number of times it loses a lottery with nine other waiters: the
+median waits ~5 draws (1.7 ms) and the unlucky hundredth waits ~100 (23 ms), at
+3 000 arrivals a second. That is the measured shape, and the arithmetic closes.
+
+**So the identity work was right about the defect and wrong about the path.** A
+visitor's channel on an `mhd` lane is a *direct* stream, and it reaches the queue
+through `push` — counted as `pooled=0 direct=5 770` in one round. The group id
+I put in the tunnel prologue only rides the multiplexed path, which an mhd lane
+never takes, which is why its A/B measured nothing.
+
+### What this fixes, and the shape of the change
+
+The fix is the one already built, applied to the path mhd actually uses: a
+channel must go to **one** waiter, not to all of them.
+
+1. The direct channel's prologue grows from four bytes to eight: the service, and
+   the stripe group that asked for it (zero for a plain visitor).
+2. `route_mhd_stream` delivers through the same claim the pairing registers, so a
+   channel wakes exactly the pairing that named it and nobody else.
+3. The shared queue stays as the fallback for a plain visitor and for a channel
+   whose group has given up.
+
+- **Gate**: the pairing's p99 falls toward the client's own path (≈7 ms), the
+  wakes per arrival falls toward one, and `bulk-n` is inside 15 %.
+- **Revert**: no movement beyond the run's floor.
+- **Test first**: a channel wakes one pairing; the others stay parked.
 
 ### Stage 3 — no per-visitor Noise handshake (latency)
 

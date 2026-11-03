@@ -1470,7 +1470,7 @@ impl tokio::io::AsyncWrite for TunnelStream {
 #[cfg(feature = "multiplex")]
 #[derive(Default)]
 struct ChannelStats {
-    samples: std::sync::Mutex<Vec<(u32, u32)>>,
+    samples: std::sync::Mutex<Vec<(u32, u32, u32)>>,
 }
 
 /// The most channel openings one reporting window keeps.
@@ -1479,17 +1479,17 @@ const CHANNEL_WINDOW_MAX: usize = 65_536;
 
 #[cfg(feature = "multiplex")]
 impl ChannelStats {
-    fn note(&self, open_us: u32, ready_us: u32) {
+    fn note(&self, open_us: u32, ready_us: u32, cmd_us: u32) {
         let mut samples = self
             .samples
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if samples.len() < CHANNEL_WINDOW_MAX {
-            samples.push((open_us, ready_us));
+            samples.push((open_us, ready_us, cmd_us));
         }
     }
 
-    fn drain(&self) -> Vec<(u32, u32)> {
+    fn drain(&self) -> Vec<(u32, u32, u32)> {
         let mut samples = self
             .samples
             .lock()
@@ -1523,10 +1523,12 @@ fn channel_stats() -> &'static std::sync::Arc<ChannelStats> {
                 if samples.is_empty() {
                     continue;
                 }
-                let mut open: Vec<u32> = samples.iter().map(|(o, _)| *o).collect();
-                let mut ready: Vec<u32> = samples.iter().map(|(_, r)| *r).collect();
+                let mut open: Vec<u32> = samples.iter().map(|(o, _, _)| *o).collect();
+                let mut ready: Vec<u32> = samples.iter().map(|(_, r, _)| *r).collect();
+                let mut cmd: Vec<u32> = samples.iter().map(|(_, _, c)| *c).collect();
                 open.sort_unstable();
                 ready.sort_unstable();
+                cmd.sort_unstable();
                 info!(
                     n = samples.len(),
                     open_p50_us = crate::transport::stats::pct_us(&open, 50, 100),
@@ -1535,6 +1537,9 @@ fn channel_stats() -> &'static std::sync::Arc<ChannelStats> {
                     ready_p50_us = crate::transport::stats::pct_us(&ready, 50, 100),
                     ready_p99_us = crate::transport::stats::pct_us(&ready, 99, 100),
                     ready_max_us = ready.last().copied().unwrap_or(0),
+                    cmd_p50_us = crate::transport::stats::pct_us(&cmd, 50, 100),
+                    cmd_p99_us = crate::transport::stats::pct_us(&cmd, 99, 100),
+                    cmd_max_us = cmd.last().copied().unwrap_or(0),
                     "client data channel, open to prologue"
                 );
             }
@@ -1550,6 +1555,7 @@ async fn run_mux_data_channel(
     tunnel: &Tunnels,
     stripe: Option<StripeOpen>,
     started_us: u64,
+    queued_at: std::time::Instant,
 ) -> Result<()> {
     // When the open itself began, so the wait can be split: the client's own open
     // and its write of the prologue happen before the server can see the channel,
@@ -1582,6 +1588,9 @@ async fn run_mux_data_channel(
     let group = stripe.map_or(0, |request| request.group);
     write_tunnel_prologue(&mut stream, args.service_id, tunnel, group).await?;
     let ready_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+    // From the command leaving the control loop to the prologue being written:
+    // the only interval in an arrival that no other instrument covers.
+    let cmd_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
     // Five milliseconds, behind the stats switch, exactly like the server's
     // pairing line — and with the group id, because that is the only way the two
     // ends' numbers can be matched event for event instead of by magnitude. A
@@ -1590,12 +1599,16 @@ async fn run_mux_data_channel(
     // own.
     if crate::transport::stats::enabled() {
         let clamp = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
-        channel_stats().note(clamp(open_us), clamp(ready_us));
+        channel_stats().note(clamp(open_us), clamp(ready_us), clamp(cmd_us));
     }
     if ready_us >= 5_000 && crate::transport::stats::enabled() {
         info!(
             group,
-            started_us, open_us, ready_us, "mhd client slow data channel: schedule, open, prologue"
+            started_us,
+            open_us,
+            ready_us,
+            cmd_us,
+            "mhd client slow data channel: schedule, open, prologue, command"
         );
     }
     // The channel belongs to one tunnel now: the client's UDP pin accounting
@@ -2807,6 +2820,14 @@ fn spawn_data_channel(
         )
     )]
     stripe: Option<StripeOpen>,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "without the multiplex feature the data plane is always direct"
+        )
+    )]
+    queued_at: std::time::Instant,
 ) {
     #[cfg(feature = "multiplex")]
     let tunnel = tunnel.cloned();
@@ -2835,7 +2856,7 @@ fn spawn_data_channel(
             let res = {
                 #[cfg(feature = "multiplex")]
                 match tunnel {
-                    Some(t) => run_mux_data_channel(&args, &t, stripe, started_us).await,
+                    Some(t) => run_mux_data_channel(&args, &t, stripe, started_us, queued_at).await,
                     None => run_data_channel(args).await,
                 }
                 #[cfg(not(feature = "multiplex"))]
@@ -3684,7 +3705,7 @@ impl LanePool {
             })
         });
         if let Some(args) = args {
-            spawn_data_channel(args, None, None);
+            spawn_data_channel(args, None, None, std::time::Instant::now());
         }
     }
 }
@@ -3729,18 +3750,22 @@ fn open_channels(active: &ActiveService, count: usize) {
     // what makes that spread structural rather than a property of the pool's
     // current size (D24).
     for _ in 0..count {
-        open_data_channel(active, None);
+        open_data_channel(active, None, std::time::Instant::now());
     }
 }
 
 /// Open one data channel for a service, as a stripe of a named group when the
 /// server asked for one.
-fn open_data_channel(active: &ActiveService, stripe: Option<StripeOpen>) {
+fn open_data_channel(
+    active: &ActiveService,
+    stripe: Option<StripeOpen>,
+    queued_at: std::time::Instant,
+) {
     #[cfg(feature = "multiplex")]
     let tunnel = active.tunnel.as_ref();
     #[cfg(not(feature = "multiplex"))]
     let tunnel = None;
-    spawn_data_channel(active.args.clone(), tunnel, stripe);
+    spawn_data_channel(active.args.clone(), tunnel, stripe, queued_at);
 }
 
 /// One endpoint's control session: the connection, its command loop, and every
@@ -3943,13 +3968,18 @@ impl ClientSession {
                     // A visitor needs a channel for that service.
                     ControlChannelCmd::CreateDataChannelFor(id) => {
                         debug!(%id, "client asked for a data channel");
-                        self.open_channel(id);
+                        // Stamped here, not in the task: everything the client
+                        // reports starts at that task's first poll, so a command
+                        // that waited in this loop is otherwise invisible — and
+                        // this loop is one task doing decode, placement and
+                        // spawn at four thousand commands a second.
+                        self.open_channel(id, std::time::Instant::now());
                     }
                     // A visitor's stripe group: the group is known, so the
                     // channel can be placed on a tunnel of its own (D24).
                     ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
                         debug!(%id, group = %hex::encode(group), index, count, "client asked for a stripe");
-                        self.open_stripe_channel(id, group, index, count);
+                        self.open_stripe_channel(id, group, index, count, std::time::Instant::now());
                     }
                     // The server will never forward that group: the stripes
                     // parked for it are capacity nobody can use.
@@ -4388,9 +4418,11 @@ impl ClientSession {
                 return read_register_result(rd).await;
             }
             match read_control_cmd(rd, &mut frame).await? {
-                ControlChannelCmd::CreateDataChannelFor(id) => self.open_channel(id),
+                ControlChannelCmd::CreateDataChannelFor(id) => {
+                    self.open_channel(id, std::time::Instant::now());
+                }
                 ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
-                    self.open_stripe_channel(id, group, index, count);
+                    self.open_stripe_channel(id, group, index, count, std::time::Instant::now());
                 }
                 ControlChannelCmd::ReleaseStripedGroup(id, group) => {
                     self.release_stripe_group(id, group);
@@ -4773,8 +4805,8 @@ impl ClientSession {
     }
 
     /// One visitor arrived: hand the server one more channel for that service.
-    fn open_channel(&self, id: ServiceId) {
-        self.open_placed_channel(id, None);
+    fn open_channel(&self, id: ServiceId, queued_at: std::time::Instant) {
+        self.open_placed_channel(id, None, queued_at);
     }
 
     /// The server asked for one stripe of a named group
@@ -4783,7 +4815,14 @@ impl ClientSession {
     ///
     /// A command whose metadata contradicts itself is a wire error, not a
     /// channel to open: it is refused here, where nothing has been placed yet.
-    fn open_stripe_channel(&self, id: ServiceId, group: [u8; 4], index: u8, count: u8) {
+    fn open_stripe_channel(
+        &self,
+        id: ServiceId,
+        group: [u8; 4],
+        index: u8,
+        count: u8,
+        queued_at: std::time::Instant,
+    ) {
         if count == 0 || index >= count {
             debug!(
                 "Ignoring a stripe request for group {group:02x?} that claims stripe {index} of \
@@ -4800,7 +4839,7 @@ impl ClientSession {
         });
         #[cfg(not(feature = "multiplex"))]
         let stripe = None;
-        self.open_placed_channel(id, stripe);
+        self.open_placed_channel(id, stripe, queued_at);
     }
 
     /// The server gave up on a stripe group before forwarding it
@@ -4820,7 +4859,12 @@ impl ClientSession {
     }
 
     /// Open one data channel for a service the server asked about.
-    fn open_placed_channel(&self, id: ServiceId, stripe: Option<StripeOpen>) {
+    fn open_placed_channel(
+        &self,
+        id: ServiceId,
+        stripe: Option<StripeOpen>,
+        queued_at: std::time::Instant,
+    ) {
         let Some(entry) = self.services.get(&id) else {
             debug!("The server asked for a data channel for unknown service {id}");
             return;
@@ -4844,7 +4888,7 @@ impl ClientSession {
                     );
                     return;
                 }
-                open_data_channel(active, stripe);
+                open_data_channel(active, stripe, queued_at);
             }
             ServiceState::Rejected => {
                 debug!("Ignoring a data channel request for rejected service {id}");
