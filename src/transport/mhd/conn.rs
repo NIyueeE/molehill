@@ -581,12 +581,9 @@ impl Conn {
         // (measured as one connection in a hundred arriving 0.85-4.1 s late).
         // Below this age, the oldest data packet is always younger than
         // [`MIN_RTO`], so a firing means a real hole and not a deep queue.
-        // The gate is about **this stream's** flight: a packet of another stream
-        // outliving the timer says nothing about the bytes being written here, and
-        // applying the connection-wide age let one parked visitor freeze the lane.
         let aged = self
             .recovery
-            .oldest_data_age_of(stream, Instant::now())
+            .oldest_data_age(Instant::now())
             .is_some_and(|age| age >= self.recovery.current_rto());
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
