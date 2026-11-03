@@ -414,6 +414,26 @@ pub(crate) fn note_shared() {
     SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Visitors that arrived, and pairings that finished, per second.
+///
+/// The gap between them is the state no other instrument can see: a pairing that
+/// never returns records neither `paired_us` (which only samples the ones that
+/// complete) nor `unfed` (which only fires once its attempts are exhausted). While
+/// it waits, the visitor's socket is not read, so its sender sees a shut window
+/// for the whole stage.
+static VISITORS_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAIRINGS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one visitor that reached the pairing.
+pub(crate) fn note_visitor_accepted() {
+    VISITORS_ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one pairing that returned, either way.
+pub(crate) fn note_pairing_done() {
+    PAIRINGS_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Stripe groups the client gave up on, and pairings the server gave up on.
 ///
 /// Both ends of the same failure: a group that never gathered every stripe on the
@@ -595,6 +615,14 @@ fn report_phases() {
 /// Its own function because it answers one question and `report` is already at the
 /// length the lint allows.
 fn report_starvation() {
+    let accepted = VISITORS_ACCEPTED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let paired = PAIRINGS_DONE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if accepted > 0 {
+        info!(
+            accepted,
+            paired, "mhd-stats: visitors that reached the pairing, and pairings that returned"
+        );
+    }
     let reaped = STRIPES_REAPED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let unfed = PAIRINGS_UNFED.swap(0, std::sync::atomic::Ordering::Relaxed);
     if reaped + unfed > 0 {

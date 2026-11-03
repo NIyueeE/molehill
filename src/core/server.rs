@@ -4137,6 +4137,7 @@ async fn serve_tcp_visitor<C>(
     // tail"). The start width is the internal measurement override
     // (`initial_stripes`), 1 in production.
     let target = crate::stripe::initial_stripes();
+    crate::transport::stats::note_visitor_accepted();
     // A multi-stripe start is atomic only for tests and measurements that ask
     // for one: hold the group lock so two such pairings cannot interleave their
     // K channels. Production's one-channel pairing takes one item from the
@@ -4162,6 +4163,7 @@ async fn serve_tcp_visitor<C>(
     {
         debug!("Striped pairing failed: {e:#}");
     }
+    crate::transport::stats::note_pairing_done();
 }
 
 /// Pair one visitor connection with its data channels and start the group's
