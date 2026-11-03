@@ -656,6 +656,43 @@ counted, no key failure. Two candidates, in order:
 Both are visible in one run with the existing `mhd stalled` line and a counter for
 `pending_fins` drained against `ends_at` firings.
 
+### The price of sealing, measured — and it is not affordable yet (2026-11-03)
+
+The patch's first end-to-end numbers, `smoke` profile, `l4` arm, sealing on:
+
+| cell | with sealing | baseline | |
+|---|---|---|---|
+| `bulk-1` throughput | **2.04 Gbit/s** | 5.5–6.5 | **−65 %** |
+| `rr-1` p50 / p99 | 0.112 / 0.151 ms | 0.098 / 0.130 | parity |
+| `rr-16` p50 / p99 | 0.507 / 1.151 ms | 0.463 / 1.347 | parity |
+| `udp-pace` | no failures | | |
+
+**The latency goal would be met and the throughput gate would be missed.** A
+sealed stream's open costs microseconds instead of 1 771 — which is the whole
+point — and `bulk-1` loses two thirds of its throughput doing it. The objective's
+order is latency first, but `bulk-n` inside 15 % is a *gate*, so this version
+cannot ship as it stands.
+
+Where the 65 % goes, before anyone builds more on it:
+
+- **A copy per received packet.** `open_stream_payload` returns `Cow::Owned` for
+  every sealed packet (`data.to_vec()`), so the receive path copies each payload
+  before it reaches the stream buffer — exactly the cost the pooled-block design
+  removed. Opening **in place** into the receive buffer is the fix that does not
+  change the wire at all.
+- **A seal per sent packet**, which is one ChaCha20-Poly1305 pass over 1 384 bytes
+  and cannot be removed — only made cheaper (a larger payload per packet would
+  amortise the tag, which the frame already allows).
+
+And the striped defect is unchanged: the group's growth heuristic reports stalls
+of 1.3–3.4 s, grows the plan to seven stripes, and the echo ends at a frame
+boundary. That is very likely the same stall that shows up as lost throughput.
+
+**So stage 3's next step is not another feature — it is to make this one cheaper
+than the handshake it replaces.** In order: open in place (no copy), then measure
+`bulk-1` again; if it is still far below baseline, the seal itself is the cost and
+the design has to be reconsidered rather than tuned.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
