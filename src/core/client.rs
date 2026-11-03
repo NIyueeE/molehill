@@ -1464,16 +1464,24 @@ async fn run_mux_data_channel(
     args: &Arc<RunDataChannelArgs>,
     tunnel: &Tunnels,
     stripe: Option<StripeOpen>,
+    started_us: u64,
 ) -> Result<()> {
     // When the open itself began, so the wait can be split: the client's own open
     // and its write of the prologue happen before the server can see the channel,
     // and a visitor's wait that is spent here is a different fix from one spent
     // after the prologue.
     let opening = std::time::Instant::now();
+    // `open_us` covers what the lane's own line does not: the pool's placement
+    // (a lock over the group's record, then the tunnel order) *and* the lane's
+    // open. A visitor whose channel is slow in placement and one whose channel is
+    // slow in the handshake look identical from the server, and only these two
+    // numbers tell them apart.
+    let stream_opening = std::time::Instant::now();
     let mut stream = match stripe {
         Some(request) => open_stripe_stream(args, tunnel, request).await?,
         None => tunnel.open_stream().await?,
     };
+    let open_us = u64::try_from(stream_opening.elapsed().as_micros()).unwrap_or(u64::MAX);
     trace!("Multiplexed data channel opened");
     // A v4 tunnel belongs to the session, so each of its streams names the
     // service it carries: the server reads these bytes before its forwarding
@@ -1485,8 +1493,17 @@ async fn run_mux_data_channel(
         crate::protocol::TunnelId::new(u32::try_from(stream.tunnel_id()).unwrap_or(u32::MAX));
     write_tunnel_prologue(&mut stream, args.service_id, tunnel).await?;
     let ready_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
-    if ready_us >= 100_000 {
-        debug!(ready_us, "data channel was slow from open to prologue");
+    // Five milliseconds, behind the stats switch, exactly like the server's
+    // pairing line — and with the group id, because that is the only way the two
+    // ends' numbers can be matched event for event instead of by magnitude. A
+    // hundred milliseconds here reported nothing on a cell whose whole tail is
+    // twenty, which is how the handshake kept the blame for a wait it did not
+    // own.
+    if ready_us >= 5_000 && crate::transport::stats::enabled() {
+        info!(
+            group = stripe.map(|request| request.group),
+            started_us, open_us, ready_us, "mhd client slow data channel: schedule, open, prologue"
+        );
     }
     // The channel belongs to one tunnel now: the client's UDP pin accounting
     // keys on the channel, so a peer's route can move a tunnel's pinned count.
@@ -2704,17 +2721,28 @@ fn spawn_data_channel(
     // not scheduled for a second is a runtime that is saturated, and the wait is
     // otherwise attributed to the carrier — which is why it is measured here,
     // where the spawn happens, and not inside the open.
+    //
+    // It is handed to the open so that the three waits a visitor can pay are one
+    // line and not three: `started_us` is spawn to first poll, `open_us` is the
+    // pool's placement plus the lane-level open, and `ready_us` is the whole of
+    // it through the prologue. At a hundred milliseconds each of them reported
+    // nothing on a cell whose tail is twenty — the same four-times-too-coarse
+    // mistake the pairing and opening lines were corrected for — so all three
+    // are now read at five.
     let spawned = std::time::Instant::now();
     tokio::spawn(
         async move {
+            // Only the multiplexed path consumes this: a direct channel has no
+            // pool to place and no prologue to write, so the whole wait it can
+            // pay is the dial itself.
+            #[cfg(feature = "multiplex")]
             let started_us = u64::try_from(spawned.elapsed().as_micros()).unwrap_or(u64::MAX);
-            if started_us >= 100_000 {
-                debug!(started_us, "data channel task waited to be scheduled");
-            }
+            #[cfg(not(feature = "multiplex"))]
+            let _ = spawned;
             let res = {
                 #[cfg(feature = "multiplex")]
                 match tunnel {
-                    Some(t) => run_mux_data_channel(&args, &t, stripe).await,
+                    Some(t) => run_mux_data_channel(&args, &t, stripe, started_us).await,
                     None => run_data_channel(args).await,
                 }
                 #[cfg(not(feature = "multiplex"))]

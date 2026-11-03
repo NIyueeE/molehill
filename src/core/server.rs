@@ -4041,6 +4041,11 @@ where
         );
         let mut gathered: Vec<C> = Vec::with_capacity(stripe_count);
         let mut attempts = 0usize;
+        // When the first channel came out of the queue: the boundary between "no
+        // channel existed yet" (request, client open, this end's arrival path) and
+        // "the command had to go out on one that did". One `paired_us` blamed the
+        // handshake for both — see the log site below.
+        let mut first_take_us: Option<u64> = None;
         loop {
             let next = tokio::select! {
                 _ = stops.shutdown.recv() => None,
@@ -4083,6 +4088,10 @@ where
             let Some(mut ch) = next else {
                 return Ok(true);
             };
+            if first_take_us.is_none() {
+                first_take_us =
+                    Some(u64::try_from(pairing_started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            }
             if write_and_flush(&mut ch, &cmds[gathered.len()])
                 .await
                 .is_ok()
@@ -4108,20 +4117,17 @@ where
         // to a hundred-millisecond threshold, and that is how this cell's tail stayed
         // unattributed through every instrument aimed at it.
         if paired >= std::time::Duration::from_millis(5) && crate::transport::stats::enabled() {
-            // `info!`, like a slow opening, and for the same reason: a line nobody
-            // captures cannot explain the gate that reports the SLO breach.
-            info!(
+            let paired_us = u64::try_from(paired.as_micros()).unwrap_or(u64::MAX);
+            let accept = arrival.accepted_at;
+            let accept_us = u64::try_from(pairing_started.duration_since(accept).as_micros())
+                .unwrap_or(u64::MAX);
+            note_slow_pairing(
                 group,
-                stripes = stripe_count,
+                stripes,
                 attempts,
-                accept_us = u64::try_from(
-                    pairing_started
-                        .duration_since(arrival.accepted_at)
-                        .as_micros()
-                )
-                .unwrap_or(u64::MAX),
-                paired_us = u64::try_from(paired.as_micros()).unwrap_or(u64::MAX),
-                "visitor waited for its data channels"
+                accept_us,
+                first_take_us.unwrap_or(paired_us),
+                paired_us,
             );
         }
         debug!("Visitor paired with a {stripe_count}-stripe group {group}");
@@ -4139,6 +4145,38 @@ where
         );
         return Ok(false);
     }
+}
+
+/// One `INFO` line for a visitor that waited too long for its data channels.
+///
+/// `wait_us` is the request, the client's open and this end's arrival path;
+/// `write_us` is the command going out on a channel that already existed.
+/// Splitting them is what keeps one number from blaming the handshake for a wait
+/// it never owned: on `churn-16` this cell read 1 587 pairings over five
+/// milliseconds against 176 slow client opens, so at least seven in eight of them
+/// were never the open.
+///
+/// `info!` at five milliseconds, like the two other slow-wait lines and behind
+/// the same stats switch: a line nobody captures cannot explain the gate that
+/// reports the SLO breach.
+fn note_slow_pairing(
+    group: u32,
+    stripes: u8,
+    attempts: usize,
+    accept_us: u64,
+    wait_us: u64,
+    paired_us: u64,
+) {
+    info!(
+        group,
+        stripes,
+        attempts,
+        accept_us,
+        wait_us,
+        write_us = paired_us.saturating_sub(wait_us),
+        paired_us,
+        "visitor waited for its data channels"
+    );
 }
 
 /// Group ids for striped visitor connections: wrapping is fine — a group is
