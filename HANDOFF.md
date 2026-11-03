@@ -1139,84 +1139,33 @@ see.
 `clean`'s p99 is separately 2.6× the limit while its p50 is 3.5 ms, so the tail is a
 few very slow arrivals rather than a shift. That is its own instrument's work.
 
-### The age gate is the dominant bound, and scoping it lost (2026-11-03)
+### Retraction: the age gate's refusals were counted wrong (2026-11-03, round 35)
 
-Three bounds can hold a write and only two were ever visible. The third — the gate
-that refuses new data when the oldest packet in flight is older than the
-retransmission timer — now has a variant of its own in `Refusal` and a per-second
-counter. Over one full run:
+The entry that stood here said the age gate refused 4.6 million writes against 0.87
+million by the congestion window, and called it the dominant bound. **That number is
+wrong and is withdrawn.** The label was read back from the previous call's
+`last_refusal`, and `Some(Aged)` short-circuited: once the gate had refused one write,
+every later refusal — on any stream, of any kind — was labelled `Aged`. The counter
+measured "refusals after the first aged one", not the gate.
 
-| bound | writes refused |
-|---|---|
-| congestion window | 866 723 |
-| peer's credit | 327 049 |
-| **the age gate** | **4 641 975** |
+The label is now built for the call it describes, and the gate's own input is logged
+once a second: how many packets the recovery table holds and how old its oldest
+unacknowledged one is. That separates a gate doing its job (a real hole older than the
+timer) from a gate held open by a record nothing will retire — and the first samples
+of the fixed counter show the gate firing with **1 580 packets in the table and the
+oldest at 200 ms**, which is exactly `MIN_RTO`: the gate working as designed, not
+stuck.
 
-**The invisible bound is the dominant one by a factor of five.** It also explains why
-a stage can carry nothing while every instrument reads zero: the bytes it refuses
-never enter the buffer, so there is no backlog to report, no credit block, and no
-starvation — the sender looks idle while the forwarding loop is parked.
+**What this costs the record.** Two of this cycle's entries leaned on that number: the
+"dominant bound" claim and the experiment it justified. The revert of the per-stream
+scoping stands on its own measurements and stays; the claim that the gate dominates
+does not.
 
-The obvious next move was to scope it per stream, since the claim it makes is about
-one stream's flight. **That was measured and lost**: the run with the scoped gate
-failed five stages against the previous run's one, and the refusal count barely moved
-(2.84 M against 4.64 M). It is reverted, and the record is that the scoping as written
-did not help — not that the gate is fine.
-
-**What this round establishes and what it does not.** The refusal split is real and
-the age gate dominates. Whether removing it helps cannot be measured by these runs:
-with near-identical builds the failure count has ranged from **1 to 5 in a single
-day**, so any one comparison is inside the noise. The plan's Stage 3 says to delete
-this gate and put RACK/PTO in its place; that change is large enough to be judged by
-its own pre-registered bet, and it needs a *paired* comparison — two binaries, one
-run, both arms interleaved — not two runs an hour apart.
-
-### The dead stages track the arm's position, not its binary (2026-11-03)
-
-A paired A/B of the age gate — two binaries, one run, arms interleaved `~b → ~aa →
-molehill`, where `~aa` is a **second copy of the same binary as `molehill`** — came
-back like this:
-
-| stage | A (gate) | **AA (same binary)** | B (no gate) |
-|---|---|---|---|
-| `clean` | p50 99.6 ms | **2.09 ms** | 3.73 ms |
-| `loss5` | **failed** | ok, 402 ms | ok, 402 ms |
-| `rate100` | **failed** | **ok, 172 ms** | failed |
-| `rate20` | **failed** | **ok, 352 ms** | failed |
-| `jitter` | **failed** | **ok, 84 ms** | failed |
-| `clean#2` | failed | failed | failed |
-
-**A and AA are the same binary, and they differ far more than A and B do.** A ran
-third and lost four stages; AA ran second and lost one. So the stage losses are not a
-property of the build under test — they follow **where in the run the arm sits**. Every
-comparison this cycle has made between one run and the next, including several in this
-file, was therefore measuring that drift as much as any change.
-
-That also explains the shape of the last ten rounds: `clean#2` — the last stage of
-every run — has failed in **every** recent run, and the stages before it fail in
-proportion to how much of the schedule has already run. Something accumulates over a
-run: namespaces, ports, sockets, conntrack entries, or simply host memory pressure.
-None of it is the carrier.
-
-**This is now the top of the queue.** Nothing else can be judged until a run's own
-drift is bounded: the gate exists to compare a build against a baseline, and it cannot
-do that while a run's last third is measurably worse than its first for reasons that do
-not involve the build.
-
-**Two things to measure next, in this order:**
-
-1. **A three-way A/A/A** of one binary in one campaign, with the arms run in the three
-   positions. If the failure count rises with position, the drift is demonstrated and
-   its size is known — and the gate's per-stage verdicts need a position-aware
-   correction before they mean anything.
-2. **What accumulates.** The cheapest candidates are process count (the new `reap_iperf`
-   may already have removed one), socket and conntrack counts, and host memory. Each is
-   one number per stage and they are already on the host.
-
-**Also recorded:** this run had to be interrupted after **2 h 25 min**, having written
-nothing for its last 30. Its own profile budget is minutes. A run that hangs is a run
-whose results cannot be compared, and a hung benchmark is the same class of defect as a
-wrong one.
+**A lesson worth its own line**: the instrument bug was invisible because the counter
+was *plausible*. A number that large was read as a finding — "the hidden bound is the
+big one" — instead of as a bug report about the instrument. The repository's own rule,
+"re-check every consumer after reshaping data", did not catch it because the reshaping
+was in the label, not in the data.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
