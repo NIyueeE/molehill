@@ -7,7 +7,7 @@
 //! to be made twice. It covers the control plane (session auth, `Ack::SessionOk`
 //! with its declared cadence, N services on one connection, per-service
 //! rejection, `Deregister` releasing a port) and one *direct* v5.1 data channel,
-//! whose service binding is the 4-byte prologue after the hello.
+//! whose service binding is the 8-byte prologue after the hello.
 //!
 //! The multiplexed tunnel's per-stream prologue is covered by the
 //! `tunnel_streams_route_by_their_prologue` unit test in `src/core/server.rs`:
@@ -392,12 +392,15 @@ impl Session {
     }
 
     /// Open a *direct* data channel for one service: the 35-byte v5.1 hello,
-    /// then the 4-byte service prologue.
+    /// then the 8-byte prologue — the service, and the stripe group that asked
+    /// for the channel (`0` here, because this test dials the channel itself
+    /// rather than answering a stripe request).
     async fn open_data_channel(&self, id: u32) -> Result<NoiseStream<TcpStream>> {
         let mut conn = connect_noise(CONTROL_ADDR).await?;
         let hello = Hello::DataChannelHello(current_version(), self.nonce);
         conn.write_all(&postcard::to_stdvec(&hello)?).await?;
         conn.write_all(&id.to_be_bytes()).await?;
+        conn.write_all(&0u32.to_be_bytes()).await?;
         conn.flush().await?;
         Ok(conn)
     }
