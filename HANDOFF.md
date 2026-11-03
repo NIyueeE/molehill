@@ -1113,16 +1113,31 @@ Measured on the next full sweep, against the run before it:
 `just bench gate` on that run: **2 failures**, down from 5 — `clean#2` produced no
 measurement, and `timeline[clean]` p99 132 ms against the 50 ms limit.
 
-**That is the single most productive change of this cycle**, and it is worth naming
-why it took so long to find: every instrument that should have caught it measured the
-*sender's* view (unsent bytes, flight age, retransmissions) or the *reader's*
-(starvation, parked reads), and the defect lived in the space between them — credit
-that moved and was never spoken. The stall line had it all along, at `debug`.
+The defect was real — credit moved and was never spoken — and it is fixed. **Its
+effect on the gate is not established**, and the next run says so: with the same
+build, four stages carried nothing again. It is therefore recorded as a correctness
+fix whose gate effect is one run old, not as the cure.
 
-**What is left is one stage and one number.** `clean#2` is the last stage in the
-schedule and fails on its own; `clean`'s p99 is 2.6× the limit while its p50 is 3.5 ms,
-so the tail is a small number of very slow arrivals. Both are their own instruments'
-work, and neither is the wedge.
+What that second run does establish is that the *shape* of the failure changed. In
+it, `mhd stalled`, `credit_blocked` and the starvation sampler are all **zero**, and
+two other counters are equal to the visitor: `accepted = paired = 33 995` over the
+whole schedule, with a per-window gap never above 2. So pairing is exonerated, no
+credit is held, nothing is queued — and four stages still carried nothing.
+
+That leaves one state: a visitor whose pairing returned, whose socket the forwarding
+loop never read, and which therefore never put a byte in front of the carrier. Its
+sender sees `snd_wnd = 0` from the first second, which is what a socket nobody reads
+looks like, and every instrument in the carrier is silent because *the carrier was
+never given anything to do*.
+
+**The next instrument is on the boundary between the visitor's socket and the
+carrier**, and it is two counters per visitor: that the forwarding loop polled the
+visitor's read at all, and that the poll returned bytes. A visitor that pairs and is
+then never polled is the remaining state, and it is the one no counter can currently
+see.
+
+`clean`'s p99 is separately 2.6× the limit while its p50 is 3.5 ms, so the tail is a
+few very slow arrivals rather than a shift. That is its own instrument's work.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
