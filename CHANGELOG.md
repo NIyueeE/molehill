@@ -11,56 +11,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known gaps
 
-- **A fresh connection's tail is eight times TCP's, and the cause is one handshake.**
+- **A fresh connection's tail is eight times TCP's, and it is a queue, not a handshake.**
   The multi-second stalls are a *different* defect and are fixed — see the entry
   about the flight outliving its timer. This one remains. Measured with
   `MOLEHILL_DATA_CARRIER` pinning a carrier per run over the same binary,
-  `churn-16` (a fresh connection per request, sixteen a second, six rounds) puts the
-  round trip's p99 at
-  **21.04 ms against TCP's 2.58**, with the medians level (2.47 against 2.25) and
-  the arrival rate at 3 469 against 6 705 per second. The cell asks for sixteen fresh
-  connections **a second** — not sixteen at once, the harness's rate is per second and
-  each request is over in a couple of milliseconds — and about one in a hundred of them
-  pays twenty milliseconds. That is the tail: not a stall (the multi-second ones are
-  gone) and not contention, but **the wait for a data channel to be provided**. Measured
-  with the pairing instrument at the same five-millisecond scale as the opening one: a
-  quarter of pairings take at least 5 ms and their distribution runs p50 8.1 ms, p90
-  16.0, p99 27.1, while the client's own stream open stays under 5 ms in all but one
-  case in two thousand. So the wait is not the open — it is what happens between the
-  server asking for a channel and that channel's first packet arriving. Narrowed again
-  with the client's own open line at the same five-millisecond scale: 291 slow opens in
-  two rounds, p50 **5.6 ms**, p90 7.6, worst 23.6, and **every microsecond of it in the
-  handshake** (`ack_us` is zero). The tail is one Noise handshake's round trip taking
-  five milliseconds where the path's own is a tenth of one — the same single-flight cost
-  this release measures everywhere, at millisecond rather than second scale. Where a connection is
-  *reused* the carriers are indistinguishable: `rr-16` agrees to within 1 % on the
-  tail and 5 % on the rate. The cause is structural rather than a tuning error —
-  every visitor channel runs its own Noise handshake before its first byte can
-  move, where a TCP tunnel runs one handshake and multiplexes every stream inside
-  it; a channel open costs 2 648 µs and 1 818 µs of that is the handshake, and
-  everything after it is at parity. Removing the handshake by deriving each
-  stream's keys from the lane's own was built and measured three times: it takes
-  the tail to 3.79 ms and doubles the arrival rate at half the CPU per bit, and
-  **every version cost the bulk cell**, in failed samples rather than in
-  percentages. So the route to arrival parity exists and a version that keeps the
-  bulk cell does not, yet. A
-  deployment whose traffic is mostly short-lived connections should measure its
-  own path before choosing this carrier; one whose connections are reused has
-  nothing to trade.
+  `churn-16` — sixteen concurrent workers, each opening a fresh connection per
+  request, 6 400 arrivals in a round at about four thousand a second — puts the
+  round trip's p99 at **21.04 ms against TCP's 2.58**, with the medians level
+  (2.47 against 2.25) and the arrival rate at 3 469 against 6 705 per second.
+
+  **Where the wait is, over one second of a measured round.** Accepting the
+  visitor takes a median of **15 µs**. Writing the command that tells the client
+  to open a channel costs **2 µs** once a channel exists. The visitor's first byte
+  after it is paired takes **13 µs**. Opening a channel — the pool's placement,
+  the per-stream Noise handshake, and the tunnel prologue — runs a median of
+  **1.73 ms**, a 99th percentile of **4.66 ms** and a worst case of 7.6 ms across
+  a whole second. And the wait for a channel to be provided runs a median of
+  **0.95 ms** with a p99 of **20.1 ms**.
+
+  **Those two distributions together are the finding.** The pairing's p99 is more
+  than twice the worst open the client performed in the same second, so the tail
+  is not a slow handshake. The pairing's *median* is below the open's, which is
+  only possible when a visitor is served by a channel that was already in flight
+  for somebody else: channels go to whichever visitor takes one from a shared
+  queue, so with sixteen opens in flight a visitor's own channel can be delivered
+  to another one and the waits add up. The control is the same pairing at sixteen
+  arrivals a second in a stage with no bulk beside it — one of about 480 over five
+  milliseconds. **The cost appears with concurrency**, and what removes it is a
+  channel delivered to the request that asked for it rather than to whoever takes
+  it first.
+
+  Where a connection is *reused* the carriers are indistinguishable: `rr-16`
+  agrees to within 1 % on the tail and 5 % on the rate.
+
+  **The handshake still sets what one open costs, and that is what a queue
+  multiplies.** A channel open measured 2 648 µs, of which 1 818 was the Noise
+  handshake, where a TCP tunnel runs one handshake and multiplexes every stream
+  inside it. Removing it by deriving each stream's keys from the lane's own was
+  built and measured three times: it takes the tail to 3.79 ms and doubles the
+  arrival rate at half the CPU per bit, and **every version cost the bulk cell**,
+  in failed samples rather than in percentages. So the route to arrival parity
+  exists and a version that keeps the bulk cell does not, yet. A deployment whose
+  traffic is mostly short-lived connections should measure its own path before
+  choosing this carrier; one whose connections are reused has nothing to trade.
 
   **The warm carrier beats TCP and the cold one does not, and the difference is the
-  carrier's own start-up.** On a clean path a run's *last* stage reads p50 **1.87 ms**,
+  same queue under bulk.** On a clean path a run's *last* stage reads p50 **1.87 ms**,
   p90 2.27 and p99 15.07 against TCP's 2.24 and 2.58 on the same cell — faster at the
   median and at the ninetieth percentile, slower at the ninety-ninth — while the *first*
   stage of the same run reads p50 **12.13**: six times the median the carrier reaches
   minutes later, and *within* that first stage the latency **rises** — its first twenty
   arrivals sit at 2.14 ms and the rest of it at 72.78 — so "cold start" is the wrong name
-  for it. **What is cold is now localised rather than explained**: the first stage's
-  visitors wait for their data channels where the last stage's do not — 471 of that
-  stage's ~480 pairings took more than five milliseconds, against **1** of the last
-  stage's — and a channel that is still being created takes a median of **9.7 ms** to
-  become usable, while accepting the visitor itself takes 17 µs. What those ten
-  milliseconds are is open. The congestion window is *not* the answer and is recorded as
+  for it. **What is cold is localised rather than explained**: the first stage's visitors
+  wait for their data channels where the last stage's do not — 471 of that stage's ~480
+  pairings took more than five milliseconds, against **1** of the last stage's — and the
+  difference between that stage and a cell with no bulk in it is the queue, not the open:
+  without bulk the pairing runs a median of 0.95 ms. So bulk is what puts a queue in
+  front of an arrival, and the queue's depth is how long a channel open takes. The
+  congestion window is *not* the answer and is recorded as
   a **rejected** explanation: it reaches its 2 MiB slow-start ceiling within the first
   second of traffic and therefore cannot explain a median that is six
   times worse across a whole stage. A deployment is therefore choosing between a carrier that is quicker than TCP
