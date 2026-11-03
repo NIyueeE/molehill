@@ -828,6 +828,43 @@ Two untouched stages are independent of the handshake and carry the same priorit
 Both are less glamorous than removing a handshake and both are measurable with the
 cells that already exist.
 
+### The release gate is the handshake under bulk, 29× slower (2026-11-03)
+
+One 0.2-scale timeline with the stats switch, the committed windows compared
+between the **first** 30 seconds and the **last** 30 of the same run:
+
+| | first stage | last stage |
+|---|---|---|
+| `hs_p50` per window (the Noise KK) | **28 876 µs** | 1 002 µs |
+| the channel's `open_p50` | **12 149 µs** (p99 79 291) | ~1 000 µs |
+| `ready − open` (the prologue) | 2–7 µs | 2–7 µs |
+| `cmd − ready` (the dequeue) | 8–10 µs | 8–10 µs |
+| the send-buffer dwell | 9 µs | 0 µs |
+| the connection lock | 0 µs | 0 µs |
+| the server's reader park, p99 | 936 µs (max 5 497) | 210 µs |
+
+**The whole first-stage penalty is inside `open_stream`, and the handshake is all
+of it.** The prologue and the dequeue are single-digit microseconds in both
+stages, the send buffer and the lock are microseconds in both, and the server's
+park is under a millisecond at p99 — so the twelve milliseconds are not the wire,
+not a queue in either send buffer, and not a lock. What is left is the handshake's
+own polls competing with four bulk streams on four workers, which is why the same
+code costs 1 ms on an idle lane and 29 on a busy one.
+
+**That reframes the gate.** It is not the arrival path being slow; it is the
+arrival path being *scheduled* behind bulk. Three consequences:
+
+1. The parked sealing patch would have removed this exactly — it took the same
+   measurement from 1 771 µs to 14 — which is why it is worth a future cycle.
+2. Without it, the cheapest lever is **where an opening stream is placed**: an
+   arrival landing on the lane carrying the most bulk pays the most. The pool picks
+   a lane by load already; whether that ordering accounts for a *newcomer* is a
+   measurement, not an assumption.
+3. And the second lever is the client's own runtime: four workers saturated by
+   bulk do not schedule a newcomer's polls promptly, and no wire change fixes that.
+   `TOKIO_WORKER_THREADS` was measured once (4 vs 8, inside the floor) on a cell
+   with no bulk; it has never been measured on the *first stage's* arrival.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
