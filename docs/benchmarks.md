@@ -947,17 +947,34 @@ one that is slower for the first stage of a run.
 **And that stage's cost is not a start-up cost.** Within it the latency *rises*: the stage's
 first twenty arrivals sit at 2.14 ms — the speed the carrier keeps — and its remaining few
 hundred at 72.78 ms. A start-up cost would do the opposite. So the table's twelve
-milliseconds is an average over a stage that begins fast and slows. **Where it goes is
-measured**: the stage's visitors wait for their data channels and the last stage's do not —
-471 of that stage's ~480 pairings took more than five milliseconds, against **1** of the
-last stage's — and a channel that is still being created takes a median of **9.7 ms** to
-become usable while accepting the visitor itself takes 17 µs. What those ten milliseconds
-inside a new channel are is still open. The congestion window is *not* the answer and is
-recorded as a **rejected** explanation: it reaches its 2 MiB slow-start ceiling within the
-first second of traffic, so it cannot account for a median that stays six times worse
-across a whole stage. A reader should take the six-fold difference as the measurement, the
-wait for a data channel as where it is spent, and the ten milliseconds inside a new channel
-as open.
+milliseconds is an average over a stage that begins fast and slows.
+
+**Where it goes is measured, in two distributions over one second of a round.** Every stage
+of an arrival is timed behind `MOLEHILL_MHD_STATS`, at one scale:
+
+| segment | p50 | p99 |
+|---|---|---|
+| accepting the visitor | 15 µs | — |
+| opening a channel (placement, Noise handshake, prologue) | **1.73 ms** | 4.66 ms |
+| **waiting for a channel to be provided** | 0.95 ms | **20.1 ms** |
+| writing the pairing command on it | 2 µs | — |
+| the visitor's first byte after pairing | 13 µs | — |
+
+The two bold rows are the finding, and they have to be read together. The pairing's p99 is
+more than twice the **worst** open the client performed in the same second, so the tail is
+not a slow handshake. Its *median* is below the open's, which is only possible when a
+visitor is served by a channel that was already in flight for somebody else: a channel goes
+to whichever visitor takes one from a shared queue, so with sixteen opens in flight a
+visitor's own channel can be delivered to another and the waits add up. The control is the
+same pairing at sixteen arrivals a second with no bulk beside it — one pairing in about 480
+over five milliseconds, against 471 of about 480 in the first stage of the schedule. **Bulk
+puts a queue in front of an arrival, and the queue's depth is what an open costs.**
+
+Two explanations are recorded as **rejected** rather than merely unproven. The congestion
+window reaches its 2 MiB slow-start ceiling within the first second of traffic, so it cannot
+account for a median that stays six times worse across a whole stage. And the handshake
+alone cannot: it is what one open costs, and the queue is what multiplies it — which is why
+the derivation attempts that halve the open moved the tail without closing it.
 
 A schedule that measured only the first stage would report the cold number and a schedule
 that measured only the last would report the warm one. This one reports both, in order,
