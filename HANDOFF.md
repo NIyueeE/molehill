@@ -776,6 +776,52 @@ Until one of them exists, the state of this work is: the cipher is proved, the
 arrival is delivered, `bulk-1` pays two thirds, and one striped transfer dies for
 a reason that lives in the layer between the carrier and the forwarding loop.
 
+### The defect is "sealing **and** two or more stripes", and nothing narrower (2026-11-03)
+
+Experiments so far, each one run on the patched tree:
+
+| varied | result |
+|---|---|
+| growth frozen (plan never grows) | fails |
+| stripes 4 → 2 (fixture adapted to expect 2) | **fails**, at 286 720 of 8 388 608 |
+| sealing off, everything else in place | **passes** |
+| one sealed stream, in process, 8 MiB | passes |
+| four sealed streams, in process, 256 KiB each | passes |
+| one sealed stream, real sockets (`bulk-1`) | 2.1 Gbit/s, no close |
+
+So the boundary is exactly: **sealing + a stripe group of two or more**. The count
+does not matter (2 fails like 4), the growth path does not matter, and the carrier
+alone does not matter. What is left is the stripe layer's own two directions —
+`send_loop`'s rotation across stripes and `stripe_reader`'s per-stripe header read
+— and the fact that in every failure the visitor→peer direction *completes* early
+and the half-close grace then cuts the other one.
+
+### A decision with a rule, so this cannot run on for ever
+
+Seven rounds have gone into this and nothing has landed. The measured prize is
+large (arrival p50 −38 %, p99 −63 %, rate +82 %, and the handshake gone), so it is
+worth **two more rounds and no more**, on this rule:
+
+1. **Round 18** builds the stripe-group harness with sealed ends — `spawn_group`
+   over `StreamIo`s behind a `Shared` that a test pump drives. That is the only
+   configuration where the layer can be bisected without sockets, and it is the
+   last variable not yet excluded.
+2. **If the harness reproduces**, the defect is in the layer's frame distribution
+   and can be fixed and proved in that harness — the patch then lands with its own
+   regression test.
+3. **If it does not reproduce**, sockets are part of it; the next step is the run
+   builder's segmentation of packets whose sizes differ (a sealed packet is 16
+   bytes longer, and `send_run` hands the kernel a run of spans).
+4. **If neither closes it by round 19**, sealing is parked: the patch, its tests
+   and its measurements are recorded as a design that works and cannot be finished
+   cheaply, and the next cycle takes a different route to the arrival — the
+   handshake is the cost, and sealing is not the only way to remove it.
+
+The reason to bound it is in this file's own record: fourteen rounds of the earlier
+cycle went into a tail that turned out to be one instrument set four times too
+coarse. A design with a proven win and an unproven defect is worth a bounded
+effort, not an open one.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
