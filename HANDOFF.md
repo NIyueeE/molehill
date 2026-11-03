@@ -940,6 +940,45 @@ counter is telling the truth about a shared port, not about a broken lane.
 as a refusal of ours, or every future run reads a defect that is not there. Until
 it has one, a run's `malformed_decode` is evidence only when the UDP probe is off.
 
+### The dead stages were never read: `snd_wnd = 0` from the first second (2026-11-03)
+
+The per-sample raw artefacts the model keeps answer the question the summaries could
+not. From one run, the iperf3 client's own first and last intervals:
+
+| stage | outcome | first interval | last interval |
+|---|---|---|---|
+| `clean` | passed | `bytes=180 092 928  snd_wnd=98 304` | `bytes=106 561 536` |
+| `clean#2` | failed | `bytes=917 504  snd_wnd=0` | `bytes=0  snd_wnd=0` |
+| `jitter` | failed | `bytes=786 432  snd_wnd=0` | `bytes=0  snd_wnd=0` |
+
+**`snd_wnd = 0` in the *first* second of a connection that then carries nothing.**
+The peer's receive window was closed from the outset, which means the tool never
+read that visitor socket at all — not "the credit ran out later under load". About
+900 KB arrives (the kernel's socket buffer) and then the connection is stuck for the
+whole stage, until iperf3's sink gives up after 117 s and the client exits with
+`control socket has closed unexpectedly`.
+
+This also explains why every other instrument was silent: `dwell` measures a
+sender's unsent bytes, `mhd stalled` measures a flight, the pool counts lanes, and
+none of them looks at *a receiver that was never started*. The chain that should
+end in "somebody reads this visitor's socket" ends in a channel nobody serves.
+
+**The prime suspect is the one recent change on that path**: the identity delivery
+that hands a channel to the pairing that named its group. A channel delivered into a
+group that can no longer take it — already complete, or already finished — waits in
+a queue that nobody drains, and its visitor's window stays shut for ever. That would
+be a regression from this cycle's own work, and it is cheap to test: count a channel
+handed to a group with no live stripe waiting for it.
+
+**The instrument for the next round**, in order:
+
+1. A counter pair beside `claimed`/`shared`: **delivered to a group that was gone**
+   (`dead_group`), and **claimed by a stripe that never started reading**
+   (`orphaned`). Either rising during a failing stage names the defect outright.
+2. If both are zero, the missing read is downstream of delivery, and the next place
+   to look is the client's `register` → `run` handoff for a stripe whose group
+   completed while it was still being registered.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
