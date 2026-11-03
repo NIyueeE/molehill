@@ -1139,6 +1139,38 @@ see.
 `clean`'s p99 is separately 2.6× the limit while its p50 is 3.5 ms, so the tail is a
 few very slow arrivals rather than a shift. That is its own instrument's work.
 
+### The age gate is the dominant bound, and scoping it lost (2026-11-03)
+
+Three bounds can hold a write and only two were ever visible. The third — the gate
+that refuses new data when the oldest packet in flight is older than the
+retransmission timer — now has a variant of its own in `Refusal` and a per-second
+counter. Over one full run:
+
+| bound | writes refused |
+|---|---|
+| congestion window | 866 723 |
+| peer's credit | 327 049 |
+| **the age gate** | **4 641 975** |
+
+**The invisible bound is the dominant one by a factor of five.** It also explains why
+a stage can carry nothing while every instrument reads zero: the bytes it refuses
+never enter the buffer, so there is no backlog to report, no credit block, and no
+starvation — the sender looks idle while the forwarding loop is parked.
+
+The obvious next move was to scope it per stream, since the claim it makes is about
+one stream's flight. **That was measured and lost**: the run with the scoped gate
+failed five stages against the previous run's one, and the refusal count barely moved
+(2.84 M against 4.64 M). It is reverted, and the record is that the scoping as written
+did not help — not that the gate is fine.
+
+**What this round establishes and what it does not.** The refusal split is real and
+the age gate dominates. Whether removing it helps cannot be measured by these runs:
+with near-identical builds the failure count has ranged from **1 to 5 in a single
+day**, so any one comparison is inside the noise. The plan's Stage 3 says to delete
+this gate and put RACK/PTO in its place; that change is large enough to be judged by
+its own pre-registered bet, and it needs a *paired* comparison — two binaries, one
+run, both arms interleaved — not two runs an hour apart.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
