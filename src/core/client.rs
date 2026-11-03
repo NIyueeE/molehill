@@ -1458,6 +1458,88 @@ impl tokio::io::AsyncWrite for TunnelStream {
     }
 }
 
+/// What one reporting window of channel openings looked like.
+///
+/// The per-event line only fires past five milliseconds, so it answers "how bad
+/// is the tail" and not "what does an ordinary channel cost". That gap mattered:
+/// a server-side pairing wait of eight milliseconds beside a client whose slow
+/// openings are four per cent of arrivals is consistent with a fast client *and*
+/// with a client that spends four milliseconds on every channel under a
+/// threshold that never reports it. The distribution is what tells the two
+/// apart, so it is reported as a window rather than as a line per event.
+#[cfg(feature = "multiplex")]
+#[derive(Default)]
+struct ChannelStats {
+    samples: std::sync::Mutex<Vec<(u32, u32)>>,
+}
+
+/// The most channel openings one reporting window keeps.
+#[cfg(feature = "multiplex")]
+const CHANNEL_WINDOW_MAX: usize = 65_536;
+
+#[cfg(feature = "multiplex")]
+impl ChannelStats {
+    fn note(&self, open_us: u32, ready_us: u32) {
+        let mut samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if samples.len() < CHANNEL_WINDOW_MAX {
+            samples.push((open_us, ready_us));
+        }
+    }
+
+    fn drain(&self) -> Vec<(u32, u32)> {
+        let mut samples = self
+            .samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *samples)
+    }
+}
+
+/// The process's window, and the task that reports it.
+///
+/// One reporter for the process rather than one per service: the numbers are a
+/// property of the carrier and the machine, and a daemon carries a handful of
+/// services whose channels would otherwise be reported separately at a tenth of
+/// the sample count each.
+#[cfg(feature = "multiplex")]
+fn channel_stats() -> &'static std::sync::Arc<ChannelStats> {
+    static STATS: std::sync::OnceLock<std::sync::Arc<ChannelStats>> = std::sync::OnceLock::new();
+    STATS.get_or_init(|| {
+        let stats = std::sync::Arc::new(ChannelStats::default());
+        let reporter = std::sync::Arc::clone(&stats);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if !crate::transport::stats::enabled() {
+                    continue;
+                }
+                let samples = reporter.drain();
+                if samples.is_empty() {
+                    continue;
+                }
+                let mut open: Vec<u32> = samples.iter().map(|(o, _)| *o).collect();
+                let mut ready: Vec<u32> = samples.iter().map(|(_, r)| *r).collect();
+                open.sort_unstable();
+                ready.sort_unstable();
+                info!(
+                    n = samples.len(),
+                    open_p50_us = crate::transport::stats::pct_us(&open, 50, 100),
+                    open_p99_us = crate::transport::stats::pct_us(&open, 99, 100),
+                    open_max_us = open.last().copied().unwrap_or(0),
+                    ready_p50_us = crate::transport::stats::pct_us(&ready, 50, 100),
+                    ready_p99_us = crate::transport::stats::pct_us(&ready, 99, 100),
+                    ready_max_us = ready.last().copied().unwrap_or(0),
+                    "client data channel, open to prologue"
+                );
+            }
+        });
+        stats
+    })
+}
+
 /// Run a data channel as one stream of the multiplexed tunnels.
 #[cfg(feature = "multiplex")]
 async fn run_mux_data_channel(
@@ -1499,6 +1581,10 @@ async fn run_mux_data_channel(
     // hundred milliseconds here reported nothing on a cell whose whole tail is
     // twenty, which is how the handshake kept the blame for a wait it did not
     // own.
+    if crate::transport::stats::enabled() {
+        let clamp = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        channel_stats().note(clamp(open_us), clamp(ready_us));
+    }
     if ready_us >= 5_000 && crate::transport::stats::enabled() {
         info!(
             group = stripe.map(|request| request.group),

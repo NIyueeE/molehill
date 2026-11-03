@@ -318,3 +318,17 @@ impl Timing {
         }
     }
 }
+
+/// Nearest-rank percentile of an ascending slice, in whole microseconds.
+///
+/// Taken as `numerator/denominator` rather than a float so the rank is integer
+/// arithmetic: a percentile that is off by a rounding error is a percentile
+/// nobody can reproduce. Shared by the two daemons' arrival reports, which must
+/// be readable at the same scale.
+pub(crate) fn pct_us(sorted: &[u32], numerator: usize, denominator: usize) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (numerator * sorted.len()).div_ceil(denominator);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}

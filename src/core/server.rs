@@ -3853,19 +3853,6 @@ impl ArrivalStats {
     }
 }
 
-/// Nearest-rank percentile of an ascending slice, in whole microseconds.
-///
-/// Taken as `numerator/denominator` rather than a float so the rank is integer
-/// arithmetic: a percentile that is off by a rounding error is a percentile
-/// nobody can reproduce.
-fn pct_us(sorted: &[u32], numerator: usize, denominator: usize) -> u32 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let rank = (numerator * sorted.len()).div_ceil(denominator);
-    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
-}
-
 /// Print one window of arrival splits: both halves, three points each.
 ///
 /// `p50` and `p99` rather than a mean on purpose: the question is whether the
@@ -3881,11 +3868,11 @@ fn report_arrivals(stats: &ArrivalStats) {
     first.sort_unstable();
     info!(
         n = samples.len(),
-        paired_p50_us = pct_us(&paired, 50, 100),
-        paired_p99_us = pct_us(&paired, 99, 100),
+        paired_p50_us = crate::transport::stats::pct_us(&paired, 50, 100),
+        paired_p99_us = crate::transport::stats::pct_us(&paired, 99, 100),
         paired_max_us = paired.last().copied().unwrap_or(0),
-        first_p50_us = pct_us(&first, 50, 100),
-        first_p99_us = pct_us(&first, 99, 100),
+        first_p50_us = crate::transport::stats::pct_us(&first, 50, 100),
+        first_p99_us = crate::transport::stats::pct_us(&first, 99, 100),
         first_max_us = first.last().copied().unwrap_or(0),
         "visitor arrival, split at the pairing"
     );
