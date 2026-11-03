@@ -210,6 +210,11 @@ enum Refusal {
     Aged,
 }
 
+/// Whether a refusal is one the recovery table can cause.
+fn takes_room_refusal(refusal: Option<Refusal>) -> bool {
+    matches!(refusal, Some(Refusal::Aged))
+}
+
 /// What the scheduler picked for one packet.
 ///
 /// `repair` is the difference between new data and a range the recovery already
@@ -628,6 +633,21 @@ impl Conn {
                 Some(Refusal::Credit) => "credit",
                 _ => "window",
             });
+            // What the recovery table is holding when the age gate refuses. A
+            // record that is neither acknowledged nor declared lost never leaves
+            // the table, so its timestamp is the gate's input for ever: the lane
+            // then refuses every write with no backlog and no credit block, which
+            // is a stage that carries nothing and blames nothing.
+            if takes_room_refusal(self.last_refusal) && crate::transport::stats::enabled() {
+                let (held, oldest) = self.recovery.table_stats();
+                tracing::debug!(
+                    stream,
+                    flight_packets = held,
+                    oldest_data_ms =
+                        oldest.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                    "mhd write refused: what the recovery table holds"
+                );
+            }
         }
         if take == 0 {
             // An opening that cannot write a byte is the arrival path's whole

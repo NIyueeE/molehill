@@ -364,6 +364,25 @@ impl Recovery {
     /// Kept as a running total rather than a sum over the table: the window this
     /// feeds is asked on every write, and a sum over a wide flight per write is
     /// a cost that grows with the bandwidth-delay product.
+    /// How many packets the table is holding, and how old its oldest data is.
+    ///
+    /// A record that is neither acknowledged nor declared lost sits in the table
+    /// for ever, and the age gate reads its timestamp: the oldest age then grows
+    /// without bound and refuses every write on the lane, with no backlog and no
+    /// credit block to show for it. Two numbers make that visible.
+    pub(crate) fn table_stats(&self) -> (usize, Option<Duration>) {
+        let oldest = self
+            .in_flight
+            .values()
+            .filter(|sent| sent.lost_at.is_none())
+            .map(|sent| sent.time)
+            .min();
+        (
+            self.in_flight.len(),
+            oldest.map(|time| Instant::now().saturating_duration_since(time)),
+        )
+    }
+
     pub(crate) fn flight_bytes(&self) -> u64 {
         self.flight_bytes
     }
