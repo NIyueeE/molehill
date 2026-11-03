@@ -328,6 +328,38 @@ pub(crate) fn note_direct_channel() {
     DIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How long a stream's Noise handshake took, per second — for **every** open.
+///
+/// The per-event line reports this only past five milliseconds, so it answers how
+/// bad the tail is and not what the handshake costs an ordinary arrival. That
+/// distinction decides whether replacing it is worth the design: 1.8 ms per
+/// arrival is a different proposition from 0.3.
+static OPEN_HS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Record one successful open's handshake, in microseconds.
+pub(crate) fn note_open_handshake(hs_us: u64) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(hs_us).unwrap_or(u32::MAX);
+    let mut samples = OPEN_HS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's handshake samples, sorted, and leave it empty.
+fn take_open_handshake() -> Vec<u32> {
+    let mut samples = OPEN_HS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Where a delivered channel went: to the pairing that named it, or to the pool.
 ///
 /// The number that says whether the identity is live: a channel that still lands
@@ -511,6 +543,17 @@ fn report() {
             park_p99_us = pct_us(&parks, 99, 100),
             park_max_us = parks.last().copied().unwrap_or(0),
             "mhd-stats: a stream's reader waiting for bytes"
+        );
+    }
+    let handshake = take_open_handshake();
+    if !handshake.is_empty() {
+        let n = handshake.len();
+        info!(
+            n,
+            hs_p50_us = pct_us(&handshake, 50, 100),
+            hs_p99_us = pct_us(&handshake, 99, 100),
+            hs_max_us = handshake.last().copied().unwrap_or(0),
+            "mhd-stats: a stream's Noise handshake, every open"
         );
     }
     let claimed = CLAIMED.swap(0, std::sync::atomic::Ordering::Relaxed);

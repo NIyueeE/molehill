@@ -921,6 +921,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         match ack {
             crate::protocol::Ack::Ok => {
                 let us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+                crate::transport::stats::note_open_handshake(hs_us);
                 tracing::debug!(
                     lane = self.id,
                     us,

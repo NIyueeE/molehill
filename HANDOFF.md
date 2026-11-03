@@ -476,29 +476,50 @@ and it is what Stage 3 attacks. The tail that remains — p99 9.7 against a p50 
 instrument for it is the one already built: `cmd_us` and `open_us` per window,
 now read against a pairing that no longer waits for a lottery.
 
-### Stage 3 — no per-visitor Noise handshake (latency)
+### Stage 3 — no per-visitor Noise handshake (the median, quantified)
 
-With the queue gone, what is left of one open is its own cost — 1.73 ms at the
-median, of which the Noise KK handshake is the larger part. Derive each stream's
-keys from the lane's established session instead: `HKDF(lane handshake hash,
-direction, stream id)`, per-direction counters as AEAD nonces, sealing inside the
-carrier's own packet framing.
+**The target is now a single number.** On every open, not only the slow ones:
 
-Why this shape and not the three that failed: a mux over the lane adds a copy and
-cost 23.75 % of `bulk-n`; a record layer above the carrier cost the bulk cell at
-three record sizes because the reader could park mid-record; a stock of
-pre-opened channels is consumed in the first four of 6 400 arrivals. Deriving
-keys keeps every stream its own flow — its own offsets, credit and window — and
-adds no layer.
+| | p50 | p99 | max |
+|---|---|---|---|
+| the stream's Noise KK handshake | **1 771 µs** | 5 781 µs | 8 348 µs |
+| the whole open (placement + handshake + prologue) | 1 779 µs | 5 748 µs | 8 369 µs |
+| the command's whole path (dequeue → prologue) | 1 806 µs | 5 784 µs | 8 377 µs |
 
-- **Gate**: `churn-16` p99 materially toward TCP's 2.58 ms and both clean stages
-  improved, `bulk-n` inside 15 %, no level change in memory; dialect 6.0 may be
-  extended in place, `just interop` still 3 of 3.
-- **Revert**: no effect beyond the run's floor, or any bulk regression.
-- **Tests first**: no `(key, nonce)` reuse across stream or direction; replay,
-  duplication, reordering, stream-id reuse and lane re-establishment all refused;
-  plain and encrypted data planes both still open; half-close, reset and
-  FIN-after-data hold.
+**The handshake is 99.5 % of what a channel costs.** Removing it takes the open to
+single-digit microseconds and the pairing's median from 2.6 ms to roughly 0.8 —
+which is where TCP's 2.24 ms p50 actually is.
+
+The design, and its one honest trade:
+
+1. **One handshake per lane.** A lane's first stream runs the KK it runs today;
+   both ends keep the handshake hash.
+2. **Derived keys per stream.** `HKDF-SHA256(lane hash, info = direction ‖ stream
+   id)` gives each direction of each stream its own 32-byte key and its own
+   counter; the packet number is the AEAD nonce and the header is the associated
+   data, so **a packet is the record** — there is no separate framing to park
+   in, which is the failure mode that killed the three record-layer attempts.
+3. **The selector stays in the clear.** A new selector byte says "derived"; the
+   rest of the first packet and every later packet of that stream are sealed.
+
+The trade, stated so a reviewer can refuse it: **forward secrecy moves from
+per-stream to per-lane.** Today every visitor's channel has its own ephemeral
+X25519 exchange; with derivation, a lane's compromise exposes its streams'
+keys. Mutual authentication is unchanged — the lane's KK is the same KK — and a
+lane is per **session and carrier connection**, so the window is one pool
+connection's lifetime rather than one channel's. Two further constraints keep it
+honest: stream ids never reuse within a lane, and a lane re-establishment starts
+a new hash.
+
+- **Gate**: the open's p50 falls to ≤ 100 µs and the pairing's p50 to ≤ 1 ms;
+  `churn-16` p99 stays at or below its current 9.7 ms; `bulk-n` inside 15 %;
+  CPU per carried Gbit is measured but does not gate (priority four).
+- **Revert**: any bulk regression, or any failure in the crypto tests below.
+- **Tests before the wire**: (key, nonce) never reused across stream or
+  direction; a packet replayed, reordered, truncated or from another stream is
+  refused; a lane re-established with the same four-tuple does not decrypt the
+  old lane's traffic; plain (`PLAIN_SELECTOR`) and per-stream KK paths both still
+  work; the striped, half-close, reset and hot-reload suites stay green.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
