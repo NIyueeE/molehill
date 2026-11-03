@@ -302,6 +302,55 @@ placement works to keep.
   arrival is held for its waiter; an abandoned group leaks no waiter; a plain
   visitor still takes the shared queue.
 
+### Measured: identity delivery does not move the tail (2026-11-03, `ed6fa76`)
+
+The change the queueing story predicted, built and interleaved against a build
+of `78923cb` on `churn-16` (4 rounds, `--aa`, `--ab-arm l4 --binary-b`):
+
+| arm | p50 | p99 | max | rate |
+|---|---|---|---|---|
+| `l4` (identity delivery) | 2.28 ms | **19.52 ms** | 41.0 | 3 688 /s |
+| `l4~aa` (the same build again) | 2.84 | 21.49 | 51.1 | 3 235 /s |
+| `l4~b` (before) | 2.57 | 21.74 | 44.3 | 3 489 /s |
+
+**No claim**: the run's own p99 floor is 8.19 %, the point estimate is −10 %,
+and the A/A twin sits *between* the two arms. The traffic floor is 12.2 % from
+four rounds.
+
+So the exchange-of-channels story is refuted as the cause of the tail, though it
+was the right reading of the earlier distributions: the pairing median does sit
+below the open median, and with identity delivery it no longer can — yet the
+tail is unchanged. **The 15 ms that separates the pairing's p99 from the open's
+p99 is somewhere else**, and it is now the only unexplained interval left:
+
+- not accept (15 µs), not the command write (2 µs), not the first byte (13 µs);
+- not the open, whose p99 is 4.66 ms;
+- and not the exchange, which this A/B removed.
+
+The change is **kept as a correctness fix and as the identity the next
+instrument needs**, explicitly not as the fix for the tail — the same disposition
+the small-flight timer got earlier. It closes a real hole: with `stripes > 1` the
+old FIFO could hand a channel opened for group A to group B, which is exactly the
+"K stripes on K distinct tunnels" invariant the client's placement keeps.
+
+### Stage 2b — the serial prologue read (next)
+
+The remaining suspect is the per-tunnel accept loop: `serve_mhd_lane`'s
+`while let Some(stream) = bridge_rx.recv()` reads each stream's prologue
+**sequentially**, so one stream whose prologue bytes are late blocks every later
+stream on that tunnel. With four lanes and ~1 000 streams a second per lane, a
+single 15 ms stall delays about fifteen streams — a heavy tail over a tight
+median, which is the shape measured.
+
+- **Instrument first**: time `route_tunnel_stream` (the prologue read) and the
+  delivery, and log anything at or past 5 ms. If those lines exist and line up
+  with the slow pairings, the loop is the bottleneck; if they do not, it is not.
+- **Then**: read the prologue concurrently (a task per stream, or the prologue
+  carried in the stream's opening frame so no read is needed at all). The second
+  is the aggressive one and it removes the await rather than hiding it.
+- **Gate**: `wait_us` p99 falls toward `open_us` p99; `bulk-n` inside 15 %; the
+  striping test still passes at `stripes > 1`.
+
 ### Stage 3 — no per-visitor Noise handshake (latency)
 
 With the queue gone, what is left of one open is its own cost — 1.73 ms at the
