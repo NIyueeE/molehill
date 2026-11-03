@@ -244,6 +244,14 @@ pub(crate) struct StreamIo {
 }
 
 impl StreamIo {
+    /// The carrier stream this handle carries.
+    ///
+    /// The identity a per-stream key would be derived from, and the only thing
+    /// that can pair one end's handshake with the other's in a log.
+    pub(crate) fn stream_id(&self) -> u32 {
+        self.id
+    }
+
     /// Wrap one stream of a connection.
     pub(crate) fn new(shared: Arc<Shared>, id: u32) -> Self {
         Self {

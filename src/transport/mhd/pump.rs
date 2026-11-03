@@ -616,6 +616,13 @@ pub(crate) struct MhdLane {
     /// deadlock; a lane whose first open failed after the server reserved just
     /// falls back to the two-flight shape.
     registered: std::sync::atomic::AtomicBool,
+    /// The handshake hash this lane's first stream ended on.
+    ///
+    /// Recorded, not yet used: it is the root a per-stream key would be derived
+    /// from, and the two ends only agree on it if the transcript is what the
+    /// design assumes. Reported per lane so a run can prove that before any
+    /// stream stops paying for its own handshake.
+    lane_hash: std::sync::Mutex<Option<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for MhdLane {
@@ -674,6 +681,7 @@ impl MhdLane {
             noise,
             nonce,
             registered,
+            lane_hash: std::sync::Mutex::new(None),
         }))
     }
 
@@ -784,6 +792,18 @@ impl MhdLane {
                     .wrap_initiator_carrying(plain, payload)
                     .await
                     .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+                let hash = wrapped.handshake_hash();
+                if let Ok(mut slot) = self.lane_hash.lock()
+                    && slot.is_none()
+                {
+                    *slot = Some(hash);
+                    tracing::info!(
+                        lane = self.id,
+                        stream = id,
+                        hash = %hex::encode(&hash[..4]),
+                        "mhd lane handshake completed"
+                    );
+                }
                 Ok((id, Box::new(wrapped), theirs))
             }
             _ => Err(crate::transport::multiplex::LaneError::Closed),
@@ -1194,6 +1214,7 @@ fn spawn_dispatcher(
                             noise: None,
                             nonce: [0u8; crate::protocol::HASH_WIDTH_IN_BYTES],
                             registered: std::sync::atomic::AtomicBool::new(false),
+                            lane_hash: std::sync::Mutex::new(None),
                         });
                         // The lane's owner is gone (the listener dropped): the
                         // dispatcher keeps routing for the connections it

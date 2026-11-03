@@ -312,6 +312,14 @@ pub struct NoiseStream<T> {
 
     /// Decrypt output of the current record: `payload_len` valid bytes.
     payload_len: usize,
+
+    /// The handshake hash this session ended on.
+    ///
+    /// Both ends compute the same value from the same transcript, which is what
+    /// makes it usable as the root for per-stream keys: a stream can derive its
+    /// own key from it without another exchange. Reported per lane so a run can
+    /// show that the two ends agree before anything is built on the assumption.
+    handshake_hash: [u8; 32],
 }
 
 impl<T: Debug> Debug for NoiseStream<T> {
@@ -330,6 +338,15 @@ impl<T> NoiseStream<T> {
     /// this by the transport layer's `hint`).
     pub fn get_inner(&self) -> &T {
         &self.inner
+    }
+
+    /// The handshake hash both ends of this session ended on.
+    ///
+    /// The root a per-stream key would be derived from, and identical on the two
+    /// ends by construction. Exposed rather than used so a run can prove that
+    /// agreement before a design depends on it.
+    pub fn handshake_hash(&self) -> [u8; 32] {
+        self.handshake_hash
     }
 }
 
@@ -395,6 +412,11 @@ where
         let mut produce = Some(produce);
         loop {
             if state.is_handshake_finished() {
+                // `get_handshake_hash` answers the transcript's digest as a
+                // slice; it is 32 bytes for BLAKE2s and every pattern the
+                // configuration admits.
+                let mut handshake_hash = [0u8; 32];
+                handshake_hash.copy_from_slice(state.get_handshake_hash());
                 let transport = state.into_transport_mode()?;
                 return Ok((
                     Self {
@@ -408,6 +430,7 @@ where
                         read_filled: 0,
                         read_expected: UNKNOWN_FRAME_LEN,
                         payload_len: 0,
+                        handshake_hash,
                     },
                     theirs,
                 ));

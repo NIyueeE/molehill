@@ -521,6 +521,27 @@ a new hash.
   old lane's traffic; plain (`PLAIN_SELECTOR`) and per-stream KK paths both still
   work; the striped, half-close, reset and hot-reload suites stay green.
 
+### The derivation's prerequisite is not yet proved (2026-11-03)
+
+A per-stream key needs a root both ends agree on, so both ends now record the
+handshake hash their lane's first stream ended on, with the stream id that
+produced it:
+
+```
+client: lane=1 stream=3 hash=40a8d14d    server: stream=1 hash=04a768ee
+```
+
+**They cannot be compared yet, and the ids do not even line up**: every client
+lane's first hashed stream is id 3, every server lane's is id 1. Either the two
+ends disagree about which stream a handshake belongs to — which would be a defect
+in its own right — or the client's first two streams on a lane (the control
+channel and the lane's reservation) are not the ones the server hashes first.
+
+**Nothing may be derived from this hash until that is answered**, which is the
+first item of the next round: log the hash on *every* completion with its stream
+id on both ends and match them one to one. Only then does "one handshake per
+lane" have a root to derive from.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents

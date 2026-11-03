@@ -2284,6 +2284,13 @@ async fn run_mhd_listener(
 #[derive(Default)]
 struct MhdLaneState {
     registered: tokio::sync::Mutex<Option<MhdLaneRegistration>>,
+    /// The handshake hash this lane's first stream ended on.
+    ///
+    /// Recorded, not yet used: the root a per-stream key would be derived from.
+    /// The two ends agree on it only if the transcript is what the design
+    /// assumes, so it is reported per lane and compared between the daemons'
+    /// logs before anything stops paying for its own handshake.
+    lane_hash: tokio::sync::Mutex<Option<[u8; 32]>>,
 }
 
 /// The session one lane belongs to, and the slot it holds in the valve.
@@ -2350,6 +2357,9 @@ async fn wrap_mhd_stream(
     Option<Vec<u8>>,
     bool,
 )> {
+    // Captured before the stream is consumed: it is the identity that pairs this
+    // end's handshake hash with the peer's in a log.
+    let stream_id = stream.stream_id();
     let mut stream: crate::transport::multiplex::CarrierStream = Box::new(stream);
     let mut carried: Option<Vec<u8>> = None;
     // Whether the handshake's reply already carried the lane's acknowledgement,
@@ -2405,6 +2415,22 @@ async fn wrap_mhd_stream(
                 )
                 .await
                 .with_context(|| "mhd stream noise handshake timed out")??;
+                // The transcript both ends ended on. Recorded, not used: it is
+                // the root a per-stream key would be derived from, and nothing
+                // should stop paying for its own handshake until a run shows the
+                // two daemons agree on this value.
+                let hash = wrapped.handshake_hash();
+                {
+                    let mut slot = state.lane_hash.lock().await;
+                    if slot.is_none() {
+                        *slot = Some(hash);
+                        info!(
+                            stream = stream_id,
+                            hash = %hex::encode(&hash[..4]),
+                            "mhd lane handshake completed"
+                        );
+                    }
+                }
                 if !theirs.is_empty() {
                     carried = Some(theirs);
                 }
