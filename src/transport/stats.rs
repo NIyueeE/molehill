@@ -280,6 +280,35 @@ pub(crate) fn wake_age() -> Option<Duration> {
 /// How long a woken pairing waited to be polled, per second.
 static RESUME: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// How long a stream's reader parked with nothing to read, per second.
+///
+/// The interval between "a reader asked for bytes" and "bytes arrived": the last
+/// one an arrival can be spent in, and the one no phase timer sees. Its own line
+/// existed at `debug!` and at twenty milliseconds, which is four times too coarse
+/// for the fifteen-millisecond wait that is left.
+static READ_PARK: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Record one reader's park, in microseconds.
+pub(crate) fn note_read_park(wait: Duration) {
+    let us = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = READ_PARK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's reader parks, sorted, and leave it empty.
+fn take_read_park() -> Vec<u32> {
+    let mut samples = READ_PARK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Which producer handed a visitor's channel over, per second.
 ///
 /// The two paths look identical from outside and both used to log the same
@@ -392,7 +421,10 @@ pub(crate) fn spawn_reporter() {
 }
 
 /// One cumulative line, in microseconds and counts.
-fn report() {
+///
+/// Its own function so the per-second windows `report` prints stay readable: a
+/// single function that did both outgrew the line budget the lints enforce.
+fn report_phases() {
     let (_, rx_total_n) = PHASES.rx_total.read();
     let (_, decode_n) = PHASES.decode.read();
     let (_, ack_n) = PHASES.ack.read();
@@ -436,6 +468,11 @@ fn report() {
         open_n = PHASES.open.read().1,
         "mhd-stats: cumulative phase timings"
     );
+}
+
+/// Drain every per-second window and print the ones that saw traffic.
+fn report() {
+    report_phases();
     let dwell = take_dwell();
     if !dwell.is_empty() {
         let n = dwell.len();
@@ -445,6 +482,17 @@ fn report() {
             dwell_p99_us = pct_us(&dwell, 99, 100),
             dwell_max_us = dwell.last().copied().unwrap_or(0),
             "mhd-stats: a stream's first byte waiting for the wire"
+        );
+    }
+    let parks = take_read_park();
+    if !parks.is_empty() {
+        let n = parks.len();
+        info!(
+            n,
+            park_p50_us = pct_us(&parks, 50, 100),
+            park_p99_us = pct_us(&parks, 99, 100),
+            park_max_us = parks.last().copied().unwrap_or(0),
+            "mhd-stats: a stream's reader waiting for bytes"
         );
     }
     let pooled = POOLED.swap(0, std::sync::atomic::Ordering::Relaxed);

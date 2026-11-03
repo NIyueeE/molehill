@@ -300,6 +300,7 @@ impl AsyncRead for StreamIo {
         if taken > 0 {
             if let Some(at) = this.read_parked_at.take() {
                 let waited = at.elapsed();
+                crate::transport::stats::note_read_park(waited);
                 if waited >= std::time::Duration::from_millis(20) {
                     // The discriminator: how long the bytes had been *ready* at
                     // the instant they were finally taken. Equal to the park
@@ -325,6 +326,12 @@ impl AsyncRead for StreamIo {
         }
         if ended || !open {
             return Poll::Ready(Ok(()));
+        }
+        if let Some(at) = this.read_parked_at {
+            // A poll that found nothing again: the park continues, but each
+            // round trip through the scheduler is worth counting once.
+            crate::transport::stats::note_read_park(at.elapsed());
+            this.read_parked_at = Some(std::time::Instant::now());
         }
         if this.read_parked_at.is_none() {
             this.read_parked_at = Some(std::time::Instant::now());

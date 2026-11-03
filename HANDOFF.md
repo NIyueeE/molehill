@@ -365,21 +365,50 @@ still unmeasured and both are scheduling rather than work:
 The instruments that would separate them are a wake count and a poll-gap on the
 accept path — the same pair that was needed for the reader park earlier.
 
+### Every segment measured, and the one interval left (2026-11-03)
+
+Ten instruments, each at five milliseconds or finer and each behind the stats
+switch. In one second of a `churn-16` round (~3 600 arrivals):
+
+| segment | p50 | p99 | max |
+|---|---|---|---|
+| accepting the visitor | 16 µs | 80 µs | 153 µs |
+| control request crosses to the client | 132 µs | 357 µs | 357 µs |
+| the client's channel open + prologue | 1.70 ms | 4.66 ms | 8.05 ms |
+| bytes accepted → a packet carries them (client) | 5 µs | 26 µs | 210 µs |
+| waiting for the connection lock (client) | 0 µs | 2 µs | 246 µs |
+| a stream's reader park (server) | 21 µs | 752 µs | 2 639 µs |
+| a pairing woken → polled | **14 µs** | 52 µs | 254 µs |
+| the command write on the channel | 2 µs | 7 µs | 15 µs |
+| the visitor's first byte after pairing | 14 µs | 120 µs | 451 µs |
+| **the pairing's whole wait** | **0.97 ms** | **18 987 µs** | 42 615 µs |
+
+**Nothing inside the path costs the twenty milliseconds, and the pairing is not
+descheduled**: it parks about 37 000 times a second — ten wakes per arrival —
+and is polled 14 µs after each one. So a pairing wakes, finds no channel, parks
+again, and repeats until one arrives. The channel itself arrives late.
+
+Excluded so far, each by its own measurement: accept, the control trip, the
+client's open, the send-buffer dwell, the connection lock, the pairing's own
+scheduling, the reader's park, the per-tunnel prologue read, the command write,
+the post-pairing forwarding, the worker count (4 vs 8 is inside the floor), and
+the exchange of channels between visitors.
+
+**The one interval no instrument covers is on the client: from the control
+command being read to the task that opens the channel being spawned.** The
+client's `ready_us` starts when that task is first polled, so a command that
+waited in the control loop's own queue is invisible — and the loop is a single
+task that reads, decodes, places and spawns, at four thousand commands a second.
+
 ### What this changes about the plan
 
-The queueing story is finished: identity was built, measured, and kept only for
-correctness. What remains for latency is **the number of task hops an arrival
-pays**, not the cost of any one of them. That makes the structural options
-narrower than the plan assumed:
-
-- a channel's arrival already costs a stream, a task, a Noise handshake and four
-  wakes; deriving the keys removes the handshake but not the hops.
-- the hop count is what a design change can remove: accept a visitor's channel in
-  the listener's own pass instead of handing it to a per-stream task, and hand the
-  paired group its channel from the same pass.
-
-That is the aggressive version of stage 2b, and it is worth pricing before stage 3
-because it attacks the interval that is actually 3 ms.
+The arrival is one serial loop away from being understood: stamp the dequeue and
+carry the instant into the open, then `ready_us` becomes `cmd_us` and the last
+gap closes. If the control loop is the bottleneck, the fix is structural and
+worth naming now: **a control command must not be handled by the same task that
+reads the next one** — either a second task that owns the command dispatch, or
+(depending on what the number says) placing the channel without the placement
+lock the loop currently takes.
 
 ### Stage 3 — no per-visitor Noise handshake (latency)
 
