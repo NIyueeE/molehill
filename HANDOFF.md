@@ -78,14 +78,50 @@ arrival measurement this cycle has:
 
 ### Cold: a visitor that has just arrived
 
-`churn-16` is **sixteen fresh connections a second**, not sixteen concurrent
-ones. Each connection is one request.
+`churn-16` is **sixteen concurrent workers, each opening a fresh connection per
+request**: 6 400 arrivals in a round, about **four thousand a second**. (The
+`churn_per_s: 16` field in the model's parameters belongs to the *timeline's*
+churn probe — a different instrument at one arrival every 62 ms. Reading it as
+this cell's rate is what withdrew the concurrency explanation for a dozen rounds,
+and it was wrong; see the correction below.)
 
 | cell | mhd | TCP |
 |---|---|---|
-| `churn-16` p50 | 2.42–2.51 ms | 2.24 |
-| `churn-16` p99 | **20.4–21.75 ms** | **2.58** |
-| `churn-16` rate | ~3 400–3 600 /s | 6 728 /s |
+| `churn-16` p50 | 1.95–2.51 ms | 2.24 |
+| `churn-16` p99 | **17.97–21.75 ms** | **2.58** |
+| `churn-16` rate | 3 500–4 061 /s | 6 728 /s |
+
+**Where an arrival's time goes, in one second of a measured round.** Every stage
+is timed behind `MOLEHILL_MHD_STATS`, at one five-millisecond-or-finer scale, as
+a per-second window:
+
+| segment | p50 | p99 | max |
+|---|---|---|---|
+| accepting the visitor (`accept_us`) | 15 µs | — | 133 µs |
+| opening a channel: placement + Noise handshake + prologue (`open_us`) | **1.73 ms** | 4.66 ms | 7.6 ms |
+| **waiting for a channel to be provided (`wait_us`)** | 0.95 ms | **20.1 ms** | 50.9 ms |
+| writing the pairing command on it (`write_us`) | 2 µs | 7 µs | 15 µs |
+| the visitor's first byte after pairing (`first_*`) | 13 µs | 117 µs | 575 µs |
+
+**Read the two bold rows together, because they decide the diagnosis.** The
+pairing's p99 is more than twice the *worst* open the client performed in the
+same second, so the tail is not a slow handshake. And the pairing's *median* is
+below the open's median, which is only possible when a visitor is served by a
+channel that was already in flight for somebody else.
+
+That is the mechanism: **channels are interchangeable.** The client opens one per
+request, hands it to a shared queue, and `pair_striped_group` takes whichever
+channel is at the head — so with sixteen opens in flight, a visitor's own channel
+can be delivered to another visitor and the waits add up. The control is the same
+pairing at sixteen arrivals a second with no bulk beside it: **one pairing in
+~480** over five milliseconds, against 471 of ~480 in a scheduled stage's first
+`clean`. Bulk is what puts a queue in front of an arrival, and the queue's depth
+is what one open costs.
+
+The four explanations this replaces, and why each is now retired: the tail is not
+a stall (the multi-second ones are fixed), not the handshake alone (a 4.66 ms p99
+cannot make a 20.1 ms one), not the command write (2 µs), and not the forwarding
+loop (13 µs after pairing).
 
 The first stage of a timeline is where this lands as an SLO failure. Across the
 23 timeline records this cycle produced:
@@ -107,35 +143,22 @@ and per-stage, in one 0.2-scale run:
 in one run.** That is the defect the gate reports, and it is why a single
 "carrier is fast/slow" summary is not a usable statement.
 
-### Where the cold cost is, measured
+### What the old instruments still say
 
 The pairing diagnostic fires once per successful pairing, at and past 5 ms,
-behind `MOLEHILL_MHD_STATS=1` (`src/core/server.rs`, "visitor waited for its
-data channels"). One `churn-16` round, 2 336 pairings, **every one above 5 ms**:
+behind `MOLEHILL_MHD_STATS=1`. It is the *conditional* distribution of the slow
+subset, not the population's — 25 % of arrivals in a `churn-16` round — so it is
+read as "how bad is the slow part", never as a median:
 
 | field | p50 | p90 | p99 | max |
 |---|---|---|---|---|
 | `accept_us` | 17 µs | 25 µs | 37 µs | 62 µs |
-| `paired_us` | **9 746 µs** | 21 471 µs | 40 662 µs | 69 854 µs |
+| `paired_us`, on pairings over 5 ms | 8.0 ms | 17.6 ms | 29.1 ms | 57.8 ms |
 
-`attempts=0` and `stripes=1` on all 2 336 lines, so nothing is retrying and the
-striping plan is not involved. And per stage at 0.2 scale, out of ~480 visitors:
-
-| stage | pairings over 5 ms |
-|---|---|
-| `clean` | 471 (~98 %) |
-| `loss1` | 243 (~51 %) |
-| `loss5` | 4 (~0.8 %) |
-| `clean#2` | 1 (~0.2 %) |
-
-The probe's own rate field confirms the last stage was fully loaded
-(`churn_per_s` 15.99–16.005 in `clean#2` in all 23 records), so this is not an
-idle-stage artefact.
-
-**So the gap is one number: a newly created data channel takes a median of ten
-milliseconds to become usable.** On a `10.10.0.0/24` netns with a sub-millisecond
-round trip, that is a timer or a queue, not a path cost — and the visitor pays
-one per arrival because **every stream runs its own Noise KK handshake**.
+and per stage at 0.2 scale, out of ~480 visitors, the count of pairings over
+5 ms: `clean` **471**, `loss1` 243, `loss5` 4, `clean#2` **1**. The probe's own
+rate field confirms the last stage was fully loaded (`churn_per_s` 15.99–16.005
+in `clean#2` in all 23 records), so no stage's numbers are an idle artefact.
 
 ### What landed this cycle, each with its own measurement
 
@@ -157,10 +180,10 @@ the reason is recorded — not tuned around.
 
 ### O1. The first `clean` stage fails the SLO (latency, blocking)
 
-`timeline[clean]` p99 is 36–801 ms against a 50 ms bar, in 20 of 23 records.
-The mechanism is localised (above): the visitor's wait for a data channel, of
-which ~10 ms is a new channel becoming usable and the rest is the per-stream
-Noise handshake plus queueing behind bulk.
+`timeline[clean]` p99 is 36–801 ms against a 50 ms bar, in 20 of 23 records,
+and the first stage's median is 12.13 ms against the last stage's 1.87 in the
+same run. The mechanism is localised (above): a queue of interchangeable channels
+in front of an arrival, whose depth is what one open costs.
 
 - **Gate**: both clean stages independently under 50 ms p99 with error rate
   under 0.5 %, in a full-scale run, with the first stage's hold unchanged.
@@ -169,8 +192,11 @@ Noise handshake plus queueing behind bulk.
 
 ### O2. `churn-16` p99 is 8× TCP (latency)
 
-20.4–21.75 ms against 2.58. The median is level; the tail is the same cost as
-O1, measured on a cell with no bulk and no concurrency.
+17.97–21.75 ms against 2.58 at ~4 000 arrivals a second from sixteen concurrent
+workers. The median is level (1.95–2.51 against 2.24). Same mechanism as O1, on a
+cell with no bulk: the pairing's p99 is 20.1 ms while the worst open in the same
+second is 7.6 ms, so the waits are adding up across concurrent arrivals rather
+than each one being slow.
 
 - **Gate**: within the run's own A/A floor of TCP's 2.58 on an interleaved A/B,
   with `rr-16` and `bulk-n` unmoved.
@@ -213,58 +239,102 @@ Configuration keys do not move in any of them.
 Consolidate the handoff; keep the negative results as a table and the narrative
 in the archive.
 
-### Stage 1 — a comparable baseline, and an end-to-end attribution
+### Stage 1 — attribution (done, 2026-11-03)
 
-Before touching the carrier again, make the starting point reproducible and
-finish the attribution O1 needs.
+The arrival is now attributable to five named segments, each timed behind
+`MOLEHILL_MHD_STATS` and reported per second: `accept_us`, `open_us` (placement
+plus handshake plus prologue), `wait_us` (the pairing's wait for a channel),
+`write_us` (the command on it) and the existing `first_*` (the visitor's first
+byte afterwards). The numbers are in "Where an arrival's time goes" above, and
+they answer the question Stage 1 was written for: the tail is a queue of
+interchangeable channels, not one slow step.
 
-- Freeze the measurement contract: per-stage numbers, no added warm-up, TCP
-  contrast from `MOLEHILL_DATA_CARRIER=tcp` on the same build family, every
-  optimisation as an interleaved `--ab-arm`/`--binary-b` A/B with its own A/A
-  twin, artifacts under `target/evidence/` or `~/tmp/`.
-- Correlate **one arrival end to end by identity** — group id, stream id,
-  packet number — across: server accept → request queued → client read → pool
-  open → first opening packet posted → server received → reply posted → channel
-  registered → stripe command written → visitor echo. Existing pieces:
-  `paired_us`, `accept_us`, `us`/`hs_us`/`ack_us`, `mhd stream opened and
-  acknowledged`, `mhd slow stream open`, `mhd window`, `mhd stalled`.
-- Keep the cost on the slow path only (5 ms thresholds behind the stats switch);
-  the hot path gains no per-packet clock read.
-- **Gate**: every millisecond of the arrival is attributable to a named segment,
-  and the current mhd/TCP baseline plus its noise is on the record.
+What it took, and what is worth keeping from it:
 
-### Stage 2 — no per-visitor Noise handshake (latency, first priority)
+- Two instruments, both at the same five-millisecond-or-finer scale as the older
+  two, plus a per-second window on each end — because a per-event line at a
+  threshold shows the tail and never the population, and the population is what
+  distinguishes "a few slow opens" from "every open is slow".
+- Three instruments had to be re-scaled first: the client's lane open (5 ms), the
+  client's open-to-prologue (was 100 ms), the client's task-scheduling delay (was
+  100 ms), and both windows (were 10 s, against a 5 s cell). An instrument coarser
+  than the thing it measures reports a healthy system — four times in this cycle.
+- One earlier conclusion had to be withdrawn *before* it could mislead the plan:
+  that `churn-16` runs at sixteen arrivals a second. It runs at about four
+  thousand, and the `churn_per_s: 16` field belongs to the timeline's probe.
 
-Derive each stream's keys from the lane's established session instead of
-running a KK handshake per stream: `HKDF(lane handshake hash, direction, stream
-id)`, per-direction counters as AEAD nonces, sealing inside the carrier's own
-packet framing.
+Measurement discipline from here (unchanged from AGENTS.md §10, restated because
+it is what the next stages will be judged by): per-stage numbers, no added
+warm-up, the TCP contrast from `MOLEHILL_DATA_CARRIER=tcp` on the same build
+family, every optimisation an interleaved `--ab-arm`/`--binary-b` A/B with its
+own A/A twin, and artifacts under `target/evidence/` or `~/tmp/`.
 
-Why this shape and not the three that failed: a mux over the lane adds a copy
-and cost 23.75 % of `bulk-n`; a record layer above the carrier cost the bulk
-cell at three record sizes because the reader could park mid-record; a stock of
+### Stage 2 — a channel belongs to the request that asked for it (latency, first)
+
+**This is the change the measurements above ask for, and it is ahead of the
+handshake work** because the tail is queueing, not a slow step.
+
+Today a channel is anonymous: the client opens one per request, drops it in a
+shared queue, and `pair_striped_group` takes whichever is at the head. So a
+visitor's own channel can be delivered to another visitor, and with sixteen opens
+in flight the waits add up. Give the pairing an identity:
+
+1. A channel names the request it was opened for. The group id already exists on
+   the wire and in both ends' hands; it goes into the tunnel prologue next to the
+   service and tunnel ids, which is four bytes and no new key.
+2. The server reads it where it already reads the prologue and delivers the
+   channel to **that group's waiter**, with the shared queue kept for plain
+   visitors. A waiter registers before its request is written, so a channel that
+   arrives early is not lost.
+3. An abandoned group is released as it is today (`ReleaseGroup`, plus a TTL),
+   so a visitor that gives up cannot leak a waiter.
+
+This also removes a latent correctness hole rather than only a latency one: with
+`stripes > 1` the current FIFO can hand a channel opened for group A to group B,
+which is exactly the "K stripes on K distinct tunnels" invariant the client's
+placement works to keep.
+
+- **Gate**: `churn-16` p99 falls toward TCP's 2.58 ms; the pairing's p99 stops
+  exceeding the open's p99; `bulk-n` inside 15 %; both clean stages improved; the
+  striped integration test still passes with `stripes > 1`.
+- **Revert**: no movement beyond the run's floor, or any bulk regression.
+- **Tests first**: a channel for group A never satisfies group B; an early
+  arrival is held for its waiter; an abandoned group leaks no waiter; a plain
+  visitor still takes the shared queue.
+
+### Stage 3 — no per-visitor Noise handshake (latency)
+
+With the queue gone, what is left of one open is its own cost — 1.73 ms at the
+median, of which the Noise KK handshake is the larger part. Derive each stream's
+keys from the lane's established session instead: `HKDF(lane handshake hash,
+direction, stream id)`, per-direction counters as AEAD nonces, sealing inside the
+carrier's own packet framing.
+
+Why this shape and not the three that failed: a mux over the lane adds a copy and
+cost 23.75 % of `bulk-n`; a record layer above the carrier cost the bulk cell at
+three record sizes because the reader could park mid-record; a stock of
 pre-opened channels is consumed in the first four of 6 400 arrivals. Deriving
-keys keeps every stream its own flow — its own offsets, credit and window —
-and adds no layer.
+keys keeps every stream its own flow — its own offsets, credit and window — and
+adds no layer.
 
 - **Gate**: `churn-16` p99 materially toward TCP's 2.58 ms and both clean stages
-  improved, `bulk-n` inside 15 %, no level change in memory; wire dialect 6.0
-  may be extended in place, `just interop` still 3 of 3.
+  improved, `bulk-n` inside 15 %, no level change in memory; dialect 6.0 may be
+  extended in place, `just interop` still 3 of 3.
 - **Revert**: no effect beyond the run's floor, or any bulk regression.
 - **Tests first**: no `(key, nonce)` reuse across stream or direction; replay,
-  duplication, reordering, stream-id reuse and lane re-establishment all
-  refused; plain and encrypted data planes both still open; half-close, reset
-  and FIN-after-data hold.
+  duplication, reordering, stream-id reuse and lane re-establishment all refused;
+  plain and encrypted data planes both still open; half-close, reset and
+  FIN-after-data hold.
 
-### Stage 3 — RACK plus PTO, instead of one timer for everything
+### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
 ([loss_detection.c](https://github.com/microsoft/msquic/blob/21a4d9c4affa8da13b7f3758ed02c6180e567629/src/core/loss_detection.c)):
 a **RACK** deadline for packets with later acknowledgement evidence, a **PTO**
-that sends one or two probes instead of declaring a flight lost, and the
-existing peer-silence rule for a dead path. Retire the global "oldest data
-packet older than the RTO blocks every non-opening write" gate; the opening
-reserve stays as anti-starvation, not as a mask.
+that sends one or two probes instead of declaring a flight lost, and the existing
+peer-silence rule for a dead path. Retire the global "oldest data packet older
+than the RTO blocks every non-opening write" gate; the opening reserve stays as
+anti-starvation, not as a mask.
 
 Take the ack-timing rules from a reference that has them
 ([quic-go's received-packet tracker](https://github.com/quic-go/quic-go/blob/aa265c3fc6489e3bfa8071b333be95e0e887a51d/internal/ackhandler/received_packet_tracker.go)):
@@ -275,10 +345,11 @@ gap immediately; aggregate only within a bounded delay.
   does not storm; `churn-16`, `rr-16`, both clean stages and `loss1`/`loss5`/
   `rtt100` each judged on their own cell.
 
-### Stage 4 — latency-aware internal scheduling (latency)
+### Stage 5 — latency-aware internal scheduling (latency)
 
-Replace the flat per-stream round robin with classes: control and repair; a
-stream still opening; interactive; bulk. Borrow the queueing shape from Quinn's
+With the arrival path cheap, the remaining queue is the one bulk makes. Replace
+the flat per-stream round robin with classes: control and repair; a stream still
+opening; interactive; bulk. Borrow the queueing shape from Quinn's
 [priority plus recency round-robin](https://github.com/quinn-rs/quinn/blob/2c5750139fa09aab588bf0f939c83f521d658baf/quinn-proto/src/connection/pacing.rs)
 and quic-go's urgency queues, but with **no new configuration key** — the class
 is derived from the stream's own state.
@@ -286,31 +357,31 @@ is derived from the stream's own state.
 - **Gate**: arrivals under bulk are not slowed; `bulk-n` unmoved; a burst of new
   streams cannot starve a mature one (bounded quantum per class).
 
-### Stage 5 — a rate- and BDP-driven window (throughput, third)
+### Stage 6 — a rate- and BDP-driven window (throughput, third)
 
-The current window grows additively and is never cut, `slow_start` latches off
-at the first loss forever, and a flight may outlive its own timer. Add delivery
-rate and `app_limited` sampling (the shape in
+The current window grows additively and is never cut, `slow_start` latches off at
+the first loss forever, and a flight may outlive its own timer. Add delivery rate
+and `app_limited` sampling (the shape in
 [MsQuic's BBR](https://github.com/microsoft/msquic/blob/21a4d9c4affa8da13b7f3758ed02c6180e567629/src/core/bbr.c)),
 then a simplified Startup/Drain/ProbeBW with a token-bucket pacer whose burst is
 bounded by RTT and MTU.
 
 - **Gate**: `bulk-n` and `rtt100` improve or hold; `rate20`/`rate100` do not
   collapse; RSS and CPU are compared only after latency and throughput hold.
-- **Revert**: the controller alone, keeping stages 2–4.
+- **Revert**: the controller alone, keeping stages 2–5.
 
-### Stage 6 — memory, then processor
+### Stage 7 — memory, then processor
 
-Only after the two axes above hold: reclaim windows and blocks from the real
-peak flight, keep the pooled receive blocks and the sliced send payload, and
-give the recovery table bounded, low-allocation storage. Do not retry region
-pinning, a piece per datagram, or a chunk queue without a cursor — each was
-built, measured and rejected.
+Only after the two axes above hold: reclaim windows and blocks from the real peak
+flight, keep the pooled receive blocks and the sliced send payload, and give the
+recovery table bounded, low-allocation storage. Do not retry region pinning, a
+piece per datagram, or a chunk queue without a cursor — each was built, measured
+and rejected.
 
-### Stage 7 — the full ritual
+### Stage 8 — the full ritual
 
-`just fmt`, `just py-fmt`, `just check`, `just interop`, `just l3-accept`, then
-a repeated `dev` plus `timeline` plus `capacity` campaign, then the five-arm
+`just fmt`, `just py-fmt`, `just check`, `just interop`, `just l3-accept`, then a
+repeated `dev` plus `timeline` plus `capacity` campaign, then the five-arm
 `sweep`. Only a gate-green record becomes
 `benches/records/results-bench-v1.0.0.json`, with charts and both READMEs in the
 same commit. A method change makes it a re-baseline release (no `--baseline`),
