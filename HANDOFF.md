@@ -5088,9 +5088,39 @@ look at lane supply or at where a connection waits. No per-stage number on this 
 needs to be discarded; the schedule just measures a real first-stage cost that nothing has
 yet explained.
 
+**And the wait was then split in one run (2026-11-03).** `churn-16` alone, dev profile,
+one round, `MOLEHILL_MHD_STATS=1` reaching the tool (the previous attempt did not: `sudo`
+drops the variable, so `sudo -n env MOLEHILL_MHD_STATS=1 just bench …` is the form that
+works, and a run whose `server.log` has no pairing lines is a run with the switch off).
+2 336 pairings, every one above the five-millisecond gate:
+
+| field | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| `accept_us` | 17 µs | 25 µs | 37 µs | 62 µs |
+| `paired_us` | **9 746 µs** | 21 471 µs | 40 662 µs | 69 854 µs |
+
+**Accepting the visitor is not where the time goes — 17 µs — and every millisecond of the
+wait is inside the gather.** Two further fields close off the cheap explanations:
+`attempts=0` on all 2 336 lines (the gather succeeded on its first attempt, so nothing is
+retrying) and `stripes=1` on all of them (the striping plan is not involved).
+
+So the shape is: the visitor arrives instantly, the client is asked for one data channel,
+and **a newly created channel takes a median of ten milliseconds to be usable.** Against
+that, the visitor's own dial is 91 µs (`setup_p50_ms` on the same run) and the carrier's
+interactive median is 3.48 ms — both an order of magnitude below the gap that this cell is
+failing on.
+
+Ten milliseconds on a `10.10.0.0/24` netns with a sub-millisecond round trip is a **timer,
+not a network cost**, and the obvious suspects are the ones that handshake a fresh mhd
+connection (pre-handshake ack, delayed ACK without `QUICKACK`, or a poll interval in the
+channel-request path). The next instrument therefore does not go in the gather: it goes
+**around the channel's own creation**, on the client side, where nothing is logged today.
+Splitting "request leaves the server" from "channel registered at the server" is one
+timestamp on each end.
+
 **This is where the cycle ends.** The tree is green, the record is consistent, every
-hypothesis has its outcome written down, and the remaining gap is localised to a
-measurement that already exists.
+hypothesis has its outcome written down, and the remaining gap is now a ten-millisecond
+cost with a name and a boundary.
 
 
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
