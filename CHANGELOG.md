@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The multi-second stalls are a *different* defect and are fixed — see the entry
   about the flight outliving its timer. This one remains. Measured with
   `MOLEHILL_DATA_CARRIER` pinning a carrier per run over the same binary,
-  `churn-16` (a fresh connection per request, sixteen at once, six rounds) puts the
+  `churn-16` (a fresh connection per request, sixteen a second, six rounds) puts the
   round trip's p99 at
   **21.04 ms against TCP's 2.58**, with the medians level (2.47 against 2.25) and
   the arrival rate at 3 469 against 6 705 per second. The cell asks for sixteen fresh
@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's keys from the lane's own was built and measured three times: it takes
   the tail to 3.79 ms and doubles the arrival rate at half the CPU per bit, and
   **every version cost the bulk cell**, in failed samples rather than in
-  percentages. The mechanism and the state of each attempt are in `HANDOFF.md`. A
+  percentages. So the route to arrival parity exists and a version that keeps the
+  bulk cell does not, yet. A
   deployment whose traffic is mostly short-lived connections should measure its
   own path before choosing this carrier; one whose connections are reused has
   nothing to trade.
@@ -54,11 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stage of the same run reads p50 **12.13**: six times the median the carrier reaches
   minutes later, and *within* that first stage the latency **rises** — its first twenty
   arrivals sit at 2.14 ms and the rest of it at 72.78 — so "cold start" is the wrong name
-  for it and the mechanism is unattributed. **What is cold is not yet attributed**: the only start-up quantity this
-  release measures is the congestion window, which reaches its 2 MiB slow-start ceiling
-  within the first second of traffic and therefore cannot explain a median that is six
-  times worse across a whole stage — so that is a *rejected* explanation, not the
-  explanation. A deployment is therefore choosing between a carrier that is quicker than TCP
+  for it. **What is cold is now localised rather than explained**: the first stage's
+  visitors wait for their data channels where the last stage's do not — 471 of that
+  stage's ~480 pairings took more than five milliseconds, against **1** of the last
+  stage's — and a channel that is still being created takes a median of **9.7 ms** to
+  become usable, while accepting the visitor itself takes 17 µs. What those ten
+  milliseconds are is open. The congestion window is *not* the answer and is recorded as
+  a **rejected** explanation: it reaches its 2 MiB slow-start ceiling within the first
+  second of traffic and therefore cannot explain a median that is six
+  times worse across a whole stage. A deployment is therefore choosing between a carrier that is quicker than TCP
   once it has been running and one that is slower for the first minutes of its life.
   Two further numbers: the capacity ramp climbs **all eight levels**, and on a run whose
   first stage happened to land well the first stage read **46.2 ms** at the 99th
@@ -114,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healthy run's thousands of short visitors stay silent.
 
 - **A visitor that waited for its data channels says so at `INFO`.** The line exists
-  and fires past a tenth of a second, but it was `DEBUG`: a release run keeps the
+  and fires past five milliseconds, but it was `DEBUG`: a release run keeps the
   default filter, so the one measurement that explains an SLO failure on a clean stage
   was absent from the record that reports the failure. It is `INFO` now, matching the
   server's own slow-open line, and it costs nothing on a healthy path — a healthy

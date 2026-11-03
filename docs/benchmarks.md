@@ -947,13 +947,17 @@ one that is slower for the first stage of a run.
 **And that stage's cost is not a start-up cost.** Within it the latency *rises*: the stage's
 first twenty arrivals sit at 2.14 ms — the speed the carrier keeps — and its remaining few
 hundred at 72.78 ms. A start-up cost would do the opposite. So the table's twelve
-milliseconds is an average over a stage that begins fast and slows, and the mechanism is
-**unattributed**. **Which part of
-that state is still open**: the congestion window is the only start-up quantity this
-schedule measures, and it reaches its 2 MiB slow-start ceiling within the first second of
-traffic, so it cannot account for a median that stays six times worse across a whole
-stage. A reader should take the six-fold difference as the measurement and the mechanism
-as unattributed.
+milliseconds is an average over a stage that begins fast and slows. **Where it goes is
+measured**: the stage's visitors wait for their data channels and the last stage's do not —
+471 of that stage's ~480 pairings took more than five milliseconds, against **1** of the
+last stage's — and a channel that is still being created takes a median of **9.7 ms** to
+become usable while accepting the visitor itself takes 17 µs. What those ten milliseconds
+inside a new channel are is still open. The congestion window is *not* the answer and is
+recorded as a **rejected** explanation: it reaches its 2 MiB slow-start ceiling within the
+first second of traffic, so it cannot account for a median that stays six times worse
+across a whole stage. A reader should take the six-fold difference as the measurement, the
+wait for a data channel as where it is spent, and the ten milliseconds inside a new channel
+as open.
 
 A schedule that measured only the first stage would report the cold number and a schedule
 that measured only the last would report the warm one. This one reports both, in order,
@@ -962,10 +966,10 @@ which is why the order is part of the method.
 Removing the handshake by deriving each stream's keys from the lane's own was
 built and measured three times. It takes the tail to 3.79 ms and doubles the
 arrival rate at half the CPU per bit, and **every version cost the bulk cell** —
-samples that failed outright, not percentages that needed a floor. The mechanism
-and the state of each attempt are in `HANDOFF.md`. A deployment whose traffic is
-mostly short-lived connections should measure its own path before choosing a
-carrier; one whose connections are reused has nothing to trade.
+samples that failed outright, not percentages that needed a floor. A deployment
+whose traffic is mostly short-lived connections should therefore measure its own
+path before choosing a carrier; one whose connections are reused has nothing to
+trade.
 
 ## The transparent-L3 wire question (the acceptance harness)
 
