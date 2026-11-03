@@ -3632,7 +3632,15 @@ impl<C> ChannelQueue<C> {
                     Err(mpsc::error::TrySendError::Full(channel)) => {
                         return self.push(channel).await;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                    // The pairing that named this group has gone, so nobody is
+                    // waiting to read this channel. It is counted and given back
+                    // to the shared queue rather than dropped: a dropped channel
+                    // is a visitor whose receive window never opens, which is what
+                    // the release sweep's dead stages look like from the sender.
+                    Err(mpsc::error::TrySendError::Closed(channel)) => {
+                        crate::transport::stats::note_dead_group();
+                        return self.push(channel).await;
+                    }
                 }
             }
         }

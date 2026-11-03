@@ -390,7 +390,19 @@ pub(crate) fn note_rejected(reason: &str) {
 /// in the shared queue is a channel that wakes every waiter, which is the
 /// lottery this change exists to remove.
 static CLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Channels handed to a pairing that had already gone.
+///
+/// A channel in this state is served by nobody, and its visitor waits with a shut
+/// receive window: measured on a release sweep, the stages that carried nothing
+/// showed `snd_wnd = 0` in their *first* second, which is what a receiver that was
+/// never started looks like from the sender.
+static DEAD_GROUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one channel handed to a pairing that had already gone.
+pub(crate) fn note_dead_group() {
+    DEAD_GROUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Record one channel handed to the pairing that named its group.
 pub(crate) fn note_claimed() {
@@ -596,6 +608,7 @@ fn report() {
         );
     }
     let claimed = CLAIMED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let dead_group = DEAD_GROUP.swap(0, std::sync::atomic::Ordering::Relaxed);
     let shared = SHARED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let pooled = POOLED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let direct = DIRECT.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -605,6 +618,7 @@ fn report() {
             direct,
             claimed,
             shared,
+            dead_group,
             "mhd-stats: data channels by path, and where each was delivered"
         );
     }
