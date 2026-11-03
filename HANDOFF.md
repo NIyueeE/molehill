@@ -5051,23 +5051,46 @@ question that remains has a named mechanism, a one-command test and a rule for e
 **Every visitor in every stage rides exactly one stripe.** The plan never adds one under
 this schedule, so it cannot be what makes a run's first stage slow and its last fast.
 
-It also explains something this file got wrong an hour ago. The same counts show the
-**churn probe's own traffic collapsing across the run** — 471 pairings in the first stage,
-243 in the next, 4, then **1**. So `clean#2`'s good numbers — 3.93 ms in one run, 22.559 in
-this one — are computed over a stage in which the fresh-connection probe essentially did
-not run, while the first stage's are computed over 471 of them. **Comparing the first stage
-to the last was comparing a loaded stage to an idle one**, which is why no carrier-side
-lever ever explained the difference.
+**The first reading of those counts was wrong, and correcting it inverted the conclusion
+(2026-11-02).** They are not connection counts in the sense of "how much traffic ran". The
+pairing line fires once per successful pairing, gated at five milliseconds
+(`src/core/server.rs:4110`, `if paired >= Duration::from_millis(5) && stats::enabled()`),
+so 471 / 243 / 4 / 1 are the number of pairings **slower than five milliseconds** in each
+stage. The stage is a `--scale 0.2` hold of about 30 s at 16 arrivals per second, so each
+stage carried roughly 480 visitors:
 
-That is the last correction of the cycle and it is the same one as the first: **the number
-was measuring the instrument.** The handoff for the next cycle is therefore not a
-mechanism but a question about the harness — why the churn probe's connection rate decays
-from 471 to 1 across a schedule — and until that is answered, no per-stage comparison of
-arrival latency on this schedule means what it appears to mean.
+| stage | pairings over 5 ms | of ~480 visitors |
+|---|---|---|
+| `clean` | 471 | ~98 % |
+| `loss1` | 243 | ~51 % |
+| `loss5` | 4 | ~0.8 % |
+| `clean#2` | 1 | ~0.2 % |
+
+The probe's own rate field says the same thing from the other side: `churn_per_s` is
+15.99–16.005 in `clean#2` in **every** record that has one (23 of them), and 5.73–15.8 in
+the first `clean`. **The fresh-connection probe ran at its full nominal 16 per second in
+the last stage.** It never decayed, so `clean#2`'s numbers are not computed over an idle
+stage and the earlier "loaded stage compared to an idle one" reading is withdrawn.
+
+What the corrected reading gives is not an instrument defect but the sharpest statement of
+the remaining gap this cycle produced: **in the first stage essentially every visitor waits
+more than 5 ms for its data channels; in the last stage one in five hundred does.** And it
+is not a property of a lightly loaded stage: the first stage is slower at *full* rate too —
+`churn_per_s` 15.54 → p99 155.4 ms (p103), 15.75 → 93.0 (p92), 14.48 → 151.8 (p105) — so
+the tail survives the load and is not a sample-count artefact.
+
+That makes the handoff for the next cycle a carrier question after all, and a narrow one:
+**the wait for data channels goes from almost every visitor to almost none between the
+first stage and the last.** The same line already prints `paired_us` and `accept_us`, so
+the next run can say whether those 471 sit at 5–10 ms (a channel supply that is merely thin
+at the start) or at 100 ms (a wait that is pathological), and that answer decides whether to
+look at lane supply or at where a connection waits. No per-stage number on this schedule
+needs to be discarded; the schedule just measures a real first-stage cost that nothing has
+yet explained.
 
 **This is where the cycle ends.** The tree is green, the record is consistent, every
-hypothesis has its outcome written down, and the one question that remains is now about the
-measuring apparatus rather than about the carrier.
+hypothesis has its outcome written down, and the remaining gap is localised to a
+measurement that already exists.
 
 
 **And the third part is now measured rather than argued (2026-11-02).** The obvious
