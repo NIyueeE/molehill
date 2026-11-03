@@ -730,6 +730,17 @@ impl Conn {
         // The window follows the reader: credit is what has been consumed plus
         // one window, so a peer that fills it meets a reader that drains it.
         self.recv_credit = self.read.saturating_add(WINDOW);
+        // **And the move has to be speakable.** `credit_due` wakes the pump, but
+        // a pump with nothing to send emits no packet, and a packet that is not
+        // an acknowledgement carries no credit. So a reader that drains a window
+        // on a quiet lane — a one-way stream, which is every response flowing
+        // back to a visitor — used to wait for the keepalive's two seconds, or,
+        // with the keepalive also quiet, for ever: the sender sat on fifteen
+        // megabytes it could not send while this end reported an empty buffer.
+        // Arming the acknowledgement here is what makes the wake mean something.
+        if self.credit_due() {
+            self.ack_pending = true;
+        }
     }
 
     /// Settle every finishing stream, after an acknowledgement moved a base.
