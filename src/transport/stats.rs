@@ -360,6 +360,26 @@ fn take_open_handshake() -> Vec<u32> {
     taken
 }
 
+/// Why a datagram was refused, per second.
+///
+/// Every rejection used to be silent: a lane that dropped every packet of a new
+/// stream looked exactly like a lane whose peer never sent one, and a run could
+/// only say "the visitor was not served". One counter per reason turns that into
+/// a sentence — and this is what a sealed-stream defect needed and did not have.
+static REJECT_MALFORMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REJECT_OVER_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REJECT_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one refused datagram, by reason.
+pub(crate) fn note_rejected(reason: &str) {
+    let counter = match reason {
+        "malformed" => &REJECT_MALFORMED,
+        "over_window" => &REJECT_OVER_WINDOW,
+        _ => &REJECT_UNKNOWN,
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Where a delivered channel went: to the pairing that named it, or to the pool.
 ///
 /// The number that says whether the identity is live: a channel that still lands
@@ -554,6 +574,15 @@ fn report() {
             hs_p99_us = pct_us(&handshake, 99, 100),
             hs_max_us = handshake.last().copied().unwrap_or(0),
             "mhd-stats: a stream's Noise handshake, every open"
+        );
+    }
+    let malformed = REJECT_MALFORMED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let over_window = REJECT_OVER_WINDOW.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let unknown = REJECT_UNKNOWN.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if malformed + over_window + unknown > 0 {
+        info!(
+            malformed,
+            over_window, unknown, "mhd-stats: datagrams refused, by reason"
         );
     }
     let claimed = CLAIMED.swap(0, std::sync::atomic::Ordering::Relaxed);

@@ -1474,6 +1474,13 @@ impl Conn {
         let total = stats::Timing::start(sampled);
         let outcome = self.apply_datagram(now, buf, sampled);
         total.stop(&stats::PHASES.rx_total);
+        if let Err(refused) = outcome {
+            stats::note_rejected(match refused {
+                Rejected::Malformed => "malformed",
+                Rejected::OverWindow => "over_window",
+                Rejected::UnknownStream => "unknown_stream",
+            });
+        }
         outcome
     }
 
