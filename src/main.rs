@@ -10,15 +10,27 @@ use tracing::{debug, info};
 
 /// How many runtime workers a process gets unless the environment says otherwise.
 ///
-/// The data plane is a handful of hot tasks that never block: a worker per core
-/// lends them nothing and costs a great deal. Tokio's workers spin briefly for
-/// work before they park, so on a wide machine the idle ones burn CPU that the
-/// carrier is charged for — measured on a twenty-core bench host, the same
-/// workload cost `0.93 s` of CPU per Gbit at twenty workers and `0.64` at four,
-/// with the delivered throughput moving by less than a tenth. Four is the
-/// widest setting that still ties the TCP carrier's cost; a deployment that
-/// wants more sets `TOKIO_WORKER_THREADS`, which is read here and honoured.
-const DEFAULT_WORKERS: usize = 4;
+/// Two measurements disagree and the objective's priority order decides between
+/// them: **latency > throughput > memory > processor.**
+///
+/// - **Processor cost** prefers few. On a twenty-core bench host the same
+///   workload cost `0.93 s` of CPU per Gbit at twenty workers and `0.64` at four,
+///   with delivered throughput moving by less than a tenth — because tokio's
+///   workers spin briefly before they park, so idle ones burn CPU the carrier is
+///   charged for.
+/// - **Latency** prefers more, and on the cell that gates the release it prefers
+///   it by a factor of two. A fresh connection's per-stream Noise handshake is a
+///   handful of polls on this runtime; with four bulk streams on four workers
+///   those polls queue behind them. Measured on the staged schedule, first stage
+///   against last: `hs_p50` **26 501 µs at four workers and 12 970 at eight**,
+///   while the last stage read 1 004 and 1 132 — so the workers buy the *busy*
+///   stage's arrival, not the idle one's. The stage's own median and p99 fell in
+///   both orderings of the pair (p50 65.1 → 39.5 and 37.6 → 2.0 ms).
+///
+/// Latency is first, so eight is the default and `min(cores, 8)` is what a small
+/// machine gets. `TOKIO_WORKER_THREADS` still overrides it, and a deployment that
+/// would rather have the CPU back can set it to four.
+const DEFAULT_WORKERS: usize = 8;
 
 /// The workers this process will start.
 fn workers() -> usize {

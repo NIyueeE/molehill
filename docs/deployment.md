@@ -863,18 +863,23 @@ The client variant is the same file with
 
 ## Runtime threads
 
-A molehill process runs its I/O on a Tokio runtime sized to `min(4, available
-cores)` worker threads; `TOKIO_WORKER_THREADS` overrides that count. Fewer
-threads is usually the better trade here: the data plane is a few tasks that
-never block, and a worker with nothing to run still looks for work, so each extra
-one spends CPU on bytes another thread is already moving. Four is the widest
-setting at which the UDP carrier's CPU per byte stayed level with the TCP
-carrier's on the benchmark host; going to one thread per core cost roughly a
-third more CPU for the same delivered bytes.
+A molehill process runs its I/O on a Tokio runtime sized to `min(8, available
+cores)` worker threads; `TOKIO_WORKER_THREADS` overrides that count.
 
-Raise it with `TOKIO_WORKER_THREADS` when a process serves enough concurrent
-services that four threads, not the CPU, are the limit — a busy server with many
-independent claims is the case to measure, not to assume.
+The trade is between latency and CPU, and the default takes latency. Fewer
+threads costs less CPU: a worker with nothing to run still looks for work, so each
+extra one spends time on bytes another thread is already moving — on the
+benchmark host, one thread per core cost roughly a third more CPU per carried Gbit
+than four. But fewer threads also means a **new connection's handshake queues
+behind whatever is already running**: with four bulk streams on four workers, the
+per-connection handshake measured 26.5 ms in a busy stage against 13.0 ms at eight
+workers, while an idle stage read 1.0 ms either way. That is the cell the release
+gate is stated on, so eight is the default.
+
+Lower it when CPU is the scarce resource: `TOKIO_WORKER_THREADS=4` is the setting
+to measure on a small box serving many long-lived streams, and raise it further
+when a process serves enough concurrent services that the workers, not the CPU,
+are the limit.
 
 ## Network requirements
 
