@@ -796,6 +796,27 @@ alone does not matter. What is left is the stripe layer's own two directions —
 — and the fact that in every failure the visitor→peer direction *completes* early
 and the half-close grace then cuts the other one.
 
+### GSO and many streams are excluded too (2026-11-03, round 18)
+
+`bulk-n` with sealing — eight streams over four lanes, real sockets, GSO and GRO —
+runs at **4.60 Gbit/s with no failures**. So the last infrastructure candidate is
+gone: the carrier seals correctly when many streams share lanes over real
+sockets.
+
+The round's next step was the stripe-group harness with sealed ends, and it is
+**half-built and stuck**: `spawn_group` is bidirectional on the same streams, so a
+peer made of "drain the frames and discard them" carries nothing back, and the
+harness stalled at zero bytes. Making it work needs the peer's side to be a real
+`spawn_group` as well — which means understanding how the two groups share one
+set of duplex stripes without reading their own writes, and that is a design
+question about `stripe.rs` that this round did not answer. The half-built harness
+is in the patch so the next attempt starts from it.
+
+**Round 19 is the last one this rule allows.** If the harness is not finished and
+the defect not explained by then, sealing is parked and the next cycle takes a
+different route to the 1.8 ms — the evidence for the prize and against the effort
+is all written down above and in the measurements table.
+
 ### A decision with a rule, so this cannot run on for ever
 
 Seven rounds have gone into this and nothing has landed. The measured prize is
