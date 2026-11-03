@@ -1090,21 +1090,33 @@ pub async fn read_hello<T: AsyncRead + Unpin>(conn: &mut T) -> Result<(ProtocolV
 }
 
 /// The prologue a stream of a **multiplexed tunnel** opens with: the service it
-/// serves, and the tunnel carrying it.
+/// serves, the tunnel carrying it, and the **stripe group** that asked for it.
 ///
-/// Eight raw bytes, the same shape [`write_lane_prologue`] uses for a claim's
-/// lane, and for the same reason: the receiving end has to be able to talk about
-/// the *connection* a stream arrived on, and a service id alone cannot say which
-/// one it was.
+/// Twelve raw bytes. The service and the tunnel are the same shape
+/// [`write_lane_prologue`] uses for a claim's lane, and for the same reason: the
+/// receiving end has to be able to talk about the *connection* a stream arrived
+/// on, and a service id alone cannot say which one it was.
+///
+/// The group is what makes a channel belong to the request that asked for it.
+/// Without it the server took whichever channel reached its queue first, so with
+/// several opens in flight a visitor's own channel could be handed to another
+/// visitor — measured as a pairing p99 of 20.1 ms beside a worst channel open of
+/// 7.6 ms in the same second, and as a pairing *median* below the open's. Zero
+/// means "no group": a plain visitor's channel, which the shared queue serves.
+///
+/// This rides a dialect that is not released yet (`6.0`), so it is an extension
+/// in place rather than a new number (AGENTS.md §5).
 #[cfg(all(feature = "client", feature = "multiplex"))]
 pub async fn write_tunnel_prologue<T: AsyncWrite + Unpin>(
     conn: &mut T,
     service_id: ServiceId,
     tunnel: TunnelId,
+    group: u32,
 ) -> Result<()> {
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 12];
     buf[..4].copy_from_slice(&service_id.0);
-    buf[4..].copy_from_slice(&tunnel.0);
+    buf[4..8].copy_from_slice(&tunnel.0);
+    buf[8..].copy_from_slice(&group.to_be_bytes());
     conn.write_all(&buf)
         .await
         .with_context(|| "Failed to write the v5 tunnel prologue")?;
@@ -1116,16 +1128,17 @@ pub async fn write_tunnel_prologue<T: AsyncWrite + Unpin>(
 #[cfg(all(feature = "server", feature = "multiplex"))]
 pub async fn read_tunnel_prologue<T: AsyncRead + Unpin>(
     conn: &mut T,
-) -> Result<(ServiceId, TunnelId)> {
-    let mut buf = [0u8; 8];
+) -> Result<(ServiceId, TunnelId, u32)> {
+    let mut buf = [0u8; 12];
     conn.read_exact(&mut buf)
         .await
         .with_context(|| "Failed to read the v5 tunnel prologue")?;
     let mut service = [0u8; 4];
     let mut tunnel = [0u8; 4];
     service.copy_from_slice(&buf[..4]);
-    tunnel.copy_from_slice(&buf[4..]);
-    Ok((ServiceId(service), TunnelId(tunnel)))
+    tunnel.copy_from_slice(&buf[4..8]);
+    let group = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    Ok((ServiceId(service), TunnelId(tunnel), group))
 }
 
 /// Write the 4-byte service prologue that opens every stream of a v4 data
@@ -2173,13 +2186,18 @@ mod tests {
         let (mut tx, mut rx) = duplex(64);
         let service = ServiceId::new(0x0BAD_F00D);
         let tunnel = TunnelId::new(0x0000_1234);
-        write_tunnel_prologue(&mut tx, service, tunnel)
+        write_tunnel_prologue(&mut tx, service, tunnel, u32::from_be_bytes([1, 2, 3, 4]))
             .await
             .unwrap();
-        let (read_service, read_tunnel) = read_tunnel_prologue(&mut rx).await.unwrap();
+        let (read_service, read_tunnel, group) = read_tunnel_prologue(&mut rx).await.unwrap();
         assert_eq!(read_service, service);
         assert_eq!(read_tunnel, tunnel);
         assert_eq!(read_tunnel.get(), 0x1234);
+        assert_eq!(
+            group,
+            u32::from_be_bytes([1, 2, 3, 4]),
+            "the group is what makes a channel belong to the request that asked for it"
+        );
     }
 
     /// A lane's prologue is eight fixed bytes — the service, then the lane —

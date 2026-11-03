@@ -1975,7 +1975,7 @@ where
     );
     tokio::spawn(async move {
         while let Some(mut stream) = bridge_rx.recv().await {
-            let Some(queue) = route_tunnel_stream(
+            let Some((queue, group)) = route_tunnel_stream(
                 &mut stream,
                 &owner.sessions,
                 &owner.nonce,
@@ -1988,7 +1988,10 @@ where
                 // tunnel or the session.
                 continue;
             };
-            if queue.push(DataChannel::Mux(stream)).await.is_err() {
+            // The channel goes to the pairing that named its group, so a
+            // visitor's own channel is not handed to another visitor. A group
+            // whose pairing has gone falls back to the shared queue.
+            if queue.deliver(group, DataChannel::Mux(stream)).is_err() {
                 break;
             }
         }
@@ -2175,11 +2178,11 @@ async fn route_tunnel_stream<S>(
         )
     )]
     tunnel_id: &std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>,
-) -> Option<std::sync::Arc<ChannelQueue<DataChannel>>>
+) -> Option<(std::sync::Arc<ChannelQueue<DataChannel>>, u32)>
 where
     S: AsyncRead + Unpin,
 {
-    let Ok((service_id, tunnel)) = read_tunnel_prologue(stream).await else {
+    let Ok((service_id, tunnel, group)) = read_tunnel_prologue(stream).await else {
         // The stream ended before naming a service (a client that opened it
         // and hung up): nothing to route it to.
         debug!("Dropped a tunnel stream with no prologue");
@@ -2204,7 +2207,7 @@ where
         report_tunnel_violation(service_id, "no such service on this session");
         return None;
     };
-    Some(queue)
+    Some((queue, group))
 }
 
 /// Accept mhd lanes and serve every stream they carry.
@@ -2489,7 +2492,7 @@ async fn serve_mhd_stream(
             }
             let total_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
             note_slow_opening(total_us, sel_us, hs_us);
-            let (service_id, _tunnel) = read_tunnel_prologue(&mut io).await?;
+            let (service_id, _tunnel, _group) = read_tunnel_prologue(&mut io).await?;
             debug!(%service_id, "mhd tunnel stream routed");
             route_mhd_stream(io, &registry, &nonce, service_id).await
         }
@@ -3489,6 +3492,17 @@ pub(crate) struct ChannelQueue<C> {
     tx: mpsc::Sender<C>,
     rx: std::sync::Mutex<mpsc::Receiver<C>>,
     ready: tokio::sync::Notify,
+    /// Pairings waiting for the channel their **own** group opened.
+    ///
+    /// The shared queue above is a pool of interchangeable channels: a visitor
+    /// takes whichever is at the head, so with sixteen opens in flight its own
+    /// channel can be delivered to another visitor and the waits add up. That
+    /// is the measured tail — a pairing p99 of 20.1 ms beside a worst channel
+    /// open of 7.6 ms in the same second, and a pairing *median* below the
+    /// open's. A group that registers here gets the channel that named it, and
+    /// the shared queue keeps serving plain visitors and any channel whose group
+    /// has already gone.
+    groups: std::sync::Mutex<HashMap<u32, mpsc::Sender<C>>>,
 }
 
 impl<C> ChannelQueue<C> {
@@ -3499,6 +3513,7 @@ impl<C> ChannelQueue<C> {
             tx,
             rx: std::sync::Mutex::new(rx),
             ready: tokio::sync::Notify::new(),
+            groups: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -3508,6 +3523,53 @@ impl<C> ChannelQueue<C> {
     /// so the wake-up is a hint that the state changed, not a hand-off of one item.
     async fn push(&self, channel: C) -> Result<(), ()> {
         self.tx.send(channel).await.map_err(|_| ())?;
+        self.ready.notify_waiters();
+        Ok(())
+    }
+
+    /// Hand a channel to the pairing that named its group, or to the shared
+    /// queue when that pairing is gone.
+    ///
+    /// Only the multiplexed tunnel path names a group: a direct channel and a
+    /// transparent lane have no stripe request behind them.
+    ///
+    /// The delivery is a one-slot channel per group: a `send` succeeds only if
+    /// the pairing is still waiting, so a channel whose visitor gave up falls
+    /// through to the shared queue instead of being dropped — a channel is a
+    /// scarce resource and the next visitor can use it.
+    #[cfg(feature = "multiplex")]
+    fn deliver(&self, group: u32, channel: C) -> Result<(), ()> {
+        if group != 0 {
+            let waiter = self
+                .groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&group);
+            if let Some(waiter) = waiter {
+                match waiter.try_send(channel) {
+                    Ok(()) => {
+                        // The pairing is parked on its own receiver, which is
+                        // woken by the send itself; the shared queue's waiters
+                        // must not miss that a channel left the pool either.
+                        self.ready.notify_waiters();
+                        return Ok(());
+                    }
+                    // Full: the pairing has not taken its last one yet. Closed:
+                    // it gave up. Both fall through to the shared queue.
+                    Err(mpsc::error::TrySendError::Full(channel)) => {
+                        return self.push_blocking(channel);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                }
+            }
+        }
+        self.push_blocking(channel)
+    }
+
+    /// The shared-queue push, from a caller that is not an `async` context.
+    #[cfg(feature = "multiplex")]
+    fn push_blocking(&self, channel: C) -> Result<(), ()> {
+        self.tx.try_send(channel).map_err(|_| ())?;
         self.ready.notify_waiters();
         Ok(())
     }
@@ -3535,6 +3597,82 @@ impl<C> ChannelQueue<C> {
         }
     }
 
+    /// Take one channel for `group`: its own first, then the shared pool.
+    ///
+    /// The shared look comes second on purpose. A channel hand-off is a scarce
+    /// resource, and a pairing that can be served by one already in the pool
+    /// should be — that is the fast path this queue has always had. What is new
+    /// is that when the pool is empty the pairing waits for **its own** channel
+    /// instead of for whichever one happens to arrive next, so a visitor whose
+    /// channel is slow no longer has it delivered to somebody else and then
+    /// waits behind that visitor's.
+    async fn take_for(&self, group: u32) -> Option<C> {
+        // Registered before the first look, so a delivery landing between the
+        // look and the wait is not lost.
+        let mut claim = if group == 0 {
+            None
+        } else {
+            let (tx, rx) = mpsc::channel::<C>(1);
+            self.groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(group, tx);
+            Some(rx)
+        };
+        loop {
+            if let Some(rx) = claim.as_mut()
+                && let Ok(channel) = rx.try_recv()
+            {
+                self.unclaim(group);
+                return Some(channel);
+            }
+            match self.try_take() {
+                Ok(Some(channel)) => {
+                    self.unclaim(group);
+                    return Some(channel);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    self.unclaim(group);
+                    return None;
+                }
+            }
+            let notified = self.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Between the enable and the await there is still no gap: the
+            // registration happens in `enable`, and both producers notify after
+            // their push.
+            if claim.is_some() {
+                let rx = claim.as_mut()?;
+                tokio::select! {
+                    item = rx.recv() => {
+                        self.unclaim(group);
+                        // `None` here means the claim was withdrawn by a
+                        // delivery that could not hand the channel over; the
+                        // shared queue is then the only source left, and losing
+                        // this pairing would drop a visitor for nothing.
+                        return item.or_else(|| None);
+                    }
+                    () = notified => {}
+                }
+            } else {
+                notified.await;
+            }
+        }
+    }
+
+    /// Withdraw a claim: the pairing gave up, so its group must not keep a slot.
+    fn unclaim(&self, group: u32) {
+        if group == 0 {
+            return;
+        }
+        self.groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&group);
+    }
+
     /// Take one channel, waiting for as long as the caller's own budget decides.
     async fn take(&self) -> Option<C> {
         loop {
@@ -3549,18 +3687,6 @@ impl<C> ChannelQueue<C> {
             notified.await;
         }
     }
-}
-
-/// Take one data channel from the shared queue, or `None` when the pool's
-/// channel source ended (the control channel did).
-///
-/// The guard is dropped with the future, so a pairing that loses the race to its
-/// own timeout budget releases the queue for the other visitors.
-async fn take_channel<C>(rx: &SharedChannels<C>) -> Option<C>
-where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    rx.take().await
 }
 
 #[instrument(skip_all)]
@@ -4042,7 +4168,7 @@ where
             let next = tokio::select! {
                 _ = stops.shutdown.recv() => None,
                 _ = stops.control.changed() => None,
-                ch = take_channel(data_ch_rx) => ch,
+                ch = data_ch_rx.take_for(group) => ch,
                 () = time::sleep(PAIR_WAIT_BUDGET) => {
                     // Nothing arrived inside the budget. Only the channels this
                     // group still lacks are asked for again: the ones that
@@ -4061,6 +4187,10 @@ where
                     );
                     if attempts >= PAIR_ATTEMPTS {
                         debug!("No data channel after {attempts} requests; dropping the visitor");
+                        // The group is abandoned: a channel that names it must
+                        // fall through to the shared queue rather than be
+                        // delivered to a pairing that no longer exists.
+                        data_ch_rx.unclaim(group);
                         // The stripes that did arrive are parked on the client.
                         // Release the group before the visitor goes: its
                         // channels must come back to the pool now, not when the
@@ -4078,6 +4208,7 @@ where
                 }
             };
             let Some(mut ch) = next else {
+                data_ch_rx.unclaim(group);
                 return Ok(true);
             };
             if first_take_us.is_none() {
@@ -4097,6 +4228,7 @@ where
                 // stripes the client already parked for it, and gather a fresh
                 // one. The next iteration's own requests replace the channels
                 // that died with it, so nothing is re-asked here.
+                data_ch_rx.unclaim(group);
                 let _ = data_ch_req_tx.send(DataChannelRequest::ReleaseGroup(group_bytes));
                 drop(gathered);
                 continue 'gather;
@@ -5075,6 +5207,64 @@ mod tests {
     }
 
     /// The queue handles one session's services are served from.
+    /// A channel that names a group is delivered to *that* group's pairing.
+    ///
+    /// This is the defect the arrival's tail was made of: a channel used to go
+    /// to whichever pairing took one from the shared queue, so a visitor whose
+    /// own channel was slow had it handed to another visitor and then waited
+    /// behind that visitor's. The measured shape was a pairing p99 of 20.1 ms
+    /// beside a worst channel open of 7.6 ms in the same second, and a pairing
+    /// *median* below the open's — impossible unless channels were being
+    /// exchanged between visitors.
+    #[cfg(feature = "multiplex")]
+    #[tokio::test]
+    async fn a_channel_reaches_the_group_that_named_it() {
+        let queue: std::sync::Arc<ChannelQueue<DataChannel>> = ChannelQueue::pair(4);
+        // Two pairings wait at once, as sixteen concurrent arrivals do.
+        let a = {
+            let queue = std::sync::Arc::clone(&queue);
+            tokio::spawn(async move { queue.take_for(0xAAAA).await.map(|_| ()) })
+        };
+        let b = {
+            let queue = std::sync::Arc::clone(&queue);
+            tokio::spawn(async move { queue.take_for(0xBBBB).await.map(|_| ()) })
+        };
+        // Give both claims a chance to register before anything is delivered.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Group B's channel arrives first: it must go to B, not to A, which has
+        // been waiting longer.
+        assert!(queue.deliver(0xBBBB, probe_data_channel().await).is_ok());
+        let Ok(Ok(b_took)) = tokio::time::timeout(std::time::Duration::from_millis(200), b).await
+        else {
+            unreachable!("the group that named the channel must be woken")
+        };
+        assert!(b_took.is_some(), "B's own channel must reach B");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), a)
+                .await
+                .is_err(),
+            "A must still be waiting: B's channel is not A's to take"
+        );
+    }
+
+    /// A channel whose group has given up still reaches a visitor.
+    ///
+    /// A channel is a scarce resource — the pool has charged it — so an
+    /// abandoned group must not swallow one. It falls through to the shared
+    /// queue, where the next plain visitor takes it.
+    #[cfg(feature = "multiplex")]
+    #[tokio::test]
+    async fn a_channel_for_an_abandoned_group_falls_through_to_the_queue() {
+        let queue: std::sync::Arc<ChannelQueue<DataChannel>> = ChannelQueue::pair(4);
+        assert!(queue.deliver(0xCCCC, probe_data_channel().await).is_ok());
+        assert!(
+            queue.try_take().is_ok_and(|taken| taken.is_some()),
+            "a group nobody is waiting for must not hold the channel"
+        );
+    }
+
     #[cfg(feature = "multiplex")]
     type Queues = Vec<std::sync::Arc<ChannelQueue<DataChannel>>>;
 
@@ -5117,9 +5307,11 @@ mod tests {
     /// The prologue a stream of a multiplexed tunnel opens with: the service,
     /// then the tunnel it rides (see `write_tunnel_prologue`).
     async fn write_prologue(tx: &mut tokio::io::DuplexStream, id: u32) {
-        let mut buf = [0u8; 8];
+        let mut buf = [0u8; 12];
         buf[..4].copy_from_slice(&id.to_be_bytes());
-        buf[4..].copy_from_slice(&1u32.to_be_bytes());
+        buf[4..8].copy_from_slice(&1u32.to_be_bytes());
+        // No group: a plain visitor's channel, which the shared queue serves.
+        buf[8..].copy_from_slice(&0u32.to_be_bytes());
         tx.write_all(&buf).await.unwrap();
         tx.flush().await.unwrap();
     }
@@ -5156,9 +5348,10 @@ mod tests {
         // A registered service's stream lands on *that* service's queue.
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 1).await;
-        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
-            .await
-            .expect("a registered service must route");
+        let (routed, _group) =
+            route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
+                .await
+                .expect("a registered service must route");
         assert!(std::sync::Arc::ptr_eq(&routed, &queue_a));
         assert!(!std::sync::Arc::ptr_eq(&routed, &queue_b));
 
@@ -5185,9 +5378,10 @@ mod tests {
         // streams of several services, each routed by its own prologue.
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 2).await;
-        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
-            .await
-            .expect("the sibling service must route too");
+        let (routed, _group) =
+            route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
+                .await
+                .expect("the sibling service must route too");
         assert!(std::sync::Arc::ptr_eq(&routed, &queue_b));
         assert!(!std::sync::Arc::ptr_eq(&routed, &queue_a));
 

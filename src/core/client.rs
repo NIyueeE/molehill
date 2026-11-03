@@ -1576,7 +1576,11 @@ async fn run_mux_data_channel(
     // that connection (see `TunnelId`).
     let tunnel =
         crate::protocol::TunnelId::new(u32::try_from(stream.tunnel_id()).unwrap_or(u32::MAX));
-    write_tunnel_prologue(&mut stream, args.service_id, tunnel).await?;
+    // The group the server named in its request travels with the channel, so the
+    // server can deliver this channel to *that* pairing instead of to whichever
+    // visitor takes one from the shared queue first. Zero for a plain visitor.
+    let group = stripe.map_or(0, |request| request.group);
+    write_tunnel_prologue(&mut stream, args.service_id, tunnel, group).await?;
     let ready_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
     // Five milliseconds, behind the stats switch, exactly like the server's
     // pairing line — and with the group id, because that is the only way the two
@@ -1590,7 +1594,7 @@ async fn run_mux_data_channel(
     }
     if ready_us >= 5_000 && crate::transport::stats::enabled() {
         info!(
-            group = stripe.map(|request| request.group),
+            group,
             started_us, open_us, ready_us, "mhd client slow data channel: schedule, open, prologue"
         );
     }
