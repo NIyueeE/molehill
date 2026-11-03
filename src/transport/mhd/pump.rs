@@ -935,6 +935,11 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 // server's two halves of this wait. At a hundred milliseconds this line
                 // reported nothing on a cell whose tail is twenty: the instrument was
                 // four times coarser than the defect it was written to find.
+                //
+                // `info!`, like the two server-side lines and for the same reason:
+                // the configuration page promises all three at `info` while the switch
+                // is set, and a `debug!` line is invisible in a release run's default
+                // filter — which is precisely the run whose SLO failure needs it.
                 if us >= 5_000 && crate::transport::stats::enabled() {
                     let (credit, window, buffer, queued, retransmits) = self.shared.with(|conn| {
                         let (credit, window, buffer, queued) = conn.budget();
@@ -951,7 +956,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                     // budgets are three different defects, and the line below only
                     // says which *budget* was short — which is the answer to a
                     // question this line assumed had already been asked.
-                    tracing::debug!(
+                    tracing::info!(
                         lane = self.id,
                         us,
                         hs_us = hs_us,
