@@ -3591,14 +3591,14 @@ impl<C> ChannelQueue<C> {
                 match waiter.try_send(channel) {
                     Ok(()) => {
                         crate::transport::stats::note_claimed();
-                        // The pairing is parked on its own receiver, which is
-                        // woken by the send itself; the shared queue's waiters
-                        // must not miss that a channel left the pool either.
-                        // Stamped like the shared push, because this is the
-                        // common path once a channel names its group: without it
-                        // the resume window measured nothing at all.
                         crate::transport::stats::note_wake();
-                        self.ready.notify_waiters();
+                        // Deliberately **no** `notify_waiters` here. The send
+                        // itself wakes the one pairing that named this channel,
+                        // and waking the others would leave the thundering herd
+                        // in place: it was ten wakes per arrival even after the
+                        // delivery became targeted, because the blanket notify
+                        // still fired. The shared queue's waiters have nothing
+                        // to learn from a channel that was never theirs.
                         return Ok(());
                     }
                     // Full: the pairing has not taken its last one yet. Closed:
