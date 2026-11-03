@@ -1035,12 +1035,41 @@ class _RestoresCondition:
             self.topo.set_condition(self.leg, model.CONDITIONS["clean"])
 
 
+#: Failure reasons that belong to the instrument rather than to the arm.
+#:
+#: `iperf3`'s client exits with this line when its own control socket closes, and
+#: its sink then reports the streams established with zero bytes for the whole
+#: stage — indistinguishable, in a summary, from a carrier that forwards a
+#: connection and drops its payload. Measured on the release sweep: the sender's
+#: window grew to 13.5 MB with the flight at zero through the stages that lost
+#: their cells, so the carrier was idle rather than broken.
+INSTRUMENT_FAILURES = ("control socket has closed unexpectedly",)
+
+
+def _instrument_failure(reason: str | None) -> bool:
+    """Whether a stage's failure is the instrument's own."""
+    return bool(reason) and any(marker in reason for marker in INSTRUMENT_FAILURES)
+
+
 def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
-    """One stage: impose the condition, let the leg go quiet, then measure."""
+    """One stage: impose the condition, let the leg go quiet, then measure.
+
+    A stage whose `iperf3` client died for the instrument's own reason is measured
+    a second time, in place, so the schedule keeps its shape and one dead client
+    does not leave a hole in the coverage the gate checks. The second attempt is
+    what the sample carries; the first one's reason travels in its evidence.
+    """
     condition = stage[1]
     ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
     with _RestoresCondition(ctx.topo, ctx.leg):
-        return _measure_stage(ctx, stage, params, logs)
+        cell = _measure_stage(ctx, stage, params, logs)
+        if cell.ok or not _instrument_failure(cell.reason):
+            return cell
+        first = cell.reason
+        ctx.topo.drain(ctx.leg)
+        again = _measure_stage(ctx, stage, params, logs)
+        again.evidence["retried_after"] = (first or "")[:200]
+        return again
 
 
 def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
