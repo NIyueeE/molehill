@@ -3592,9 +3592,14 @@ where
         plan,
         arrival: std::sync::Arc::clone(&arrival),
     };
-    // One line every ten seconds while the switch is on: a bench round is tens
-    // of seconds, and a window shorter than that would print hundreds of lines
-    // for a handful of arrivals. The task ends with the pool.
+    // One line a second while the switch is on, which is the cadence the main
+    // stats line already uses. Ten seconds was chosen for a staged run's
+    // 150-second stage and is wrong for everything else: `churn-16` is a
+    // five-second cell, so a ten-second window never closed and the line never
+    // appeared — an instrument coarser than the thing it measures, which is the
+    // fourth time this cycle has made that mistake. A second's samples are
+    // enough to read a distribution, and one line a second is one line a second.
+    // The task ends with the pool.
     {
         let arrival = std::sync::Arc::clone(&arrival);
         let mut shutdown = shutdown_rx.resubscribe();
@@ -3602,7 +3607,7 @@ where
             loop {
                 tokio::select! {
                     _ = shutdown.recv() => return,
-                    () = time::sleep(Duration::from_secs(10)) => {
+                    () = time::sleep(Duration::from_secs(1)) => {
                         if crate::transport::stats::enabled() {
                             report_arrivals(&arrival);
                         }

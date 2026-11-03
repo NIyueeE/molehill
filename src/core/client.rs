@@ -1511,8 +1511,11 @@ fn channel_stats() -> &'static std::sync::Arc<ChannelStats> {
         let stats = std::sync::Arc::new(ChannelStats::default());
         let reporter = std::sync::Arc::clone(&stats);
         tokio::spawn(async move {
+            // One second, for the same reason as the server's arrival window: a
+            // `churn-16` cell is five seconds long, so a ten-second window
+            // never closes and reports nothing at all.
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 if !crate::transport::stats::enabled() {
                     continue;
                 }
