@@ -552,6 +552,32 @@ is the frame header the carrier already writes — a sealed-stream frame kind or
 flag — because the header is also the AEAD's associated data, so the same bytes
 that say "sealed" are the bytes the tag covers.
 
+### The key schedule exists and is tested, and is not wired (2026-11-03, `6cdc25a`)
+
+`src/transport/mhd/cipher.rs` derives one direction of one stream's key from the
+lane's handshake root: `HKDF-SHA256(root, "molehill mhd stream v1" ‖ direction ‖
+stream id)`, nonce = packet number, associated data = the packet header. Six
+tests pin the properties the design depends on — per-(stream, direction) keys,
+roots that never collide across lanes, an authenticated header, tampering and
+truncated tags refused.
+
+It is `#[cfg(test)]` until it is used, because a key schedule with no caller is a
+cipher nothing uses. Three things wire it, and they are the next round in this
+order:
+
+1. **A frame flag that says "sealed".** In the header, because the header is
+   already the associated data: the bytes that say which stream a packet belongs
+   to are the bytes the tag covers, and the decision travels with the stream
+   rather than being inferred from lane state (which would race — see above).
+2. **The lane's root.** Both ends already record it; the client keeps the first
+   successful handshake's, the server the same. A stream opened after it is sealed.
+3. **`Conn` seals and opens per packet.** `transmit_stream` seals the payload span
+   it just laid out; `on_datagram` opens it; the payload's bound shrinks by the
+   sixteen-byte tag, which is the one arithmetic that must be right everywhere.
+
+**Gate** (from the design above): the open's p50 ≤ 100 µs, the pairing's p50 ≤ 1 ms,
+`churn-16` p99 ≤ 9.7 ms, `bulk-n` inside 15 %.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
