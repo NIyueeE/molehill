@@ -746,6 +746,36 @@ differently-sized packets.
 - and one striped transfer still dies, isolated this round to "sealing **and**
   stripes together".
 
+### The carrier is clean with several sealed streams; the stripe layer is not (2026-11-03)
+
+A new in-process test, `four_sealed_streams_carry_their_own_bytes`: four sealed
+streams on one lane, written interleaved under the peer's credit and read at the
+other end, each with 256 KiB of its own bytes. **It passes.** So the carrier has
+no defect with several sealed streams — the interleaving, the per-stream keys and
+the run builder are all fine together.
+
+That leaves the stripe layer, and one experiment would say whether the *number* of
+stripes matters: run `striped_data_channels` with `set_initial_stripes(2)`. It is
+**not a valid experiment as the test stands** — the test asserts that all four
+pool tunnels carried a stream (`no pool carried a stream on each of its four
+tunnels`), so halving the stripes changes the fixture rather than the load. A
+2-stripe run needs a striped fixture that expects two, which is a small piece of
+work for the next round rather than a one-line change.
+
+**Two ways forward, both cheap and both named here so they are not re-derived:**
+
+1. **A stripe-group harness with sealed ends.** `spawn_group` takes `AsyncWrite`
+   halves; a sealed end is a `StreamIo` over a `Shared`, which needs a pump task
+   to move bytes. Building that harness is the *only* way to bisect the layer's
+   frame distribution without sockets — and sockets are the last variable left
+   that has not been excluded.
+2. **A second striped fixture** that expects two stripes, so the count can be
+   varied against a test written for it.
+
+Until one of them exists, the state of this work is: the cipher is proved, the
+arrival is delivered, `bulk-1` pays two thirds, and one striped transfer dies for
+a reason that lives in the layer between the carrier and the forwarding loop.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
