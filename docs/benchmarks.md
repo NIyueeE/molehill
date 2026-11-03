@@ -563,6 +563,18 @@ seconds). A stage whose `iperf3` client fails is a typed failure for that cell
 and the run continues: one bad stage cannot poison the next, and the cell
 carries the instrument's own reason.
 
+**A failure of the instrument is retried once, and only that kind.** `iperf3`'s
+client exits with `control socket has closed unexpectedly` when its own control
+connection drops, and its sink then reports the streams established with zero
+bytes for the whole stage — indistinguishable, in the summary, from a carrier
+that forwards a connection and drops its payload. Measured on the release sweep,
+the sender's window grew to 13.5 MB with the flight at zero through the stages
+that lost their cells, so the carrier was idle rather than broken. A scenario
+whose every cell failed with that reason is therefore measured a second time, after
+a restart, and the sample carries `retried_after` with the first attempt's reason —
+so the gate still sees that the cell was lost once, and a second failure stands as
+a failure. Every other reason is reported as it happens, with no second attempt.
+
 ## Running it
 
 ```bash

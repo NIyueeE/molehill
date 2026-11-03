@@ -509,6 +509,34 @@ class ArmTurn:
         time.sleep(grace)
 
 
+#: Failure reasons that belong to the instrument, not to the arm under test.
+#:
+#: `iperf3`'s client exits with this line when its own control socket closes, and
+#: its sink then shows the streams established with **zero bytes** for the whole
+#: stage — which looks exactly like a carrier that forwards a connection and drops
+#: its payload. It is not: measured 2026-11-03 on the release sweep, the sender's
+#: window grew to 13.5 MB with the flight at zero through the stages that lost
+#: their cells, i.e. the carrier was idle. A second attempt is what separates the
+#: two, and the first attempt's reason travels in the sample's evidence so the gate
+#: still sees that the cell was lost once.
+INSTRUMENT_FAILURES = ("control socket has closed unexpectedly",)
+
+
+def instrument_failure(cells: list) -> str | None:
+    """The reason to retry a scenario, when every cell failed for the instrument.
+
+    `None` means the failure, if any, is the arm's: a cell that failed for any
+    other reason is reported as it stands.
+    """
+    if not cells or any(cell.ok for cell in cells):
+        return None
+    for cell in cells:
+        reason = cell.reason or ""
+        if any(marker in reason for marker in INSTRUMENT_FAILURES):
+            return reason
+    return None
+
+
 def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
     """One arm's turn: every scenario, once, with its counters around it."""
     topo = camp.topo
@@ -557,6 +585,22 @@ def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
             except Exception as exc:  # noqa: BLE001 — one cell must not kill a run
                 reason = f"{type(exc).__name__}: {exc}"[:400]
                 cells = [workloads.Cell("", False, reason=reason)]
+            retried = instrument_failure(cells)
+            if retried is not None:
+                _log(
+                    f"    [{arm.id}] {scenario.id} retrying once: the instrument "
+                    f"failed ({retried[:60]})"
+                )
+                turn.restart()
+                ctx.restart_arm = turn.restart
+                try:
+                    again = workloads.run(scenario.kind, ctx, params)
+                except Exception as exc:  # noqa: BLE001 — the retry may fail too
+                    reason = f"{type(exc).__name__}: {exc}"[:400]
+                    again = [workloads.Cell("", False, reason=reason)]
+                for cell in again:
+                    cell.evidence["retried_after"] = retried[:200]
+                cells = again
             cost = round(time.perf_counter() - t0, 3)
             for cell in cells:
                 cell.evidence["scenario_cost_s"] = cost
