@@ -234,6 +234,114 @@ static DWELL: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// The most dwell samples one reporting window keeps.
 const DWELL_WINDOW_MAX: usize = 65_536;
 
+/// How long a caller waited for its connection's lock, per second.
+///
+/// The lock is `parking_lot`, so waiting for it blocks an OS thread — and with
+/// one connection carrying four thousand arrivals a second, a wait here is
+/// charged to every task that thread was running and to no phase at all.
+static LOCK_WAIT: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Record one connection-lock acquisition's wait.
+pub(crate) fn note_lock_wait(wait: Duration) {
+    let us = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = LOCK_WAIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// When a producer last notified a pairing that a channel had arrived.
+///
+/// The discriminator a parked pairing cannot answer for itself: a pairing that
+/// resumed long after the notify was **woken late** (the producer's wake did not
+/// reach the runtime), while one that resumed promptly and then waited is a
+/// queue. Two different defects with two different fixes, and the durations the
+/// pairing already measures cannot tell them apart — every phase inside the path
+/// reads microseconds while the wait is milliseconds.
+static LAST_WAKE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Record that a producer has just handed a channel over.
+pub(crate) fn note_wake() {
+    *LAST_WAKE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+}
+
+/// How long ago the last hand-off was.
+pub(crate) fn wake_age() -> Option<Duration> {
+    LAST_WAKE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .map(|at| at.elapsed())
+}
+
+/// How long a woken pairing waited to be polled, per second.
+static RESUME: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Which producer handed a visitor's channel over, per second.
+///
+/// The two paths look identical from outside and both used to log the same
+/// message, so a measurement could not say which one a visitor took — and it
+/// matters: the pooled path is the one that names a group, so an identity
+/// measurement on the other path measures nothing.
+static POOLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one channel that arrived on a pooled stream of a lane.
+pub(crate) fn note_pooled_channel() {
+    POOLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one channel that arrived as a direct mhd data channel.
+pub(crate) fn note_direct_channel() {
+    DIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many times a pairing parked waiting for its channel.
+///
+/// The counter that says whether the wait is a park at all. If pairings park and
+/// the resume window stays empty, the instrument is wrong; if they never park,
+/// the wait is somewhere the park would have been the only explanation for.
+static PARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that a pairing is about to park.
+pub(crate) fn note_park() {
+    PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one pairing's resume latency, in microseconds.
+pub(crate) fn note_resume(wait: Duration) {
+    let us = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = RESUME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's resume latencies, sorted, and leave it empty.
+fn take_resume() -> Vec<u32> {
+    let mut samples = RESUME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
+/// Take the window's lock waits, sorted, and leave it empty.
+fn take_lock_wait() -> Vec<u32> {
+    let mut samples = LOCK_WAIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Record one stream's wait for the wire.
 ///
 /// Takes the `Duration` and checks the switch itself, so a call site is one line
@@ -337,6 +445,48 @@ fn report() {
             dwell_p99_us = pct_us(&dwell, 99, 100),
             dwell_max_us = dwell.last().copied().unwrap_or(0),
             "mhd-stats: a stream's first byte waiting for the wire"
+        );
+    }
+    let pooled = POOLED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let direct = DIRECT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if pooled + direct > 0 {
+        info!(
+            pooled,
+            direct, "mhd-stats: data channels by path (pooled stream or direct)"
+        );
+    }
+    let parks = PARKS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let resume = take_resume();
+    if parks > 0 {
+        let n = resume.len();
+        info!(
+            parks,
+            n,
+            resume_p50_us = pct_us(&resume, 50, 100),
+            resume_p99_us = pct_us(&resume, 99, 100),
+            resume_max_us = resume.last().copied().unwrap_or(0),
+            "mhd-stats: pairings parked, and how long they waited to be polled"
+        );
+    }
+    if !resume.is_empty() && parks == 0 {
+        let n = resume.len();
+        info!(
+            n,
+            resume_p50_us = pct_us(&resume, 50, 100),
+            resume_p99_us = pct_us(&resume, 99, 100),
+            resume_max_us = resume.last().copied().unwrap_or(0),
+            "mhd-stats: a pairing woken to take its channel"
+        );
+    }
+    let lock = take_lock_wait();
+    if !lock.is_empty() {
+        let n = lock.len();
+        info!(
+            n,
+            lock_p50_us = pct_us(&lock, 50, 100),
+            lock_p99_us = pct_us(&lock, 99, 100),
+            lock_max_us = lock.last().copied().unwrap_or(0),
+            "mhd-stats: waiting for the connection lock"
         );
     }
 }

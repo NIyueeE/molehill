@@ -92,12 +92,11 @@ impl Shared {
         let asked = std::time::Instant::now();
         let mut conn = self.conn.lock();
         let waited = asked.elapsed();
-        if waited >= std::time::Duration::from_millis(100) {
-            tracing::debug!(
-                waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
-                "mhd connection lock waited"
-            );
-        }
+        // Every wait, not only the long ones: this mutex is blocking, so a
+        // waiter parks the whole worker thread and every other task that thread
+        // was running with it. That is an interval no phase timer can see, and
+        // it is exactly where an arrival's unexplained milliseconds would be.
+        crate::transport::stats::note_lock_wait(waited);
         f(&mut conn)
     }
 

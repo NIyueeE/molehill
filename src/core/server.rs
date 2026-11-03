@@ -2001,6 +2001,7 @@ where
             // visitor's own channel is not handed to another visitor. A group
             // whose pairing has gone falls back to the shared queue.
             let handing = Instant::now();
+            crate::transport::stats::note_pooled_channel();
             let delivered = queue.deliver(group, DataChannel::Mux(stream));
             let handed_us = u64::try_from(handing.elapsed().as_micros()).unwrap_or(u64::MAX);
             let total_us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -2582,6 +2583,7 @@ async fn route_mhd_stream(
     // for a channel that already exists. A hundred milliseconds is fifty times a
     // healthy pairing, so anything past it is worth one line.
     let queued = std::time::Instant::now();
+    crate::transport::stats::note_direct_channel();
     let sent = queue.push(DataChannel::RawMhd(io)).await;
     let waited = queued.elapsed();
     if waited >= std::time::Duration::from_millis(100) {
@@ -3493,6 +3495,17 @@ const MAX_CONCURRENT_VISITORS: usize = 128;
 /// prologue — so the mutex serializes only the *take*, never the wait.
 type SharedChannels<C> = std::sync::Arc<ChannelQueue<C>>;
 
+/// Record how long this pairing waited between the notify and its own poll.
+///
+/// Zero-ish means the wake reached the runtime and the task was scheduled at
+/// once; milliseconds mean the task was woken and **not polled**, which is a
+/// scheduler interval no phase timer can see.
+fn note_resume() {
+    if let Some(age) = crate::transport::stats::wake_age() {
+        crate::transport::stats::note_resume(age);
+    }
+}
+
 /// One service's queue of data channels, shared by every visitor pairing.
 ///
 /// The mutex guards **the take only**, never the wait. That distinction is the
@@ -3544,6 +3557,10 @@ impl<C> ChannelQueue<C> {
     /// so the wake-up is a hint that the state changed, not a hand-off of one item.
     async fn push(&self, channel: C) -> Result<(), ()> {
         self.tx.send(channel).await.map_err(|_| ())?;
+        // Stamped here as well as in the claim path: on an `mhd` lane a visitor's
+        // channel is a direct stream and arrives through this one, so a window
+        // that only saw the other path measured nothing at all.
+        crate::transport::stats::note_wake();
         self.ready.notify_waiters();
         Ok(())
     }
@@ -3572,6 +3589,10 @@ impl<C> ChannelQueue<C> {
                         // The pairing is parked on its own receiver, which is
                         // woken by the send itself; the shared queue's waiters
                         // must not miss that a channel left the pool either.
+                        // Stamped like the shared push, because this is the
+                        // common path once a channel names its group: without it
+                        // the resume window measured nothing at all.
+                        crate::transport::stats::note_wake();
                         self.ready.notify_waiters();
                         return Ok(());
                     }
@@ -3591,6 +3612,7 @@ impl<C> ChannelQueue<C> {
     #[cfg(feature = "multiplex")]
     fn push_blocking(&self, channel: C) -> Result<(), ()> {
         self.tx.try_send(channel).map_err(|_| ())?;
+        crate::transport::stats::note_wake();
         self.ready.notify_waiters();
         Ok(())
     }
@@ -3658,6 +3680,7 @@ impl<C> ChannelQueue<C> {
                     return None;
                 }
             }
+            crate::transport::stats::note_park();
             let notified = self.ready.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -3668,6 +3691,7 @@ impl<C> ChannelQueue<C> {
                 let rx = claim.as_mut()?;
                 tokio::select! {
                     item = rx.recv() => {
+                        note_resume();
                         self.unclaim(group);
                         // `None` here means the claim was withdrawn by a
                         // delivery that could not hand the channel over; the
@@ -3675,10 +3699,11 @@ impl<C> ChannelQueue<C> {
                         // this pairing would drop a visitor for nothing.
                         return item.or_else(|| None);
                     }
-                    () = notified => {}
+                    () = notified => note_resume(),
                 }
             } else {
                 notified.await;
+                note_resume();
             }
         }
     }
@@ -4172,6 +4197,7 @@ where
                 return Ok(true);
             }
         }
+        let enqueue_us = u64::try_from(pairing_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         debug!(
             group,
             stripes,
@@ -4262,18 +4288,16 @@ where
         // to a hundred-millisecond threshold, and that is how this cell's tail stayed
         // unattributed through every instrument aimed at it.
         if paired >= std::time::Duration::from_millis(5) && crate::transport::stats::enabled() {
-            let paired_us = u64::try_from(paired.as_micros()).unwrap_or(u64::MAX);
-            let accept = arrival.accepted_at;
-            let accept_us = u64::try_from(pairing_started.duration_since(accept).as_micros())
-                .unwrap_or(u64::MAX);
-            note_slow_pairing(
-                group,
-                stripes,
-                attempts,
-                accept_us,
+            let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+            let paired_us = micros(paired);
+            let accept = pairing_started.duration_since(arrival.accepted_at);
+            let facts = (
+                micros(accept),
+                enqueue_us,
                 first_take_us.unwrap_or(paired_us),
                 paired_us,
             );
+            note_slow_pairing(group, stripes, attempts, facts);
         }
         debug!("Visitor paired with a {stripe_count}-stripe group {group}");
         let paired_at = std::time::Instant::now();
@@ -4304,19 +4328,14 @@ where
 /// `info!` at five milliseconds, like the two other slow-wait lines and behind
 /// the same stats switch: a line nobody captures cannot explain the gate that
 /// reports the SLO breach.
-fn note_slow_pairing(
-    group: u32,
-    stripes: u8,
-    attempts: usize,
-    accept_us: u64,
-    wait_us: u64,
-    paired_us: u64,
-) {
+fn note_slow_pairing(group: u32, stripes: u8, attempts: usize, facts: (u64, u64, u64, u64)) {
+    let (accept_us, enqueue_us, wait_us, paired_us) = facts;
     info!(
         group,
         stripes,
         attempts,
         accept_us,
+        enqueue_us,
         wait_us,
         write_us = paired_us.saturating_sub(wait_us),
         paired_us,
