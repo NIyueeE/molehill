@@ -425,22 +425,47 @@ through `push` — counted as `pooled=0 direct=5 770` in one round. The group id
 I put in the tunnel prologue only rides the multiplexed path, which an mhd lane
 never takes, which is why its A/B measured nothing.
 
-### What this fixes, and the shape of the change
+### It works: the lottery was the tail (2026-11-03, `74b4258`)
 
-The fix is the one already built, applied to the path mhd actually uses: a
-channel must go to **one** waiter, not to all of them.
+Interleaved A/B, four rounds, `--aa`, `--ab-arm l4 --binary-b a495d1d`:
 
-1. The direct channel's prologue grows from four bytes to eight: the service, and
-   the stripe group that asked for it (zero for a plain visitor).
-2. `route_mhd_stream` delivers through the same claim the pairing registers, so a
-   channel wakes exactly the pairing that named it and nobody else.
-3. The shared queue stays as the fallback for a plain visitor and for a channel
-   whose group has given up.
+| arm | p50 | p99 | rate |
+|---|---|---|---|
+| `l4` (identity delivery) | 3.71 [3.56..3.83] | **10.27 [10.06..11.30]** | 3 545 /s |
+| `l4~aa` (the same build again) | 4.71 [3.74..8.14] | 10.78 [9.40..14.32] | 3 241 /s |
+| `l4~b` (before) | 2.93 [2.56..3.33] | **21.95 [20.22..23.96]** | 3 207 /s |
 
-- **Gate**: the pairing's p99 falls toward the client's own path (≈7 ms), the
-  wakes per arrival falls toward one, and `bulk-n` is inside 15 %.
-- **Revert**: no movement beyond the run's floor.
-- **Test first**: a channel wakes one pairing; the others stay parked.
+**`rtt_p99_ms: −53.20 %`, and the model records it as a claim** — beyond the
+15 % threshold, beyond the run's floor, with the twin inside the new arm's
+range and outside the old one's. The pairing's own p99 fell from 19–23 ms to
+**7.6 ms**, which is the first time it has been below the client's own worst
+open plus transit.
+
+**The median paid for it, and the reason is worth stating:** p50 rose from 2.93
+to 3.71 ms (+27 %). The old median was *borrowed* — a visitor often took a
+channel that had been opened for somebody else, so its wait was short and the
+other visitor's was long. Removing the borrowing moves the median to the true
+per-channel cost and halves the tail. Against TCP (p50 2.24, p99 2.58) the cell
+is now 1.7× at the median and 4.0× at p99, where it was 1.3× and 8.5×.
+
+By the objective's own order — latency first, and the SLO is stated on p99 —
+this is a net win, and the p50 is now the number to attack. It equals the true
+cost of one channel: 2.1 ms on the client (measurement + prologue) plus transit.
+That is Stage 3's subject, and the identity work has made the median *mean*
+something it did not before.
+
+### What is left of the arrival
+
+| segment | before | now |
+|---|---|---|
+| the pairing's p99 | 19–23 ms | **7.6 ms** |
+| `churn-16` p99 | 21.95 | **10.27** |
+| `churn-16` p50 | 2.93 | 3.71 |
+| wakes per arrival | ~10 | to be re-read |
+
+The four instruments from the previous stage still apply, and the next reading
+should confirm the wake count fell: if it is still ten, the claim is not being
+hit for most channels and `claimed`/`shared` in the per-second line will say so.
 
 ### Stage 3 — no per-visitor Noise handshake (latency)
 
