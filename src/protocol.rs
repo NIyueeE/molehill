@@ -1141,20 +1141,31 @@ pub async fn read_tunnel_prologue<T: AsyncRead + Unpin>(
     Ok((ServiceId(service), TunnelId(tunnel), group))
 }
 
-/// Write the 4-byte service prologue that opens every stream of a v4 data
-/// plane: a direct data channel (right after its hello) and every stream
-/// inside a multiplexed tunnel alike.
+/// Write the prologue that opens a direct data channel: the service it carries,
+/// and the **stripe group** that asked for it.
 ///
-/// A v4 session carries N services, so the server can no longer infer the
-/// service from the session nonce — the binding is explicit, and it is four
-/// raw bytes, never a varint, so a reader knows exactly how many bytes to
-/// consume before any application data can follow.
+/// A v4 session carries N services, so the server cannot infer the service from
+/// the session nonce — the binding is explicit, and it is raw bytes, never a
+/// varint, so a reader knows exactly how many to consume before any application
+/// data can follow.
+///
+/// The group is four more bytes, and it is what makes a channel belong to the
+/// request that asked for it. Without it the server hands a channel to whichever
+/// visitor takes one from the shared queue first, and — because the queue wakes
+/// *every* waiting pairing for every arrival — a visitor's wait is the number of
+/// times it loses that draw. Measured at ten wakes per arrival: a median of five
+/// losses and a hundredth losing about a hundred. Zero means "no group", which is
+/// a visitor that did not arrive through a stripe request.
 #[cfg(feature = "client")]
 pub async fn write_stream_prologue<T: AsyncWrite + Unpin>(
     conn: &mut T,
     service_id: ServiceId,
+    group: u32,
 ) -> Result<()> {
-    conn.write_all(&service_id.0)
+    let mut buf = [0u8; 8];
+    buf[..4].copy_from_slice(&service_id.0);
+    buf[4..].copy_from_slice(&group.to_be_bytes());
+    conn.write_all(&buf)
         .await
         .with_context(|| "Failed to write the v4 service prologue")?;
     conn.flush().await?;
@@ -1163,12 +1174,15 @@ pub async fn write_stream_prologue<T: AsyncWrite + Unpin>(
 
 /// Read the prologue written by [`write_stream_prologue`].
 #[cfg(feature = "server")]
-pub async fn read_stream_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<ServiceId> {
-    let mut buf = [0u8; std::mem::size_of::<ServiceId>()];
+pub async fn read_stream_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<(ServiceId, u32)> {
+    let mut buf = [0u8; 8];
     conn.read_exact(&mut buf)
         .await
         .with_context(|| "Failed to read the v4 service prologue")?;
-    Ok(ServiceId(buf))
+    let mut service = [0u8; 4];
+    service.copy_from_slice(&buf[..4]);
+    let group = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    Ok((ServiceId(service), group))
 }
 
 /// The prologue a **lane** opens with: the service it serves, and the identity
@@ -2230,7 +2244,7 @@ mod tests {
 
         let (mut tx, mut rx) = duplex(64);
         let id = ServiceId::new(0xdead_beef);
-        write_stream_prologue(&mut tx, id).await.unwrap();
+        write_stream_prologue(&mut tx, id, 0).await.unwrap();
 
         let mut raw = [0u8; 4];
         rx.read_exact(&mut raw).await.unwrap();
@@ -2256,8 +2270,8 @@ mod tests {
         for raw in [0u32, 1, 0xdead_beef, u32::MAX] {
             let (mut tx, mut rx) = duplex(64);
             let id = ServiceId::new(raw);
-            write_stream_prologue(&mut tx, id).await.unwrap();
-            assert_eq!(read_stream_prologue(&mut rx).await.unwrap(), id);
+            write_stream_prologue(&mut tx, id, 0).await.unwrap();
+            assert_eq!(read_stream_prologue(&mut rx).await.unwrap(), (id, 0));
         }
     }
 
@@ -2275,14 +2289,14 @@ mod tests {
             postcard::to_stdvec(&Hello::DataChannelHello(CURRENT_PROTO_VERSION, nonce)).unwrap();
         assert_eq!(hello.len(), PacketLength::new().hello);
         tx.write_all(&hello).await.unwrap();
-        write_stream_prologue(&mut tx, id).await.unwrap();
+        write_stream_prologue(&mut tx, id, 0).await.unwrap();
 
         let (version, back) = read_hello(&mut rx).await.unwrap();
         assert_eq!(version, CURRENT_PROTO_VERSION);
         assert!(matches!(back, Hello::DataChannelHello(_, n) if n == nonce));
         // Only now, and only after the hello, does the server read the
         // prologue: it is what names the service the channel carries.
-        assert_eq!(read_stream_prologue(&mut rx).await.unwrap(), id);
+        assert_eq!(read_stream_prologue(&mut rx).await.unwrap(), (id, 0));
     }
 
     /// The current hello is 35 bytes (tag, two-byte version, digest). The

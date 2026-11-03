@@ -328,6 +328,24 @@ pub(crate) fn note_direct_channel() {
     DIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Where a delivered channel went: to the pairing that named it, or to the pool.
+///
+/// The number that says whether the identity is live: a channel that still lands
+/// in the shared queue is a channel that wakes every waiter, which is the
+/// lottery this change exists to remove.
+static CLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one channel handed to the pairing that named its group.
+pub(crate) fn note_claimed() {
+    CLAIMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one channel that had to go to the shared queue.
+pub(crate) fn note_shared() {
+    SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How many times a pairing parked waiting for its channel.
 ///
 /// The counter that says whether the wait is a park at all. If pairings park and
@@ -495,12 +513,17 @@ fn report() {
             "mhd-stats: a stream's reader waiting for bytes"
         );
     }
+    let claimed = CLAIMED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let shared = SHARED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let pooled = POOLED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let direct = DIRECT.swap(0, std::sync::atomic::Ordering::Relaxed);
     if pooled + direct > 0 {
         info!(
             pooled,
-            direct, "mhd-stats: data channels by path (pooled stream or direct)"
+            direct,
+            claimed,
+            shared,
+            "mhd-stats: data channels by path, and where each was delivered"
         );
     }
     let parks = PARKS.swap(0, std::sync::atomic::Ordering::Relaxed);

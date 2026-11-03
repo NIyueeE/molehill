@@ -1278,6 +1278,7 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
 
 async fn do_data_channel_handshake(
     args: Arc<RunDataChannelArgs>,
+    group: u32,
 ) -> Result<(ClientStream, Option<LaneId>)> {
     let mut conn = connect_direct_channel(&args).await?;
 
@@ -1302,14 +1303,14 @@ async fn do_data_channel_handshake(
         write_lane_prologue(&mut conn, args.service_id, lane).await?;
         return Ok((conn, Some(lane)));
     }
-    write_stream_prologue(&mut conn, args.service_id).await?;
+    write_stream_prologue(&mut conn, args.service_id, group).await?;
 
     Ok((conn, None))
 }
 
-async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
+async fn run_data_channel(args: Arc<RunDataChannelArgs>, group: u32) -> Result<()> {
     // Do the handshake
-    let (conn, lane) = do_data_channel_handshake(args.clone()).await?;
+    let (conn, lane) = do_data_channel_handshake(args.clone(), group).await?;
 
     // Forward
     forward_data_channel(
@@ -2853,14 +2854,20 @@ fn spawn_data_channel(
             let started_us = u64::try_from(spawned.elapsed().as_micros()).unwrap_or(u64::MAX);
             #[cfg(not(feature = "multiplex"))]
             let _ = spawned;
+            // Without the multiplex feature a direct channel still names the
+            // group, because the server's queue serves both carriers.
+            #[cfg(feature = "multiplex")]
+            let group = stripe.map_or(0, |request| request.group);
+            #[cfg(not(feature = "multiplex"))]
+            let group = 0;
             let res = {
                 #[cfg(feature = "multiplex")]
                 match tunnel {
                     Some(t) => run_mux_data_channel(&args, &t, stripe, started_us, queued_at).await,
-                    None => run_data_channel(args).await,
+                    None => run_data_channel(args, group).await,
                 }
                 #[cfg(not(feature = "multiplex"))]
-                run_data_channel(args).await
+                run_data_channel(args, group).await
             };
             if let Err(e) = res.with_context(|| "Failed to run the data channel") {
                 // One visitor connection's life, and its end: the log line for

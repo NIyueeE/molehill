@@ -865,8 +865,8 @@ async fn handle_connection(
             // A direct data channel names its service right after the hello;
             // a transparent lane names itself beside it (see
             // `read_channel_prologue`).
-            let service_id = read_stream_prologue(&mut conn).await?;
-            do_v4_data_channel(tcp_data_channel(conn), registry, nonce, service_id).await?;
+            let (service_id, group) = read_stream_prologue(&mut conn).await?;
+            do_v4_data_channel(tcp_data_channel(conn), registry, nonce, service_id, group).await?;
         }
         #[cfg(feature = "multiplex")]
         Hello::DataChannelTunnelHello(_, nonce) => {
@@ -1683,6 +1683,7 @@ async fn do_v4_data_channel(
     registry: Arc<Registry>,
     nonce: Nonce,
     service_id: ServiceId,
+    group: u32,
 ) -> Result<()> {
     debug!("Handshaking a data channel");
 
@@ -1693,7 +1694,7 @@ async fn do_v4_data_channel(
 
     handle
         .data_channel
-        .push(conn)
+        .deliver(group, conn)
         .await
         .map_err(|()| anyhow!("Data channel for a stale control session"))?;
     Ok(())
@@ -2002,7 +2003,7 @@ where
             // whose pairing has gone falls back to the shared queue.
             let handing = Instant::now();
             crate::transport::stats::note_pooled_channel();
-            let delivered = queue.deliver(group, DataChannel::Mux(stream));
+            let delivered = queue.deliver(group, DataChannel::Mux(stream)).await;
             let handed_us = u64::try_from(handing.elapsed().as_micros()).unwrap_or(u64::MAX);
             let total_us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
             if total_us >= 5_000 && crate::transport::stats::enabled() {
@@ -2467,8 +2468,8 @@ async fn serve_mhd_stream(
     };
     match hello {
         Hello::DataChannelHello(_, nonce) => {
-            let service_id = read_stream_prologue(&mut io).await?;
-            do_v4_data_channel(DataChannel::RawMhd(io), registry, nonce, service_id).await
+            let (service_id, group) = read_stream_prologue(&mut io).await?;
+            do_v4_data_channel(DataChannel::RawMhd(io), registry, nonce, service_id, group).await
         }
         Hello::DataChannelTunnelHello(_, nonce) => {
             // Reserve the lane's slot once. Every later stream of the same lane
@@ -2514,9 +2515,9 @@ async fn serve_mhd_stream(
             }
             let total_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
             note_slow_opening(total_us, sel_us, hs_us);
-            let (service_id, _tunnel, _group) = read_tunnel_prologue(&mut io).await?;
+            let (service_id, _tunnel, group) = read_tunnel_prologue(&mut io).await?;
             debug!(%service_id, "mhd tunnel stream routed");
-            route_mhd_stream(io, &registry, &nonce, service_id).await
+            route_mhd_stream(io, &registry, &nonce, service_id, group).await
         }
         other @ Hello::ControlChannelHello(..) => {
             bail!("Expected a data-plane hello on the mhd stream, got {other:?}")
@@ -2566,6 +2567,7 @@ async fn route_mhd_stream(
     registry: &Registry,
     nonce: &Nonce,
     service_id: ServiceId,
+    group: u32,
 ) -> Result<()> {
     let queue = registry
         .sessions
@@ -2584,7 +2586,10 @@ async fn route_mhd_stream(
     // healthy pairing, so anything past it is worth one line.
     let queued = std::time::Instant::now();
     crate::transport::stats::note_direct_channel();
-    let sent = queue.push(DataChannel::RawMhd(io)).await;
+    // The group the client named: this is the path an `mhd` lane actually takes
+    // for a visitor's channel, so it is the one where a channel must reach the
+    // pairing that asked for it instead of waking every waiter.
+    let sent = queue.deliver(group, DataChannel::RawMhd(io)).await;
     let waited = queued.elapsed();
     if waited >= std::time::Duration::from_millis(100) {
         debug!(
@@ -3575,8 +3580,7 @@ impl<C> ChannelQueue<C> {
     /// the pairing is still waiting, so a channel whose visitor gave up falls
     /// through to the shared queue instead of being dropped — a channel is a
     /// scarce resource and the next visitor can use it.
-    #[cfg(feature = "multiplex")]
-    fn deliver(&self, group: u32, channel: C) -> Result<(), ()> {
+    async fn deliver(&self, group: u32, channel: C) -> Result<(), ()> {
         if group != 0 {
             let waiter = self
                 .groups
@@ -3586,6 +3590,7 @@ impl<C> ChannelQueue<C> {
             if let Some(waiter) = waiter {
                 match waiter.try_send(channel) {
                     Ok(()) => {
+                        crate::transport::stats::note_claimed();
                         // The pairing is parked on its own receiver, which is
                         // woken by the send itself; the shared queue's waiters
                         // must not miss that a channel left the pool either.
@@ -3599,22 +3604,14 @@ impl<C> ChannelQueue<C> {
                     // Full: the pairing has not taken its last one yet. Closed:
                     // it gave up. Both fall through to the shared queue.
                     Err(mpsc::error::TrySendError::Full(channel)) => {
-                        return self.push_blocking(channel);
+                        return self.push(channel).await;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                 }
             }
         }
-        self.push_blocking(channel)
-    }
-
-    /// The shared-queue push, from a caller that is not an `async` context.
-    #[cfg(feature = "multiplex")]
-    fn push_blocking(&self, channel: C) -> Result<(), ()> {
-        self.tx.try_send(channel).map_err(|_| ())?;
-        crate::transport::stats::note_wake();
-        self.ready.notify_waiters();
-        Ok(())
+        crate::transport::stats::note_shared();
+        self.push(channel).await
     }
 
     /// Whether no channel can arrive any more: the producer side is gone.
@@ -5275,7 +5272,12 @@ mod tests {
 
         // Group B's channel arrives first: it must go to B, not to A, which has
         // been waiting longer.
-        assert!(queue.deliver(0xBBBB, probe_data_channel().await).is_ok());
+        assert!(
+            queue
+                .deliver(0xBBBB, probe_data_channel().await)
+                .await
+                .is_ok()
+        );
         let Ok(Ok(b_took)) = tokio::time::timeout(std::time::Duration::from_millis(200), b).await
         else {
             unreachable!("the group that named the channel must be woken")
@@ -5298,7 +5300,12 @@ mod tests {
     #[tokio::test]
     async fn a_channel_for_an_abandoned_group_falls_through_to_the_queue() {
         let queue: std::sync::Arc<ChannelQueue<DataChannel>> = ChannelQueue::pair(4);
-        assert!(queue.deliver(0xCCCC, probe_data_channel().await).is_ok());
+        assert!(
+            queue
+                .deliver(0xCCCC, probe_data_channel().await)
+                .await
+                .is_ok()
+        );
         assert!(
             queue.try_take().is_ok_and(|taken| taken.is_some()),
             "a group nobody is waiting for must not hold the channel"
