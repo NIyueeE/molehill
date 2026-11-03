@@ -254,6 +254,17 @@ def iperf_sink(ctx: Ctx, tag: str, port: int):
         time.sleep(0.2)
 
 
+def reap_iperf(ctx: Ctx) -> None:
+    """Kill anything still running `iperf3` on either side of the path.
+
+    Both the sink's namespace and the client's: a leftover from the previous stage
+    either holds the port or reconnects into the fresh sink, and either way this
+    stage's measurements are lost to a process nobody is measuring.
+    """
+    for ns in (topology.CLI_NS, topology.VIS_NS):
+        ctx.topo.ns_run(ns, ["pkill", "-9", "-x", "iperf3"], check=False)
+
+
 def wait_dial_port(ctx: Ctx, port: int, timeout: float = 30.0) -> bool:
     """Is the port this workload is about to dial actually open yet?
 
@@ -1043,7 +1054,11 @@ class _RestoresCondition:
 #: connection and drops its payload. Measured on the release sweep: the sender's
 #: window grew to 13.5 MB with the flight at zero through the stages that lost
 #: their cells, so the carrier was idle rather than broken.
-INSTRUMENT_FAILURES = ("control socket has closed unexpectedly",)
+INSTRUMENT_FAILURES = (
+    "control socket has closed unexpectedly",
+    "the server is busy running",
+    "exit -9: no output",
+)
 
 
 def _instrument_failure(reason: str | None) -> bool:
@@ -1077,6 +1092,12 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     label, condition, secs = stage
     drain = ctx.topo.drain(ctx.leg)
     port = topology.IPERF_PORT
+    # A stage must not inherit the previous one's traffic crew. `iperf3` leaves a
+    # client behind when it is killed, and one that reconnects makes the fresh sink
+    # answer `the server is busy running` to every client of *this* stage — a
+    # failure attributed to the arm that is entirely the instrument's (measured
+    # 2026-11-03: two stages lost that way, and one run died outright).
+    reap_iperf(ctx)
     # `streams: 0` is the bulk spine switched off: the staged timeline still
     # measures its interactive, datagram and churn series for every stage, and
     # the throughput cell reads as a typed absence rather than as zero. A tool
