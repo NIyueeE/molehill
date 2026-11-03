@@ -2238,25 +2238,35 @@ mod tests {
     /// and nothing else precedes a v4 stream's first byte.
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
-    async fn stream_prologue_is_four_raw_bytes() {
+    async fn stream_prologue_is_eight_raw_bytes() {
         use tokio::io::duplex;
         use tokio::time::{Duration, timeout};
 
         let (mut tx, mut rx) = duplex(64);
         let id = ServiceId::new(0xdead_beef);
-        write_stream_prologue(&mut tx, id, 0).await.unwrap();
+        let group = 0x0102_0304;
+        write_stream_prologue(&mut tx, id, group).await.unwrap();
 
-        let mut raw = [0u8; 4];
+        let mut raw = [0u8; 8];
         rx.read_exact(&mut raw).await.unwrap();
-        assert_eq!(raw, [0xde, 0xad, 0xbe, 0xef], "the id must be big-endian");
+        assert_eq!(
+            raw[..4],
+            [0xde, 0xad, 0xbe, 0xef],
+            "the id must be big-endian"
+        );
+        assert_eq!(
+            raw[4..],
+            [0x01, 0x02, 0x03, 0x04],
+            "the group is what makes a channel belong to the request that asked for it"
+        );
 
-        // Exactly four: a fifth byte would shift every payload that follows.
+        // Exactly eight: a ninth byte would shift every payload that follows.
         let mut extra = [0u8; 1];
         assert!(
             timeout(Duration::from_millis(50), rx.read(&mut extra))
                 .await
                 .is_err(),
-            "the prologue must be exactly four bytes"
+            "the prologue must be exactly eight bytes"
         );
     }
 
