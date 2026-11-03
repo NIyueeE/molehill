@@ -879,9 +879,13 @@ impl<S> StripeGroups<S> {
         // Reap groups the server abandoned: their parked channels are
         // closed here, which ends any wait the server still holds on them.
         let now = Instant::now();
+        let before = state.groups.len();
         state
             .groups
             .retain(|_, g| now.duration_since(g.started) < STRIPE_GROUP_TTL);
+        for _ in state.groups.len()..before {
+            crate::transport::stats::note_stripe_reaped();
+        }
         while let Some((_, released_at)) = state.released.front() {
             if now.duration_since(*released_at) < STRIPE_GROUP_TTL {
                 break;

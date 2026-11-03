@@ -414,6 +414,26 @@ pub(crate) fn note_shared() {
     SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Stripe groups the client gave up on, and pairings the server gave up on.
+///
+/// Both ends of the same failure: a group that never gathered every stripe on the
+/// client leaves the server's forwarding loop writing into a channel nobody
+/// drains, and the visitor's socket is then never read — which a sender sees as a
+/// shut receive window for the whole stage. The two counters say which end noticed
+/// first.
+static STRIPES_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAIRINGS_UNFED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one partial stripe group the client reaped.
+pub(crate) fn note_stripe_reaped() {
+    STRIPES_REAPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one visitor the server dropped for want of a data channel.
+pub(crate) fn note_pairing_unfed() {
+    PAIRINGS_UNFED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Streams whose unread bytes have been waiting for over a second.
 ///
 /// Sampled by the pump rather than counted by the reader: a reader that is never
@@ -575,6 +595,14 @@ fn report_phases() {
 /// Its own function because it answers one question and `report` is already at the
 /// length the lint allows.
 fn report_starvation() {
+    let reaped = STRIPES_REAPED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let unfed = PAIRINGS_UNFED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if reaped + unfed > 0 {
+        info!(
+            reaped,
+            unfed, "mhd-stats: stripe groups reaped, and visitors dropped for want of a channel"
+        );
+    }
     let starved = STARVED_STREAMS.swap(0, std::sync::atomic::Ordering::Relaxed);
     if starved > 0 {
         info!(

@@ -4179,6 +4179,24 @@ async fn serve_tcp_visitor<C>(
 /// learns its real index from `StartForwardStripedTcp` — nothing about the
 /// pairing depends on a request's index coming back with it.
 ///
+/// The budget expired with nothing to pair: one line, with the attempt count.
+fn note_expired(
+    attempts: usize,
+    group: u32,
+    stripes: usize,
+    gathered: usize,
+    started: std::time::Instant,
+) {
+    debug!(
+        attempts,
+        group,
+        stripes,
+        gathered,
+        waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "pairing budget expired with no data channel"
+    );
+}
+
 /// Returns `Ok(true)` when the control channel ended mid-pairing (the pool must
 /// stop) and `Ok(false)` once the group is forwarding.
 ///
@@ -4242,6 +4260,11 @@ where
         // "the command had to go out on one that did". One `paired_us` blamed the
         // handshake for both — see the log site below.
         let mut first_take_us: Option<u64> = None;
+        // While this visitor waits, its socket is **not read**: the kernel's
+        // receive buffer fills and the sender's window shuts, which is exactly what
+        // a stage that carries nothing looks like from the other end. The budget's
+        // own expiry line carries the group and the wait, because a timer here
+        // would keep a paused-time test's clock from ever advancing.
         loop {
             let next = tokio::select! {
                 _ = stops.shutdown.recv() => None,
@@ -4257,14 +4280,10 @@ where
                     // request is answered a budget late pays this whole wait and
                     // then succeeds on the retry, so the only symptom is a
                     // latency the operator sees and the log, until this, did not.
-                    debug!(
-                        attempts,
-                        stripes = stripe_count,
-                        gathered = gathered.len(),
-                        "pairing budget expired with no data channel"
-                    );
+                    note_expired(attempts, group, stripe_count, gathered.len(), pairing_started);
                     if attempts >= PAIR_ATTEMPTS {
                         debug!("No data channel after {attempts} requests; dropping the visitor");
+                        crate::transport::stats::note_pairing_unfed();
                         // The group is abandoned: a channel that names it must
                         // fall through to the shared queue rather than be
                         // delivered to a pairing that no longer exists.
