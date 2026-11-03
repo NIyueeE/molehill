@@ -836,6 +836,65 @@ mod tests {
         (c.unwrap(), s.unwrap())
     }
 
+    /// Both ends of one session end on the **same** handshake hash.
+    ///
+    /// That is the whole premise of deriving a stream's key from the lane's
+    /// handshake instead of running a second handshake: the two sides must agree
+    /// on the root without another exchange. The test also pins the negative —
+    /// two sessions over the same keys do **not** share a hash — because a root
+    /// that repeats across sessions would make one lane's key derivable from
+    /// another's.
+    #[tokio::test]
+    async fn both_ends_agree_on_the_handshake_hash() {
+        let (c, s) = pair().await;
+        assert_eq!(
+            c.handshake_hash(),
+            s.handshake_hash(),
+            "the initiator and the responder must end on one transcript"
+        );
+        let (c2, _s2) = pair().await;
+        assert_ne!(
+            c.handshake_hash(),
+            c2.handshake_hash(),
+            "two sessions must not share a transcript: a repeated root would let one lane's streams be derived from another's"
+        );
+    }
+
+    /// The same, for the shape production uses: each side carries a payload.
+    ///
+    /// The payloads are part of the transcript, so an implementation that mixed
+    /// them differently on the two ends would still round-trip its own bytes and
+    /// still disagree on the root. This is the variant the lane runs.
+    #[tokio::test]
+    async fn both_ends_agree_with_a_payload_each_way() {
+        let (a, b) = duplex(1024 * 1024);
+        let params: snow::params::NoiseParams =
+            "Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let init = Builder::new(params.clone()).build_initiator().unwrap();
+        let resp = Builder::new(params).build_responder().unwrap();
+        let hello = b"hello-in-the-opening-message".to_vec();
+        let answer = b"acknowledgement-in-the-reply".to_vec();
+        let (c, s) = tokio::join!(
+            NoiseStream::handshake_carrying(a, init, |_| hello.clone()),
+            NoiseStream::handshake_carrying(b, resp, |_| answer.clone()),
+        );
+        let (c, carried_by_client) = c.unwrap();
+        let (s, carried_by_server) = s.unwrap();
+        assert_eq!(
+            carried_by_client, answer,
+            "the initiator must read the responder's payload"
+        );
+        assert_eq!(
+            carried_by_server, hello,
+            "the responder must read the initiator's payload"
+        );
+        assert_eq!(
+            c.handshake_hash(),
+            s.handshake_hash(),
+            "a carried payload is part of the transcript; both ends must still agree"
+        );
+    }
+
     #[tokio::test]
     async fn roundtrip_sizes() {
         let (mut c, mut s) = pair().await;

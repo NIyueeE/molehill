@@ -521,26 +521,36 @@ a new hash.
   old lane's traffic; plain (`PLAIN_SELECTOR`) and per-stream KK paths both still
   work; the striped, half-close, reset and hot-reload suites stay green.
 
-### The derivation's prerequisite is not yet proved (2026-11-03)
+### The derivation's root is proved, and the rule that must not be broken (2026-11-03)
 
-A per-stream key needs a root both ends agree on, so both ends now record the
-handshake hash their lane's first stream ended on, with the stream id that
-produced it:
+Two tests settle the premise:
 
-```
-client: lane=1 stream=3 hash=40a8d14d    server: stream=1 hash=04a768ee
-```
+- `both_ends_agree_on_the_handshake_hash` — the initiator and the responder of one
+  session end on the **same** hash, and two sessions over the same keys do
+  **not** share one. The second half matters as much as the first: a root that
+  repeats across sessions would make one lane's keys derivable from another's.
+- `both_ends_agree_with_a_payload_each_way` — the same for the carrying shape
+  production uses, where each side's hello rides a handshake message. The
+  payloads are part of the transcript, so an implementation that mixed them
+  differently on the two ends would still round-trip its own bytes and still
+  disagree on the root.
 
-**They cannot be compared yet, and the ids do not even line up**: every client
-lane's first hashed stream is id 3, every server lane's is id 1. Either the two
-ends disagree about which stream a handshake belongs to — which would be a defect
-in its own right — or the client's first two streams on a lane (the control
-channel and the lane's reservation) are not the ones the server hashes first.
+The process-level stream ids that did not line up (client 3, server 1) were an
+instrumentation artefact, not a protocol one: both `Conn`s allocate stream ids by
+**side parity** (`next_stream` starts at the dialer's bit and steps by two), so a
+client-opened stream is odd on both ends and the first hashed stream on each lane
+is 1. The client's `3` is the first stream whose wrap *succeeded* — the earlier
+ones are the lane's reservation probe and a stream that ended first.
 
-**Nothing may be derived from this hash until that is answered**, which is the
-first item of the next round: log the hash on *every* completion with its stream
-id on both ends and match them one to one. Only then does "one handshake per
-lane" have a root to derive from.
+**A design rule that fell out of writing this down, and that would otherwise have
+shipped as corruption.** "Sealed" must not be inferred from *lane state* ("is
+this lane's root set?"). Streams are opened concurrently: a second stream can be
+created while the lane's first handshake is still in flight, so one end would
+decide "sealed" and the other "not", and each would read the other's bytes as the
+wrong thing. The decision has to travel **with the stream**. The cheapest place
+is the frame header the carrier already writes — a sealed-stream frame kind or
+flag — because the header is also the AEAD's associated data, so the same bytes
+that say "sealed" are the bytes the tag covers.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
