@@ -776,72 +776,57 @@ Until one of them exists, the state of this work is: the cipher is proved, the
 arrival is delivered, `bulk-1` pays two thirds, and one striped transfer dies for
 a reason that lives in the layer between the carrier and the forwarding loop.
 
-### The defect is "sealing **and** two or more stripes", and nothing narrower (2026-11-03)
+### Stage 3 is PARKED: the design works, one striped transfer does not (2026-11-03)
 
-Experiments so far, each one run on the patched tree:
+The rule set two rounds ago was two more, then park. The harness did not close it:
+the two-group version — a real `spawn_group` on each end with an echo between them
+— stalls at **zero bytes**, which is a defect in the harness rather than a
+reproduction, and this round could not finish it.
 
-| varied | result |
-|---|---|
-| growth frozen (plan never grows) | fails |
-| stripes 4 → 2 (fixture adapted to expect 2) | **fails**, at 286 720 of 8 388 608 |
-| sealing off, everything else in place | **passes** |
-| one sealed stream, in process, 8 MiB | passes |
-| four sealed streams, in process, 256 KiB each | passes |
-| one sealed stream, real sockets (`bulk-1`) | 2.1 Gbit/s, no close |
+**What stage 3 proved, and it is not nothing:**
 
-So the boundary is exactly: **sealing + a stripe group of two or more**. The count
-does not matter (2 fails like 4), the growth path does not matter, and the carrier
-alone does not matter. What is left is the stripe layer's own two directions —
-`send_loop`'s rotation across stripes and `stripe_reader`'s per-stripe header read
-— and the fact that in every failure the visitor→peer direction *completes* early
-and the half-close grace then cuts the other one.
+| | with sealing | baseline |
+|---|---|---|
+| `churn-16` p50 / p99 | **2.30 / 3.59 ms** | 3.71 / 9.74 |
+| `churn-16` rate | **6 463 /s** | 3 545 |
+| the per-open handshake | **14 µs** | 1 771 µs |
+| against TCP | 1.17× / 1.66× | 1.7× / 4.0× |
 
-### GSO and many streams are excluded too (2026-11-03, round 18)
+with the cipher correct under load (`unsealed_tags = 0` at ~200 000 sealed
+packets a second), four tests pinning its properties, and four real bugs found and
+fixed on the way. The cost is two thirds of `bulk-1`, of which one copy per
+received packet is removable.
 
-`bulk-n` with sealing — eight streams over four lanes, real sockets, GSO and GRO —
-runs at **4.60 Gbit/s with no failures**. So the last infrastructure candidate is
-gone: the carrier seals correctly when many streams share lanes over real
-sockets.
+**What it never got:** a striped 8 MiB echo through a sealed group. Nine
+configurations were excluded by measurement — growth, stripe count, GSO, many
+streams, single stream, four streams, in-process volume, the prologue length, the
+accept announcement — and the boundary is exactly "sealing plus two or more
+stripes". The cause is in the stripe layer's interaction, and the harness that
+would have found it is unfinished.
 
-The round's next step was the stripe-group harness with sealed ends, and it is
-**half-built and stuck**: `spawn_group` is bidirectional on the same streams, so a
-peer made of "drain the frames and discard them" carries nothing back, and the
-harness stalled at zero bytes. Making it work needs the peer's side to be a real
-`spawn_group` as well — which means understanding how the two groups share one
-set of duplex stripes without reading their own writes, and that is a design
-question about `stripe.rs` that this round did not answer. The half-built harness
-is in the patch so the next attempt starts from it.
+**So the patch is parked, not deleted.** `~/tmp/stage3-sealing-parked.patch`
+(1 171 lines) carries every fix, all six tests, and the half-built harness. A
+later cycle that wants the arrival can pick it up from a known state instead of
+rediscovering four bugs.
 
-**Round 19 is the last one this rule allows.** If the harness is not finished and
-the defect not explained by then, sealing is parked and the next cycle takes a
-different route to the 1.8 ms — the evidence for the prize and against the effort
-is all written down above and in the measurements table.
+### Where the next cycle should work instead
 
-### A decision with a rule, so this cannot run on for ever
+Stage 3 was the only route tried for the arrival tail, and it is now bounded off.
+Two untouched stages are independent of the handshake and carry the same priority:
 
-Seven rounds have gone into this and nothing has landed. The measured prize is
-large (arrival p50 −38 %, p99 −63 %, rate +82 %, and the handshake gone), so it is
-worth **two more rounds and no more**, on this rule:
+1. **Stage 4 — RACK and PTO.** One `MIN_RTO` decides both "this packet is lost"
+   and "this flight is too old"; the record already shows that every attempt to
+   move that one number breaks a different cell. Splitting it is the change the
+   measurements have asked for since the first `loss5` run, and it is local to
+   `recovery.rs`.
+2. **Stage 5 — latency-aware scheduling.** The `rr-16` and `bulk-n` cells already
+   show mhd at parity with TCP when work is interleaved across streams; the stall
+   cells are where it is not. A per-stream quantum that keeps an arrival from
+   queueing behind a bulk run is the shape, and `dwell`/`rx_total` are the
+   instruments that would show it working.
 
-1. **Round 18** builds the stripe-group harness with sealed ends — `spawn_group`
-   over `StreamIo`s behind a `Shared` that a test pump drives. That is the only
-   configuration where the layer can be bisected without sockets, and it is the
-   last variable not yet excluded.
-2. **If the harness reproduces**, the defect is in the layer's frame distribution
-   and can be fixed and proved in that harness — the patch then lands with its own
-   regression test.
-3. **If it does not reproduce**, sockets are part of it; the next step is the run
-   builder's segmentation of packets whose sizes differ (a sealed packet is 16
-   bytes longer, and `send_run` hands the kernel a run of spans).
-4. **If neither closes it by round 19**, sealing is parked: the patch, its tests
-   and its measurements are recorded as a design that works and cannot be finished
-   cheaply, and the next cycle takes a different route to the arrival — the
-   handshake is the cost, and sealing is not the only way to remove it.
-
-The reason to bound it is in this file's own record: fourteen rounds of the earlier
-cycle went into a tail that turned out to be one instrument set four times too
-coarse. A design with a proven win and an unproven defect is worth a bounded
-effort, not an open one.
+Both are less glamorous than removing a handshake and both are measurable with the
+cells that already exist.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
