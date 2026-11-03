@@ -656,42 +656,51 @@ counted, no key failure. Two candidates, in order:
 Both are visible in one run with the existing `mhd stalled` line and a counter for
 `pending_fins` drained against `ends_at` firings.
 
-### The price of sealing, measured — and it is not affordable yet (2026-11-03)
+### Sealing delivers the arrival — and costs the bulk (2026-11-03)
 
-The patch's first end-to-end numbers, `smoke` profile, `l4` arm, sealing on:
+The patch's end-to-end numbers, same host, same hour, one round each:
 
 | cell | with sealing | baseline | |
 |---|---|---|---|
-| `bulk-1` throughput | **2.04 Gbit/s** | 5.5–6.5 | **−65 %** |
-| `rr-1` p50 / p99 | 0.112 / 0.151 ms | 0.098 / 0.130 | parity |
-| `rr-16` p50 / p99 | 0.507 / 1.151 ms | 0.463 / 1.347 | parity |
-| `udp-pace` | no failures | | |
+| `churn-16` p50 | **2.30 ms** | 3.71 | **−38 %** |
+| `churn-16` p99 | **3.59 ms** | 9.74 | **−63 %** |
+| `churn-16` rate | **6 463 /s** | 3 545 | **+82 %** |
+| the handshake per open | **14 µs** (p99 45) | 1 771 µs | **−126×** |
+| `bulk-1` throughput | 2.11 Gbit/s | 5.60 | **−62 %** |
+| `bulk-1` CPU per Gbit | 1.27 s | 0.67 | **+90 %** |
+| `bulk-1` cores busy | 1.95 | 3.36 | fewer, at lower throughput |
 
-**The latency goal would be met and the throughput gate would be missed.** A
-sealed stream's open costs microseconds instead of 1 771 — which is the whole
-point — and `bulk-1` loses two thirds of its throughput doing it. The objective's
-order is latency first, but `bulk-n` inside 15 % is a *gate*, so this version
-cannot ship as it stands.
+**Against TCP the cell reads p50 2.30 vs 1.97 and p99 3.59 vs 2.16** — 1.17× and
+1.66×, where the carrier stood at 1.7× and 4.0× before this work. Rate 6 463
+against TCP's 6 728.
 
-Where the 65 % goes, before anyone builds more on it:
+So the top-priority axis moves exactly as designed: the 1.8 ms handshake is gone
+(14 µs), the arrival median falls by 38 %, the tail by 63 %, and the cell carries
+82 % more arrivals. **That is the largest latency win of the whole effort and the
+first one that is not a trade against itself.**
 
-- **A copy per received packet.** `open_stream_payload` returns `Cow::Owned` for
-  every sealed packet (`data.to_vec()`), so the receive path copies each payload
-  before it reaches the stream buffer — exactly the cost the pooled-block design
-  removed. Opening **in place** into the receive buffer is the fix that does not
-  change the wire at all.
-- **A seal per sent packet**, which is one ChaCha20-Poly1305 pass over 1 384 bytes
-  and cannot be removed — only made cheaper (a larger payload per packet would
-  amortise the tag, which the frame already allows).
+**And the bulk pays for it.** Two thirds of `bulk-1`'s throughput, at 1.9× the CPU
+per bit, with *fewer* cores busy — the signature of a stall on top of a per-byte
+cost, not of crypto alone. Both are named below.
 
-And the striped defect is unchanged: the group's growth heuristic reports stalls
-of 1.3–3.4 s, grows the plan to seven stripes, and the echo ends at a frame
-boundary. That is very likely the same stall that shows up as lost throughput.
+### What is left before this can land
 
-**So stage 3's next step is not another feature — it is to make this one cheaper
-than the handshake it replaces.** In order: open in place (no copy), then measure
-`bulk-1` again; if it is still far below baseline, the seal itself is the cost and
-the design has to be reconsidered rather than tuned.
+1. **The striped 8 MiB echo still ends early**, and its growth heuristic reports
+   1.3–3.4 s stalls before it does. The most likely cause is now visible in the
+   arithmetic: the stripe layer hands a stream a record of up to
+   `MAX_STREAM_PAYLOAD` (1 400) bytes, and a sealed packet carries
+   `MAX_SEALED_PAYLOAD` (1 384) — so a full frame needs **two** packets, and if
+   the second is not emitted the frame never completes and the writer parks.
+   Check: count packets whose payload equals `MAX_SEALED_PAYLOAD` against packets
+   smaller than it; a stream that only ever sends the first kind is a stream whose
+   tail never goes out.
+2. **The stall that halves the bulk** is very probably the same one.
+3. **One copy per received packet** (`Cow::Owned`) is still there. Removing it is
+   worth doing but cannot explain a two-thirds loss on its own.
+
+**Verdict so far: the design is right and the implementation is not finished.**
+The next round attacks the striped stall; the measurement above is what makes it
+worth the round.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
