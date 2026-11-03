@@ -1092,6 +1092,38 @@ credit update was due. Three numbers in one line separate "full because unread" 
 "full because the accounting lost it" — and the second is a bug that has been in this
 carrier for as long as the window has.
 
+### The credit wedge is fixed, and the release gate drops to two failures (2026-11-03)
+
+`advance_read` moved the window and never armed an acknowledgement. `credit_due`
+woke the pump, the pump had nothing to send, and a packet that is not an
+acknowledgement carries no credit — so a reader that drained a window on a quiet or
+one-way stream left the sender with `send_credit - written == 0` and no way to hear
+otherwise. One line in `advance_read` now arms that acknowledgement.
+
+Measured on the next full sweep, against the run before it:
+
+| | before | after |
+|---|---|---|
+| stages with no measurement | **5** (`loss5`, `rate100`, `rate20`, `jitter`, `clean#2`) | **1** (`clean#2`) |
+| `credit_blocked` lines (server) | **1 492** of 2 282 stall lines | **0** — no stall line at all |
+| `clean` p50 / p99 | 78.3 / 248.5 ms | **3.5 / 132.2** |
+| `rate100` p50 / p99 | no measurement | **84.6 / 105.1** |
+| `jitter` p50 / p99 | no measurement | **81.7 / 107.9** |
+
+`just bench gate` on that run: **2 failures**, down from 5 — `clean#2` produced no
+measurement, and `timeline[clean]` p99 132 ms against the 50 ms limit.
+
+**That is the single most productive change of this cycle**, and it is worth naming
+why it took so long to find: every instrument that should have caught it measured the
+*sender's* view (unsent bytes, flight age, retransmissions) or the *reader's*
+(starvation, parked reads), and the defect lived in the space between them — credit
+that moved and was never spoken. The stall line had it all along, at `debug`.
+
+**What is left is one stage and one number.** `clean#2` is the last stage in the
+schedule and fails on its own; `clean`'s p99 is 2.6× the limit while its p50 is 3.5 ms,
+so the tail is a small number of very slow arrivals. Both are their own instruments'
+work, and neither is the wedge.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
