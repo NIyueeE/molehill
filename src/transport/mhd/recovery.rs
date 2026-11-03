@@ -694,8 +694,24 @@ impl Recovery {
     }
 
     /// How long the oldest data packet has been outstanding.
-    pub(crate) fn oldest_data_age(&self, now: Instant) -> Option<Duration> {
-        self.oldest_data_time()
+    /// How old the oldest unacknowledged data packet **of one stream** is.
+    ///
+    /// The connection-wide age was the wrong scope: one stale packet belonging to a
+    /// visitor that had stopped reading froze every other stream's writes on the
+    /// lane, so a single parked visitor took the whole lane with it. Measured on the
+    /// release sweep, the gate refused 4.6 million writes in a run against 0.9
+    /// million by the congestion window and 0.3 million by credit — the dominant
+    /// bound, and the only one that left no trace.
+    pub(crate) fn oldest_data_age_of(&self, stream: u32, now: Instant) -> Option<Duration> {
+        self.in_flight
+            .values()
+            .filter(|sent| sent.lost_at.is_none())
+            .filter(|sent| {
+                sent.range
+                    .is_some_and(|range| range.len > 0 && range.stream == stream)
+            })
+            .map(|sent| sent.time)
+            .min()
             .map(|time| now.saturating_duration_since(time))
     }
 
