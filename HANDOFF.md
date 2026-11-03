@@ -614,47 +614,47 @@ visible with the existing `debug` lines on the request and on
 three counters (`sealed_sent`, `unsealed`, `no_key`) are in the per-second stats
 line and made both bugs above findable in one run each.
 
-### The sealed wiring: three bugs down, one scale defect left (2026-11-03)
+### The sealed wiring: four bugs down, and the crypto is now clean (2026-11-03)
 
-Patch v4 is outside the tree (`~/tmp/stage3-wiring-v4.patch`, 809 lines). The
-first two bugs were the previous rounds'; this round found the third, and the
-small-transfer path now **works**.
+Patch v5 is outside the tree (`~/tmp/stage3-wiring-v5.patch`, 848 lines). The
+fourth bug was the one that made a busy lane fail while an idle one worked, and
+it is worth stating plainly because every counter pointed away from it.
 
-**Bug 3 — the accept announcement never ran.** Opening a sealed payload created
-its stream state inside the open, so `known` was true one line later and the
-branch that does `inbound.push_back(id)` — the only thing that tells the accept
-loop a stream exists — was skipped. The stream existed, the bytes were counted,
-and nothing was ever told to accept it: a stall with **no rejection, no error and
-no log of any kind**, which is why two rounds of counting found zero.
+**Bug 4 — the associated data was the whole run buffer.** `transmit_stream` seals
+each packet into a shared run buffer of up to `SEND_RUN` (44) packets, and the
+header it signed was `out[..payload_at]` — every packet *before it in the run*
+included. The receiver signs one datagram's header. So the first packet of each
+run opened and the other forty-three did not: `sealed_sent=704, unsealed=688` is
+exactly `1 in 44`. The fix is one line — remember where the packet starts and
+sign `out[packet_start..payload_at]`.
 
-The lesson is the same one this cycle keeps paying for: the counters were right
-and the *state* was wrong. `open_stream_payload` now returns the keys it derived
-and the caller creates the stream, so the announcement cannot be skipped.
+**With that, the crypto is correct under load.** A striped 8 MiB echo runs at
+`sealed_sent ≈ 1100` packets a second with `unsealed_tags = 0` and `no_key = 0`.
+Four bugs were found in four rounds, each by one counter:
 
-With that: `mhd_tunnel_carries_streams` passes, the lib suite is 344/344, and the
-integration suite goes 21 of 22.
+| counter | bug |
+|---|---|
+| `no_key=12` | the sealing rule was per lane; a lane's first stream predates its root |
+| `unsealed == sealed_sent` | the frame's length described the plaintext, not the wire |
+| nothing at all | a sealed stream was created but never announced to the accept loop |
+| `1 in 44` | the AD was the run buffer, not the packet |
 
-**What still fails, and it is scale.** `striped_data_channels` — an 8 MiB echo
-over a striped group — fails at `closed after 0/8388608`, and the counters are
-unambiguous:
+**What still fails is not the cipher.** The same test closes the visitor after a
+*variable* number of bytes — 0.4 MB, 2.2 MB, 4.5 MB across runs — and the close is
+a clean EOF (`n == 0`), not a reset: no `mhd stream ended: …` error, no rejection
+counted, no key failure. Two candidates, in order:
 
-```
-sealed streams (sent, refused, keyless)  sealed_sent=704  unsealed=688
-```
+1. **A lost finish.** `ends_at(offset, len)` compares a *plaintext* offset with
+   `fin_at`, and the payload clamp changed how much one packet carries; if the
+   last chunk never satisfies it and `pending_fins` does not cover the gap, the
+   peer sees a stream that stops without ending — and the forwarding loop closes
+   on its own timeout.
+2. **Flow control under sealing**: the receiver's credit is plaintext, the wire is
+   sixteen bytes per packet larger, and a window that is exactly sized could stall
+   the sender at the point where the two diverge.
 
-Nearly every *received* packet fails its tag, while a small transfer passes. So
-the two ends agree on the key and on the framing for an idle lane, and stop
-agreeing once a lane is busy. The two candidates the next round should separate
-first are the ones that only appear under load:
-
-1. **A repair.** A retransmitted range is encoded afresh, and if anything about
-   its header differs between the two ends — the acknowledgement block is the only
-   part that varies in length — the associated data differs and the tag fails.
-   Check by counting `unsealed` split by "offset is below the sender's send point"
-   (a repair) against fresh data.
-2. **A packet number reused across a repair.** That would be a nonce reuse, which
-   is worse than an interop bug: it must be checked in the sender
-   (`recovery.next_number`) before anything else is tried.
+Both are visible in one run with the existing `mhd stalled` line and a counter for
+`pending_fins` drained against `ends_at` firings.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
