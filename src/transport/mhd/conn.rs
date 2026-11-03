@@ -210,9 +210,22 @@ enum Refusal {
     Aged,
 }
 
-/// Whether a refusal is one the recovery table can cause.
-fn takes_room_refusal(refusal: Option<Refusal>) -> bool {
-    matches!(refusal, Some(Refusal::Aged))
+impl Conn {
+    /// One log a second, however many writes the gate refuses.
+    ///
+    /// `&self` because the caller already holds the stream's own borrow: the stamp
+    /// is a cell for exactly that reason, and this connection is never shared.
+    fn table_log_due(&self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .table_logged_at
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
+        if due {
+            self.table_logged_at.set(Some(now));
+        }
+        due
+    }
 }
 
 /// What the scheduler picked for one packet.
@@ -329,6 +342,9 @@ pub(crate) struct Conn {
     stall_logged_at: Option<Instant>,
     /// Which bound refused the last partial write (see [`Conn::write`]).
     last_refusal: Option<Refusal>,
+    /// When the recovery table's hold was last logged, so a refused write in a hot
+    /// loop costs one line a second and not one per call.
+    table_logged_at: std::cell::Cell<Option<Instant>>,
     /// Why the last [`Self::poll_transmit`] answered `None`, when it did.
     ///
     /// The pump's "built nothing while bytes were queued" line reads this: a
@@ -468,6 +484,7 @@ impl Conn {
             unsent_at: None,
             stall_logged_at: None,
             last_refusal: None,
+            table_logged_at: std::cell::Cell::new(None),
             none_reason: None,
             none_snapshot: None,
             recovery: Recovery::new(),
@@ -590,6 +607,12 @@ impl Conn {
             .recovery
             .oldest_data_age(Instant::now())
             .is_some_and(|age| age >= self.recovery.current_rto());
+        // Decided before the stream's own borrow: the age gate needs to know
+        // whether this stream is still opening, and the log needs `&self`.
+        let still_opening = self.streams.get(&stream).is_some_and(opening);
+        let refused_by_age = aged && !still_opening;
+        let log_table =
+            refused_by_age && crate::transport::stats::enabled() && self.table_log_due();
         let Some(state) = self.streams.get_mut(&stream) else {
             return 0;
         };
@@ -597,12 +620,12 @@ impl Conn {
         // the timer that finds its holes, and a new stream's handshake is not part of
         // that flight. Applying it here made a lane behind on acknowledgements — which
         // is every lane on a lossy path — refuse to start a stream at all.
-        let room = if aged && !opening(state) {
-            self.last_refusal = Some(Refusal::Aged);
-            0
-        } else {
-            room
-        };
+        //
+        // The label is built fresh for this call. Reading the previous call's value
+        // made `Aged` sticky: once set, every later refusal was labelled `Aged` even
+        // with an empty table, and a measurement built on it said the age gate
+        // refused 4.6 million writes when many of those were the congestion window.
+        let room = if refused_by_age { 0 } else { room };
         // A stream that has already written a reserve's worth stops short of it,
         // so an opening stream always finds room (see `OPEN_RESERVE`).
         let room = if opening(state) {
@@ -623,22 +646,25 @@ impl Conn {
             // its budget refusing is waiting on the far end's application, and
             // nothing this connection does will move it.
             // The age gate has already said why, if it is why.
-            self.last_refusal = Some(match self.last_refusal {
-                Some(Refusal::Aged) => Refusal::Aged,
-                _ if credit <= window => Refusal::Credit,
-                _ => Refusal::Window,
-            });
-            crate::transport::stats::note_refused(match self.last_refusal {
-                Some(Refusal::Aged) => "aged",
-                Some(Refusal::Credit) => "credit",
-                _ => "window",
+            let refusal = if refused_by_age {
+                Refusal::Aged
+            } else if credit <= window {
+                Refusal::Credit
+            } else {
+                Refusal::Window
+            };
+            self.last_refusal = Some(refusal);
+            crate::transport::stats::note_refused(match refusal {
+                Refusal::Aged => "aged",
+                Refusal::Credit => "credit",
+                Refusal::Window => "window",
             });
             // What the recovery table is holding when the age gate refuses. A
             // record that is neither acknowledged nor declared lost never leaves
             // the table, so its timestamp is the gate's input for ever: the lane
             // then refuses every write with no backlog and no credit block, which
             // is a stage that carries nothing and blames nothing.
-            if takes_room_refusal(self.last_refusal) && crate::transport::stats::enabled() {
+            if log_table {
                 let (held, oldest) = self.recovery.table_stats();
                 tracing::debug!(
                     stream,
