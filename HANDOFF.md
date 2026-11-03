@@ -711,6 +711,34 @@ forwarding loop's own end conditions are where to look.
 −63 %, rate +82 %, the handshake 1 771 µs → 14). What stands between this and a
 landable change is one striped transfer, and the two failures below.
 
+### The striped failure is a race, not a limit (2026-11-03, round 14)
+
+Patch v10 is outside the tree. One measurement this round, and it changes the
+shape of the problem: the striped 8 MiB echo's failure point **moves** — 0.36 MB,
+2.2 MB, 3.6 MB, 4.5 MB and **7.8 MB** across runs of one build. It is not a size
+the carrier cannot pass; it is a race that usually loses.
+
+Everything around it stays clean in every one of those runs: `unsealed_tags = 0`,
+`no_key = 0`, no refused datagrams, no `mhd stalled` line, and the close is a
+clean EOF rather than a reset. The stripe trace adds the one asymmetry worth
+following: the plan **grows to seven stripes** mid-transfer, on stalls of 1.3–3.4
+seconds, and the growth path is the only part of the striped design that adds and
+removes members *while* a transfer runs.
+
+So the next round's target is the growth path, and the instrument is the one this
+round added and did not get to read: a byte total beside the frame count in
+`stripe send direction finished`. A direction that finishes at 900 000 bytes while
+the peer saw 8 MiB is a lost tail; one that finishes at 8 MiB is a loss on the
+reader side.
+
+Two smaller items are recorded in the patch and worth keeping:
+
+- an in-process test for 8 MiB on **one** sealed stream, which passes — so the
+  carrier's sealed path carries the volume, and the defect needs the stripe layer;
+- a `#[expect(clippy::too_many_lines)]` on `transmit_stream` with the reason
+  stated: its decision (which stream, how much, sealed or not) must stay one
+  sequence because the length and the seal have to agree.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
