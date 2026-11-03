@@ -865,6 +865,45 @@ arrival path being *scheduled* behind bulk. Three consequences:
    `TOKIO_WORKER_THREADS` was measured once (4 vs 8, inside the floor) on a cell
    with no bulk; it has never been measured on the *first stage's* arrival.
 
+### The release gate fails the same four stages every time (2026-11-03)
+
+Two full-scale `timeline` runs, back to back, both fail **exactly** `rate100`,
+`rate20`, `jitter` and `clean#2` — every stage after `loss5` — with the same
+reason (`iperf3 error: control socket has closed unexpectedly`). This is not the
+intermittent harness failure the record describes as costing "0–3 stages, arm
+independently"; it is deterministic and positional.
+
+What each failure looks like, from the artefacts rather than the summary line:
+
+- the **sink** accepted the connections (`[ 5] local 127.0.0.1 port 2402 connected
+  to …`) and then logged **0.00 Bytes for 117 s** before iperf3's idle timeout;
+- the **pool** reports `established=4` once and never repairs or reaps, so no lane
+  is missing;
+- the **control session** stays up; `mhd stalled` never fires; no rejection, no
+  key failure, and the daemon's log has no `ERROR` or `WARN` at all.
+
+So the tunnel forwarded the *connection setup* and none of the *payload*: the four
+streams exist and carry nothing.
+
+**And `rate100` on its own is fine.** A single-stage campaign under the same
+condition and shaping puts the **control** arm (no tool in the path) at
+0.0956 Gbit/s and molehill at **0.0954** — within 0.3 % of a path that has no tool
+in it. So the condition is not the defect; **the stage after a lossy one is**.
+
+That is the shape the plan's Stage 5 exists for: the window grows and is never
+cut, `slow_start` latches off at the first loss, and nothing re-arms it. A sender
+whose window collapsed under `loss5` has no mechanism to grow back — and the next
+stage is where that shows, as a connection that opens and then carries nothing.
+
+**The instrument for the next round is one word away and it is already in the
+tree**: the window line is a `debug!` in `transport::mhd::pump`, and this run
+logged with `RUST_LOG=molehill::transport::mhd=debug`, which did **not** reach it
+(`mhd window` count: zero). Use `RUST_LOG=molehill=debug` — the form the earlier
+per-arrival run used successfully — and read `cwnd`, `flight` and `slow_start`
+across the `loss5 → rate100` boundary. If `cwnd` is pinned at a few kilobytes and
+`slow_start` is false, Stage 5's first half (re-arm growth after an idle or
+loss-free period) is the fix and it is local to `recovery.rs`/`conn.rs`.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
