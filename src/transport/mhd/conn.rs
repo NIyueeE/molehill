@@ -200,6 +200,14 @@ enum Refusal {
     Window,
     /// The peer's advertised credit had no room for new bytes.
     Credit,
+    /// The oldest data packet is older than the retransmission timer, so nothing
+    /// new may join a flight the timer cannot police.
+    ///
+    /// Its own variant because it is the one refusal no other instrument sees: the
+    /// stall line reports a backlog and a credit block, and this refusal leaves
+    /// neither — the bytes never enter the buffer, so the sender looks idle while
+    /// the writer is parked and the visitor's window stays shut.
+    Aged,
 }
 
 /// What the scheduler picked for one packet.
@@ -584,7 +592,12 @@ impl Conn {
         // the timer that finds its holes, and a new stream's handshake is not part of
         // that flight. Applying it here made a lane behind on acknowledgements — which
         // is every lane on a lossy path — refuse to start a stream at all.
-        let room = if aged && !opening(state) { 0 } else { room };
+        let room = if aged && !opening(state) {
+            self.last_refusal = Some(Refusal::Aged);
+            0
+        } else {
+            room
+        };
         // A stream that has already written a reserve's worth stops short of it,
         // so an opening stream always finds room (see `OPEN_RESERVE`).
         let room = if opening(state) {
@@ -604,10 +617,16 @@ impl Conn {
             // peer's credit waits for its *reader*. A stream that stalls with
             // its budget refusing is waiting on the far end's application, and
             // nothing this connection does will move it.
-            self.last_refusal = Some(if credit <= window {
-                Refusal::Credit
-            } else {
-                Refusal::Window
+            // The age gate has already said why, if it is why.
+            self.last_refusal = Some(match self.last_refusal {
+                Some(Refusal::Aged) => Refusal::Aged,
+                _ if credit <= window => Refusal::Credit,
+                _ => Refusal::Window,
+            });
+            crate::transport::stats::note_refused(match self.last_refusal {
+                Some(Refusal::Aged) => "aged",
+                Some(Refusal::Credit) => "credit",
+                _ => "window",
             });
         }
         if take == 0 {
