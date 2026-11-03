@@ -871,10 +871,16 @@ threads costs less CPU: a worker with nothing to run still looks for work, so ea
 extra one spends time on bytes another thread is already moving — on the
 benchmark host, one thread per core cost roughly a third more CPU per carried Gbit
 than four. But fewer threads also means a **new connection's handshake queues
-behind whatever is already running**: with four bulk streams on four workers, the
-per-connection handshake measured 26.5 ms in a busy stage against 13.0 ms at eight
-workers, while an idle stage read 1.0 ms either way. That is the cell the release
-gate is stated on, so eight is the default.
+behind whatever is already running**: with four bulk streams, the per-connection
+handshake measured 26.5 ms in the first stage of a run against 13.0 ms with eight
+workers, and 11.6 against 1.2 in a second run in the opposite order — while an idle
+stage read about 1 ms either way.
+
+**Treat that as a direction, not a figure.** A stage's first minute ranges from
+1.2 to 26.5 ms across runs on this host at either setting, which is wider than the
+difference between them; both paired comparisons favoured eight, and a default is a
+judgement rather than a published number. If a deployment's arrivals matter, set
+the value and measure its own path.
 
 Lower it when CPU is the scarce resource: `TOKIO_WORKER_THREADS=4` is the setting
 to measure on a small box serving many long-lived streams, and raise it further
