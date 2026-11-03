@@ -333,23 +333,53 @@ the small-flight timer got earlier. It closes a real hole: with `stripes > 1` th
 old FIFO could hand a channel opened for group A to group B, which is exactly the
 "K stripes on K distinct tunnels" invariant the client's placement keeps.
 
-### Stage 2b — the serial prologue read (next)
+### The residual, and three candidates excluded (2026-11-03)
 
-The remaining suspect is the per-tunnel accept loop: `serve_mhd_lane`'s
-`while let Some(stream) = bridge_rx.recv()` reads each stream's prologue
-**sequentially**, so one stream whose prologue bytes are late blocks every later
-stream on that tunnel. With four lanes and ~1 000 streams a second per lane, a
-single 15 ms stall delays about fifteen streams — a heavy tail over a tight
-median, which is the shape measured.
+With the group identity in place the two ends can finally be matched **by
+identity** rather than by magnitude. Twelve events had both ends' diagnostics in
+one round, and they bound the two intervals that were left:
 
-- **Instrument first**: time `route_tunnel_stream` (the prologue read) and the
-  delivery, and log anything at or past 5 ms. If those lines exist and line up
-  with the slow pairings, the loop is the bottleneck; if they do not, it is not.
-- **Then**: read the prologue concurrently (a task per stream, or the prologue
-  carried in the stream's opening frame so no read is needed at all). The second
-  is the aggressive one and it removes the await rather than hiding it.
-- **Gate**: `wait_us` p99 falls toward `open_us` p99; `bulk-n` inside 15 %; the
-  striping test still passes at `stripes > 1`.
+| interval | p50 | p99 | max |
+|---|---|---|---|
+| control request: server enqueued → client reads it | **132 µs** | 357 µs | 357 µs |
+| prologue written → server has paired | **3.0 ms** | 12.2 ms | 12.2 ms |
+
+and the second one is not any of the things inside it, each measured on its own:
+
+| candidate | reading | verdict |
+|---|---|---|
+| the send-buffer dwell: bytes accepted → a packet carries them | client p50 **5 µs**, p99 498 µs, max 591 µs; server p50 4 µs, p99 25 µs | **excluded** |
+| the per-tunnel accept loop reading prologues serially | **0** route lines over 5 ms in two rounds | **excluded** |
+| the exchange of channels between visitors | interleaved A/B: p99 19.52 against 21.74, twin 21.49 | **excluded as the cause** |
+
+So every instrument inside the path reads microseconds while the arrival's tail
+is twenty milliseconds — the same shape the archive records for the earlier
+search: **the time is between the stages, not inside them.** Two intervals are
+still unmeasured and both are scheduling rather than work:
+
+1. the client's pump posting a new stream's first packet → the server's listener
+   dispatcher handing that stream to the lane's accept loop;
+2. the lane's accept loop waking the stream's reader task and that task being
+   polled.
+
+The instruments that would separate them are a wake count and a poll-gap on the
+accept path — the same pair that was needed for the reader park earlier.
+
+### What this changes about the plan
+
+The queueing story is finished: identity was built, measured, and kept only for
+correctness. What remains for latency is **the number of task hops an arrival
+pays**, not the cost of any one of them. That makes the structural options
+narrower than the plan assumed:
+
+- a channel's arrival already costs a stream, a task, a Noise handshake and four
+  wakes; deriving the keys removes the handshake but not the hops.
+- the hop count is what a design change can remove: accept a visitor's channel in
+  the listener's own pass instead of handing it to a per-stream task, and hand the
+  paired group its channel from the same pass.
+
+That is the aggressive version of stage 2b, and it is worth pricing before stage 3
+because it attacks the interval that is actually 3 ms.
 
 ### Stage 3 — no per-visitor Noise handshake (latency)
 

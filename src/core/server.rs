@@ -1975,6 +1975,14 @@ where
     );
     tokio::spawn(async move {
         while let Some(mut stream) = bridge_rx.recv().await {
+            // This loop is per tunnel and it reads each stream's prologue in
+            // turn, so one stream whose prologue bytes are late blocks every
+            // later stream on the same tunnel. At four lanes and ~1 000 streams
+            // a second each, a single 15 ms stall delays about fifteen
+            // arrivals — a heavy tail over a tight median, which is the shape
+            // the pairing's distribution has. Timed before it is changed, so
+            // the change has something to move.
+            let asked = Instant::now();
             let Some((queue, group)) = route_tunnel_stream(
                 &mut stream,
                 &owner.sessions,
@@ -1988,10 +1996,23 @@ where
                 // tunnel or the session.
                 continue;
             };
+            let read_us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
             // The channel goes to the pairing that named its group, so a
             // visitor's own channel is not handed to another visitor. A group
             // whose pairing has gone falls back to the shared queue.
-            if queue.deliver(group, DataChannel::Mux(stream)).is_err() {
+            let handing = Instant::now();
+            let delivered = queue.deliver(group, DataChannel::Mux(stream));
+            let handed_us = u64::try_from(handing.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let total_us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if total_us >= 5_000 && crate::transport::stats::enabled() {
+                info!(
+                    read_us,
+                    handed_us,
+                    total_us,
+                    "mhd tunnel stream took long to route: prologue read and hand-off"
+                );
+            }
+            if delivered.is_err() {
                 break;
             }
         }

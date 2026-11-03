@@ -222,6 +222,45 @@ pub(crate) fn sent_run(datagrams: usize, bytes: usize) {
 /// The reporter's own once: one line per process, however many lanes start.
 static REPORTER: Once = Once::new();
 
+/// How long a stream's first queued byte waited for a packet, per second.
+///
+/// The interval between "`Conn::write` accepted these bytes" and "a packet
+/// carries them": the one part of an arrival that no other instrument covers,
+/// because the client's open and the server's pairing both end before or after
+/// it. A per-event line at twenty milliseconds could not see a three-millisecond
+/// wait, and three milliseconds is what the residual measures.
+static DWELL: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// The most dwell samples one reporting window keeps.
+const DWELL_WINDOW_MAX: usize = 65_536;
+
+/// Record one stream's wait for the wire.
+///
+/// Takes the `Duration` and checks the switch itself, so a call site is one line
+/// in a function that already has a line budget to respect.
+pub(crate) fn note_dwell(wait: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = DWELL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's dwell samples, sorted, and leave it empty.
+fn take_dwell() -> Vec<u32> {
+    let mut samples = DWELL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Start the once-a-second reporter, if the switch is set.
 ///
 /// Idempotent: every lane calls it and the first call wins, because one line per
@@ -289,6 +328,17 @@ fn report() {
         open_n = PHASES.open.read().1,
         "mhd-stats: cumulative phase timings"
     );
+    let dwell = take_dwell();
+    if !dwell.is_empty() {
+        let n = dwell.len();
+        info!(
+            n,
+            dwell_p50_us = pct_us(&dwell, 50, 100),
+            dwell_p99_us = pct_us(&dwell, 99, 100),
+            dwell_max_us = dwell.last().copied().unwrap_or(0),
+            "mhd-stats: a stream's first byte waiting for the wire"
+        );
+    }
 }
 
 /// Time `body` into `meter` when this datagram is sampled, and answer its value.

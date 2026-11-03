@@ -977,6 +977,8 @@ impl Conn {
             .and_then(|state| state.queued_at.take())
         {
             let waited = now.saturating_duration_since(at);
+            // Every wait, not only the long ones (see `stats::note_dwell`).
+            stats::note_dwell(waited);
             if waited >= Duration::from_millis(20) {
                 tracing::debug!(
                     stream = id,
