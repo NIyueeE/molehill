@@ -414,6 +414,28 @@ pub(crate) fn note_shared() {
     SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Visitors whose forwarding read was polled, and visitors whose read returned
+/// bytes.
+///
+/// The boundary between the visitor's socket and the carrier. A visitor that pairs
+/// and is then never polled is a socket nobody reads — its sender sees a shut
+/// window from the first second — while every carrier instrument stays silent,
+/// because the carrier was never given anything to do. `polled` rising without
+/// `fed` rising is that state; both rising is a carrier that has work and is not
+/// doing it.
+static VISITORS_POLLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VISITORS_FED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one visitor whose forwarding read was polled for the first time.
+pub(crate) fn note_visitor_polled() {
+    VISITORS_POLLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one visitor whose forwarding read returned bytes for the first time.
+pub(crate) fn note_visitor_fed() {
+    VISITORS_FED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Visitors that arrived, and pairings that finished, per second.
 ///
 /// The gap between them is the state no other instrument can see: a pairing that
@@ -615,6 +637,14 @@ fn report_phases() {
 /// Its own function because it answers one question and `report` is already at the
 /// length the lint allows.
 fn report_starvation() {
+    let polled = VISITORS_POLLED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let fed = VISITORS_FED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if polled + fed > 0 {
+        info!(
+            polled,
+            fed, "mhd-stats: visitors whose forwarding read ran, and whose read returned bytes"
+        );
+    }
     let accepted = VISITORS_ACCEPTED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let paired = PAIRINGS_DONE.swap(0, std::sync::atomic::Ordering::Relaxed);
     if accepted > 0 {

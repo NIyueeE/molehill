@@ -3970,6 +3970,7 @@ struct FirstByte<R> {
     arrival: Arrival,
     paired_at: std::time::Instant,
     logged: bool,
+    polled: bool,
 }
 
 impl<R> FirstByte<R> {
@@ -3979,6 +3980,7 @@ impl<R> FirstByte<R> {
             arrival,
             paired_at,
             logged: false,
+            polled: false,
         }
     }
 }
@@ -3989,8 +3991,18 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByte<R> {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.polled {
+            self.polled = true;
+            crate::transport::stats::note_visitor_polled();
+        }
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if !self.logged
+            && matches!(poll, std::task::Poll::Ready(Ok(())))
+            && buf.filled().len() > before
+        {
+            crate::transport::stats::note_visitor_fed();
+        }
         if !self.logged
             && matches!(poll, std::task::Poll::Ready(Ok(())))
             && buf.filled().len() > before
