@@ -1171,6 +1171,53 @@ this gate and put RACK/PTO in its place; that change is large enough to be judge
 its own pre-registered bet, and it needs a *paired* comparison — two binaries, one
 run, both arms interleaved — not two runs an hour apart.
 
+### The dead stages track the arm's position, not its binary (2026-11-03)
+
+A paired A/B of the age gate — two binaries, one run, arms interleaved `~b → ~aa →
+molehill`, where `~aa` is a **second copy of the same binary as `molehill`** — came
+back like this:
+
+| stage | A (gate) | **AA (same binary)** | B (no gate) |
+|---|---|---|---|
+| `clean` | p50 99.6 ms | **2.09 ms** | 3.73 ms |
+| `loss5` | **failed** | ok, 402 ms | ok, 402 ms |
+| `rate100` | **failed** | **ok, 172 ms** | failed |
+| `rate20` | **failed** | **ok, 352 ms** | failed |
+| `jitter` | **failed** | **ok, 84 ms** | failed |
+| `clean#2` | failed | failed | failed |
+
+**A and AA are the same binary, and they differ far more than A and B do.** A ran
+third and lost four stages; AA ran second and lost one. So the stage losses are not a
+property of the build under test — they follow **where in the run the arm sits**. Every
+comparison this cycle has made between one run and the next, including several in this
+file, was therefore measuring that drift as much as any change.
+
+That also explains the shape of the last ten rounds: `clean#2` — the last stage of
+every run — has failed in **every** recent run, and the stages before it fail in
+proportion to how much of the schedule has already run. Something accumulates over a
+run: namespaces, ports, sockets, conntrack entries, or simply host memory pressure.
+None of it is the carrier.
+
+**This is now the top of the queue.** Nothing else can be judged until a run's own
+drift is bounded: the gate exists to compare a build against a baseline, and it cannot
+do that while a run's last third is measurably worse than its first for reasons that do
+not involve the build.
+
+**Two things to measure next, in this order:**
+
+1. **A three-way A/A/A** of one binary in one campaign, with the arms run in the three
+   positions. If the failure count rises with position, the drift is demonstrated and
+   its size is known — and the gate's per-stage verdicts need a position-aware
+   correction before they mean anything.
+2. **What accumulates.** The cheapest candidates are process count (the new `reap_iperf`
+   may already have removed one), socket and conntrack counts, and host memory. Each is
+   one number per stage and they are already on the host.
+
+**Also recorded:** this run had to be interrupted after **2 h 25 min**, having written
+nothing for its last 30. Its own profile budget is minutes. A run that hangs is a run
+whose results cannot be compared, and a hung benchmark is the same class of defect as a
+wrong one.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
