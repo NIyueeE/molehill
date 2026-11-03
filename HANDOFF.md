@@ -614,37 +614,47 @@ visible with the existing `debug` lines on the request and on
 three counters (`sealed_sent`, `unsealed`, `no_key`) are in the per-second stats
 line and made both bugs above findable in one run each.
 
-### The sealed wiring, round two: the request arrives, the answer does not (2026-11-03)
+### The sealed wiring: three bugs down, one scale defect left (2026-11-03)
 
-Patch v3 (845 lines) is outside the tree. Two more facts, both measured:
+Patch v4 is outside the tree (`~/tmp/stage3-wiring-v4.patch`, 809 lines). The
+first two bugs were the previous rounds'; this round found the third, and the
+small-transfer path now **works**.
 
-- **The request does reach the client.** `stripe_sent` and `stripe_seen` were
-  equal in every window, and the client sends one sealed packet per request — so
-  the control plane is fine and the previous round's "the request never arrives"
-  was wrong.
-- **No data channel ever completes an open.** Counting `mhd stream opened and
-  acknowledged` over a whole run gives **four**, all with `hs_us` ≈ 150 ms: they
-  are the pool's four reservation probes. The visitor's channels never get an
-  acknowledgement, and the server logs nothing for them — not an error, not a
-  route. It is a silent stall on the server's receive side.
+**Bug 3 — the accept announcement never ran.** Opening a sealed payload created
+its stream state inside the open, so `known` was true one line later and the
+branch that does `inbound.push_back(id)` — the only thing that tells the accept
+loop a stream exists — was skipped. The stream existed, the bytes were counted,
+and nothing was ever told to accept it: a stall with **no rejection, no error and
+no log of any kind**, which is why two rounds of counting found zero.
 
-**The blind spot was that every rejection was silent** — hence `feat(mhd): count
-refused datagrams by reason`, which now reports `malformed`, `over_window` and
-`unknown` per second and reads zero on a healthy run. The next attempt runs with
-those on and the answer is one run away: a receiver that drops the first packet
-of a stream leaves no trace today, and that is the shape here.
+The lesson is the same one this cycle keeps paying for: the counters were right
+and the *state* was wrong. `open_stream_payload` now returns the keys it derived
+and the caller creates the stream, so the announcement cannot be skipped.
 
-**What to do next, in order:**
+With that: `mhd_tunnel_carries_streams` passes, the lib suite is 344/344, and the
+integration suite goes 21 of 22.
 
-1. Apply v3, add a fourth counter for the sealed path's `Rejected::Unsealed` (the
-   patch already returns it), and run the failing test with
-   `MOLEHILL_MHD_STATS=1`.
-2. If `malformed` is the one rising, the sealed packet's framing is still wrong —
-   the length arithmetic is the usual suspect and was already wrong once.
-3. If all four stay zero while the stream never opens, the packet never reached
-   `on_datagram` at all: log the listener's dispatcher for a stream id it has not
-   seen, which is the only path that can swallow a first packet before the
-   connection sees it.
+**What still fails, and it is scale.** `striped_data_channels` — an 8 MiB echo
+over a striped group — fails at `closed after 0/8388608`, and the counters are
+unambiguous:
+
+```
+sealed streams (sent, refused, keyless)  sealed_sent=704  unsealed=688
+```
+
+Nearly every *received* packet fails its tag, while a small transfer passes. So
+the two ends agree on the key and on the framing for an idle lane, and stop
+agreeing once a lane is busy. The two candidates the next round should separate
+first are the ones that only appear under load:
+
+1. **A repair.** A retransmitted range is encoded afresh, and if anything about
+   its header differs between the two ends — the acknowledgement block is the only
+   part that varies in length — the associated data differs and the tag fails.
+   Check by counting `unsealed` split by "offset is below the sender's send point"
+   (a repair) against fresh data.
+2. **A packet number reused across a repair.** That would be a nonce reuse, which
+   is worse than an interop bug: it must be checked in the sender
+   (`recovery.next_number`) before anything else is tried.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
