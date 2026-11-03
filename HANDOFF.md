@@ -1052,6 +1052,46 @@ killed by measurement, in order:
 
 A run in which (1) rises is the defect stated in one number.
 
+### The stall line was never silent: it names the wedge (2026-11-03, round 31)
+
+Earlier rounds searched for `mhd stalled` in runs logged at `INFO` and concluded it
+never fired. It is a `debug!` line, and a run with `RUST_LOG=molehill=debug` has
+**2 282 of them** on the server. Read properly, they are the clearest evidence this
+investigation has produced.
+
+Server side, over one failing run:
+
+```
+unsent_ms=200            median (max 3 211)
+unacked_ms=196           median
+credit_blocked=true      1 492 of 2 282 lines
+worst_stream=5  worst_stream_unsent=14 994 767
+worst_stream_next=73 582 695   worst_stream_written=88 523 502
+worst_stream_retransmits=0
+```
+
+So the wedge is a **live stream that has carried 88.5 MB, has sent 73.6 MB, and is
+holding 15 MB it cannot send because the peer's window is shut** — and the peer
+reports the opposite of what that implies:
+
+- the client's own stall lines are **never** credit-blocked, its unsent is **0**, and
+  the starvation sampler never fired, so by every receiver-side instrument its read
+  buffers are empty and its reader is running.
+
+Fifteen megabytes is the receive window (`WINDOW` is 16 MiB). A window that is full
+on the sender's side and empty on the receiver's is not a reader that stopped: it is
+**credit that was consumed and never given back**. That is a bookkeeping defect in
+`advance_read`/`advertised`, not a scheduling one, and it explains every symptom at
+once — the shut `snd_wnd` on the visitor's socket (the forwarding loop is parked on a
+stream that will not accept bytes), the empty receiver buffers, and the silence of
+every stream-level instrument, because those bytes never arrived to be starved over.
+
+**The instrument for the next round** is on the receiver, once a second, for the
+worst stream: `recv_credit`, `advertised`, the stream's unread bytes, and whether a
+credit update was due. Three numbers in one line separate "full because unread" from
+"full because the accounting lost it" — and the second is a bug that has been in this
+carrier for as long as the window has.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
