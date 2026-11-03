@@ -614,6 +614,38 @@ visible with the existing `debug` lines on the request and on
 three counters (`sealed_sent`, `unsealed`, `no_key`) are in the per-second stats
 line and made both bugs above findable in one run each.
 
+### The sealed wiring, round two: the request arrives, the answer does not (2026-11-03)
+
+Patch v3 (845 lines) is outside the tree. Two more facts, both measured:
+
+- **The request does reach the client.** `stripe_sent` and `stripe_seen` were
+  equal in every window, and the client sends one sealed packet per request — so
+  the control plane is fine and the previous round's "the request never arrives"
+  was wrong.
+- **No data channel ever completes an open.** Counting `mhd stream opened and
+  acknowledged` over a whole run gives **four**, all with `hs_us` ≈ 150 ms: they
+  are the pool's four reservation probes. The visitor's channels never get an
+  acknowledgement, and the server logs nothing for them — not an error, not a
+  route. It is a silent stall on the server's receive side.
+
+**The blind spot was that every rejection was silent** — hence `feat(mhd): count
+refused datagrams by reason`, which now reports `malformed`, `over_window` and
+`unknown` per second and reads zero on a healthy run. The next attempt runs with
+those on and the answer is one run away: a receiver that drops the first packet
+of a stream leaves no trace today, and that is the shape here.
+
+**What to do next, in order:**
+
+1. Apply v3, add a fourth counter for the sealed path's `Rejected::Unsealed` (the
+   patch already returns it), and run the failing test with
+   `MOLEHILL_MHD_STATS=1`.
+2. If `malformed` is the one rising, the sealed packet's framing is still wrong —
+   the length arithmetic is the usual suspect and was already wrong once.
+3. If all four stay zero while the stream never opens, the packet never reached
+   `on_datagram` at all: log the listener's dispatcher for a stream id it has not
+   seen, which is the only path that can swallow a first packet before the
+   connection sees it.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
