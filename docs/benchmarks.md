@@ -956,25 +956,27 @@ of an arrival is timed behind `MOLEHILL_MHD_STATS`, at one scale:
 |---|---|---|
 | accepting the visitor | 15 µs | — |
 | opening a channel (placement, Noise handshake, prologue) | **1.73 ms** | 4.66 ms |
-| **waiting for a channel to be provided** | 0.95 ms | **20.1 ms** |
+| waiting for a channel to be provided | 0.95 ms | **20.1 ms** (now 7.6) |
 | writing the pairing command on it | 2 µs | — |
 | the visitor's first byte after pairing | 13 µs | — |
 
-The two bold rows are the finding, and they have to be read together. The pairing's p99 is
-more than twice the **worst** open the client performed in the same second, so the tail is
-not a slow handshake. Its *median* is below the open's, which is only possible when a
-visitor is served by a channel that was already in flight for somebody else: a channel goes
-to whichever visitor takes one from a shared queue, so with sixteen opens in flight a
-visitor's own channel can be delivered to another and the waits add up. The control is the
-same pairing at sixteen arrivals a second with no bulk beside it — one pairing in about 480
-over five milliseconds, against 471 of about 480 in the first stage of the schedule. **Bulk
-puts a queue in front of an arrival, and the queue's depth is what an open costs.**
+**The tail was a queue with a lottery in it.** The wait for a channel was longer than
+everything else in the path put together — the client's whole side of an arrival is 2.1 ms
+at the median and 7.3 at its worst — and the reason was that the queue woke *every* waiting
+pairing on *every* arrival while exactly one of them could win. Ten wakes per arrival made a
+visitor's wait the number of draws it lost: about five for the median and about a hundred for
+the unlucky hundredth, which is the nineteen milliseconds measured. A channel now names the
+request that asked for it, in four bytes of both prologues, and is delivered to that pairing
+alone. An interleaved A/B with its own twin put `churn-16`'s p99 at **10.27 ms against
+21.95, −53 %**, and the pairing's own p99 at **7.6 ms**. The median rose 2.93 → 3.71 ms,
+because the old one was borrowed from other visitors; it is now the true cost of one channel.
 
 Two explanations are recorded as **rejected** rather than merely unproven. The congestion
 window reaches its 2 MiB slow-start ceiling within the first second of traffic, so it cannot
 account for a median that stays six times worse across a whole stage. And the handshake
-alone cannot: it is what one open costs, and the queue is what multiplies it — which is why
-the derivation attempts that halve the open moved the tail without closing it.
+alone cannot: it is what one open costs, and the queue multiplied it — which is why the
+derivation attempts that halve the open moved the tail without closing it, while removing the
+lottery halved it while leaving the open alone.
 
 A schedule that measured only the first stage would report the cold number and a schedule
 that measured only the last would report the warm one. This one reports both, in order,

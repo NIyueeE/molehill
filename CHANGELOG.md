@@ -11,35 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known gaps
 
-- **A fresh connection's tail is eight times TCP's, and it is a queue, not a handshake.**
-  The multi-second stalls are a *different* defect and are fixed — see the entry
-  about the flight outliving its timer. This one remains. Measured with
-  `MOLEHILL_DATA_CARRIER` pinning a carrier per run over the same binary,
-  `churn-16` — sixteen concurrent workers, each opening a fresh connection per
-  request, 6 400 arrivals in a round at about four thousand a second — puts the
-  round trip's p99 at **21.04 ms against TCP's 2.58**, with the medians level
-  (2.47 against 2.25) and the arrival rate at 3 469 against 6 705 per second.
+- **A fresh connection still costs more than TCP's, and the remainder is one
+  channel's own work.** `churn-16` — sixteen concurrent workers, each opening a
+  fresh connection per request, 6 400 arrivals in a round at about four thousand a
+  second — reads **p50 3.71 ms and p99 10.27 against TCP's 2.24 and 2.58**, at
+  3 545 arrivals a second against 6 728. Both numbers are worse than TCP's; the
+  tail used to be far worse and is now 4× rather than 8.5×.
 
-  **Where the wait is, over one second of a measured round.** Accepting the
-  visitor takes a median of **15 µs**. Writing the command that tells the client
-  to open a channel costs **2 µs** once a channel exists. The visitor's first byte
-  after it is paired takes **13 µs**. Opening a channel — the pool's placement,
-  the per-stream Noise handshake, and the tunnel prologue — runs a median of
-  **1.73 ms**, a 99th percentile of **4.66 ms** and a worst case of 7.6 ms across
-  a whole second. And the wait for a channel to be provided runs a median of
-  **0.95 ms** with a p99 of **20.1 ms**.
+  **What the tail was.** A visitor's channel is opened by the client and handed to
+  a queue that serves every pairing. That queue notifies *every* waiting pairing on
+  *every* arrival, and exactly one of them wins, so a visitor's wait was the number
+  of times it lost that draw: ten wakes per arrival meant the median lost about
+  five and the unlucky hundredth about a hundred. That is why the wait reached
+  nineteen milliseconds while every segment inside the path measured
+  microseconds — accepting the visitor 15 µs, the command 2 µs, the channel's own
+  open 1.73 ms at the median and 4.66 at p99, the visitor's first byte after
+  pairing 13 µs, and a woken pairing polled 14 µs later.
 
-  **Those two distributions together are the finding.** The pairing's p99 is more
-  than twice the worst open the client performed in the same second, so the tail
-  is not a slow handshake. The pairing's *median* is below the open's, which is
-  only possible when a visitor is served by a channel that was already in flight
-  for somebody else: channels go to whichever visitor takes one from a shared
-  queue, so with sixteen opens in flight a visitor's own channel can be delivered
-  to another one and the waits add up. The control is the same pairing at sixteen
-  arrivals a second in a stage with no bulk beside it — one of about 480 over five
-  milliseconds. **The cost appears with concurrency**, and what removes it is a
-  channel delivered to the request that asked for it rather than to whoever takes
-  it first.
+  The channel now names the request that asked for it: both prologues carry four
+  bytes for the stripe group, and the server delivers a channel to that pairing
+  alone, keeping the shared queue for a plain visitor and for a channel whose
+  pairing has gone. Interleaved A/B, four rounds with its own twin: p99
+  **21.95 → 10.27 ms, −53 %**, outside both the materiality floor and the run's own
+  scatter, with the twin at 10.78.
+
+  **What it cost and what is left.** The median rose from 2.93 to 3.71 ms, because
+  the old median was borrowed: a visitor often took a channel that had been opened
+  for somebody else, so its own wait was short and that visitor's was long. With
+  the borrowing gone the median is the true cost of one channel — 2.1 ms of
+  client-side work (the per-stream Noise handshake and the prologue) plus transit
+  — and that is the number a later change has to move. A deployment whose traffic
+  is mostly short-lived connections should expect a p50 a little above TCP's and a
+  p99 several times it.
 
   Where a connection is *reused* the carriers are indistinguishable: `rr-16`
   agrees to within 1 % on the tail and 5 % on the rate.
