@@ -1017,6 +1017,41 @@ it stays zero, the data never arrived at the buffer, the sender never sent, and 
 next place to look is the client's stripe sender for a group whose stripes were
 never started.
 
+### Not starvation either: there is no stream to starve (2026-11-03, round 30)
+
+The pump now samples, once a second, how many streams have had unread bytes for
+longer than a second — the question a reader cannot answer about itself, because a
+reader that is never polled never runs a line of code. On a full-scale run it never
+fired once, while two stages still carried nothing.
+
+So the dead stage is **not** a stream whose data waits unread. With `snd_wnd = 0`
+on the visitor's socket and no stream starving, the only shape left is:
+
+> the visitor's connection is accepted and its bytes shut the sender's window, and
+> **no data channel is ever attached to it** — so there is no stream to read, nothing
+> to starve, and every stream-level instrument is silent by construction.
+
+That is one layer above everything measured so far. Three hypotheses have now been
+killed by measurement, in order:
+
+| hypothesis | killed by |
+|---|---|
+| the drain left a tail | `drain_expired` is structural: the churn probe always holds sockets |
+| a channel is dropped for a dead group | `dead_group = 0` through a failing run |
+| data arrives and is not read | `starved = 0` through a failing run |
+
+**The instrument for the next round is a pairing, not a stream:**
+
+1. Count pairings that **wait for a channel and never receive one** before their
+   visitor gives up — the visitor-side counterpart of `parks`.
+2. Count channels delivered to a group whose **visitor has already finished** — the
+   mirror image of `dead_group`, which counted the pairing being gone rather than
+   the visitor.
+3. And record, per pairing, the group id it named and the group id of the channel it
+   was given, so a mismatched pairing is visible as an id and not as a suspicion.
+
+A run in which (1) rises is the defect stated in one number.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
