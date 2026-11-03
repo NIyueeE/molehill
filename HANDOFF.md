@@ -979,6 +979,44 @@ handed to a group with no live stripe waiting for it.
    to look is the client's `register` → `run` handoff for a stripe whose group
    completed while it was still being registered.
 
+### Refuted: it is not the identity delivery (2026-11-03, round 29)
+
+`deliver` did have a hole — it returned `Ok(())` and dropped a channel when the
+pairing that named the group had gone, while its own comment said the channel falls
+through to the shared queue. That is fixed, and a counter beside `claimed`/`shared`
+records it.
+
+**But on a full-scale run that failed the same four stages, `dead_group` stayed at
+zero from the first window to the last.** So the hole was real and is not the cause.
+Two other numbers from the same windows:
+
+```
+delivered pooled=0 direct=5..9 claimed=5..9 shared=0 dead_group=0
+```
+
+Channels were **delivered and claimed normally through the failing stages**. The
+defect is therefore *after* delivery: the channel exists, the pairing has it, and
+the data it carries is never read.
+
+**That narrows `snd_wnd = 0` to its proper owner.** The visitor's window is closed
+because the **server** never reads the visitor's socket, and the server reads when
+`wake_readers` fires for that stream. Delivery is counted and healthy; the read is
+not happening. This cycle has been bitten by exactly this class twice before (the
+`push` path and the claim path each missed a wake), which is why it is the first
+suspect rather than a new theory.
+
+**The instrument for the next round**, chosen to distinguish "no wake" from "no
+data":
+
+- count, per second, the times a stream's `poll_read` returned `Pending` **while
+  its receive buffer held unread bytes** — a reader starved with data waiting;
+- and count `wake_readers` against `RecvBuf::note_ready` per lane.
+
+A starved-read count above zero during a dead stage is the missing wake, named. If
+it stays zero, the data never arrived at the buffer, the sender never sent, and the
+next place to look is the client's stripe sender for a group whose stripes were
+never started.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
