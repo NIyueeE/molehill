@@ -578,42 +578,41 @@ order:
 **Gate** (from the design above): the open's p50 ≤ 100 µs, the pairing's p50 ≤ 1 ms,
 `churn-16` p99 ≤ 9.7 ms, `bulk-n` inside 15 %.
 
-### The wiring was attempted and reverted (2026-11-03, not committed)
+### The sealed-stream wiring: two bugs found, a third left (2026-11-03)
 
-All three pieces were built and compiled: the frame's `FLAG_SEALED` (with the tag
-reserved in `encode_stream` and carved out in `decode`), the lane's root installed
-on both ends, and `Conn` sealing on transmit and opening on receive — plus a
-`DERIVED_SELECTOR` so a sealed stream says so in its first plaintext byte. The
-patch is 715 lines and is kept outside the tree.
+The 794-line patch is kept outside the tree (`~/tmp/stage3-wiring-v2.patch`). It
+does not yet pass the integration suite, and getting this far took three
+measurements that are worth more than the patch.
 
-**It fails the integration suite, and the baseline does not.** Measured
-back-to-back on the same host: the commit before it passes **22 of 22** twice; the
-patched tree passed 16, 18 and 16 of 22 across three runs, always with the same
-shape — a visitor's connect is refused because the client never registers, and its
-log shows the control session retrying. That is a client whose pool keeps failing
-to establish, which points at the lane: `MhdLane::connect` proves the slot with
-one stream, and with sealing the streams after that one are the ones that fail.
+**Bug 1 — the sealing rule was per lane, and must be per stream.** The first
+attempt refused any stream without a key once its lane had a root. But a lane's
+*first* stream is opened before the handshake that produces the root — it is the
+control channel, and it stays plain for its whole life. Refusing its traffic the
+moment the lane acquired a root killed the lane that had just been established,
+which is why the client's control session looped on "connection refused" and the
+suite fell from 22 of 22 to 16. The counter said it in one run: `no_key=12`,
+`sealed_sent=0`. `StreamState` now carries `sealed`, set at creation.
 
-Two hypotheses were tested and neither fixed it:
+**Bug 2 — the frame's length must describe the payload on the wire.** The sender
+wrote the *plaintext* length while the receiver carved the last sixteen bytes out
+of the frame's length as the tag, so every sealed packet was read sixteen bytes
+short and its tag taken from the body. One counter caught it exactly:
+`sealed_sent` and `unsealed` were **equal**, packet for packet. With the length
+fixed, `unsealed` is zero.
 
-- **The root is ambiguous when two handshakes race.** Two opens each complete a
-  handshake with its own transcript, so the two ends can pick different roots.
-  Pinning the root to stream 1 (both ends know which stream that is) is the right
-  fix for that and did not change the failures — so the ambiguity is real but was
-  not the cause observed here.
-- **The ordering is wrong.** The server installs its root inside
-  `wrap_mhd_stream`, before it writes the acknowledgement; the client installs
-  its own only after the first `Ack::Ok`. That ordering is deliberate and is what
-  makes "the client only seals after the server can open" true — but it assumes
-  the *first* stream's handshake is the one that sets the root, which is exactly
-  what the pin above enforces.
+**What is left.** Packets now open on both ends, and the visitor still never gets
+a channel: the server's log repeats `pairing budget expired with no data channel
+… gathered=0`, and the client never logs `client asked for a stripe` — so the
+request is not reaching it. That is the next measurement, and it is one grep away
+from a cause: either the server's control task is not draining
+`data_ch_req_rx`, or the client's control loop is not reading, and both are
+visible with the existing `debug` lines on the request and on
+`ControlChannel::run`'s send.
 
-**The next attempt starts from the failure, not from the design**: apply the
-patch, and the first instrument is the client's `open_stream` error path — it
-currently logs nothing a run can read — plus a counter for the server's
-`Rejected::Unsealed` and for `stream has no key`. A lane whose second stream is
-refused is a lane whose root the server does not have yet, and those two counters
-say which side is missing it.
+**Do not start from the design again.** Apply the patch, set
+`RUST_LOG=molehill=debug MOLEHILL_MHD_STATS=1`, and read those two lines. The
+three counters (`sealed_sent`, `unsealed`, `no_key`) are in the per-second stats
+line and made both bugs above findable in one run each.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
