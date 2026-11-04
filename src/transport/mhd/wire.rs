@@ -47,6 +47,18 @@ const FLAG_FIN: u8 = 0b0001_0000;
 /// this flag is what tells the receiver not to read it as news — which also means
 /// a control packet can never acknowledge a data packet that was in fact lost.
 const FLAG_UNNUMBERED: u8 = 0b0010_0000;
+/// Set on a packet whose payload is sealed with its stream's own key.
+///
+/// In the header rather than inferred from lane state, because a stream can be
+/// opened while the lane's first handshake is still in flight: one end would
+/// decide "sealed" and the other "not", and each would read the other's bytes as
+/// the wrong thing. The flag travels with the stream, and — because the header is
+/// the AEAD's associated data — the bytes that say "sealed" are the bytes the tag
+/// covers, so a peer cannot flip it.
+const FLAG_SEALED: u8 = 0b0100_0000;
+
+/// The tag a sealed packet carries.
+pub(crate) const SEAL_TAG: usize = 16;
 
 /// flags + connection id + packet number.
 pub(crate) const HEAD: usize = 9;
@@ -430,6 +442,7 @@ pub(crate) fn encode_stream(
     number: u32,
     ack: Option<Ack>,
     range: StreamRange,
+    sealed: bool,
 ) -> Option<usize> {
     let StreamRange {
         id: stream,
@@ -438,7 +451,10 @@ pub(crate) fn encode_stream(
         len,
     } = range;
     let head = HEAD + ack.map_or(0, |_| ACK);
-    let total = head + STREAM + len;
+    // A sealed payload carries its tag inside the datagram, so the room it needs
+    // is `len` plus the tag — reserving here is what keeps the encoder from
+    // producing a packet the far end would have to truncate.
+    let total = head + STREAM + len + if sealed { SEAL_TAG } else { 0 };
     if total > MAX_DATAGRAM {
         return None;
     }
@@ -452,6 +468,9 @@ pub(crate) fn encode_stream(
     if fin {
         flags |= FLAG_FIN;
     }
+    if sealed {
+        flags |= FLAG_SEALED;
+    }
     out[start] = flags;
     out[start + 1..start + 5].copy_from_slice(&id.to_le_bytes());
     out[start + 5..start + 9].copy_from_slice(&number.to_le_bytes());
@@ -464,10 +483,20 @@ pub(crate) fn encode_stream(
     }
     out.extend_from_slice(&stream.to_le_bytes());
     out.extend_from_slice(&offset.to_le_bytes());
-    let len = u16::try_from(len).ok()?;
+    // The frame's length describes the payload **on the wire**, so a sealed one
+    // counts its tag: the receiver carves the last sixteen bytes out of exactly
+    // this many. Writing the plaintext length here is a silent mismatch — the
+    // peer reads sixteen bytes too few as the body and sixteen bytes of body as
+    // the tag, and every sealed packet fails to open.
+    let wire_len = len + if sealed { SEAL_TAG } else { 0 };
+    let len = u16::try_from(wire_len).ok()?;
     out.extend_from_slice(&len.to_le_bytes());
     Some(total)
 }
+
+/// The plaintext a sealed packet may carry, which is the frame's payload minus
+/// the tag it has to hold.
+pub(crate) const MAX_SEALED_PAYLOAD: usize = MAX_STREAM_PAYLOAD - SEAL_TAG;
 
 /// Append one control packet (anything but a reliable stream frame) to `out`.
 ///
@@ -497,6 +526,13 @@ pub(crate) struct Packet<'a> {
     /// Whether the number repeats another packet's and must not be acknowledged
     /// (see [`FLAG_UNNUMBERED`]).
     pub(crate) unnumbered: bool,
+    /// Whether the payload is sealed with its stream's key.
+    pub(crate) sealed: bool,
+    /// The header bytes a sealed payload is authenticated against: everything
+    /// before the payload, exactly as they arrived.
+    pub(crate) ad: &'a [u8],
+    /// The tag that closes a sealed payload, when there is one.
+    pub(crate) tag: Option<&'a [u8]>,
     /// What this packet acknowledges, when it carries a block.
     pub(crate) ack: Option<Ack>,
     /// The one frame it carries.
@@ -512,6 +548,7 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
     let flags = buf[0];
     let kind = Kind::from_bits(flags & KIND_MASK).ok_or(Malformed)?;
     let fin = flags & FLAG_FIN != 0;
+    let sealed = flags & FLAG_SEALED != 0;
     let bytes = |range: std::ops::Range<usize>| -> Result<u32, Malformed> {
         let slice = buf.get(range).ok_or(Malformed)?;
         let array: [u8; 4] = slice.try_into().map_err(|_| Malformed)?;
@@ -549,6 +586,8 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
         let array: [u8; 2] = slice.try_into().map_err(|_| Malformed)?;
         Ok(u16::from_le_bytes(array))
     };
+    let mut ad: &[u8] = &[];
+    let mut tag: Option<&[u8]> = None;
     let frame = match kind {
         Kind::Ack => Frame::None,
         Kind::Stream => {
@@ -557,11 +596,24 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
             let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
             let offset = u64::from_le_bytes(array);
             let len = usize::from(u16_at(at + 12)?);
+            // A sealed payload is `len` bytes *including* its tag, and the header
+            // before it is what the tag authenticates.
+            let payload_at = at + STREAM;
+            ad = buf.get(..payload_at).ok_or(Malformed)?;
+            let (data, tag_at) = if sealed {
+                let body = len.checked_sub(SEAL_TAG).ok_or(Malformed)?;
+                (payload(payload_at, body)?, Some(payload_at + body))
+            } else {
+                (payload(payload_at, len)?, None)
+            };
+            if let Some(tag_at) = tag_at {
+                tag = Some(payload(tag_at, SEAL_TAG)?);
+            }
             Frame::Stream {
                 id: stream,
                 offset,
                 fin,
-                data: payload(at + STREAM, len)?,
+                data,
             }
         }
         Kind::Credit => {
@@ -582,6 +634,9 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
         id,
         number,
         unnumbered: flags & FLAG_UNNUMBERED != 0,
+        sealed,
+        ad,
+        tag,
         ack,
         frame,
     })

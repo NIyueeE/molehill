@@ -45,12 +45,6 @@
 //! one, so the guard against an unauthenticated flood is a separate budget
 //! (see [`pump`]), not a handshake.
 
-// The per-stream key the lane's handshake makes possible. Compiled for the
-// tests that pin its properties and not yet for the daemons: the wire that says
-// "this stream is sealed" is the next change, and a cipher with no caller is a
-// shape the lints refuse — rightly, because it would be a key schedule nothing
-// uses.
-#[cfg(test)]
 pub(crate) mod cipher;
 pub(crate) mod conn;
 pub(crate) mod lane;
@@ -68,3 +62,32 @@ pub(crate) mod wire;
 pub(crate) const MHD_OVERHEAD: usize = wire::HEAD + wire::ACK;
 
 pub(crate) use pump::{MhdLane, MhdListener};
+
+/// Whether the experimental lane-root sealing is enabled, read once per process.
+///
+/// **Off by default, and it stays off until the striped path works.** The design
+/// is proved on the arrival path — deleting the per-stream Noise handshake takes
+/// an open from 1 771 µs to 14 and `churn-16`'s p99 from 9.74 to 3.59 ms — but a
+/// group of four sealed stripes **deadlocks about half the time** (measured
+/// 2026-11-04: sealed 3 of 6 runs, unsealed 6 of 6, same test, same host). The
+/// stall is `written ≫ next` with `credit_blocked=false` and `retransmits=0`,
+/// which is not yet root-caused, and `[client.data] stripe_count` grows under
+/// backpressure — so the multi-stripe configuration is not hypothetical.
+///
+/// A switch rather than a deletion: the cipher, the derivation and the whole
+/// wiring are tested and inert, `MOLEHILL_MHD_SEAL=1` reproduces the deadlock in
+/// `striped_data_channels`, and the next round starts from a working apparatus
+/// instead of rediscovering four bugs. It is an internal measurement switch, not
+/// a configuration key, so the configuration model is untouched.
+pub(crate) fn sealing_enabled() -> bool {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static READ: Once = Once::new();
+    READ.call_once(|| {
+        let set = std::env::var_os("MOLEHILL_MHD_SEAL")
+            .is_some_and(|value| value != std::ffi::OsStr::new("0"));
+        ENABLED.store(set, Ordering::Relaxed);
+    });
+    ENABLED.load(Ordering::Relaxed)
+}

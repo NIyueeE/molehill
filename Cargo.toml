@@ -111,7 +111,7 @@ notify = { version = "8", optional = true }
 console-subscriber = { version = "0.5", optional = true, features = [
     "parking_lot",
 ] }
-snow = { version = "0.10", features = ["ring-accelerated"], optional = true }
+snow = { version = "0.10", features = ["ring-accelerated", "risky-raw-split"], optional = true }
 pin-project = { version = "1.1.13", optional = true }
 parking_lot = { version = "0.12.5", optional = true }
 nohash-hasher = { version = "0.2.0", optional = true }

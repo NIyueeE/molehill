@@ -100,6 +100,21 @@ impl Shared {
         f(&mut conn)
     }
 
+    /// Give the connection the lane's root, once.
+    ///
+    /// Built from the handshake's secret material and its transcript (see
+    /// [`super::cipher::LaneRoot`]). Called by whichever end finished the lane's
+    /// first handshake, and by nothing else: a second call is a no-op because the
+    /// first root is the one the streams in flight were sealed under.
+    pub(crate) fn set_lane_secret(&self, secret: &super::cipher::Secret) {
+        self.with(|conn| conn.set_lane_secret(secret));
+    }
+
+    /// Whether a new stream on this connection is sealed.
+    pub(crate) fn has_lane_root(&self) -> bool {
+        self.with(|conn| conn.has_lane_root())
+    }
+
     /// End the connection: every stream ends, the pump stops after its last
     /// pass, and whoever waits on the lane is woken.
     pub(crate) fn close(&self, code: ResetCode) {
@@ -244,6 +259,15 @@ pub(crate) struct StreamIo {
 }
 
 impl StreamIo {
+    /// The connection this handle belongs to.
+    ///
+    /// What a caller needs when the handle itself is about to be boxed behind a
+    /// trait object and the connection still has to be told something — the lane's
+    /// handshake root, once its first stream has finished one.
+    pub(crate) fn connection(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
+
     /// The carrier stream this handle carries.
     ///
     /// The identity a per-stream key would be derived from, and the only thing

@@ -626,13 +626,12 @@ pub(crate) struct MhdLane {
     /// deadlock; a lane whose first open failed after the server reserved just
     /// falls back to the two-flight shape.
     registered: std::sync::atomic::AtomicBool,
-    /// The handshake hash this lane's first stream ended on.
+    /// The root material this lane's first stream's handshake produced.
     ///
-    /// Recorded, not yet used: it is the root a per-stream key would be derived
-    /// from, and the two ends only agree on it if the transcript is what the
-    /// design assumes. Reported per lane so a run can prove that before any
-    /// stream stops paying for its own handshake.
-    lane_hash: std::sync::Mutex<Option<[u8; 32]>>,
+    /// Recorded here until the first stream is acknowledged, then installed on
+    /// the connection (see `seal_from_now`): a stream sealed while its own
+    /// handshake is still in flight is ciphertext the peer cannot open.
+    lane_hash: std::sync::Mutex<Option<super::cipher::Secret>>,
 }
 
 impl std::fmt::Debug for MhdLane {
@@ -746,6 +745,21 @@ impl MhdLane {
         self.shared.wake_pump();
         let plain: crate::transport::multiplex::CarrierStream =
             Box::new(StreamIo::new(Arc::clone(&self.shared), id));
+        // A lane that has a root seals every later stream with a key derived from
+        // it: no handshake, so the only bytes before the hello are one selector
+        // byte the connection itself protects.
+        if self.shared.has_lane_root() {
+            let mut plain = plain;
+            plain
+                .write_all(&[crate::protocol::DERIVED_SELECTOR])
+                .await
+                .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            plain
+                .flush()
+                .await
+                .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            return Ok((id, plain));
+        }
         match &self.noise {
             #[cfg(feature = "noise")]
             Some(config) => {
@@ -755,6 +769,7 @@ impl MhdLane {
                     .wrap_initiator(plain)
                     .await
                     .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+                self.remember_secret(id, wrapped.session_roots());
                 Ok((id, Box::new(wrapped)))
             }
             // Without the `noise` feature `noise` is always None, so this arm
@@ -802,21 +817,55 @@ impl MhdLane {
                     .wrap_initiator_carrying(plain, payload)
                     .await
                     .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-                let hash = wrapped.handshake_hash();
-                if let Ok(mut slot) = self.lane_hash.lock()
-                    && slot.is_none()
-                {
-                    *slot = Some(hash);
-                    tracing::info!(
-                        lane = self.id,
-                        stream = id,
-                        hash = %hex::encode(&hash[..4]),
-                        "mhd lane handshake completed"
-                    );
-                }
+                self.remember_secret(id, wrapped.session_roots());
                 Ok((id, Box::new(wrapped), theirs))
             }
             _ => Err(crate::transport::multiplex::LaneError::Closed),
+        }
+    }
+
+    /// Keep the lane's root material, the first time a handshake completes.
+    ///
+    /// Recorded, not acted on: the root is installed by `open_stream` once the
+    /// first stream has been **acknowledged**, because a stream sealed while its
+    /// own handshake is still in flight would be ciphertext the peer cannot open
+    /// — it has no root until that handshake returns.
+    fn remember_secret(&self, id: u32, secret: super::cipher::Secret) {
+        // **Stream 1 only.** Two opens that race would each complete a handshake
+        // with its own transcript, and the two ends could pick different ones —
+        // then one seals with a key the other cannot derive. Pinning the root to
+        // the lane's first stream makes the choice agree by construction: both
+        // ends know which stream it is.
+        if id != 1 {
+            return;
+        }
+        if let Ok(mut slot) = self.lane_hash.lock()
+            && slot.is_none()
+        {
+            *slot = Some(secret);
+            tracing::info!(
+                lane = self.id,
+                transcript = %hex::encode(&secret.1[..4]),
+                "mhd lane handshake completed"
+            );
+        }
+    }
+
+    /// Install the root once it is safe to seal: the first stream is done.
+    ///
+    /// Gated on [`super::sealing_enabled`], which is off by default: with sealing
+    /// on, a four-stripe group deadlocks about half the time (see that function).
+    /// Recording the secret above is unconditional and free — it is what the
+    /// switch's own experiment reads — and only the *installation* is gated, so
+    /// turning the switch on cannot leave half a lane sealed.
+    fn seal_from_now(&self) {
+        if !super::sealing_enabled() {
+            return;
+        }
+        if let Ok(slot) = self.lane_hash.lock()
+            && let Some(secret) = slot.as_ref()
+        {
+            self.shared.set_lane_secret(secret);
         }
     }
 
@@ -905,8 +954,12 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // Only the encrypted data plane has a carrying handshake: a plain opening
         // writes its selector byte and nothing else, so there is no first message
         // to put a hello in and the two flights are the only shape it has.
-        let carries =
-            self.noise.is_some() && self.registered.load(std::sync::atomic::Ordering::Relaxed);
+        // A sealed lane carries nothing: there is no handshake to put a hello in,
+        // and a stream that took this branch would be wrapped in Noise on one side
+        // and sealed on the other.
+        let carries = self.noise.is_some()
+            && self.registered.load(std::sync::atomic::Ordering::Relaxed)
+            && !self.shared.has_lane_root();
         // `hs_at` is stamped **after** the channel is open and **before** the
         // hello goes out, so the two numbers below are the two waits a visitor
         // can pay and not the three they look like: `hs_us` is the handshake
@@ -947,6 +1000,10 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         if matches!(ack, crate::protocol::Ack::Ok) {
             self.registered
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            // The server installs its root before it writes this acknowledgement,
+            // so by the time it arrives both ends hold the same value and every
+            // later stream can be sealed.
+            self.seal_from_now();
         }
         match ack {
             crate::protocol::Ack::Ok => {

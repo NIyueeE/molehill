@@ -315,11 +315,20 @@ pub struct NoiseStream<T> {
 
     /// The handshake hash this session ended on.
     ///
-    /// Both ends compute the same value from the same transcript, which is what
-    /// makes it usable as the root for per-stream keys: a stream can derive its
-    /// own key from it without another exchange. Reported per lane so a run can
-    /// show that the two ends agree before anything is built on the assumption.
+    /// Both ends compute the same value from the same transcript. On its own it
+    /// is **not** a secret — it is the digest of the messages both ends
+    /// exchanged — so it is only ever used as HKDF's salt, never as key
+    /// material: see [`Self::session_roots`].
     handshake_hash: [u8; 32],
+
+    /// The handshake's two directional secret keys, as Noise split them.
+    ///
+    /// Taken from `dangerously_get_raw_split` the moment the handshake finished,
+    /// which is the same material `into_transport_mode` installs as the
+    /// transport keys. snow names the method "risky" because it exports key
+    /// material; that is precisely what a derivation root needs, and a lane's
+    /// per-stream keys are derived from here (`mhd::cipher::LaneRoot`).
+    split: [[u8; 32]; 2],
 }
 
 impl<T: Debug> Debug for NoiseStream<T> {
@@ -342,11 +351,22 @@ impl<T> NoiseStream<T> {
 
     /// The handshake hash both ends of this session ended on.
     ///
-    /// The root a per-stream key would be derived from, and identical on the two
-    /// ends by construction. Exposed rather than used so a run can prove that
-    /// agreement before a design depends on it.
+    /// The **salt** of a lane's root, never the root: it is public by
+    /// construction, and a key schedule built on it would give away the secrecy
+    /// the per-stream handshake used to provide. See [`Self::session_roots`].
     pub fn handshake_hash(&self) -> [u8; 32] {
         self.handshake_hash
+    }
+
+    /// What a lane's stream keys are derived from: this handshake's secret split
+    /// and its transcript.
+    ///
+    /// The two travel together because neither alone is a root. The split is the
+    /// part an observer cannot compute; the transcript binds every derived key
+    /// to *this* handshake. `mhd::cipher::LaneRoot` mixes them, and a caller that
+    /// has no use for sealing simply does not ask.
+    pub fn session_roots(&self) -> ([[u8; 32]; 2], [u8; 32]) {
+        (self.split, self.handshake_hash)
     }
 }
 
@@ -417,6 +437,14 @@ where
                 // configuration admits.
                 let mut handshake_hash = [0u8; 32];
                 handshake_hash.copy_from_slice(state.get_handshake_hash());
+                // The secret half, taken before `into_transport_mode` consumes
+                // the state. `dangerously_get_raw_split` only *derives* — it
+                // installs nothing and does not advance the handshake — so this
+                // is the same material the transport mode is about to install,
+                // not a second schedule that could disagree with it. snow answers
+                // it as a pair of keys; the array is what the root mixes.
+                let (initiator, responder) = state.dangerously_get_raw_split();
+                let split = [initiator, responder];
                 let transport = state.into_transport_mode()?;
                 return Ok((
                     Self {
@@ -431,6 +459,7 @@ where
                         read_expected: UNKNOWN_FRAME_LEN,
                         payload_len: 0,
                         handshake_hash,
+                        split,
                     },
                     theirs,
                 ));

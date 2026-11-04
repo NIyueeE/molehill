@@ -2360,6 +2360,9 @@ async fn wrap_mhd_stream(
     // Captured before the stream is consumed: it is the identity that pairs this
     // end's handshake hash with the peer's in a log.
     let stream_id = stream.stream_id();
+    // Taken before the handle is boxed: the connection it belongs to is where the
+    // lane's root has to land, and the trait object cannot be asked for it.
+    let connection = stream.connection();
     let mut stream: crate::transport::multiplex::CarrierStream = Box::new(stream);
     let mut carried: Option<Vec<u8>> = None;
     // Whether the handshake's reply already carried the lane's acknowledgement,
@@ -2372,7 +2375,11 @@ async fn wrap_mhd_stream(
     .await
     .with_context(|| "mhd transport selector timed out")??
     {
-        PLAIN_SELECTOR => stream,
+        // `PLAIN` is followed by the hello in the clear. `DERIVED` is a sealed
+        // stream: its connection already unsealed this selector and every later
+        // packet with the same key, so there is no handshake and nothing carried
+        // — the hello follows as the next record.
+        PLAIN_SELECTOR | crate::protocol::DERIVED_SELECTOR => stream,
         NOISE_SELECTOR => {
             #[cfg(feature = "noise")]
             {
@@ -2415,21 +2422,31 @@ async fn wrap_mhd_stream(
                 )
                 .await
                 .with_context(|| "mhd stream noise handshake timed out")??;
-                // The transcript both ends ended on. Recorded, not used: it is
-                // the root a per-stream key would be derived from, and nothing
-                // should stop paying for its own handshake until a run shows the
-                // two daemons agree on this value.
-                let hash = wrapped.handshake_hash();
-                {
-                    let mut slot = state.lane_hash.lock().await;
-                    if slot.is_none() {
-                        *slot = Some(hash);
-                        info!(
-                            stream = stream_id,
-                            hash = %hex::encode(&hash[..4]),
-                            "mhd lane handshake completed"
-                        );
-                    }
+                // What this handshake contributes to the lane's root: its secret
+                // split and the transcript both ends ended on. The two halves
+                // travel together because neither alone is a root — the split is
+                // what an observer cannot compute, the transcript is what binds
+                // the keys to *this* handshake.
+                let secret = wrapped.session_roots();
+                // Pinned to the lane's first stream: see `remember_secret` on the
+                // client for why "the first handshake I saw" is not good enough.
+                let first = stream_id == 1;
+                // The lane now has a root. Set **before** this stream's
+                // acknowledgement goes out, which is what makes the client's view
+                // safe: it only seals a stream after it has been acknowledged, and
+                // by then this end holds the same root. That ordering is the whole
+                // reason the one-flight shape cannot carry a lane's *first* hello.
+                if first && crate::transport::mhd::sealing_enabled() {
+                    connection.set_lane_secret(&secret);
+                }
+                let mut slot = state.lane_hash.lock().await;
+                if slot.is_none() {
+                    *slot = Some(secret.1);
+                    info!(
+                        stream = stream_id,
+                        transcript = %hex::encode(&secret.1[..4]),
+                        "mhd lane handshake completed"
+                    );
                 }
                 if !theirs.is_empty() {
                     carried = Some(theirs);

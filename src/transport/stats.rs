@@ -360,6 +360,31 @@ fn take_open_handshake() -> Vec<u32> {
     taken
 }
 
+/// Sealed streams: packets sent, packets whose tag failed, streams with no key.
+///
+/// Three counters because the three failures are three different defects, and
+/// the first two were found by watching them: `no_key` showed a rule that was
+/// per lane where it had to be per stream, and `unsealed` equal to `sealed_sent`
+/// packet for packet showed a length field that described the wrong thing.
+static SEALED_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UNSEALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NO_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one packet that went out sealed.
+pub(crate) fn note_sealed_sent() {
+    SEALED_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one payload that could not be opened.
+pub(crate) fn note_unsealed() {
+    UNSEALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one stream that had no key where its lane has a root.
+pub(crate) fn note_no_key() {
+    NO_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Why a datagram was refused, per second.
 ///
 /// Every rejection used to be silent: a lane that dropped every packet of a new
@@ -755,6 +780,25 @@ fn report_starvation() {
     }
 }
 
+/// How many packets the sealing path carried, and how it failed when it did.
+///
+/// Split out of `report` for the lint's line budget, and because the three
+/// counters answer one question between them: `sent` is the path working,
+/// `tag failed` is a key that disagrees, and `keyless` is a stream that should
+/// have been sealed and had no key. The last is the only one that must never be
+/// non-zero on a healthy lane.
+fn report_sealed() {
+    let sealed_sent = SEALED_SENT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let unsealed_tags = UNSEALED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let no_key = NO_KEY.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if sealed_sent + unsealed_tags + no_key > 0 {
+        info!(
+            sealed_sent,
+            unsealed_tags, no_key, "mhd-stats: sealed streams (sent, tag failed, keyless)"
+        );
+    }
+}
+
 fn report() {
     report_phases();
     report_starvation();
@@ -791,6 +835,7 @@ fn report() {
             "mhd-stats: a stream's Noise handshake, every open"
         );
     }
+    report_sealed();
     let malformed = REJECT_MALFORMED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let malformed_decode = REJECT_MALFORMED_DECODE.swap(0, std::sync::atomic::Ordering::Relaxed);
     let malformed_lane = REJECT_MALFORMED_LANE.swap(0, std::sync::atomic::Ordering::Relaxed);

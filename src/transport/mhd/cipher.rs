@@ -30,6 +30,15 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 /// The tag every sealed packet carries.
 pub(super) const TAG: usize = 16;
 
+/// What one finished handshake contributes to a lane's root.
+///
+/// The two directional secret keys Noise splits out of the handshake, and the
+/// handshake hash that binds them to this transcript. Carried as one value so a
+/// caller cannot install one without the other: a root made of a transcript
+/// alone is public, and a root made of a secret alone is not bound to the
+/// handshake it belongs to.
+pub(super) type Secret = ([[u8; 32]; 2], [u8; 32]);
+
 /// The label the derivation is bound to.
 ///
 /// A version byte because the root is a long-lived value: changing what is

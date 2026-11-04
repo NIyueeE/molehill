@@ -2430,7 +2430,6 @@ that would ship a transcript-only root while still passing every "both ends
 agree" test.
 
 Two consequences written down rather than discovered later:
-
 - `from_handshake` answers `Option`, and `None` means **do not seal** — the
   caller falls back to the per-stream handshake instead of sealing under a root
   nobody computed;
@@ -2439,6 +2438,66 @@ Two consequences written down rather than discovered later:
   wrap (or re-establish the lane) rather than wrap silently. 2³² datagrams is
   ~6 TB, which no test will reach — which is exactly why it has to be an
   explicit refusal and not an assumption.
+
+### Sealing is wired, tested, and OFF: a striped group deadlocks with it (2026-11-04)
+
+The derivation is now plumbed end to end — `NoiseStream::session_roots`, a lane
+root installed on `Conn`, per-stream ciphers, the frame flag, the sealed
+`StreamState`, and `DERIVED_SELECTOR` — and it is **disabled by default** behind
+`MOLEHILL_MHD_SEAL`, because on the one topology that shares a lane between
+several streams at once it hangs. The A/B is six runs of the same test on one
+host, the only difference being whether the root is installed:
+
+| `striped_data_channels` (4 stripes, 8 MiB echo) | runs passed |
+|---|---|
+| sealing **off** (`io::copy` echo, per-stream KK) | **6 of 6** |
+| sealing **on** | **3 of 6** |
+
+What the sealed failures look like, from the carrier's own lines:
+
+```
+mhd stalled: bytes waiting unsent_ms=212 unacked_ms=213 credit_blocked=false
+  backlog_streams=0 worst_stream=5 worst_stream_unsent=950569
+  worst_stream_retransmits=0 worst_stream_next=117312 worst_stream_written=950570
+mhd window lane=3 cwnd=76893 flight=0
+```
+
+`written` 950 570 against `next` 117 312 — 833 KB queued behind a send cursor
+that stops moving — with the peer's credit untouched, **no retransmission ever
+recorded**, and a congestion window of 63–77 KB against a flight of ~0. The
+server, meanwhile, logs four `mhd transport selector timed out` half a minute
+later: the streams it had accepted never received their first byte. Nothing was
+refused (`unsealed_tags=0`, `no_key=0`, and the two new refusal counters this
+round added — `unsealed_no_root`, `unsealed_no_tag`, `unsealed_no_key` — all
+read zero on the next capture), so the bytes were **not sent**, not lost.
+
+**That missing counter was itself the defect in the instrument.** A sealed packet
+this end cannot open was dropped in total silence: `unsealed_tags` counts *tag
+failures*, so a refusal for "no root here" left every counter reading healthy
+while the peer waited out a thirty-second deadline. It is now counted apart and
+logged once with the stream id, so the next round starts from a measurement
+instead of from a timeout.
+
+Two experiments were spent ruling out the neighbours, and both are recorded
+because they cost the time:
+
+- **the echo is not the cause.** Decoupling `tests/common`'s echo — the same
+  reader/queue/writer shape the bench backend got — moved the failure rate from
+  4 of 5 to 3 of 6, i.e. not at all, and the change was reverted;
+- **the in-process stripe harness is not an instrument.** The parked patch's
+  `a_sealed_stripe_group_carries_a_transfer` stalls at **zero** bytes without
+  wake-ups, at **128** bytes with them, and at **384** bytes with sealing
+  *disabled* — so it never carried a transfer in any configuration, and it was
+  deleted rather than left red. (Its lesson is worth keeping: a harness that
+  steps `Conn` by hand must call `wake_readers`/`wake_writers` after every
+  datagram, because in production the pump task does, and a missing wake-up reads
+  exactly like a stalled layer.)
+
+So the arrival path's largest measured lever is built, proved on the arithmetic
+(one handshake per lane instead of one per visitor), and **not shipped**, because
+the striped configuration deadlocks and stripe count grows under backpressure in
+production. The next round's first job is the deadlock, with the switch as its
+reproduction, not a re-derivation of the cipher.
 
 ## Negative results: do not retry these blind
 

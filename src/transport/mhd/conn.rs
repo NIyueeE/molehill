@@ -130,6 +130,11 @@ pub(crate) enum Rejected {
     OverWindow,
     /// The frame names a stream this end never opened.
     UnknownStream,
+    /// A sealed packet whose key is missing or whose tag does not verify.
+    ///
+    /// A tag that fails is either a corrupted packet or a peer that does not hold
+    /// the lane's root; both are dropped rather than guessed at.
+    Unsealed,
 }
 
 /// One stream, as the connection sees it.
@@ -143,6 +148,20 @@ pub(crate) enum Rejected {
 struct StreamState {
     send: SendBuf,
     recv: RecvBuf,
+    /// Whether this stream was **created** after its lane had a root.
+    ///
+    /// The rule is per stream, not per lane: a lane's first stream is opened
+    /// before the handshake that produces the root, and it stays plain for its
+    /// whole life — it is the control channel, and refusing its traffic the
+    /// moment the lane acquires a root would kill the lane it just established.
+    sealed: bool,
+    /// This stream's key towards the peer, when the lane has a root.
+    ///
+    /// One per direction, because a key is derived for `(stream, direction)`:
+    /// sharing one would let a reflected packet open as if it were the peer's.
+    send_cipher: Option<Box<super::cipher::StreamCipher>>,
+    /// This stream's key towards this end.
+    recv_cipher: Option<Box<super::cipher::StreamCipher>>,
     /// Whether anything this end wrote on this stream has been acknowledged.
     ///
     /// While it is false the stream is **opening**: its packets are the handshake
@@ -318,6 +337,57 @@ pub(crate) struct Stall {
     pub(crate) worst: Option<(u32, u64, u32, u64, u64)>,
 }
 
+/// Seal the payload `out[payload_at..]` in place and append its tag.
+///
+/// The header — everything before the payload — is the associated data, so the
+/// tag covers which stream this packet belongs to and which number it carries.
+/// The tag goes after the ciphertext, inside the room `encode_stream` reserved.
+fn seal_stream_payload(
+    cipher: Option<&super::cipher::StreamCipher>,
+    sealed: bool,
+    out: &mut Vec<u8>,
+    packet_start: usize,
+    payload_at: usize,
+    number: u32,
+) -> bool {
+    if !sealed {
+        return true;
+    }
+    let Some(cipher) = cipher else {
+        return false;
+    };
+    // This packet's header alone: what the receiver has in front of the payload.
+    let header = out[packet_start..payload_at].to_vec();
+    let Some(tag) = cipher.seal(u64::from(number), &header, &mut out[payload_at..]) else {
+        // Nothing half-built reaches the wire: the caller gets its room back
+        // rather than a payload in the clear.
+        out.truncate(payload_at);
+        return false;
+    };
+    out.extend_from_slice(&tag);
+    crate::transport::stats::note_sealed_sent();
+    true
+}
+
+/// The two directions of one stream's keys, when the lane has a root.
+///
+/// A named type because it travels: minted when a stream is opened or accepted,
+/// kept in its `StreamState`, and asked for by both the send and the receive
+/// path. Every `None` in it is load-bearing — a missing direction means "do not
+/// seal this stream", never "send it in the clear".
+type StreamKeys = (
+    Option<Box<super::cipher::StreamCipher>>,
+    Option<Box<super::cipher::StreamCipher>>,
+);
+
+/// One datagram's payload after opening, and the keys a *new* stream needs.
+///
+/// The second field is `Some` only when the packet opened a stream this end had
+/// never seen: that is the one moment the receive path mints keys, and returning
+/// them here is what keeps "opened by this packet" and "a stream already in the
+/// table" from being two different derivations.
+type Opened<'a> = (std::borrow::Cow<'a, [u8]>, Option<StreamKeys>);
+
 /// A connection between two of this carrier's endpoints.
 #[derive(Debug)]
 pub(crate) struct Conn {
@@ -326,6 +396,16 @@ pub(crate) struct Conn {
     /// both allocate from disjoint spaces and an id is unique with no
     /// negotiation at all.
     dialer: bool,
+    /// The lane's root, once its first stream finished a handshake.
+    ///
+    /// Set by the carrier from that handshake's **secret** material and its
+    /// transcript (see [`super::cipher::LaneRoot`]); from then on every stream
+    /// this connection opens or accepts is sealed with a key derived from it, and
+    /// the peer knows the same root. `None` means the lane is still in its
+    /// handshake phase and streams are plain — or that the root could not be
+    /// derived, in which case sealing stays off rather than falling back to a
+    /// root nobody computed.
+    lane_root: Option<super::cipher::LaneRoot>,
     next_stream: u32,
     streams: BTreeMap<u32, StreamState>,
     /// Where the round-robin cursor stands.
@@ -472,12 +552,59 @@ pub(crate) struct Conn {
 }
 
 impl Conn {
+    /// Give this connection the lane's root, built from one finished handshake.
+    ///
+    /// Called once, when the lane's first stream completed its handshake — the
+    /// moment both ends hold the same secret and the same transcript. A connection
+    /// that already has a root keeps the first one: re-keying a live lane would
+    /// leave the streams already in flight unreadable.
+    ///
+    /// A derivation that refuses leaves `lane_root` empty, which means **no
+    /// sealing**: the streams stay plain and both ends keep working, rather than
+    /// sealing under a root nobody computed.
+    pub(crate) fn set_lane_secret(&mut self, secret: &super::cipher::Secret) {
+        if self.lane_root.is_none() {
+            self.lane_root = super::cipher::LaneRoot::from_handshake(&secret.0, &secret.1);
+        }
+    }
+
+    /// Whether this connection has a root, so a new stream is sealed.
+    pub(crate) fn has_lane_root(&self) -> bool {
+        self.lane_root.is_some()
+    }
+
+    /// The two directions of one stream's key, when the lane has a root.
+    fn stream_ciphers(&self, stream: u32) -> StreamKeys {
+        use super::cipher::Direction;
+        let Some(root) = self.lane_root.as_ref() else {
+            return (None, None);
+        };
+        let out = if self.dialer {
+            Direction::ToServer
+        } else {
+            Direction::ToClient
+        };
+        let back = if self.dialer {
+            Direction::ToClient
+        } else {
+            Direction::ToServer
+        };
+        match (root.stream(out, stream), root.stream(back, stream)) {
+            (Some(send), Some(recv)) => (Some(Box::new(send)), Some(Box::new(recv))),
+            // Unreachable for a 32-byte derivation; an unsealed stream would be a
+            // silent hole, so both directions go missing together and the send and
+            // receive paths refuse rather than fall back to plaintext.
+            _ => (None, None),
+        }
+    }
+
     /// A fresh connection. The dialing end opens odd stream ids.
     pub(crate) fn new(id: u32, dialer: bool) -> Self {
         let now = Instant::now();
         Self {
             id,
             dialer,
+            lane_root: None,
             next_stream: u32::from(dialer),
             streams: BTreeMap::new(),
             cursor: u32::from(dialer),
@@ -543,7 +670,15 @@ impl Conn {
     fn open_at(&mut self, now: Instant) -> StreamHandle {
         let id = self.next_stream;
         self.next_stream = self.next_stream.wrapping_add(2);
-        self.streams.insert(id, StreamState::default());
+        let (send_cipher, recv_cipher) = self.stream_ciphers(id);
+        let sealed = self.lane_root.is_some();
+        let state = StreamState {
+            sealed,
+            send_cipher,
+            recv_cipher,
+            ..StreamState::default()
+        };
+        self.streams.insert(id, state);
         self.stream_opened.insert(id, now);
         StreamHandle { id }
     }
@@ -1054,6 +1189,12 @@ impl Conn {
     }
 
     /// The next stream's bytes, if any stream has unsent data.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one packet's whole decision — which stream, how much, sealed or \
+                  not, and the bookkeeping after — is one sequence; splitting it \
+                  separates the length from the seal that must agree with it"
+    )]
     fn transmit_stream(
         &mut self,
         now: Instant,
@@ -1093,10 +1234,17 @@ impl Conn {
                 );
             }
         }
+        // Before the stream is borrowed: the instrument touches another field.
+        self.note_first_byte_wait(id, offset, repair, now);
         let Some(state) = self.streams.get(&id) else {
             self.none_reason = Some("stream retired mid-pick");
             return None;
         };
+        let Some((want, sealed)) = Self::payload_plan(state, want) else {
+            self.none_reason = Some("stream has no key");
+            return None;
+        };
+
         // How much the packet carries, and whether it ends the stream: the
         // buffer answers both without being walked, because the payload is
         // appended straight into the run afterwards. A repair already came back
@@ -1110,26 +1258,15 @@ impl Conn {
             self.none_reason = Some("range is empty");
             return None;
         }
-        // A stream's very first byte, handed to the socket: its age is the part
-        // of a slow open the carrier owned (see `stream_opened`).
-        if offset == 0
-            && !repair
-            && stats::enabled()
-            && let Some(at) = self.stream_opened.get(&id)
-        {
-            let waited = now.saturating_duration_since(*at);
-            if waited >= Duration::from_millis(50) {
-                tracing::debug!(
-                    stream = id,
-                    waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
-                    "mhd first stream byte waited for the socket"
-                );
-                self.stream_opened.remove(&id);
-            }
-        }
         let fin = state.send.ends_at(offset, len);
         pick.stop(&stats::PHASES.tx_pick);
         let encode = stats::Timing::start(sampled);
+        // Where this packet starts inside the run buffer. **Not** the buffer's
+        // start: a run holds up to `SEND_RUN` packets, and taking the header as
+        // `out[..payload_at]` makes every packet after the first sign a header
+        // that contains its predecessors — which no receiver can reproduce, so
+        // exactly one packet per run opens and the rest fail their tag.
+        let packet_start = out.len();
         let Some(packet_len) = wire::encode_stream(
             out,
             self.id,
@@ -1141,13 +1278,25 @@ impl Conn {
                 fin,
                 len,
             },
+            sealed,
         ) else {
             self.none_reason = Some("frame does not fit");
             return None;
         };
         // The payload follows its header, drawn chunk by chunk: a packet is no
         // longer capped by the chunk boundary the send point happens to sit in.
+        let payload_at = out.len();
         state.send.append_to(offset, len, out);
+        // A seal that cannot be produced must not become a plaintext packet.
+        seal_stream_payload(
+            state.send_cipher.as_deref(),
+            sealed,
+            out,
+            packet_start,
+            payload_at,
+            number,
+        )
+        .then_some(())?;
         encode.stop(&stats::PHASES.tx_encode);
         let book = stats::Timing::start(sampled);
         self.recovery.on_sent(
@@ -1181,6 +1330,122 @@ impl Conn {
         self.ack_pending = false;
         self.keepalive_at = now + KEEPALIVE;
         Some(packet_len)
+    }
+
+    /// The plaintext room one packet has, and whether it must be sealed.
+    ///
+    /// `None` is the one outcome that is not allowed to reach the wire: the lane
+    /// has a root, so the peer expects ciphertext, but this stream lost its key —
+    /// sending the bytes in the clear would be worse than sending nothing.
+    fn payload_plan(state: &StreamState, want: usize) -> Option<(usize, bool)> {
+        let sealed = state.sealed;
+        if sealed && state.send_cipher.is_none() {
+            // A stream created with a root but no key is the one state that must
+            // never reach the wire in the clear.
+            stats::note_no_key();
+            return None;
+        }
+        // A sealed payload holds its tag inside the same datagram, so the room for
+        // plaintext is the frame's payload minus the tag.
+        Some((
+            if sealed {
+                want.min(wire::MAX_SEALED_PAYLOAD)
+            } else {
+                want
+            },
+            sealed,
+        ))
+    }
+
+    /// A stream's very first byte, handed to the socket: its age is the part of
+    /// a slow open the carrier owned (see `stream_opened`).
+    fn note_first_byte_wait(&mut self, id: u32, offset: u64, repair: bool, now: Instant) {
+        if offset != 0 || repair || !stats::enabled() {
+            return;
+        }
+        let Some(at) = self.stream_opened.get(&id) else {
+            return;
+        };
+        let waited = now.saturating_duration_since(*at);
+        if waited < Duration::from_millis(50) {
+            return;
+        }
+        tracing::debug!(
+            stream = id,
+            waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+            "mhd first stream byte waited for the socket"
+        );
+        self.stream_opened.remove(&id);
+    }
+
+    /// Open a sealed payload, or answer it unchanged when it is not sealed.
+    ///
+    /// Borrowed when there is nothing to undo (the common case on a plain lane)
+    /// and owned when the bytes had to be unsealed in place, so the caller pays a
+    /// copy only for a stream that is actually sealed.
+    /// Open a sealed payload, or answer it unchanged when it is not sealed.
+    ///
+    /// It deliberately does **not** create the stream: announcing a new stream to
+    /// the accept loop is the caller's job (`inbound.push_back`), and a version
+    /// that inserted the state here made `known` true one line later, so the
+    /// stream existed but nothing was ever told to accept it — a silent stall
+    /// that looked exactly like a peer which never sent anything.
+    fn open_stream_payload<'a>(
+        &mut self,
+        packet: &wire::Packet<'_>,
+        id: u32,
+        data: &'a [u8],
+    ) -> Result<Opened<'a>, Rejected> {
+        if !packet.sealed {
+            return Ok((std::borrow::Cow::Borrowed(data), None));
+        }
+        let Some(tag) = packet.tag else {
+            stats::note_rejected("unsealed_no_tag");
+            return Err(Rejected::Unsealed);
+        };
+        // A stream this end has never seen is opened by this packet, and its key
+        // comes from the lane's root on both ends.
+        let fresh = if self.streams.contains_key(&id) {
+            None
+        } else {
+            let (send_cipher, recv_cipher) = self.stream_ciphers(id);
+            if recv_cipher.is_none() {
+                // **The one refusal that must be said.** A sealed packet on a lane
+                // whose root this end does not hold is dropped, and the stream
+                // that packet opens then never receives its first byte: the peer
+                // times out half a minute later with nothing in the log to explain
+                // it. `unsealed_tags` counts *tag failures*, so it read zero
+                // through exactly this, which is why it is counted apart.
+                if stats::enabled() {
+                    tracing::debug!(
+                        stream = id,
+                        packet = packet.number,
+                        has_root = self.has_lane_root(),
+                        "mhd sealed packet refused: this end holds no root"
+                    );
+                }
+                stats::note_rejected("unsealed_no_root");
+                return Err(Rejected::Unsealed);
+            }
+            Some((send_cipher, recv_cipher))
+        };
+        let cipher = match fresh.as_ref() {
+            Some((_, recv)) => recv.as_ref(),
+            None => self
+                .streams
+                .get(&id)
+                .and_then(|state| state.recv_cipher.as_ref()),
+        };
+        let Some(cipher) = cipher else {
+            stats::note_rejected("unsealed_no_key");
+            return Err(Rejected::Unsealed);
+        };
+        let mut opened = data.to_vec();
+        if !cipher.open(u64::from(packet.number), packet.ad, &mut opened, tag) {
+            stats::note_unsealed();
+            return Err(Rejected::Unsealed);
+        }
+        Ok((std::borrow::Cow::Owned(opened), fresh))
     }
 
     /// One stream's abort, if one is queued.
@@ -1227,6 +1492,11 @@ impl Conn {
                 fin: true,
                 len: 0,
             },
+            // A finish is metadata, not payload: it carries no bytes to seal, and
+            // the flag it sets is already in the clear. Sealing a zero-length
+            // frame would only add a tag the peer's decoder would have to carve
+            // out of a body that does not exist.
+            false,
         )?;
         self.recovery.on_sent(
             now,
@@ -1602,6 +1872,7 @@ impl Conn {
                 Rejected::Malformed => "malformed",
                 Rejected::OverWindow => "over_window",
                 Rejected::UnknownStream => "unknown_stream",
+                Rejected::Unsealed => "unsealed",
             });
         }
         outcome
@@ -1641,6 +1912,7 @@ impl Conn {
                 fin,
                 data,
             } => {
+                let (data, fresh) = self.open_stream_payload(&packet, id, data)?;
                 if offset + data.len() as u64 > self.recv_credit {
                     return Err(Rejected::OverWindow);
                 }
@@ -1664,8 +1936,18 @@ impl Conn {
                 } else {
                     if !known {
                         // The peer opens a stream by naming it; the accept queue is
-                        // what tells its owner.
-                        self.streams.insert(id, StreamState::default());
+                        // what tells its owner. A sealed stream arrives with the
+                        // keys this packet was opened with.
+                        let state = match fresh {
+                            Some((send_cipher, recv_cipher)) => StreamState {
+                                sealed: true,
+                                send_cipher,
+                                recv_cipher,
+                                ..StreamState::default()
+                            },
+                            None => StreamState::default(),
+                        };
+                        self.streams.insert(id, state);
                         self.inbound.push_back(id);
                         self.inbound_at.insert(id, now);
                         self.stream_opened.insert(id, now);
@@ -1673,7 +1955,7 @@ impl Conn {
                     let blocks = &mut self.blocks;
                     let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
                     stats::around(sampled, &stats::PHASES.append, || {
-                        state.recv.insert(blocks, offset, data);
+                        state.recv.insert(blocks, offset, &data);
                     });
                     state.recv.note_ready(Some(now));
                     if fin {
@@ -1994,8 +2276,156 @@ mod tests {
         buf
     }
 
+    /// One handshake's worth of root material, from a seed.
+    ///
+    /// Two directional secrets and a transcript, which is what a real handshake
+    /// contributes. A test cares that both ends hold the *same* material and that
+    /// different lanes hold different material — not that these bytes resemble a
+    /// Diffie-Hellman output, so a seed is enough and it keeps the failure
+    /// legible.
+    fn secret(seed: u8) -> super::super::cipher::Secret {
+        (
+            [[seed; 32], [seed.wrapping_add(1); 32]],
+            [seed.wrapping_add(2); 32],
+        )
+    }
+
+    /// Eight mebibytes over one sealed stream, written as the writer would.
+    ///
+    /// The striped echo moves exactly this much and dies part-way; this says
+    /// whether the volume alone is enough to reproduce it, with no stripes, no
+    /// forwarding loop and no sockets in the way.
+    #[test]
+    fn a_sealed_stream_carries_eight_mebibytes() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let root = secret(9);
+        link.a.set_lane_secret(&root);
+        link.b.set_lane_secret(&root);
+        let stream = link.a.open();
+        let total = 8 * 1024 * 1024;
+        let chunk = payload(64 * 1024);
+        let mut written = 0usize;
+        let mut got: Vec<u8> = Vec::with_capacity(total);
+        // The stream exists at the peer only once a packet names it.
+        link.a.write(stream.id, &chunk[..1]);
+        written += 1;
+        link.pump(now);
+        let Some(accepted) = link.b.accept() else {
+            unreachable!("the peer names the stream")
+        };
+        for _ in 0..200_000 {
+            while written < total {
+                let n = link
+                    .a
+                    .write(stream.id, &chunk[..(total - written).min(chunk.len())]);
+                if n == 0 {
+                    break;
+                }
+                written += n;
+            }
+            link.pump(now);
+            let out = take(&mut link.b, accepted.id);
+            got.extend_from_slice(&out);
+            if got.len() == total {
+                break;
+            }
+        }
+        assert_eq!(written, total, "every byte was accepted by the writer");
+        assert_eq!(got.len(), total, "and every byte crossed the sealed stream");
+    }
+
+    /// Several sealed streams carry data at once, as a striped group does.
+    ///
+    /// The striped echo dies only when sealing and stripes are together, so this
+    /// is the carrier's half of that combination: four sealed streams, written
+    /// interleaved and read at the peer, each with its own bytes.
+    #[test]
+    fn four_sealed_streams_carry_their_own_bytes() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let root = secret(4);
+        link.a.set_lane_secret(&root);
+        link.b.set_lane_secret(&root);
+
+        let per = 256 * 1024;
+        let bodies: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; per]).collect();
+        let ids: Vec<u32> = (0..4).map(|_| link.a.open().id).collect();
+        // Name every stream first, so the peer's accept queue has all four.
+        let mut queued = vec![0usize; ids.len()];
+        for (index, id) in ids.iter().enumerate() {
+            queued[index] += link.a.write(*id, &bodies[index][..1]);
+        }
+        link.pump(now);
+        let mut accepted = 0;
+        while link.b.accept().is_some() {
+            accepted += 1;
+        }
+        assert_eq!(accepted, 4, "four streams arrived");
+
+        // The writer is bounded by the peer's credit, so it is fed as the window
+        // moves — which is how the forwarding loop writes too.
+        let mut got: Vec<Vec<u8>> = vec![Vec::new(); ids.len()];
+        for _ in 0..200_000 {
+            for (index, id) in ids.iter().enumerate() {
+                while queued[index] < per {
+                    let n = link.a.write(*id, &bodies[index][queued[index]..]);
+                    if n == 0 {
+                        break;
+                    }
+                    queued[index] += n;
+                }
+            }
+            link.pump(now);
+            for (index, id) in ids.iter().enumerate() {
+                let out = take(&mut link.b, *id);
+                got[index].extend_from_slice(&out);
+            }
+            if got.iter().map(Vec::len).sum::<usize>() == per * ids.len() {
+                break;
+            }
+        }
+        for (index, body) in bodies.iter().enumerate() {
+            assert_eq!(got[index].len(), body.len(), "stream {index} lost bytes");
+            assert_eq!(&got[index], body, "stream {index} has the wrong bytes");
+        }
+    }
+
     /// The whole stack in memory: what one end writes, the other end reads, byte
     /// for byte, with the stream opened by naming it and accepted from the queue.
+    /// The whole stack in memory: what one end writes, the other end reads, byte
+    /// for byte, with the stream opened by naming it and accepted from the queue.
+    /// A sealed stream carries a payload **larger than one packet**.
+    ///
+    /// A sealed packet holds `MAX_SEALED_PAYLOAD`, which is `MAX_STREAM_PAYLOAD`
+    /// minus the tag — so a writer that hands the stream a full record needs a
+    /// second packet for the remaining bytes. If that tail is never emitted the
+    /// frame never completes and the writer parks for ever, which is the shape of
+    /// the striped echo's stalls.
+    #[test]
+    fn a_sealed_stream_sends_the_tail_of_an_oversized_payload() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        // Both ends hold the same root, as they do once a lane's first handshake
+        // has completed.
+        let root = secret(7);
+        link.a.set_lane_secret(&root);
+        link.b.set_lane_secret(&root);
+        let stream = link.a.open();
+        let max = super::wire::MAX_STREAM_PAYLOAD;
+        let bytes = payload(max);
+        assert!(bytes.len() > super::wire::MAX_SEALED_PAYLOAD);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        link.pump(now);
+
+        let Some(accepted) = link.b.accept() else {
+            unreachable!("the peer named a stream, so it must be queued")
+        };
+        let out = take(&mut link.b, accepted.id);
+        assert_eq!(out, bytes, "every byte, including the tail past one packet");
+    }
+
     #[test]
     fn bytes_written_on_one_end_are_read_on_the_other() {
         let now = Instant::now();

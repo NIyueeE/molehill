@@ -481,6 +481,11 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         sent += n as u64;
     }
     sender.finish().await;
+    // The group's own tally, then one line that says which direction ended and
+    // how much it carried. Both survive the merge of the parked sealing patch:
+    // that patch's version of this line predates `note_group` and the group id,
+    // and dropping them to take its text would have cost the sealed path the
+    // one instrument that names a direction at all.
     crate::transport::stats::note_group(sent, started.elapsed());
     debug!(
         group,

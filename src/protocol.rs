@@ -109,6 +109,20 @@ const HELLO_PREFIX_LEN: usize = 3;
 /// it rejects an unknown protocol version.
 pub const PLAIN_SELECTOR: u8 = 0x00;
 pub const NOISE_SELECTOR: u8 = 0x01;
+/// Sealed with a key derived from the lane's handshake, not by a handshake of
+/// its own.
+///
+/// The stream has no Noise session: its connection seals every packet with the
+/// key `(lane root, direction, stream id)` derives, and the peer knows the same
+/// root. This byte is the first *plaintext* of such a stream, and it is readable
+/// because the frame's own sealed flag told the receiver to open the payload
+/// first — which is why the flag lives in the header rather than being inferred
+/// from lane state.
+///
+/// Gated on `mhd`: only that carrier can produce it, and a build without it has
+/// no reader for the constant.
+#[cfg(feature = "mhd")]
+pub const DERIVED_SELECTOR: u8 = 0x02;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
