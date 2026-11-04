@@ -243,6 +243,16 @@ static DWELL: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// why a ten-millisecond one was invisible.
 static POSTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// How long a stream waited between the datagram that named it and the accept
+/// loop that took it, per second.
+///
+/// The first of the two hops an arrival pays on the receiving end and the last
+/// interval this carrier could not see. The server's own handshake clock starts
+/// *after* the stream exists (`opened` is stamped in the task), so a stream that
+/// sat in the accept queue for twenty milliseconds contributed nothing to any
+/// timer — the handshake would read fast and the arrival would still be slow.
+static ACCEPTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 /// The most dwell samples one reporting window keeps.
 const DWELL_WINDOW_MAX: usize = 65_536;
 
@@ -700,6 +710,30 @@ fn take_post() -> Vec<u32> {
     taken
 }
 
+/// Record one stream's wait for its accept, in microseconds.
+pub(crate) fn note_accept_age(age: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = ACCEPTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's accept-age samples, sorted, and leave it empty.
+fn take_accept_age() -> Vec<u32> {
+    let mut samples = ACCEPTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Start the once-a-second reporter, if the switch is set.
 ///
 /// Idempotent: every lane calls it and the first call wins, because one line per
@@ -878,6 +912,39 @@ fn report_rejections() {
     }
 }
 
+/// The two hops an arrival pays before its handshake can even start.
+///
+/// Split out of `report` for the lint's line budget, and kept together because
+/// they are the pair that was invisible for a whole cycle: the pump's post to the
+/// socket (a pass that blocks there delays every reader it would have woken) and
+/// the stream's wait for its accept (the server's handshake clock starts *after*
+/// the stream exists, so a stream sitting in the accept queue cost nothing on
+/// anybody's timer).
+fn report_send_path() {
+    let posted = take_post();
+    if !posted.is_empty() {
+        let n = posted.len();
+        info!(
+            n,
+            post_p50_us = pct_us(&posted, 50, 100),
+            post_p99_us = pct_us(&posted, 99, 100),
+            post_max_us = posted.last().copied().unwrap_or(0),
+            "mhd-stats: the pump's post to the socket"
+        );
+    }
+    let accepted = take_accept_age();
+    if !accepted.is_empty() {
+        let n = accepted.len();
+        info!(
+            n,
+            accept_p50_us = pct_us(&accepted, 50, 100),
+            accept_p99_us = pct_us(&accepted, 99, 100),
+            accept_max_us = accepted.last().copied().unwrap_or(0),
+            "mhd-stats: a stream waiting for its accept"
+        );
+    }
+}
+
 fn report() {
     report_phases();
     report_starvation();
@@ -892,17 +959,7 @@ fn report() {
             "mhd-stats: a stream's first byte waiting for the wire"
         );
     }
-    let posted = take_post();
-    if !posted.is_empty() {
-        let n = posted.len();
-        info!(
-            n,
-            post_p50_us = pct_us(&posted, 50, 100),
-            post_p99_us = pct_us(&posted, 99, 100),
-            post_max_us = posted.last().copied().unwrap_or(0),
-            "mhd-stats: the pump's post to the socket"
-        );
-    }
+    report_send_path();
     let parks = take_read_park();
     if !parks.is_empty() {
         let n = parks.len();

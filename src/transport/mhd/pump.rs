@@ -916,6 +916,11 @@ impl MhdLane {
             let now = Instant::now();
             conn.accept_aged(now).map(|(handle, age)| (handle.id, age))
         })?;
+        // The whole distribution, not only the hundred-millisecond tail. This is
+        // the interval between the datagram that named the stream and the loop
+        // that takes it — the first of the two hops an arrival pays that no
+        // counter used to see, and the one a task-spawn delay would show up in.
+        crate::transport::stats::note_accept_age(age);
         if age >= std::time::Duration::from_millis(100) {
             tracing::debug!(
                 lane = self.id,
