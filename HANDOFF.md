@@ -1832,6 +1832,39 @@ So the tree is sound and the gate is blocked by the network, which is what this 
 recorded before. Nothing about the carrier depends on it, but no commit should be described
 as "gate-green" today without saying which half of the gate ran.
 
+### The request crosses and the response never starts (2026-11-04)
+
+The trace could not be read until the group id carried the **role** — both processes number
+their groups from one, and the parked patch had lost the top bit the client/server split
+needs. Restored, one failing run reads:
+
+```
+server group=4294967297  send direction finished, frames and bytes seq=257 bytes=8388608
+client group=2           receive direction finished frames=257 seen=257 written=8388608
+Error: echo service closed after 450560/8388608 bytes
+```
+
+- the **server read all 8 388 608 bytes** from the visitor and put them on the stripes (257
+  frames);
+- the **client read all 257 frames** and wrote 8 388 608 bytes into its backend;
+- **the response direction never appears at all**: no `send direction finished` for the
+  client's second group, and the server's receive direction never logs either.
+
+So the request crosses in full, both ends agreeing. The response — the backend's echo back to
+the visitor — never starts. Ten seconds later the group's grace expires, drops the visitor's
+write half, and the test sees a clean EOF after 450 560 bytes.
+
+**That is the whole defect, and it is in the response direction's *start*, not its end.** The
+client's `send_loop` for that group is alive (its `recv_loop` for the same group finished) but
+nothing it reads is reaching the stripes; no `stripe source read waited` and no `stripe write
+waited` line appears, so neither its source read nor its stripe write parked for twenty
+milliseconds — which is only possible if it is not being polled at all.
+
+**The next instrument is therefore one line in `send_loop`**: log the frame index and the
+elapsed time on its first iteration, and again whenever it goes a second without a frame. A
+direction that never logs its first iteration is a task that was never polled, and that is a
+different fix from one that reads and writes and loses the bytes.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
