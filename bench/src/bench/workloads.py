@@ -254,6 +254,40 @@ def iperf_sink(ctx: Ctx, tag: str, port: int):
         time.sleep(0.2)
 
 
+#: What the boundary probe prints: an outcome and a duration.
+PROBE_FIELDS = 2
+
+
+def echo_round_trip(ctx: Ctx, timeout_s: float = 3.0) -> dict:
+    """One visitor's whole life through the tool, asked at a stage boundary.
+
+    A stage's carrier counters can read clean while its bulk transfer carries nothing,
+    so "was the tool serving anyone now" has to be asked from outside it: connect to
+    the **echo** service, send a byte, read it back, close. Cheap, harmless, and it
+    separates "the tool stopped forwarding" from "this stage's iperf client never got
+    going" — two failures a summary cannot tell apart.
+    """
+    host, port = ctx.arm.dial_host, topology.ECHO_PORT
+    script = (
+        "import socket,time\n"
+        "t=time.time()\n"
+        "try:\n"
+        f"    s=socket.create_connection(('{host}', {port}), {timeout_s})\n"
+        "    s.sendall(b'x')\n"
+        "    print('ok' if s.recv(1) else 'eof', round((time.time()-t)*1000, 2))\n"
+        "except Exception as e:\n"
+        "    print('fail', type(e).__name__, round((time.time()-t)*1000, 2))\n"
+    )
+    done = ctx.topo.ns_run(
+        topology.VIS_NS, ["python3", "-c", script], timeout=timeout_s + 5, check=False
+    )
+    parts = (done.stdout or "").split()
+    # The probe prints exactly `<outcome> <milliseconds>`; anything else is no answer.
+    if len(parts) == PROBE_FIELDS:
+        return {"outcome": parts[0], "ms": float(parts[-1])}
+    return {"outcome": "no-answer", "ms": None}
+
+
 def reap_iperf(ctx: Ctx) -> None:
     """Kill anything still running `iperf3` on either side of the path.
 
@@ -1106,6 +1140,9 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     """The body of one stage, with its condition already imposed."""
     label, condition, secs = stage
     drain = ctx.topo.drain(ctx.leg)
+    # Asked before the condition and before this stage's own traffic: was the tool
+    # serving anyone at this boundary at all?
+    boundary = echo_round_trip(ctx)
     port = topology.IPERF_PORT
     # A stage must not inherit the previous one's traffic crew. `iperf3` leaves a
     # client behind when it is killed, and one that reconnects makes the fresh sink
@@ -1165,6 +1202,9 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     built = _iperf_cell(Spot(ctx, window, label), result, stage_metrics)
     built.unavailable |= unavailable
     built.evidence["series"] = evidence["series"]
+    # The boundary's own answer, on every stage: a visitor's whole life through the
+    # tool, asked before this stage's traffic started.
+    built.evidence["echo_probe"] = boundary
     built.evidence["series_logs"] = evidence["series_logs"]
     built.evidence |= {
         "condition": condition,
