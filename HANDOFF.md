@@ -1943,6 +1943,21 @@ nothing failed, which is the correct way for it to be idle.
 **So the harness is sound and the carrier passes at 0.3 scale.** What remains is the full-scale
 run, and it must be launched when nothing else is running.
 
+### The probe's answer was thrown away with the cell it was recorded on (2026-11-04)
+
+A full-scale sweep on a verified clean host reproduced the familiar shape — `clean` 58.1 / 281.1
+ms, then **five stages lost from `loss5` onward**, each retried and each failing again — and the
+new reachability field was **absent on every one of them**, even though `retried_after` was set.
+
+That is an instrument bug, not a measurement: `_one_stage` recorded the answer on the first
+attempt's cell and then **returned the retried cell**, discarding the first one and its evidence
+with it. The facts are now copied across before the retry's cell is returned.
+
+**So the round's datum is still missing, but the shape is not**: five consecutive stages after
+`loss5` fail, and their retry fails the same way, on a host where nothing else was running. That
+is deterministic and it is the last gate failure that does not depend on the parked sealing
+design.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
