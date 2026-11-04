@@ -1987,6 +1987,37 @@ roughly twenty minutes of run while its socket still answers. The instruments fo
 credit refusals, the age gate, the reader parks, and the close line — and the one counter this
 run can name is that the failure comes *late*, in the stage that follows the last shaped one.
 
+### The lost stage is a bulk-only silence, with every instrument idle (2026-11-04)
+
+The counters from the run whose only failure was `clean#2`, over the last 160 seconds — the
+stage that was lost:
+
+| counter | server | client |
+|---|---|---|
+| writes refused by credit | **0** | — |
+| writes refused by the age gate | **0** | — |
+| writes refused by the window | 24 / s median | — |
+| `mhd stalled` lines | **0** | **0** |
+| `credit_blocked=true` | **0** | **0** |
+| reader park p99 | 46 930 µs (last 447 743) | 48 484 µs (last 560 943) |
+| send-buffer dwell | 9 µs | — |
+| pairing p50 | **1 357 µs** | — |
+| visitors whose forwarding read ran / returned bytes | **5 760 / 5 758** | — |
+
+So nothing in the carrier is stuck: no refusal, no stall, no credit block, dwell of
+microseconds, visitors pairing in 1.4 ms, and *every* visitor's first read returning bytes.
+
+**And the bulk transfer carried nothing for the whole stage.** The churn probe kept working
+through it — thirty-six arrivals a second, paired in a millisecond — so the tool was serving
+small connections perfectly while one bulk flow moved zero bytes. Both ends' readers park on
+empty because there is nothing to read: the bulk data never entered the tool.
+
+That is the shape to chase, and it is narrower than any hypothesis this file has carried: **not
+a lane that stops, but a flow that never starts, on a tool that is otherwise healthy.** The next
+instrument is a per-visitor byte count with the worst one reported per window — `fed` says a
+visitor's first read returned *something*, and the question is now how much, and for how long it
+stops growing.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
