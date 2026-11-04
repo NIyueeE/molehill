@@ -1375,36 +1375,42 @@ instead of after a KK, so the window in which the writer blocks closes. The next
 should therefore **measure the gap between the server's first write and the client's
 `group started`** — one timestamp each — rather than add another theory.
 
-### The frames are all delivered, and the visitor still loses megabytes (2026-11-04)
+### The sealed stream ends with megabytes unaccounted (2026-11-04)
 
-One run, both directions, group ids with the role bit:
+The previous entry read a partial delivery as a close that resets a connection. **A
+clean EOF refutes it** — the visitor's read returned zero, not an error — and the byte
+counter added this round replaces the guess with a number from each end:
 
 ```
-stripe source ended: eof group=1 frames=257           <- client: its backend had 257 frames
-stripe send direction finished group=1 frames=257     <- client sent all 257, 8 388 608 bytes
-stripe receive direction finished group=2 frames=257 seen=257   <- server received all 257
-Error: echo service closed after 1892352/8388608 bytes
+stripe receive direction finished group=3 frames=257 seen=257 written=8388608   <- client to its backend
+stripe send direction finished group=2 frames=257                                  <- client sent 257
+stripe half-close grace: what the receive direction had left
+        highest=167 delivered=167 missing=0                                        <- server, at the cut
+Error: echo service closed after 5464064/8388608 bytes
 ```
 
-**Every frame was sent, every frame was received, and the visitor still saw 1.9 MB.**
-`recv_loop` writes its payloads with `write_all`, which cannot silently drop bytes, and
-no write or read parked for even twenty milliseconds (`stripe write waited` and
-`stripe read waited` are both absent from all three runs). So the loss is not in the
-layer and not in the carrier: it happens **after** the bytes are in the visitor's socket
-— which leaves one mechanism with a name: the connection is closed with unread data
-still on it, and TCP answers that with a reset, discarding everything the peer has not
-read yet.
+Read across, that is:
 
-That fits every number this investigation has produced: the amount lost varies with how
-much was in flight (0.14–6.2 MB across runs), a retried run can pass because the timing
-differs, and the buffer the visitor *did* fill is a socket buffer, not a frame count.
-The request direction is the one with unread data — the server never reads the visitor
-when its group ends — so the reset lands on the response.
+- the **client** wrote all 8 388 608 bytes of request into its backend, so the request
+  crossed the carrier intact;
+- the client then sent **257 frames** of response;
+- the **server's** receive direction had seen **167** when the grace cut it, and
+  `missing=0` says it had delivered every frame it ever saw — the last ninety frames
+  were never seen at all;
+- 167 frames is 5 472 256 bytes, and the visitor saw 5 464 064. The arithmetic closes.
 
-**The fix to try is therefore not in the sealed design at all**: a group that ends must
-drain its source, or close the read half before the write half, so the peer is not reset
-with unread data. That is a rule the archive already states as binding — "FIN/reset/close
-must not overtake queued data" — and this is the second time this cycle has met it.
+So the loss is inside the **sealed stream**, not in the stripe layer's ordering: 90
+frames' worth of bytes were accepted by the sender's carrier, never arrived at the
+receiver's, and the stream then ended **cleanly** — which is why nothing counts a gap,
+a rejection or a retransmission. This is the third appearance of one rule in this file:
+**a close must not overtake queued data.** Here it is the close of a *sealed stream*
+that overtakes its own send buffer.
+
+**The instrument for the next round is in `Conn`, where both ends are already known**:
+at stream close, log the stream's `written`, `sent` (highest offset put on the wire) and
+the peer-side `arrived` from the last acknowledgement. A stream that closes with
+`sent > arrived` is this defect, named, on the exact stream — and it is one line per
+stream while the stats switch is on.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
