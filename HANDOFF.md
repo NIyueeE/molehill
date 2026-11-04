@@ -1910,6 +1910,39 @@ remaining gate failure that does not depend on the parked sealing design, so it 
 finishing first: every lost stage is a cell the gate reports as missing, and until the harness
 can say which of the two it is, each loss costs a round to investigate.
 
+### Two bench chains at once destroys both, and a clean 0.3 sweep passes (2026-11-04)
+
+The full-scale sweep launched last round lost **every** stage — `iperf3 exit -9: no output` on
+all eight, the new reachability field absent, and in its log `Cannot open network namespace
+"mhbsrv"`. The cause is not the carrier and not the harness code: the worker-count A/B from the
+round before was **still running**, and its teardown deleted the namespaces the sweep was using.
+Two chains overlap, both die, and the one that survives writes a record that means nothing.
+
+That rule is already in this file ("do not run two bench chains at once"). This round broke it,
+and the cost was a 22-minute run and a round. The lesson is not new, only re-earned: **check for
+a running chain before launching one**, and treat `Cannot open network namespace` as proof that
+*another* run owns the host, not as a reason to retry.
+
+On a clean host, immediately after: a 0.3-scale sweep with the new probe in place —
+
+| stage | p50 | p99 |
+|---|---|---|
+| `clean` | **2.74 ms** | **44.4 ms** |
+| `rtt100` | 402 | 423 |
+| `loss1` | 42.4 | 1 053 |
+| `loss5` | 402 | 1 670 |
+| `rate100` | 84.9 | 106 |
+| `rate20` | 170 | 217 |
+| `jitter` | 81.5 | 109 |
+| `clean#2` | **2.20 ms** | **22.4 ms** |
+
+**`bench gate: PASS`** — every stage measured, both clean stages inside the SLO with room, and
+this is the second independent pass at this scale. The reachability probe did not fire because
+nothing failed, which is the correct way for it to be idle.
+
+**So the harness is sound and the carrier passes at 0.3 scale.** What remains is the full-scale
+run, and it must be launched when nothing else is running.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
