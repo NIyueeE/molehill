@@ -387,6 +387,7 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut src: R,
     mut sender: StripeSender<W>,
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    group: u64,
 ) -> anyhow::Result<()> {
     let mut seq = 0u64;
     // The two halves of a forwarded chunk, timed only while the switch is on.
@@ -443,7 +444,7 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         seq += 1;
     }
     sender.finish().await;
-    debug!("stripe send direction finished after {seq} frames");
+    debug!(group, frames = seq, "stripe send direction finished");
     Ok(())
 }
 
@@ -542,6 +543,14 @@ impl Drop for ReaderTasks {
 /// Receive direction: reassemble every stripe's frames in sequence order
 /// and write them to `dest`.
 ///
+/// The id printed on a group's lifecycle lines.
+///
+/// The send and receive directions log separately and neither knew which group it was
+/// in, so a run that lost a transfer could not say *which* direction was short on
+/// *which* group: the visitor's byte count cannot be tied to a line. This is a
+/// per-process counter, enough to pair the two lines of one group.
+static GROUP_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Frames seen, and frames delivered in order, for one group's receive direction.
 #[derive(Default)]
 struct Frames {
@@ -559,6 +568,7 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
     mut dest: W,
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     frames: std::sync::Arc<Frames>,
+    group: u64,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<StripeEvent>(STRIPE_REORDER_QUEUE);
     // The readers are owned by a guard for this direction's whole life. An
@@ -658,7 +668,12 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
         );
     }
     dest.shutdown().await?;
-    debug!("stripe receive direction finished after {next} frames");
+    debug!(
+        group,
+        frames = next,
+        seen = frames.highest.load(std::sync::atomic::Ordering::Relaxed),
+        "stripe receive direction finished"
+    );
     Ok(())
 }
 
@@ -699,7 +714,11 @@ where
             writes.push(w);
         }
         let stripes = writes.len();
-        debug!("stripe group started with {stripes} stripes");
+        let group_id = GROUP_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug!(
+            group = group_id,
+            "stripe group started with {stripes} stripes"
+        );
 
         // One clock for both directions: a connection that moves nothing in
         // EITHER direction for FORWARD_IDLE_TIMEOUT is closed, exactly like
@@ -709,6 +728,7 @@ where
             src,
             StripeSender::new(writes, plan),
             activity.clone(),
+            group_id,
         ));
         // What the receive direction has seen and what it has delivered, shared
         // with the half-close grace below. A grace that fires while `delivered`
@@ -722,6 +742,7 @@ where
             dest,
             activity.clone(),
             std::sync::Arc::clone(&frames),
+            group_id,
         ));
         let send_abort = send.abort_handle();
         let recv_abort = recv.abort_handle();
