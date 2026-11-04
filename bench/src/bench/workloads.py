@@ -1081,6 +1081,14 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         if cell.ok or not _instrument_failure(cell.reason):
             return cell
         first = cell.reason
+        # **What the path looks like at the moment it failed**, before the retry
+        # changes it: whether the tool still answers on the port it just failed to
+        # carry on. A stage that fails and is still reachable is a carrier that
+        # stopped forwardting; one that is unreachable is a tool that died or a
+        # listener that went away, and the two want different investigations.
+        cell.evidence["reachable_after_failure"] = wait_dial_port(
+            ctx, topology.IPERF_PORT, 5.0
+        )
         ctx.topo.drain(ctx.leg)
         again = _measure_stage(ctx, stage, params, logs)
         again.evidence["retried_after"] = (first or "")[:200]
