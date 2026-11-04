@@ -566,6 +566,8 @@ static GROUP_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 struct Frames {
     highest: std::sync::atomic::AtomicU64,
     delivered: std::sync::atomic::AtomicU64,
+    /// Bytes handed to the destination, which is the number the peer can check.
+    written: std::sync::atomic::AtomicU64,
 }
 
 /// Frames are held in a `BTreeMap` keyed by sequence number while an earlier
@@ -646,10 +648,16 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
                     .fetch_max(seq + 1, std::sync::atomic::Ordering::Relaxed);
                 if seq == next {
                     write_dest(&mut dest, &bytes).await?;
+                    frames
+                        .written
+                        .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     activity.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
                     next += 1;
                     while let Some(bytes) = pending.remove(&next) {
                         write_dest(&mut dest, &bytes).await?;
+                        frames
+                            .written
+                            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         activity.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
                         next += 1;
                     }
@@ -682,6 +690,7 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
         group,
         frames = next,
         seen = frames.highest.load(std::sync::atomic::Ordering::Relaxed),
+        written = frames.written.load(std::sync::atomic::Ordering::Relaxed),
         "stripe receive direction finished"
     );
     Ok(())
