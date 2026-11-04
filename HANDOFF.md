@@ -1167,6 +1167,43 @@ big one" — instead of as a bug report about the instrument. The repository's o
 "re-check every consumer after reshaping data", did not catch it because the reshaping
 was in the label, not in the data.
 
+### First green gate, and the refusal mix measured honestly (2026-11-03)
+
+With the refusal label fixed, a 0.3-scale `timeline` — every stage measured, none
+failed — gives the proportions the broken counter had inverted:
+
+| bound | writes refused | share |
+|---|---|---|
+| the peer's credit | **565 039** | 64 % |
+| the congestion window | 255 688 | 29 % |
+| the age gate | **66 251** | 7.5 % |
+
+**The age gate is the smallest of the three, not the largest.** The dominant bound is
+the peer's reader, which is what `credit_blocked` said all along and what the earlier
+1 492-of-2 282 ratio suggested before the label went wrong.
+
+And the run itself:
+
+| stage | p50 | p99 |
+|---|---|---|
+| `clean` | **2.17 ms** | **22.3 ms** |
+| `rtt100` | 402 | 403 |
+| `loss1` | 42.0 | 1 054 |
+| `loss5` | 403 | 1 460 |
+| `rate100` | 82.3 | 103 |
+| `rate20` | 163 | 164 |
+| `jitter` | 81.6 | 109 |
+| `clean#2` | **2.18 ms** | **23.0 ms** |
+
+**`bench gate`: PASS** — the first green gate of this effort. Both clean stages are
+inside the 50 ms SLO by a factor of two on the median and by more than a factor of two
+on the tail, and the coverage is complete.
+
+Two caveats, both stated by the gate itself and neither to be dropped: the timeline ran
+500 s, which is **under the 900 s a drift slope needs**, so the drift axis is only
+partly gated; and this is scale 0.3. Every full-scale run this cycle has lost between
+one and five stages, so the 0.3 → 1.0 transition is the open question, not the SLO.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
