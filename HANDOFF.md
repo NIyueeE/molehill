@@ -1897,6 +1897,19 @@ independent of sealing: the credit-wedge fix (five stages restored, `clean` 78 �
 grace fix, the per-stream sealing rule and prologue that made the diagnosis possible, the
 worker default, four harness fixes, and a 0.3-scale sweep that passes `bench gate`.
 
+### In flight: does the tool still answer when a stage's instrument fails? (2026-11-04)
+
+The retry re-measures a stage whose `iperf3` client died, and in several runs the retry failed
+the same way — which says the path was still broken seconds later but not *what* was broken.
+The harness now asks, before the retry changes anything, whether the tool still answers on the
+port the stage failed to carry on, and records it in the sample's evidence: reachable means a
+carrier that stopped forwarding, unreachable means a listener that went away.
+
+A full-scale sweep is running with that in place (`~/tmp/m63-reach.json`). It is the only
+remaining gate failure that does not depend on the parked sealing design, so it is the one worth
+finishing first: every lost stage is a cell the gate reports as missing, and until the harness
+can say which of the two it is, each loss costs a round to investigate.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
