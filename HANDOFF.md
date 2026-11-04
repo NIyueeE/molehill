@@ -1233,6 +1233,40 @@ route is Stage 4, whose subject is exactly this: an opening must not wait behind
 one stage in eight, after `reap_iperf`. That is the harness's remaining leak, and it is
 separate from the carrier.
 
+### The parked sealing patch was retried and still fails, at the same byte (2026-11-04)
+
+With the credit wedge fixed, the question worth one probe was whether the parked
+sealing patch's striped failure was really that wedge in another dress. It is not.
+
+The patch applies to current HEAD **cleanly** (no conflicts across eight files), builds
+after one duplicate line is removed, passes 347 of 348 library tests, and then fails
+`striped_data_channels` at **465 920 of 8 388 608 bytes — the identical byte count it
+failed at in round 19**, before `advance_read` armed its acknowledgement.
+
+A failure that lands on the same byte across builds is not a race and not the credit
+wedge; it is a deterministic defect in how the layer and the sealed stream meet. That
+is a *better* starting point than a race, and it is where the next attempt should
+begin — with the trace of which frame is in flight at 465 920, not with another theory.
+
+The probe is abandoned and the patch stays as it was
+(`~/tmp/stage3-sealing-parked.patch`), with this round's finding added to it: the
+blocker is deterministic, is unchanged by the credit fix, and reproduces in one test
+run of nine seconds.
+
+**And one thing worth recording on its own:** the first-stage arrivals at full scale
+spend their time in *two* places, both inflated about six-fold against the last stage —
+
+| window | first 120 s | last 120 s |
+|---|---|---|
+| client `hs_p50` | **6 499 µs** | 1 030 |
+| client `open_p50` | 6 419 | 1 035 |
+| server `paired_p50` | **12 115 µs** | 1 166 |
+| server dwell | 0 µs | 7 µs |
+
+so the first stage's tail is the handshake *and* the wait for a channel, at six times
+their steady-state cost, with nothing queued in any send buffer. That is the target
+Stage 4 inherits, and it is the same number the parked patch takes to 14 µs.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
