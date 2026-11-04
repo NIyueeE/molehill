@@ -1204,6 +1204,35 @@ Two caveats, both stated by the gate itself and neither to be dropped: the timel
 partly gated; and this is scale 0.3. Every full-scale run this cycle has lost between
 one and five stages, so the 0.3 → 1.0 transition is the open question, not the SLO.
 
+### What the gate refuses now is the first stage's tail, and nothing else (2026-11-04)
+
+A full-scale run after the refusal fix:
+
+| stage | p50 | p99 | |
+|---|---|---|---|
+| `clean` (first) | 22.0 ms | **135.3** | SLO fail |
+| `rtt100` | 402 | 422 | |
+| `loss1` | 42.0 | 1 068 | |
+| `loss5` | 402 | 1 463 | |
+| `rate100` | 84.8 | 105 | |
+| `rate20` | 359 | 397 | |
+| `jitter` | — | — | failed, instrument |
+| `clean#2` (last) | **1.74 ms** | **2.41 ms** | |
+
+Seven of eight stages measured, and **`clean#2` — which failed in every recent full
+run — is now the best cell in the schedule**. The one SLO failure is the *first*
+stage, whose own last-stage twin reads 1.74/2.41 in the same code and the same run.
+
+That fixes the target precisely: the first stage's arrivals queue behind the run's own
+start-up — pool establishment, the control session, the bulk spine's first flow — and
+a queue is a scheduling problem, not a handshake one. The parked sealing patch would
+have removed the handshake entirely (1 771 µs → 14) and is still parked; the remaining
+route is Stage 4, whose subject is exactly this: an opening must not wait behind bulk.
+
+`jitter`'s single loss is the instrument's (`control socket has closed unexpectedly`),
+one stage in eight, after `reap_iperf`. That is the harness's remaining leak, and it is
+separate from the carrier.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
