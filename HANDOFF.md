@@ -24,6 +24,28 @@
 act (AGENTS.md §5); what is missing is a gate that passes every time, and the
 numbers that say why are on this page.
 
+### The plan's stages, as they actually stand (2026-11-04)
+
+| stage | state |
+|---|---|
+| 0 — converge this page | **done** (6 838 lines → this page + the archive) |
+| 1 — measurement baseline | **done** (per-stage attribution, the five-segment split, the committed windows) |
+| 2 — no per-visitor handshake (sealing) | **parked at 7 of 8 runs**; the design is proved (handshake 1 771 µs → 14) and the remaining failure is a channel-lifecycle contract, written below |
+| 3 — RACK + PTO | not started; the refusal mix is now known honestly (credit 64 %, window 29 %, age gate 7.5 %) |
+| 4 — internal scheduling | **refuted before starting**: the first stage's arrivals are not queued anywhere (dwell 0 µs, reader park 54 µs, lock 3 µs), so there is no queue to schedule |
+| 5, 6 — rate/BDP window, memory | not started |
+| 7 — the release gate | **fails on two things and nothing else**: one stage lost to the instrument, and the *first* clean stage's p99 |
+
+The gate, measured today: **a 0.3-scale sweep passes** (`bench gate: PASS`, both clean
+stages inside 50 ms with room); at full scale, seven of eight stages measure, `clean#2`
+reads 1.74 / 2.41 ms, and `clean` reads 22.0 / 135.3 — the first stage is the only SLO
+failure and the only thing standing between this branch and a release record.
+
+**What the first stage costs, and where**: arrivals there pay 6 499 µs of handshake and
+12 115 µs of pairing against 1 030 and 1 166 later in the same run, with nothing queued in
+any send buffer. It is the *count* of round trips and task handoffs per arrival, and the
+one measured lever that removes them is the parked sealing design.
+
 ## The goal, and what may not change
 
 The objective: **make `mhd` the more reasonable first carrier — better than
