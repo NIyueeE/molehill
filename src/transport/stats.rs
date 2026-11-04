@@ -500,6 +500,15 @@ pub(crate) fn note_group(bytes: u64, alive: Duration) {
     GROUPS_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if alive >= STARVED_AFTER && bytes < STARVED_BYTES {
         GROUPS_STARVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Rare enough to name: thirteen in a run of thirty-six thousand groups, and
+        // each one is a visitor whose transfer stopped without a single other
+        // instrument moving. `INFO` because a run without the stats switch cannot
+        // afford the line and does not need it.
+        info!(
+            bytes,
+            alive_ms = u64::try_from(alive.as_millis()).unwrap_or(u64::MAX),
+            "mhd-stats: a group ended having carried almost nothing"
+        );
     }
 }
 
