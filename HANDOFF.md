@@ -1233,39 +1233,40 @@ route is Stage 4, whose subject is exactly this: an opening must not wait behind
 one stage in eight, after `reap_iperf`. That is the harness's remaining leak, and it is
 separate from the carrier.
 
-### The parked sealing patch was retried and still fails, at the same byte (2026-11-04)
+### The sealed striped failure is the half-close grace, and it is not deterministic (2026-11-04)
 
-With the credit wedge fixed, the question worth one probe was whether the parked
-sealing patch's striped failure was really that wedge in another dress. It is not.
+The previous entry read a repeat at exactly 465 920 bytes as proof of a deterministic
+defect. **It is not deterministic**: a third run of the same tree failed at
+**5 184 512** bytes. The "same byte" was a coincidence of two runs, and the claim is
+withdrawn.
 
-The patch applies to current HEAD **cleanly** (no conflicts across eight files), builds
-after one duplicate line is removed, passes 347 of 348 library tests, and then fails
-`striped_data_channels` at **465 920 of 8 388 608 bytes — the identical byte count it
-failed at in round 19**, before `advance_read` armed its acknowledgement.
+What the trace does say is better. On the failing run, with `molehill=debug`:
 
-A failure that lands on the same byte across builds is not a race and not the credit
-wedge; it is a deterministic defect in how the layer and the sealed stream meet. That
-is a *better* starting point than a race, and it is where the next attempt should
-begin — with the trace of which frame is in flight at 465 920, not with another theory.
+```
+stripe send direction finished, frames and bytes seq=257 bytes=8388608
+stripe reader ended at a frame boundary  last_seq=Some(253..256)
+stripe receive direction finished after 257 frames
+stripe half-close grace expired; cutting the other direction      <- seven seconds later
+Error: echo service closed after 5184512/8388608 bytes
+```
 
-The probe is abandoned and the patch stays as it was
-(`~/tmp/stage3-sealing-parked.patch`), with this round's finding added to it: the
-blocker is deterministic, is unchanged by the credit fix, and reproduces in one test
-run of nine seconds.
+**The layer carried all 257 frames and 8 388 608 bytes in both directions**, the readers
+ended cleanly at frame boundaries, and *then* the half-close grace expired and cut the
+other direction. So the bytes the visitor never saw were not lost in a frame, a stream
+or a credit path: they were discarded when a direction was **cut while it still had
+work**, which is a rule the archive already states as binding — "FIN/reset/close must
+not overtake queued data".
 
-**And one thing worth recording on its own:** the first-stage arrivals at full scale
-spend their time in *two* places, both inflated about six-fold against the last stage —
+That makes the next attempt a small, local one: the grace's job is to stop a
+half-closed group waiting for ever, and it is currently allowed to cut a direction that
+has written frames the peer has not confirmed. Giving the grace a *drain* predicate —
+the peer's read has caught up with what this end wrote — is the fix to try, and it is
+testable in the one nine-second test that reproduces this.
 
-| window | first 120 s | last 120 s |
-|---|---|---|
-| client `hs_p50` | **6 499 µs** | 1 030 |
-| client `open_p50` | 6 419 | 1 035 |
-| server `paired_p50` | **12 115 µs** | 1 166 |
-| server dwell | 0 µs | 7 µs |
-
-so the first stage's tail is the handshake *and* the wait for a channel, at six times
-their steady-state cost, with nothing queued in any send buffer. That is the target
-Stage 4 inherits, and it is the same number the parked patch takes to 14 µs.
+**And a correction this cycle has now made twice**, worth stating once: a single repeat
+is not a mechanism. Two runs at the same byte looked like determinism; a third run
+dissolved it. The instrument that would have shown it is a repeat count, and the rule
+is to run the failing test three times before naming a number.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
