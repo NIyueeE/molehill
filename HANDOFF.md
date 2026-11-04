@@ -1574,6 +1574,39 @@ too early in these runs, and that is the thing to fix, not the announcement.
 fix, seven of eight after it, four of eight with the retirement reset. The instrument is
 that test and the number is the pass count; no other claim in this file depends on it.
 
+### The false acknowledgement is load-bearing, and that is the real finding (2026-11-04)
+
+Two halves of one obvious fix, both measured on eight runs of the sealed striped test:
+
+| change | pass rate |
+|---|---|
+| none (after the grace fix) | **7 / 8** |
+| a retirement announces itself with a reset | 4 / 8 |
+| returning a dead stream's window no longer counts as delivery | 5 / 8 |
+
+Both are *correctness* fixes and both are reverted. Their combination is what the design
+currently runs on: a stream that ends with unread bytes returns its window **and** claims
+delivery, so the peer retires the stream, the channel goes back to the pool, and the next
+visitor gets one. Take either half away and streams stop completing — the pool stalls, the
+transfer truncates, and the pass rate falls.
+
+**So the defect cannot be patched locally, and five rounds of local attempts are the
+evidence.** The sealed path's remaining failure is a *lifecycle* problem: a channel is
+created per visitor, its server side ends with that visitor, and the client's pool then
+hands the same channel to the next one. Every honest way of ending a stream early makes
+that reuse fail; the dishonest way works seven times in eight.
+
+**What the design needs, stated as a contract**: a channel that has served a visitor is
+finished for both ends, and the pool must replace it rather than recycle it — with the
+replacement opened *before* the next visitor needs it. That is the same shape as the
+pre-opened-stock idea this file rejected long ago, and the difference that makes it
+legitimate here is that the stock is *per lane, one deep, and refilled by the retreat of a
+channel* rather than a fixed pool of four.
+
+That is a design change of its own, with its own measurement, not a patch. Until it exists,
+the sealed path stays parked at seven in eight, and this file says so rather than
+pretending a local fix is one line away.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
