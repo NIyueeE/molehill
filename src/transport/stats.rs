@@ -231,6 +231,18 @@ static REPORTER: Once = Once::new();
 /// wait, and three milliseconds is what the residual measures.
 static DWELL: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// How long the pump's one post to the socket took, per second.
+///
+/// The gap nothing else could see. A `fetch_add`/`append_to` instrument shows
+/// the send *buffer* is not the wait — at full scale both ends read a dwell p99
+/// of 0.5 ms and 0.14 ms — and yet an arrival's channel takes eleven. The pump
+/// builds up to `SEND_RUN` packets and then posts them in one `send_run`, which
+/// waits on `socket.writable()`; while it waits, nothing else in that task runs,
+/// so a handshake record that arrives *during* a post is not read until the post
+/// returns. Those waits were only logged above a hundred milliseconds, which is
+/// why a ten-millisecond one was invisible.
+static POSTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 /// The most dwell samples one reporting window keeps.
 const DWELL_WINDOW_MAX: usize = 65_536;
 
@@ -661,6 +673,33 @@ fn take_dwell() -> Vec<u32> {
     taken
 }
 
+/// Record how long one post to the socket took.
+///
+/// Called once per pump pass, so its cost is one clock read behind the switch and
+/// nothing at all in a healthy run's hot path.
+pub(crate) fn note_post(wait: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = POSTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's post samples, sorted, and leave it empty.
+fn take_post() -> Vec<u32> {
+    let mut samples = POSTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Start the once-a-second reporter, if the switch is set.
 ///
 /// Idempotent: every lane calls it and the first call wins, because one line per
@@ -851,6 +890,17 @@ fn report() {
             dwell_p99_us = pct_us(&dwell, 99, 100),
             dwell_max_us = dwell.last().copied().unwrap_or(0),
             "mhd-stats: a stream's first byte waiting for the wire"
+        );
+    }
+    let posted = take_post();
+    if !posted.is_empty() {
+        let n = posted.len();
+        info!(
+            n,
+            post_p50_us = pct_us(&posted, 50, 100),
+            post_p99_us = pct_us(&posted, 99, 100),
+            post_max_us = posted.last().copied().unwrap_or(0),
+            "mhd-stats: the pump's post to the socket"
         );
     }
     let parks = take_read_park();
