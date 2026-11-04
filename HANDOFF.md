@@ -1736,9 +1736,26 @@ does not, the first stage is host-bound and this file says so.
 
 ### In flight: eight workers against sixteen (2026-11-04)
 
-**Progress while it runs**: at half scale the discriminating condition is present, so the
-comparison will mean something — arm A (eight workers) reads `open_p50` **18 108 µs** in its
-first ninety seconds and **1 151 µs** in its last.
+**Result — refuted by its own A/A twin.** Channel-open `open_p50` in each arm's first ninety
+seconds, half scale, three arms in one campaign:
+
+| arm | workers | first 90 s | last 90 s |
+|---|---|---|---|
+| A | 8 | 18 108 µs | 1 151 |
+| **B** | **16** | **14 298 µs** | 1 149 |
+| A/A twin | 8 (same binary as A) | **15 742 µs** | 1 163 |
+
+**The two copies of the same binary differ by 15 %, and sixteen workers is 9 % below one of
+them and 21 % below the other.** The effect is inside the run's own noise, so it is not a
+result and the default stays at eight. The last ninety seconds agree to within 1 % across
+all three arms, which is the other half of the answer: the steady state does not care about
+the worker count at all.
+
+**So the first stage is host-bound, as the pre-registration said it would be if the lever
+did not win.** The lever that removes the cost is the one that removes the round trips — the
+parked sealing design — and nothing in the scheduling or thread count moves it. That is now
+measured three ways: establishment (46 ms), refused openings (0), and worker count (inside
+noise).
 
 The A/B the previous entry calls for is running as this entry is written: two binaries
 built from the same tree, differing only in `DEFAULT_WORKERS` (8 and 16, both `min`-clamped
