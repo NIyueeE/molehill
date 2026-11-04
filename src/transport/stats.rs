@@ -396,6 +396,15 @@ static REJECT_MALFORMED_DECODE: std::sync::atomic::AtomicU64 = std::sync::atomic
 static REJECT_MALFORMED_LANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REJECT_OVER_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REJECT_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Sealed packets this end could not open, whichever of the three reasons it was.
+///
+/// Its own counter because it is its own defect: a sealed packet refused for
+/// want of a key is a **key schedule or an ordering** problem, while an
+/// `unknown` stream is a routing one. They shared a bucket until this existed —
+/// `note_rejected` sent every unrecognised label to `unknown` — so a run whose
+/// sealing was failing printed "datagrams refused: unknown=N" or, when only the
+/// unsealed ones fired, printed nothing at all and read perfectly healthy.
+static REJECT_UNSEALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record one refused datagram, by reason.
 pub(crate) fn note_rejected(reason: &str) {
@@ -404,6 +413,10 @@ pub(crate) fn note_rejected(reason: &str) {
         "malformed_decode" => &REJECT_MALFORMED_DECODE,
         "malformed_lane" => &REJECT_MALFORMED_LANE,
         "over_window" => &REJECT_OVER_WINDOW,
+        // Every sealing refusal says `unsealed…`: no tag, no root, no key. The
+        // prefix is matched rather than the three labels enumerated, so a fourth
+        // site added later cannot silently fall back to "unknown".
+        label if label.starts_with("unsealed") => &REJECT_UNSEALED,
         _ => &REJECT_UNKNOWN,
     };
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -799,6 +812,33 @@ fn report_sealed() {
     }
 }
 
+/// Why datagrams were refused, one counter per reason.
+///
+/// Split from `report` for the lint's budget and because these five answer one
+/// question between them: a refusal here means the peer sent something this end
+/// could not use, and which of the five it was decides where to look — a framing
+/// bug, a lane mix-up, a receive window that never opened, a stream that is not
+/// here, or a sealed packet whose key this end does not hold.
+fn report_rejections() {
+    let malformed = REJECT_MALFORMED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let malformed_decode = REJECT_MALFORMED_DECODE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let malformed_lane = REJECT_MALFORMED_LANE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let over_window = REJECT_OVER_WINDOW.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let unknown = REJECT_UNKNOWN.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let unsealed = REJECT_UNSEALED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if malformed + malformed_decode + malformed_lane + over_window + unknown + unsealed > 0 {
+        info!(
+            malformed,
+            malformed_decode,
+            malformed_lane,
+            over_window,
+            unknown,
+            unsealed,
+            "mhd-stats: datagrams refused, by reason"
+        );
+    }
+}
+
 fn report() {
     report_phases();
     report_starvation();
@@ -836,21 +876,7 @@ fn report() {
         );
     }
     report_sealed();
-    let malformed = REJECT_MALFORMED.swap(0, std::sync::atomic::Ordering::Relaxed);
-    let malformed_decode = REJECT_MALFORMED_DECODE.swap(0, std::sync::atomic::Ordering::Relaxed);
-    let malformed_lane = REJECT_MALFORMED_LANE.swap(0, std::sync::atomic::Ordering::Relaxed);
-    let over_window = REJECT_OVER_WINDOW.swap(0, std::sync::atomic::Ordering::Relaxed);
-    let unknown = REJECT_UNKNOWN.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if malformed + malformed_decode + malformed_lane + over_window + unknown > 0 {
-        info!(
-            malformed,
-            malformed_decode,
-            malformed_lane,
-            over_window,
-            unknown,
-            "mhd-stats: datagrams refused, by reason"
-        );
-    }
+    report_rejections();
     let claimed = CLAIMED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let dead_group = DEAD_GROUP.swap(0, std::sync::atomic::Ordering::Relaxed);
     let shared = SHARED.swap(0, std::sync::atomic::Ordering::Relaxed);

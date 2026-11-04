@@ -301,8 +301,10 @@ async fn flush(
             worst_stream = stall.worst.map_or(0, |(id, ..)| id),
             worst_stream_unsent = stall.worst.map_or(0, |(_, unsent, ..)| unsent),
             worst_stream_retransmits = stall.worst.map_or(0, |(_, _, retransmits, ..)| retransmits),
-            worst_stream_next = stall.worst.map_or(0, |(_, _, _, next, _)| next),
-            worst_stream_written = stall.worst.map_or(0, |(_, _, _, _, written)| written),
+            worst_stream_next = stall.worst.map_or(0, |(_, _, _, next, _, _, _)| next),
+            worst_stream_written = stall.worst.map_or(0, |(_, _, _, _, written, _, _)| written),
+            worst_stream_reset = stall.worst.is_some_and(|(.., reset, _)| reset),
+            worst_stream_repair = stall.worst.is_some_and(|(.., repair)| repair),
             "mhd stalled: bytes waiting"
         );
     }

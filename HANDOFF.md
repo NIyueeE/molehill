@@ -2513,6 +2513,47 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
+### The sealed deadlock is a repair loop, and the instrument was lying twice (2026-11-04)
+
+Two instrument defects came out of following the stall, and each of them had been
+hiding it:
+
+- **`note_rejected` collapsed every sealing refusal into `unknown`.** The
+  label-to-counter map recognised `malformed`, `malformed_decode`,
+  `malformed_lane` and `over_window`, and sent *everything else* — including
+  `unsealed`, `unsealed_no_root`, `unsealed_no_tag`, `unsealed_no_key` — to the
+  **unknown-stream** counter. So a run whose sealing was failing printed either
+  `datagrams refused: unknown=N`, which reads as a routing defect, or (when only
+  the sealing labels fired) nothing at all, because the print condition counted
+  the four statics that cannot receive them. Sealing now has its own counter,
+  matched by prefix so a fourth site cannot fall back to "unknown" again.
+- **the stall line could not say *why* a stream with unsent bytes was passed
+  over.** It now carries `worst_stream_reset` and `worst_stream_repair`: those
+  two are the only ways the scheduler skips such a stream without building a
+  packet for it.
+
+With them, the sealed failure names itself:
+
+```
+mhd stalled: unsent_ms=0 unacked_ms=569 credit_blocked=false
+  worst_stream=5 worst_stream_unsent=1136478 worst_stream_retransmits=1130
+  worst_stream_next=2119826 worst_stream_written=2119826
+  worst_stream_reset=false worst_stream_repair=true
+```
+
+`next == written` — that stream has put **every byte on the wire** — and it is
+sitting on a **repair that is re-declared lost and re-sent 1 130 times**, with
+no write ever refused (`credit_blocked=false`, `unsent_ms=0`). So the lane is not
+stuck for want of room or for want of data: it is stuck spending its flight on
+one range it will never see acknowledged, and the four streams whose selectors
+the server timed out never got a turn behind it.
+
+That is much narrower than "sealing plus stripes", and it is testable without
+sockets: the question is *why a range that the peer has already read is declared
+lost again*, which lives in the acknowledgement-to-frontier path, not in the
+cipher. The next round starts there — and the first thing it needs is the same
+line again, which now exists.
+
 ## Negative results: do not retry these blind
 
 Every row was built (or measured) and reverted with its numbers. The archive has
