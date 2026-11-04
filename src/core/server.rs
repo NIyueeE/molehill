@@ -4363,18 +4363,20 @@ where
             );
             note_slow_pairing(group, stripes, attempts, facts);
         }
-        debug!("Visitor paired with a {stripe_count}-stripe group {group}");
+        debug!(group, stripe_count, "Visitor paired with a striped group");
         let paired_at = std::time::Instant::now();
         let (read, write) = incoming.into_split();
         // The group reports its own stalls to the plan: a frame that sat
         // parked on the path longer than `STRIPE_BACKPRESSURE` and then moved
         // is this group telling the server that one more stripe would have
         // helped.
-        crate::stripe::spawn_group(
+        // The layer's lines carry the pairing's group id: one story, not two.
+        crate::stripe::spawn_group_tagged(
             FirstByte::new(read, arrival, paired_at),
             write,
             gathered,
             Some(Arc::clone(&plan)),
+            u64::from(group),
         );
         return Ok(false);
     }

@@ -402,9 +402,19 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         frame.resize(STRIPE_HEADER_LEN, 0);
         let reading = std::time::Instant::now();
         let n = match src.read_buf(&mut frame).await {
-            Ok(0) => break,
+            // **Why** the source ended is the whole question when a transfer
+            // truncates: an EOF from the visitor or the backend is the peer
+            // closing, an error is a broken socket, and the visitor's byte count
+            // cannot tell them apart. One line, on the group it belongs to.
+            Ok(0) => {
+                debug!(group, frames = seq, "stripe source ended: eof");
+                break;
+            }
             Ok(n) => n,
-            Err(e) => anyhow::bail!("stripe source read failed: {e}"),
+            Err(e) => {
+                debug!(group, frames = seq, "stripe source ended: {e}");
+                anyhow::bail!("stripe source read failed: {e}");
+            }
         };
         if sampled {
             let waited = reading.elapsed();
@@ -693,11 +703,47 @@ async fn write_dest<W: AsyncWrite + Unpin>(dest: &mut W, bytes: &[u8]) -> anyhow
 /// server's striping plan when this is the server's side of a group (the
 /// client passes `None`): the sender reports a parked group's contiguous
 /// stall there.
+/// Spawn a group whose lines carry `tag` instead of a fresh id.
+///
+/// The server's pairing knows the group it asked the client for, and the layer's own
+/// counter knows nothing about it: without this the log of a lost transfer says which
+/// *layer* group carried what, and the pairing's log says which *visitor* group was
+/// built, and nothing ties the two together.
+pub fn spawn_group_tagged<R, D, S>(
+    src: R,
+    dest: D,
+    streams: Vec<S>,
+    plan: Option<std::sync::Arc<StripePlan>>,
+    tag: u64,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    D: AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_inner(src, dest, streams, plan, Some(tag))
+}
+
 pub fn spawn_group<R, D, S>(
     src: R,
     dest: D,
     streams: Vec<S>,
     plan: Option<std::sync::Arc<StripePlan>>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    D: AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_inner(src, dest, streams, plan, None)
+}
+
+fn spawn_inner<R, D, S>(
+    src: R,
+    dest: D,
+    streams: Vec<S>,
+    plan: Option<std::sync::Arc<StripePlan>>,
+    tag: Option<u64>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -714,7 +760,8 @@ where
             writes.push(w);
         }
         let stripes = writes.len();
-        let group_id = GROUP_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let group_id =
+            tag.unwrap_or_else(|| GROUP_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         debug!(
             group = group_id,
             "stripe group started with {stripes} stripes"
