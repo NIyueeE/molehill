@@ -1958,6 +1958,35 @@ with it. The facts are now copied across before the retry's cell is returned.
 is deterministic and it is the last gate failure that does not depend on the parked sealing
 design.
 
+### One gate failure left, and the first stage passes at full scale (2026-11-04)
+
+A full-scale sweep on a clean host, with the evidence fix in place:
+
+| stage | p50 | p99 |
+|---|---|---|
+| `clean` | **2.27 ms** | **20.0 ms** |
+| `rtt100` | 402 | 404 |
+| `loss1` | 42.4 | 1 068 |
+| `loss5` | 403 | 2 477 |
+| `rate100` | 177 | 199 |
+| `rate20` | 360 | 402 |
+| `jitter` | 82.1 | 108 |
+| `clean#2` | — | — (lost) |
+
+**`bench gate`: 1 failure** — the coverage of `clean#2` and nothing else. The SLO passes at full
+scale, the first stage reads 2.27 / 20.0 ms against a 50 ms limit, and every shaped stage is
+measured. That is the best gate state of this whole cycle: five failures, then two, now one.
+
+**And the probe answered**: the lost stage records `reachable_after_failure = True`. The tool
+still accepts on the port it just failed to carry on — so it is not a dead listener, it is a
+carrier that stopped forwarding for one stage and then kept accepting connections. The retry
+re-measured and failed the same way, so the state lasts longer than one stage.
+
+**That is the last gate item, and it now has an address**: a lane that stops carrying after
+roughly twenty minutes of run while its socket still answers. The instruments for it exist — the
+credit refusals, the age gate, the reader parks, and the close line — and the one counter this
+run can name is that the failure comes *late*, in the stage that follows the last shaped one.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
