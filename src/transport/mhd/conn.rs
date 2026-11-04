@@ -1246,9 +1246,49 @@ impl Conn {
             self.none_reason = Some("no eligible stream");
             return None;
         };
+        // Before the stream is borrowed: the instrument touches another field.
+        self.note_first_byte_wait(id, offset, repair, now);
+        // **Everything that can refuse happens before a packet number is taken**,
+        // and before the dwell stamp is cleared. A number consumed by a packet
+        // that is never built is a hole in the peer's cumulative *number*
+        // frontier, and that hole can never be filled: a retransmission carries
+        // a new number, so the frontier stays pinned for the connection's life.
+        // Every later acknowledgement then re-declares everything above it lost
+        // (three behind the largest, absent from the bitmap), so one refused
+        // packet becomes a repair loop that spends the whole window — measured on
+        // the sealed striped path as `retransmits=1532` on one stream with
+        // nothing refused and no byte owed (`unsent=0`), starving the four
+        // streams that were waiting for their first packet.
+        let (sealed, len, fin) = {
+            let Some(state) = self.streams.get(&id) else {
+                self.none_reason = Some("stream retired mid-pick");
+                return None;
+            };
+            let Some((want, sealed)) = Self::payload_plan(state, want) else {
+                self.none_reason = Some("stream has no key");
+                return None;
+            };
+            // How much the packet carries, and whether it ends the stream: the
+            // buffer answers both without being walked, because the payload is
+            // appended straight into the run afterwards. A repair already came
+            // back clamped to what is still owed, so only new data is bounded
+            // here.
+            let len = if repair {
+                want.min(state.send.available(offset, want))
+            } else {
+                state.send.available(offset, want)
+            };
+            if len == 0 {
+                self.none_reason = Some("range is empty");
+                return None;
+            }
+            (sealed, len, state.send.ends_at(offset, len))
+        };
         let number = self.recovery.next_number();
         // The dwell: from the write that made this stream non-empty to the packet
-        // that carries its oldest owed byte.
+        // that carries its oldest owed byte. Stamped out here rather than above,
+        // because a refusal does not carry the bytes and must not clear the
+        // measurement of how long they have waited.
         if let Some(at) = self
             .streams
             .get_mut(&id)
@@ -1265,31 +1305,13 @@ impl Conn {
                 );
             }
         }
-        // Before the stream is borrowed: the instrument touches another field.
-        self.note_first_byte_wait(id, offset, repair, now);
+        // Re-borrowed for the payload and the accounting below: the refusal
+        // checks above deliberately ended their borrow so that no packet number
+        // could be taken for a packet that is never built.
         let Some(state) = self.streams.get(&id) else {
             self.none_reason = Some("stream retired mid-pick");
             return None;
         };
-        let Some((want, sealed)) = Self::payload_plan(state, want) else {
-            self.none_reason = Some("stream has no key");
-            return None;
-        };
-
-        // How much the packet carries, and whether it ends the stream: the
-        // buffer answers both without being walked, because the payload is
-        // appended straight into the run afterwards. A repair already came back
-        // clamped to what is still owed, so only new data is bounded here.
-        let len = if repair {
-            want.min(state.send.available(offset, want))
-        } else {
-            state.send.available(offset, want)
-        };
-        if len == 0 {
-            self.none_reason = Some("range is empty");
-            return None;
-        }
-        let fin = state.send.ends_at(offset, len);
         pick.stop(&stats::PHASES.tx_pick);
         let encode = stats::Timing::start(sampled);
         // Where this packet starts inside the run buffer. **Not** the buffer's
@@ -2713,6 +2735,48 @@ mod tests {
             "still found after the cursor moved: cursor={}",
             conn.cursor
         );
+    }
+
+    /// A refused packet must not consume a packet number.
+    ///
+    /// A number that never reaches the wire is a hole in the peer's cumulative
+    /// frontier, and a retransmission carries a *new* number, so the hole can
+    /// never be filled: every later acknowledgement then re-declares everything
+    /// above it lost. One refused packet therefore becomes a repair loop that
+    /// spends the window, which is what the sealed striped path measured as
+    /// `retransmits=1532` with nothing refused and no byte owed.
+    ///
+    /// The refusal here is the sealing one — a stream marked sealed with no key
+    /// is the state `payload_plan` exists to refuse — and the assertion is that
+    /// the connection's own numbering did not move.
+    #[test]
+    fn a_refused_packet_does_not_consume_a_packet_number() {
+        let now = Instant::now();
+        let mut conn = Conn::new(1, true);
+        let stream = conn.open();
+        assert_eq!(conn.write(stream.id, b"handshake"), 9);
+
+        // Sealed with no cipher: the one state that must never reach the wire in
+        // the clear, and therefore the one that is refused.
+        let state = conn.streams.get_mut(&stream.id).unwrap();
+        state.sealed = true;
+        assert!(state.send_cipher.is_none());
+
+        let before = conn.recovery.last_number();
+        let mut out = Vec::new();
+        assert!(
+            conn.transmit_stream(now, &mut out, None).is_none(),
+            "a sealed stream without a key is refused"
+        );
+        assert_eq!(
+            conn.recovery.last_number(),
+            before,
+            "the refusal took no packet number, so the peer has no hole to wait for"
+        );
+        assert!(out.is_empty(), "and nothing half-built reached the run");
+        // The bytes are still owed, so the next pass can still carry them once a
+        // key exists.
+        assert_eq!(conn.streams.get(&stream.id).unwrap().send.held(), 9);
     }
 
     /// An opening stream finds room in the connection's budget even when a bulk
