@@ -1512,6 +1512,33 @@ broken", and it has its own instrument already: the close line now prints `writt
 `next`, `acked` and `peer_fin` for every stream, so a recycled channel shows as a stream
 that closed `peer_fin=false` shortly before the next group's first frame.
 
+### The failing run drops data on the lane's first stream (2026-11-04)
+
+Looping the sealed striped test until it failed, then reading the carrier's own log:
+
+```
+mhd dropped data for a retired stream stream=1      (five times, in the failing run)
+```
+
+`Conn::open_at` allocates ids monotonically by two and **never reuses one**, so `stream=1`
+is the *first* stream this end ever opened on that lane — the one the lane's validation
+used. The receiver had retired it; the sender was still writing to it; every one of those
+datagrams was dropped, and `apply_datagram`'s own comment says why that is invisible: the
+packet is still acknowledged, because a sender that keeps re-sending an unacknowledged
+packet counts ten unanswered retransmissions and declares the lane dead.
+
+**So the two ends disagree about whether the lane's first stream is finished.** That is
+Mode A, stated as an identity rather than a shape: on the client the first stream becomes
+a pooled data channel, on the server it is validation-only and is retired when the
+prologue is done. A visitor whose channel lands on it carries nothing, and the log says
+nothing except five lines at `debug`.
+
+**The next step is a decision, not an experiment**: either the first stream is a data
+channel on both ends (and the server must not retire it), or it is validation-only on
+both (and the client must never hand it to the pool). The measurement that picks between
+them is already in place — the eight-run rate — and either choice must take it to eight
+of eight.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
