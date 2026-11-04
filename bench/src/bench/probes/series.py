@@ -87,14 +87,25 @@ def remaining(started_at: float) -> float:
 
 
 def ping(target: tuple, size: int) -> None:
-    """One fresh TCP connection, one echo, timed end to end."""
+    """One fresh TCP connection, one echo, timed end to end.
+
+    The round trip is also split at the send: `connect_ms` is everything up to and
+    including the request leaving this process, `echo_ms` is the wait for the reply.
+    The split exists because the sum is what the SLO is stated on, and at a p99 of a
+    hundred milliseconds the carrier's own round trip was measured at twenty — so the
+    question "which side of the request byte is the tail on" cannot be answered from
+    the total. Both travel as extra fields on the same line, so nothing about the
+    metrics changes; they are evidence, and the engine hash still covers this file.
+    """
     started = time.perf_counter()
     started_at = time.time()
+    sent_at = started
     try:
         with socket.create_connection(target, remaining(started_at)) as sock:
             payload = bytes(size)
             sock.settimeout(remaining(started_at))
             sock.sendall(payload)
+            sent_at = time.perf_counter()
             got = 0
             while got < size:
                 sock.settimeout(remaining(started_at))
@@ -108,10 +119,13 @@ def ping(target: tuple, size: int) -> None:
     if got != size:
         emit_error(f"short echo: {got} of {size} bytes", started_at)
         return
+    finished = time.perf_counter()
     emit(
         "rtt_ms",
-        round((time.perf_counter() - started) * 1000, 4),
+        round((finished - started) * 1000, 4),
         started_at=started_at,
+        connect_ms=round((sent_at - started) * 1000, 4),
+        echo_ms=round((finished - sent_at) * 1000, 4),
     )
 
 

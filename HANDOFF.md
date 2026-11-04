@@ -2513,6 +2513,52 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
+### The tail is the pairing wait, and the arithmetic finally closes (2026-11-05)
+
+The probe now splits its own round trip at the send. 555 arrivals of one staged cell:
+
+| | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| the whole round trip | 14.44 ms | 72.78 | **228.56** | 457.28 |
+| connect + send | 0.193 ms | 0.271 | 0.452 | 1.403 |
+| **waiting for the echo** | **14.19 ms** | 72.65 | **228.40** | 457.05 |
+
+So the tool's accept path is fast and the tail is the wait for the reply. The first
+version of this entry guessed the *kernel accept queue* and was refuted in one
+experiment: `ss -ltn` inside the server's namespace, sampled 134 times across a run of
+the same cell, read `Recv-Q = 0` **every time**. Nothing was piling up.
+
+The same run's server-side windows then close the arithmetic exactly:
+
+| phase (34 one-second windows, median of the window p50s) | |
+|---|---|
+| `accept → paired` | **10.232 ms** (p99 42.2) |
+| `paired → first byte` | 0.022 ms |
+| the echo (first byte → reply byte written) | 3.296 ms |
+| **sum** | **13.550 ms** |
+| the probe's own "waiting for the echo" | **14.19 ms** |
+
+**The pairing wait is the tail** — 10.2 ms of the 14.2 — and everything after it is
+microseconds plus a three-millisecond echo. That is the same conclusion the first stage
+reached from a different direction (`paired_p99` 112 ms in the full-scale run); what is
+new is that it is now the *whole* explanation of a warm cell, not a fragment of a
+cold one.
+
+So the arrival's cost is: server accepts, **asks the client for a channel**, the client
+opens an mhd stream, the server pairs. The client's own phases are known — dequeue
+~0, `spawn → first poll` 4–12 µs, handshake 1.34–1.38 ms — so of the 10.2 ms, about
+1.4 is the open and the rest is the **control-plane round trip plus the pairing
+hand-off**: the request crossing to the client's control loop, and the channel's
+arrival waking the pairing.
+
+That is the last interval in an arrival that has never been stamped, and it is
+pre-registered for the next round: emit the server's send time and the client's receive
+time for the same `CreateDataChannelFor` group id — both ends are on one host, so epoch
+milliseconds are comparable — and split the 8.8 ms between the control hop and the
+pairing hand-off. Whichever it is decides between the two remaining structural
+candidates, a server-initiated stream (which deletes the request entirely) and a
+direct hand-off (which deletes the wake).
+
 ### The carrier's whole round trip is fast, and the tail is outside it (2026-11-05)
 
 The interval every previous instrument stopped short of now has a distribution: from
