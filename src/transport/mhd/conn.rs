@@ -767,10 +767,17 @@ impl Conn {
                 // the stream that did it.
                 let written = state.send.written();
                 let next = state.send.next_offset();
+                // `base` is the frontier the peer has **acknowledged**. A stream
+                // reaches this line only when `unacked` is zero, so `base == written`
+                // is not a coincidence of this log: the peer said it had every byte.
+                // If the peer's own reader saw less, the acknowledgement is what
+                // lied — and this number is where that becomes visible.
+                let acked = state.send.base();
                 tracing::debug!(
                     stream,
                     written,
                     next,
+                    acked,
                     unsent = written.saturating_sub(next),
                     reset = ?state.reset,
                     peer_fin = state.peer_fin,
