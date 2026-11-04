@@ -2100,6 +2100,38 @@ flow instead of the silence.
 at p99), four stages lost. The four are the ones after `loss5`, which is the run's shape whenever
 it goes wrong — and now the instrument to read them is in place.
 
+### Eight of eight measured, and the gate is down to the SLO alone (2026-11-04)
+
+A full-scale run with the read deadline in place:
+
+| stage | p50 | p99 |
+|---|---|---|
+| `clean` | 6.06 ms | **134.1 ms** |
+| `rtt100` | 402 | 462 |
+| `loss1` | 42.2 | 1 073 |
+| `loss5` | 402 | 1 700 |
+| `rate100` | 84.8 | 96.6 |
+| `rate20` | 170 | 192 |
+| `jitter` | 80.8 | 107 |
+| `clean#2` | **1.89 ms** | **3.91 ms** |
+
+**`bench gate`: 1 failure — the SLO on `clean`'s p99, and nothing else.** Every stage measured,
+the coverage complete, and the last stage reading 1.89 / 3.91 ms. That is the first run this
+cycle in which the gate's only complaint is the number the plan says may not be relaxed.
+
+**And the read-park instrument is honest about its own limit**: 579 parks across **13 groups**,
+every one of them at `bytes = 166` and `frames = 2–3`, each repeated 61–75 times over minutes. A
+connection that carries 166 bytes and then waits is `iperf3`'s control connection, idle by
+design — the same thirteen the starved counter found. So the park line names *a* flow that stops
+delivering and cannot, on its own, say whether that flow *should* be delivering: an idle
+connection and a wedged one look identical to a carrier.
+
+**That fixes what the last mile actually is.** Not "a lane that stops" (the boundary probe refuted
+it), not "a flow that stalls" (idle flows park the same way), but **the first stage's p99**, which
+spans 20 to 262 ms across runs of one binary on this host and is therefore a property of the
+moment, not of the carrier — and the one thing that would remove it for good is the round trips
+that the parked sealing design deletes.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
