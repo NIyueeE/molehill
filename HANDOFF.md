@@ -1629,6 +1629,34 @@ That is a design change of its own, with its own measurement, not a patch. Until
 the sealed path stays parked at seven in eight, and this file says so rather than
 pretending a local fix is one line away.
 
+### The first stage is cold start, and the cold cost is establishment (2026-11-04)
+
+A diagnostic, not a way to pass: the same full-scale schedule run once with
+`--warmup-rounds 1`, so the pool, the control session and the first channels exist before
+the measured stage begins.
+
+| stage | cold (no warmup) | **warm (one round first)** |
+|---|---|---|
+| `clean` p50 / p99 | 22.0 / **135.3** ms | **2.01 / 34.7** ms |
+| `clean#2` p50 / p99 | 1.74 / 2.41 | (stage lost to the instrument) |
+
+**With the pool already up, the first stage is inside the SLO** — 34.7 ms against a 50 ms
+limit — and it reads like the last stage. So the SLO failure is not the carrier's steady
+state and not the handshake's cost on a quiet lane: it is what a *cold* process pays to
+establish four lanes, a control session and its first channels while the churn probe is
+already arriving.
+
+That reframes the remaining work as a **cold-start** problem, which is legitimate to fix —
+the plan forbids adding a warmup *stage to pass the gate*, and this run is a measurement,
+not a gate result; it stays out of any record. What it licenses is the question the next
+rounds should answer: **where does a cold process spend its first second**, and can the
+four lanes be established concurrently rather than one after another, with the arrivals
+that are already waiting served by the first one instead of the fourth.
+
+The measurement is in the logs already: `pool-stats: tunnel pool established tunnels=4
+established=4` is one line, and the time from process start to it is the number that must
+come down.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
