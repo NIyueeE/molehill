@@ -1797,6 +1797,29 @@ the frame and byte counters are already placed to answer.
 does not get to skip it: three wrong mechanisms in one area is enough evidence that the
 next sentence written here about the sealed path must quote a line of code.
 
+### What the corrected question is, precisely (2026-11-04)
+
+With the reuse story gone, the failing run's numbers read as follows, and all three lines
+are from the same run:
+
+- the **client** wrote all 8 388 608 bytes of response into its four stripe streams, and
+  every one of them closed with `written == next == acked` — the carrier put them on the
+  wire and the peer acknowledged them;
+- the **server's** receive direction delivered **167 of 257 frames** and then ended,
+  `missing = 0`, which means it delivered every frame it ever *saw*;
+- the visitor received 5 472 256 bytes, which is 167 frames, and the arithmetic closes.
+
+So the bytes were sent, acknowledged, and not read by the layer that was supposed to read
+them. A FIN cannot overtake data here: `fin_sent` is only set once `unacked == 0`, and
+`poll_transmit` offers stream data before fins. That leaves **the server's stripe readers
+ending before their streams were drained**, and the instrument for that is per-stripe at
+`recv_loop`'s end: bytes read against the stream's `written` and `acked`, one line per
+stripe.
+
+If those agree, the layer read everything and its frames went elsewhere. If they do not, a
+reader stopped with bytes still available — and that is a reader-park or a wake problem in
+`lane.rs`, not in the carrier's close path. Either way the next entry quotes a line.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
