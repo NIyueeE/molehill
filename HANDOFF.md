@@ -1451,36 +1451,35 @@ receiver finished its half before the peer finished sending, which is what let t
 of the response be dropped as "unknown stream" — the path that documents itself in
 `apply_datagram` as *"a retired stream"*.
 
-### The acknowledgement covers bytes the visitor never got (2026-11-04)
+### The grace was cutting a direction that was still working (2026-11-04)
 
-The close line with the peer's frontier answers it, and the answer is not in the layer:
+The previous entry blamed `release_unread` for acknowledging discarded bytes. **That was
+wrong** and is withdrawn: `RecvBuf::arrived()` returns the *contiguous* frontier and stops
+at a hole, and `discard()` does not move it, so releasing unread bytes cannot over-ack.
 
-```
-mhd stream closed stream=7 written=2097800 next=2097800 acked=2097800 unsent=0
-    peer_fin=false local_fin=true      (x4 lanes, 8 390 020 bytes total)
-Error: echo service closed after 4791296/8388608 bytes
-```
+What the numbers did say is where the bytes stopped: the sender's streams closed with
+`written == next == acked ≈ 2.1 MB` each — every byte legitimately received — and the
+stripe layer's receive direction had delivered **167 of 257 frames** when the group's
+half-close grace **aborted it**. The grace was a fixed ten seconds from the moment the
+*other* direction ended, and it did not care whether the surviving direction was still
+working. It cut a receive direction in the middle of a transfer; the frames that never
+came were then dropped at close by the carrier, correctly, because the stream's own
+frontier had never reached them.
 
-A stream only reaches that line when `unacked` is zero, so `acked == written` means **the
-peer said it had every byte of all four streams** — and the visitor received 4.8 MB of
-8.4. **The acknowledgement covered bytes the application never received.**
+**So the grace now waits for ten seconds of no progress**, using the activity clock the
+group already keeps for its idle watchdog — which is the condition it was always meant to
+describe. Three runs of the sealed striped test after the fix: **two passed**, one failed
+at the familiar 465 920 (the mode where the transfer's group never starts at all). Before
+it, one of three passed.
 
-The mechanism is in `Conn::release_unread`, and its own comment says why it exists: a
-stream that ends holding bytes nobody read must give the window back, or a lane narrows
-by one dead stream at a time. It calls `advance_read(held)`, which is honest for the
-**window** and a lie for **delivery**: the peer's frontier for that stream moves past
-bytes that were discarded, so the sender retires the stream believing they arrived.
-Nothing retransmits, nothing counts a gap, and the visitor simply gets less.
+That is a real improvement and not yet a cure, and the remaining failure is a *different*
+defect — the one the group-id trace isolated as "no group carries the visitor" — with its
+own line still to write.
 
-**The fix is one rule**: bytes that are discarded rather than read must end the stream
-with a **reset**, not an acknowledgement. The peer then knows those bytes were not
-delivered, the sender's frontier stays behind them, and a repair or an error surfaces
-instead of a silent truncation.
-
-**This is not a sealed-path defect.** It is the plain carrier's rule, and the plain
-paths survive it only because their readers normally drain before a stream is released;
-the sealed design shifted that timing, which is why a nine-second test now fails a third
-of the time and the whole release gate has been chasing it for eighteen rounds.
+**One more retraction for the pile, and it is the same lesson twice in three rounds**: a
+mechanism that fits the numbers (`release_unread` lying) is not evidence that it is the
+mechanism. Reading `arrived()` took two minutes and would have saved the round. Read the
+code before naming the cause; measure before writing the entry.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
