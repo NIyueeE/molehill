@@ -542,6 +542,13 @@ impl Drop for ReaderTasks {
 /// Receive direction: reassemble every stripe's frames in sequence order
 /// and write them to `dest`.
 ///
+/// Frames seen, and frames delivered in order, for one group's receive direction.
+#[derive(Default)]
+struct Frames {
+    highest: std::sync::atomic::AtomicU64,
+    delivered: std::sync::atomic::AtomicU64,
+}
+
 /// Frames are held in a `BTreeMap` keyed by sequence number while an earlier
 /// one is missing, and released as soon as the gap fills. Out-of-order
 /// buffering is bounded by [`STRIPE_REORDER_QUEUE`]: when the queue is full
@@ -551,6 +558,7 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
     reads: Vec<R>,
     mut dest: W,
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    frames: std::sync::Arc<Frames>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<StripeEvent>(STRIPE_REORDER_QUEUE);
     // The readers are owned by a guard for this direction's whole life. An
@@ -613,6 +621,9 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
         let Some(event) = event else { break };
         match event {
             StripeEvent::Frame { seq, bytes } => {
+                frames
+                    .highest
+                    .fetch_max(seq + 1, std::sync::atomic::Ordering::Relaxed);
                 if seq == next {
                     write_dest(&mut dest, &bytes).await?;
                     activity.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
@@ -622,6 +633,9 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
                         activity.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
                         next += 1;
                     }
+                    frames
+                        .delivered
+                        .store(next, std::sync::atomic::Ordering::Relaxed);
                 } else if seq > next {
                     pending.insert(seq, bytes);
                 }
@@ -696,7 +710,19 @@ where
             StripeSender::new(writes, plan),
             activity.clone(),
         ));
-        let mut recv = tokio::spawn(recv_loop(reads, dest, activity.clone()));
+        // What the receive direction has seen and what it has delivered, shared
+        // with the half-close grace below. A grace that fires while `delivered`
+        // trails `highest` is cutting a direction that still had frames to write;
+        // a grace that fires with a *gap* (`highest + 1 > delivered` and no reader
+        // left to fill it) is a frame that never arrived. The visitor's byte count
+        // cannot tell those apart.
+        let frames = std::sync::Arc::new(Frames::default());
+        let mut recv = tokio::spawn(recv_loop(
+            reads,
+            dest,
+            activity.clone(),
+            std::sync::Arc::clone(&frames),
+        ));
         let send_abort = send.abort_handle();
         let recv_abort = recv.abort_handle();
         let monitor = tokio::spawn(async move {
@@ -749,8 +775,17 @@ where
                 } else {
                     send.abort_handle()
                 };
+                let frames = std::sync::Arc::clone(&frames);
                 grace = Some(tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    let highest = frames.highest.load(std::sync::atomic::Ordering::Relaxed);
+                    let delivered = frames.delivered.load(std::sync::atomic::Ordering::Relaxed);
+                    debug!(
+                        highest,
+                        delivered,
+                        missing = highest.saturating_sub(delivered),
+                        "stripe half-close grace: what the receive direction had left"
+                    );
                     debug!("stripe half-close grace expired; cutting the other direction");
                     other.abort();
                 }));
