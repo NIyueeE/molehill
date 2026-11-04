@@ -1656,16 +1656,44 @@ def _verdict_line(entry: dict) -> str:
 
 
 def _ramp(results: dict, lines: list) -> list:
-    """A capacity ramp that carried nothing is not a reading."""
+    """How far each arm climbed, and whether that is far enough to publish.
+
+    The level *where* a tool breaks the SLO is the measurement, so `_slo` does
+    not judge a ramp level — which is why the **ceiling** is checked here. A
+    subject arm that stops short of the declared `streams_max` has not shown the
+    capacity the release claims, and before this it printed a line and passed: a
+    ramp that broke at three streams was green as long as it broke at something.
+    A reference peer is reported with its number and never blocks, since its
+    ceiling is a finding about the peer.
+    """
     failures: list = []
+    params_of = {
+        s["id"]: s.get("params", {})
+        for s in results.get("meta", {}).get("scenarios", [])
+    }
     for summary_cell in results.get("summary", {}).get("cells", []):
         if summary_cell["cell"] != "ramp":
             continue
+        ceiling = params_of.get(summary_cell["scenario"], {}).get("streams_max")
         for arm, stats in summary_cell["arms"].items():
+            subject = _arm_kind(results, arm) in SUBJECT_KINDS
             streams = (stats["metrics"].get("capacity_streams") or {}).get("median")
-            lines.append(f"capacity: {arm} sustained {streams} stream(s)")
-            if streams == 0 and _arm_kind(results, arm) in SUBJECT_KINDS:
+            if streams is None:
+                lines.append(f"capacity: {arm} measured no level")
+                if subject:
+                    failures.append(f"capacity: {arm} produced no level to read")
+                continue
+            lines.append(f"capacity: {arm} sustained {streams} of {ceiling} stream(s)")
+            if not subject:
+                continue
+            if streams == 0:
                 failures.append(f"capacity: {arm} carried no level that met the SLO")
+            elif ceiling and streams < ceiling:
+                failures.append(
+                    f"capacity: {arm} sustained {streams} of the {ceiling} streams "
+                    f"the release claims — a ramp that broke early is a capacity "
+                    f"regression, not a host reading"
+                )
     return failures
 
 
@@ -1860,7 +1888,16 @@ def _endpoints(results: dict, lines: list) -> list:
 
 
 def _slo(results: dict, lines: list) -> list:
-    """The clean stages must meet the SLO — for the product's own arms."""
+    """The clean stages must meet the SLO — for the product's own arms.
+
+    A **stage** is a cell a timeline held, which is what `_is_clean` reads: a
+    capacity level and a ramp's or a run's summary cell carry the clean
+    condition too, and they are judged by their own rules (`_ramp` for the
+    ceiling, `_drift` for the slope). The second thing this refuses is silence:
+    a clean stage that was measured and carries no `rtt_p99_ms` used to be
+    counted as "gated" and say nothing at all, which is the one shape that can
+    turn an unmeasured stage into a green gate.
+    """
     failures: list = []
     clean = 0
     for summary_cell in results.get("summary", {}).get("cells", []):
@@ -1869,19 +1906,28 @@ def _slo(results: dict, lines: list) -> list:
         for arm, stats in summary_cell["arms"].items():
             if _arm_kind(results, arm) not in SUBJECT_KINDS:
                 continue
+            if not stats.get("rounds"):
+                # Nothing was measured here at all: `_coverage` names it, and a
+                # second message about one hole is not a second finding.
+                continue
             clean += 1
+            where = f"{arm} / {summary_cell['scenario']}[{summary_cell['cell']}]"
             p99 = (stats["metrics"].get("rtt_p99_ms") or {}).get("median")
             errors = (stats["metrics"].get("rtt_error_rate_pct") or {}).get("median")
-            if p99 is not None and p99 > model.SLO_RTT_P99_MS:
+            if p99 is None:
                 failures.append(
-                    f"SLO: {arm} / {summary_cell['scenario']}"
-                    f"[{summary_cell['cell']}] p99 {p99} ms > "
+                    f"SLO: {where} measured {stats['rounds']} round(s) but carries "
+                    f"no rtt_p99_ms — a clean stage that cannot be gated is not a "
+                    f"clean stage that passed"
+                )
+            elif p99 > model.SLO_RTT_P99_MS:
+                failures.append(
+                    f"SLO: {where} p99 {p99} ms > "
                     f"{model.SLO_RTT_P99_MS} ms on a clean stage"
                 )
             if errors is not None and errors > model.SLO_ERROR_RATE_PCT:
                 failures.append(
-                    f"SLO: {arm} / {summary_cell['scenario']}"
-                    f"[{summary_cell['cell']}] error rate {errors} % > "
+                    f"SLO: {where} error rate {errors} % > "
                     f"{model.SLO_ERROR_RATE_PCT} % on a clean stage"
                 )
     lines.append(f"SLO: {clean} clean-stage cells gated")
@@ -1889,6 +1935,14 @@ def _slo(results: dict, lines: list) -> list:
 
 
 def _is_clean(results: dict, summary_cell: dict) -> bool:
+    """Whether a cell is a **clean stage**: a timeline hold, cleanly conditioned.
+
+    `hold_s` is the discriminator, and it is the stage's own fact: only a stage
+    is held for a length of time. A capacity level, a ramp's summary and a run's
+    summary all carry `condition: clean` — they are aggregates with their own
+    gate rules (`_ramp`, `_drift`), and judging them against the *stage* SLO
+    reports a cell that was never a stage.
+    """
     scenario = summary_cell["scenario"]
     cell = summary_cell["cell"]
     for sample in results.get("samples", []):
@@ -1896,7 +1950,7 @@ def _is_clean(results: dict, summary_cell: dict) -> bool:
             continue
         evidence = sample.get("evidence") or {}
         if "condition" in evidence:
-            return evidence["condition"] == "clean"
+            return evidence["condition"] == "clean" and "hold_s" in evidence
     return False
 
 

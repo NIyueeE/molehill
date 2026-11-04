@@ -206,6 +206,22 @@ class Spot:
     cell: str
 
 
+@dataclass(frozen=True)
+class Span:
+    """The seconds a stage was measured over, and what it was asked to offer.
+
+    Its own value rather than four parameters: the window's start, its length
+    and the cadences the probes were told to keep travel together, and a stage
+    metric that is computed from a window without knowing which window it was
+    is the mistake that made a ninety-second median look like a property of the
+    carrier.
+    """
+
+    since: float
+    seconds: float
+    params: dict
+
+
 #: The running arm's pid map, supplied by the runner.
 PidsOf = Callable[[], dict[str, int]]
 #: The backend's peers announced since the previous cell, or no reader.
@@ -1007,9 +1023,13 @@ def _stage_absences(metrics: dict, interaction: list, datagrams: list) -> dict:
 
 
 def _stage_metrics(
-    interaction: list, datagrams: list, churn: list, window_s: float
+    interaction: list,
+    datagrams: list,
+    churn: list,
+    span: Span,
 ) -> tuple:
     """One stage's interactive/datagram/churn numbers, from its own samples."""
+    window_s = span.seconds
     rtts = [p["v"] for p in interaction if p["metric"] == "rtt_ms"]
     errors = [p for p in interaction if p["metric"] == "error"]
     churn_setup = [p["v"] for p in churn if p["metric"] == "setup_ms"]
@@ -1044,8 +1064,74 @@ def _stage_metrics(
             "churn": len(churn),
         },
         "series_logs": [str(p) for p in (interaction, datagrams, churn) if p],
+        # The stage's shape, not only its summary: a median over ninety seconds
+        # is the same number for a stage that was flat and for one that began
+        # fast and slowed, and the difference between those two is the whole
+        # first-stage question.
+        "interactive_per_s": _per_second(interaction, span.since),
+        "interactive_cadence": _probe_cadence(
+            interaction, span.params.get("ping_interval_ms", 50.0) / 1000.0
+        ),
+        # The offered rate beside the achieved one (`churn_per_s` is measured):
+        # a churn probe that fell behind offers less than the timeline asked
+        # for, and its cells are then a statement about the probe.
+        "churn_offered_per_s": span.params.get("churn_per_s", 16.0),
     }
     return metrics, evidence, _stage_absences(metrics, interaction, datagrams)
+
+
+def _per_second(points: list, since: float) -> list:
+    """The interactive stream's own second-by-second shape inside one stage.
+
+    Each row is one second that produced attempts. A second with **none is
+    absent**, which is what keeps "the probe stopped" from reading as "the
+    stream was fast": a probe that dies leaves no row, and one that is merely
+    slow leaves a row with a large gap to the next (see `_probe_cadence`).
+    """
+    buckets: dict = {}
+    for point in points:
+        kind = point["metric"]
+        if kind not in ("rtt_ms", "error"):
+            continue
+        second = int(point["t"] - since)
+        row = buckets.setdefault(second, {"rtt": [], "errors": 0})
+        if kind == "rtt_ms":
+            row["rtt"].append(point["v"])
+        else:
+            row["errors"] += 1
+    return [
+        {
+            "s": second,
+            "n": len(row["rtt"]),
+            "errors": row["errors"],
+            "p50": inst.pct(row["rtt"], 0.50),
+            "p99": inst.pct(row["rtt"], 0.99),
+            "max": max(row["rtt"]) if row["rtt"] else None,
+        }
+        for second, row in sorted(buckets.items())
+    ]
+
+
+def _probe_cadence(points: list, interval_s: float) -> dict:
+    """Whether the probe kept its own cadence: the instrument's health.
+
+    A probe slower than its interval reports the *probe's* load as the path's.
+    The gap between attempts is the part of the measurement no carrier can
+    influence, so it is recorded beside the number it decided, and `overruns`
+    counts the intervals the probe missed by more than a factor of two.
+    """
+    times = [p["t"] for p in points if p["metric"] in ("rtt_ms", "error")]
+    if len(times) < inst.MIN_WEDGE_POINTS:
+        return {"samples": len(times)}
+    gaps = [(b - a) * 1000.0 for a, b in itertools.pairwise(times)]
+    limit_ms = 2.0 * interval_s * 1000.0
+    return {
+        "samples": len(times),
+        "interval_ms": round(interval_s * 1000.0, 3),
+        "gap_p50_ms": inst.pct(gaps, 0.50),
+        "gap_p99_ms": inst.pct(gaps, 0.99),
+        "overruns": sum(1 for gap in gaps if gap > limit_ms),
+    }
 
 
 def _worst_second(points: list):
@@ -1273,7 +1359,7 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     churn = read_series(logs["churn"], t0, t1)
     window_s = max(t1 - t0, 1e-9)
     stage_metrics, evidence, unavailable = _stage_metrics(
-        interaction, datagrams, churn, window_s
+        interaction, datagrams, churn, Span(since=t0, seconds=window_s, params=params)
     )
     stage_metrics |= {"slo_broken": _breaks_slo(stage_metrics)}
     # Only the interactive metrics carry the stage's verdict; throughput is the
@@ -1282,15 +1368,24 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         stage_metrics["throughput_gbps"] = result.get("gbps_received_own_window")
     built = _iperf_cell(Spot(ctx, window, label), result, stage_metrics)
     built.unavailable |= unavailable
-    built.evidence["series"] = evidence["series"]
+    # Everything the stage's own samples said about themselves — the counts, the
+    # within-window shape (`interactive_per_s`), the probe's own cadence, and the
+    # rate the churn probe was asked for beside the one it achieved. A stage is
+    # one number per metric, and the first-stage question is about a stage that
+    # changes *inside* itself, so the shape is evidence and not a chart.
+    built.evidence |= evidence
     # The boundary's own answer, on every stage: a visitor's whole life through the
     # tool, asked before this stage's traffic started.
     built.evidence["echo_probe"] = boundary
-    built.evidence["series_logs"] = evidence["series_logs"]
     built.evidence |= {
         "condition": condition,
         "hold_s": secs,
         "series_window_s": round(window_s, 3),
+        # The window's own edges in unix time, so a reader can line these rows up
+        # with the host's load average and the tool's counters instead of
+        # re-deriving the window from a duration.
+        "window_start": round(t0, 3),
+        "window_end": round(t1, 3),
     }
     built.evidence |= drain
     return built

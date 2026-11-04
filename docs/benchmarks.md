@@ -191,9 +191,15 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   side of that boundary is not comparable with one from this side.
 - **Evidence stays with the number.** Each cell records the commands it ran,
   the counters it read, the endpoint the probe dialed, the peers the backend
-  saw, the raw per-round sample arrays and the log its probe left behind. The
-  results file is written as the run goes, so an interrupted campaign is still
-  analysable.
+  saw, the raw per-round sample arrays and the log its probe left behind. A
+  staged cell also carries its **shape within the window** — the interactive
+  stream's per-second median, p99 and failure count, the intervals between its
+  own attempts (a probe slower than its cadence reports the probe's load as the
+  path's), the window's own edges in unix time, and the churn rate the stage
+  asked for beside the one it achieved. A ninety-second median is the same
+  number for a flat stage and for one that began fast and slowed, and that
+  difference is what a first stage is. The results file is written as the run
+  goes, so an interrupted campaign is still analysable.
 - **Results live outside the tree** unless the run *is* the release sweep: a
   run writes `~/tmp/bench-<stamp>.json` and its artifacts beside it (the
   invoking user's home, even under `sudo`); `--out`/`--work` move them, and an
@@ -661,7 +667,9 @@ must act on:
   to (a transparent arm is the documented exception: the visitor dials the
   address the client owns, and the client's kernel delivers it);
 - **the SLO on the clean stages** — for the product's own arms; a reference
-  peer that misses it is reported with its number and never blocks a tag;
+  peer that misses it is reported with its number and never blocks a tag. A
+  clean stage that was measured but carries no round trip **fails** here: it is
+  counted, so it cannot be one of the cells a green gate silently skipped;
 - **the drift and wedge axes** — a leak is a slope over time and a wedge is an
   interactive silence; a slope is only judged when the run is long enough to
   carry one (fifteen minutes), and a shorter run's slopes are reported as
@@ -674,7 +682,12 @@ must act on:
   lossy path is 1 s and then 3 s. The threshold is **two attempt budgets**
   (2 × 5 s) for the same reason: at one budget, a single unanswered attempt is
   a silence by construction, and the axis becomes a coin flip;
-- **the capacity ramp** — a ramp that sustained nothing is not a reading;
+- **the capacity ramp** — the level *where* a tool breaks the SLO is the
+  measurement, so a ramp level is not judged by the stage SLO above. The
+  ceiling is judged instead: a subject arm that stopped **short of the declared
+  `streams_max`** fails, because a ramp that broke at three streams is a
+  capacity regression and not a host reading. A reference peer's ceiling is
+  reported and never blocks;
 - and, with `--baseline`, the **regression half**: the same comparison
   `just bench compare` makes, refused unless the two files' method records
   match.
