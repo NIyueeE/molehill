@@ -1702,6 +1702,38 @@ next round's change is small and measurable: make the reserve big enough that on
 flight always fits, and watch `refused credit` at minute one and the first stage's
 `paired_p50` together.
 
+### The reserve works, and the first stage is not refused anything (2026-11-04)
+
+A refusal now says whether the stream that was refused was still opening. A 0.3-scale
+timeline, refused writes per second by bound:
+
+```
+credit=478   window=12 296   aged=128   opening=0
+credit=2 915 window=10 317   aged=973   opening=0
+credit=2 222 window=8 327    aged=0     opening=0
+```
+
+**`opening=0` in every window.** The eight-payload reserve does exactly what it was built
+to do — an opening finds room against a window the bulk spine has filled — so the first
+stage's slowness is **not** a refused arrival, and the hypothesis that motivated the counter
+is dead.
+
+Also worth reading: the bound that refuses most often on a shaped run is the **congestion
+window**, not credit and not the age gate — a different picture from the minute-one window
+of the run compared earlier, which is why per-window numbers and not per-run totals are the
+only ones this file should quote.
+
+**So what is left for the first stage?** Not establishment (46 ms), not credit (0 refused
+openings), not the send buffer (dwell 0 µs), not a lock (46 µs). What remains is the
+handshake's own round trips spent while the host is busy — and the one measurement that ever
+moved it was the worker count, 26 501 µs at four workers against 12 970 at eight, on a cell
+whose run-to-run range is wider than the effect.
+
+That makes the next step an A/B, not a change: **eight workers against sixteen, both
+binaries in one campaign, interleaved**, judged on the first stage's p99 and `bulk-n`. If
+sixteen wins outside the paired noise, the default moves and the first stage improves; if it
+does not, the first stage is host-bound and this file says so.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
