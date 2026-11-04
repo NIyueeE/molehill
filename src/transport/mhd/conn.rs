@@ -370,16 +370,6 @@ pub(crate) struct Conn {
     recv_credit: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
-    /// Bytes discarded rather than read: given back to the peer's window, and
-    /// deliberately **not** counted as delivered.
-    ///
-    /// These were spent from the window when they were sent, so a stream that ends
-    /// holding unread bytes must return them or a lane narrows one dead stream at a
-    /// time. But the frontier a peer is told about is *delivery*, and bytes nobody
-    /// read were not delivered: conflating the two let a close acknowledge megabytes
-    /// the visitor never saw, so the sender retired the stream believing it had
-    /// arrived and nothing retransmitted anything.
-    discarded: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
     read: u64,
     /// The stream whose arrived prefix rides this end's acknowledgements.
@@ -503,7 +493,6 @@ impl Conn {
             ack_pending: false,
             send_credit: WINDOW / 2,
             recv_credit: WINDOW,
-            discarded: 0,
             advertised: 0,
             read: 0,
             arrived_stream: 0,
@@ -818,17 +807,7 @@ impl Conn {
             .streams
             .get_mut(&stream)
             .map_or(0, |state| state.recv.discard(blocks));
-        // **The window moves; the frontier does not.** These bytes were never read,
-        // so telling the peer they were delivered is a lie the peer cannot detect —
-        // and the transfer that depended on them ends short by exactly this much.
-        self.discarded = self.discarded.saturating_add(held);
-        self.recv_credit = self
-            .read
-            .saturating_add(self.discarded)
-            .saturating_add(WINDOW);
-        if self.credit_due() {
-            self.ack_pending = true;
-        }
+        self.advance_read(held);
     }
 
     /// Move this end's consumed position, and the window that follows it.
@@ -839,10 +818,7 @@ impl Conn {
         self.read = self.read.saturating_add(bytes);
         // The window follows the reader: credit is what has been consumed plus
         // one window, so a peer that fills it meets a reader that drains it.
-        self.recv_credit = self
-            .read
-            .saturating_add(self.discarded)
-            .saturating_add(WINDOW);
+        self.recv_credit = self.read.saturating_add(WINDOW);
         // **And the move has to be speakable.** `credit_due` wakes the pump, but
         // a pump with nothing to send emits no packet, and a packet that is not
         // an acknowledgement carries no credit. So a reader that drains a window
