@@ -3,10 +3,9 @@
 //!
 //! A visitor's channel used to pay a full Noise KK before its first byte: two
 //! round trips and three Diffie-Hellman operations, measured at **1 771 µs**
-//! against an open of 1 779 — the whole of what a channel costs. The lane and
-//! the server already share a transcript, and both ends compute the same
-//! handshake hash from it (proved in `noise_stream`'s tests), so a stream can
-//! derive its own key from that root and start sending at once.
+//! against an open of 1 779 — the whole of what a channel costs. The lane
+//! already ran one handshake, and both ends hold its secret output, so a stream
+//! can derive its own key from [`LaneRoot`] and start sending at once.
 //!
 //! Three properties are load-bearing and each has a test:
 //!
@@ -22,7 +21,8 @@
 //!   another stream, replayed under another number, or truncated.
 //!
 //! What this trades away is stated where the design is: forward secrecy moves
-//! from per stream to per lane.
+//! from per stream to per lane. What it must **not** trade away is the secret
+//! itself — see [`LaneRoot`] for why the transcript hash alone is not a root.
 
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -71,9 +71,10 @@ impl std::fmt::Debug for StreamCipher {
 impl StreamCipher {
     /// Derive the key for one direction of one stream.
     ///
-    /// `root` is the lane's handshake hash — identical on both ends. `info`
-    /// mixes the label, the direction and the stream id, so the derivation is
-    /// injective over `(stream, direction)` for a given root.
+    /// `root` is the lane's root — the secret half of its handshake, salted
+    /// with its transcript (see [`LaneRoot`]). `info` mixes the label, the
+    /// direction and the stream id, so the derivation is injective over
+    /// `(stream, direction)` for a given root.
     pub(super) fn derive(root: &[u8; 32], direction: Direction, stream: u32) -> Option<Self> {
         let mut info = Vec::with_capacity(LABEL.len() + 5);
         info.extend_from_slice(LABEL);
@@ -131,6 +132,79 @@ impl StreamCipher {
         self.aead
             .decrypt_inout_detached(&Self::nonce(packet), ad, cipher.into(), &tag)
             .is_ok()
+    }
+}
+
+/// The lane's secret root: what every stream's key is derived from.
+///
+/// Two inputs, and neither alone is enough:
+///
+/// - the **raw split** is the Noise handshake's secret output — the material a
+///   passive observer cannot compute, and the thing that has to protect every
+///   stream now that they share one handshake;
+/// - the **handshake hash** is the transcript's digest, which binds each
+///   derived key to *this* handshake.
+///
+/// The distinction is the reason this type exists. An earlier design used the
+/// transcript hash as the root on its own, and that hash is a function of the
+/// messages both ends exchanged: a party who watched the handshake — or who
+/// holds either static key and can replay the exchange — recomputes it. A key
+/// schedule built on it moves forward secrecy from per-stream to per-lane and
+/// then gives it away, which is worse than the per-stream handshake it replaced
+/// because at least that one was secret.
+pub(super) struct LaneRoot {
+    root: [u8; 32],
+}
+
+impl std::fmt::Debug for LaneRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the key: a debug print of a root is a key leak waiting for a
+        // log line.
+        f.write_str("LaneRoot(..)")
+    }
+}
+
+impl Drop for LaneRoot {
+    fn drop(&mut self) {
+        self.root.fill(0);
+    }
+}
+
+impl LaneRoot {
+    /// The label the root derivation is bound to.
+    ///
+    /// A version byte because the root outlives any one stream: changing what
+    /// is derived from it must not silently decrypt a newer stream as an older
+    /// one.
+    const LABEL: &'static [u8] = b"molehill mhd lane root v1";
+
+    /// Build the root from one finished handshake, or `None` if it refuses.
+    ///
+    /// `split` is the handshake's two directional secret keys (snow's
+    /// `dangerously_get_raw_split`, which is exactly the material
+    /// `into_transport_mode` installs) and `transcript` is its handshake hash.
+    /// `None` means "do not derive": the caller must fall back to the
+    /// per-stream handshake rather than seal under a root nobody computed.
+    pub(super) fn from_handshake(split: &[[u8; 32]; 2], transcript: &[u8; 32]) -> Option<Self> {
+        let mut ikm = [0u8; 64];
+        ikm[..32].copy_from_slice(&split[0]);
+        ikm[32..].copy_from_slice(&split[1]);
+        // The transcript is the HKDF *salt*, not the input key material: it is
+        // public, and HKDF binds it without ever becoming derivable from it.
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(transcript), &ikm);
+        let mut root = [0u8; 32];
+        let result = hk.expand(Self::LABEL, &mut root);
+        ikm.fill(0);
+        if result.is_err() {
+            root.fill(0);
+            return None;
+        }
+        Some(Self { root })
+    }
+
+    /// One direction of one stream, sealed under this lane's root.
+    pub(super) fn stream(&self, direction: Direction, stream: u32) -> Option<StreamCipher> {
+        StreamCipher::derive(&self.root, direction, stream)
     }
 }
 
@@ -284,5 +358,72 @@ mod tests {
         let short = &tag[..TAG - 1];
         let mut buf = *b"payload";
         assert!(!recv.open(1, b"h", &mut buf, short));
+    }
+
+    /// Both halves of the handshake reach the root, and neither replaces it.
+    ///
+    /// The regression this pins: a root derived from the transcript alone — the
+    /// public digest of the messages — would still be "identical on both ends"
+    /// and would still pass every agreement test above, while giving the key
+    /// schedule away. Changing the secret while holding the transcript fixed
+    /// must change every stream key, and so must changing the transcript while
+    /// holding the secret fixed.
+    #[test]
+    fn the_root_mixes_the_secret_and_the_transcript() {
+        let split = [[1u8; 32], [2u8; 32]];
+        let transcript = [3u8; 32];
+        let Some(base) = LaneRoot::from_handshake(&split, &transcript) else {
+            unreachable!("a 32-byte derivation cannot fail")
+        };
+        let Some(other_secret) = LaneRoot::from_handshake(&[[9u8; 32], [2u8; 32]], &transcript)
+        else {
+            unreachable!("a 32-byte derivation cannot fail")
+        };
+        let Some(other_transcript) = LaneRoot::from_handshake(&split, &[4u8; 32]) else {
+            unreachable!("a 32-byte derivation cannot fail")
+        };
+        let Some(send) = base.stream(Direction::ToServer, 1) else {
+            unreachable!("a 32-byte derivation cannot fail")
+        };
+        let mut sealed = *b"payload";
+        let Some(tag) = send.seal(1, b"h", &mut sealed) else {
+            unreachable!("sealing into a sized buffer cannot fail")
+        };
+        for (what, other) in [
+            ("another handshake's secret", &other_secret),
+            ("another transcript", &other_transcript),
+        ] {
+            let Some(recv) = other.stream(Direction::ToServer, 1) else {
+                unreachable!("a 32-byte derivation cannot fail")
+            };
+            let mut buf = sealed;
+            assert!(
+                !recv.open(1, b"h", &mut buf, &tag),
+                "{what} must not open this lane's stream packet"
+            );
+        }
+        // And the root still does the job it was built for: the same lane's
+        // other direction and other stream are different keys.
+        let Some(same) = base.stream(Direction::ToServer, 1) else {
+            unreachable!("a 32-byte derivation cannot fail")
+        };
+        let mut buf = sealed;
+        assert!(same.open(1, b"h", &mut buf, &tag), "own tag opens");
+        let mut buf = sealed;
+        let Some(back) = base.stream(Direction::ToClient, 1) else {
+            unreachable!("a 32-byte derivation cannot fail")
+        };
+        assert!(
+            !back.open(1, b"h", &mut buf, &tag),
+            "the other direction is another key"
+        );
+        let mut buf = sealed;
+        let Some(next) = base.stream(Direction::ToServer, 3) else {
+            unreachable!("a 32-byte derivation cannot fail")
+        };
+        assert!(
+            !next.open(1, b"h", &mut buf, &tag),
+            "the next stream is another key"
+        );
     }
 }

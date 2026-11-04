@@ -2329,14 +2329,116 @@ recovery table bounded, low-allocation storage. Do not retry region pinning, a
 piece per datagram, or a chunk queue without a cursor — each was built, measured
 and rejected.
 
-### Stage 8 — the full ritual
+### The first stage is the carrier's, and its tail is the per-stream handshake queueing (2026-11-04)
 
-`just fmt`, `just py-fmt`, `just check`, `just interop`, `just l3-accept`, then a
-repeated `dev` plus `timeline` plus `capacity` campaign, then the five-arm
-`sweep`. Only a gate-green record becomes
-`benches/records/results-bench-v1.0.0.json`, with charts and both READMEs in the
-same commit. A method change makes it a re-baseline release (no `--baseline`),
-recorded as such in the changelog.
+One campaign, full-scale `sweep` schedule, one round, `control` and `molehill` in
+the same run, same binary, `MOLEHILL_MHD_STATS=1`. This is the row that decides
+whether the first stage is the run or the carrier:
+
+| arm | stage | n | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|---|
+| control (no tool) | `clean` (first) | 3 035 | **1.58** | 2.03 | **2.57** | 5.41 |
+| control | `clean#2` (last) | 3 034 | 1.57 | 1.90 | 2.28 | 3.32 |
+| molehill | `clean` (first) | 2 934 | 2.94 | **15.15** | **112.85** | 244.72 |
+
+**The tool-free path's first stage is 2.6 ms at p99 and does not degrade for
+being first.** molehill's is 112.85 — 44× the control on the same stage, 38× its
+own p50. So the first-stage failure is a property of the **carrier's arrival
+path**, not of the harness, the host, or the position in the schedule. And it is
+not "the first stage warms up": its first ten-second bucket already reads p99
+**37.7 ms** and every bucket after it reads 80–209, with a flat p50 near 3 ms and
+a p90 of 7–21. A stage that began fast and slowed would look nothing like this.
+*(The earlier "first two windows read 1 111 and 1 094 µs, then it slows" was
+measured on the server's own `paired_p50`, a different instrument on a different
+run; this cell's probe disagrees with it and the older sentence is not a reading
+of this one.)*
+
+The shape says which part of the arrival to look at, and the carrier's own
+counters name it. In the same second the probe reads 112.85 ms, the server's
+`visitor arrival, split at the pairing` window reads `paired_p50_us 1 901` and
+`paired_p99_us 112 454` — the probe and the pairing agree to 0.4 %, so the tail
+is **accept → a channel in hand**, and nothing after it.
+
+Then the split, over every slow (`≥ 5 ms`) opening the client logged in that arm
+(1 141 of them):
+
+| field | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| the whole open (`us`) | 11.50 ms | 41.22 | 128.72 | 371.74 |
+| **the Noise KK inside it (`hs_us`)** | **11.50** | **41.22** | **128.71** | **371.74** |
+| the acknowledgement (`ack_us`) | 0.00 | 0.00 | 0.00 | 0.00 |
+
+**The handshake is the entire open — a share of 1.000 at p50 and at p90** — and
+the server says the same from its side: of the openings slow enough to log,
+`sel_us ≈ 0`, `hello_us ≈ 0`, and `hs_us` is `total_us` to the microsecond. Its
+own bound snapshot says this is not a budget: `credit` 16.5 MB, `buffer` at its
+32 MiB ceiling, `queued_streams` 0, `retransmits` ≤ 9.
+
+So the cost is **not** the KK's cryptography. On an idle lane the same handshake
+measures 1 771 µs. Here its **median is 11.5 ms**, which is the two small records
+it exchanges **waiting on a lane that is carrying bulk** — the one thing the
+five-millisecond-or-finer instruments inside each stage could never see, because
+what they measured was the CPU, and what the arrival pays is the queue.
+
+Two consequences for the plan, and this is the whole point of the row:
+
+1. **sealing (stage C) attacks exactly this**, and now for a measured reason
+   rather than a design preference: it deletes the two records and the round trip
+   they wait on. The parked patch's own end-to-end A/B put `churn-16` p99 at 3.59
+   against 9.74 ms with the handshake at 14 µs;
+2. **the scheduler (stage F1) is not made redundant by it** and is not
+   speculative either: the measured defect is a small record queueing behind a
+   full run, which is what a class-aware transmit order exists to prevent. C
+   first, because it removes the work; F1 after, because the remaining small
+   records (selector, hello, prologue, ack) will still queue.
+
+**And the harness still eats four stages.** Everything after `loss5` failed with
+`iperf3 error: control socket has closed unexpectedly` — `rate100`, `rate20`,
+`jitter` and `clean#2`, i.e. no `clean#2` for molehill at all, which is why the
+table above has no fourth row. That is the release gate's coverage problem and it
+is *not* the carrier: it must be fixed before any sweep can be published.
+
+### The lane root is the handshake's secret, and the transcript only salts it (2026-11-04)
+
+The parked sealing design derived each stream's key from the lane's **handshake
+hash**. That is wrong, and it is wrong in the direction that matters: the
+handshake hash is a digest of the messages both ends exchanged. Anyone who
+watched the handshake — or who holds either static key and can replay the
+exchange — recomputes it. A key schedule built on it would move forward secrecy
+from per-stream to per-lane and then hand it away, which is worse than the
+per-stream handshake it exists to replace, because that handshake was at least
+secret.
+
+So [`LaneRoot`](src/transport/mhd/cipher.rs) takes two inputs and documents
+why neither alone will do:
+
+- the **raw split** — Noise's own secret output, the exact material
+  `into_transport_mode` installs, reached through snow's `risky-raw-split`
+  feature (`dangerously_get_raw_split`). Named "risky" by the crate because it
+  exports key material; that is precisely what a derivation root needs, and it
+  is the reason the feature is the right tool here rather than a re-implementation
+  of the state machine;
+- the **handshake hash**, as the HKDF **salt** — a public value that binds the
+  root to one handshake without ever being derivable from it.
+
+`HKDF-SHA256(salt = transcript, ikm = split[0] ‖ split[1], info = "molehill mhd
+lane root v1")` gives the root; `StreamCipher::derive` then derives one
+(direction, stream) key from it as before. A test pins both halves: changing
+the secret while holding the transcript fixed changes every stream key, and so
+does changing the transcript while holding the secret fixed — the regression
+that would ship a transcript-only root while still passing every "both ends
+agree" test.
+
+Two consequences written down rather than discovered later:
+
+- `from_handshake` answers `Option`, and `None` means **do not seal** — the
+  caller falls back to the per-stream handshake instead of sealing under a root
+  nobody computed;
+- the nonce is the packet number, which is `u32` per connection. A wrap would
+  reuse a nonce with the same key, so the sealing path must refuse near the
+  wrap (or re-establish the lane) rather than wrap silently. 2³² datagrams is
+  ~6 TB, which no test will reach — which is exactly why it has to be an
+  explicit refusal and not an assumption.
 
 ## Negative results: do not retry these blind
 

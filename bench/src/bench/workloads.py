@@ -1063,7 +1063,10 @@ def _stage_metrics(
             "datagram": len(datagrams),
             "churn": len(churn),
         },
-        "series_logs": [str(p) for p in (interaction, datagrams, churn) if p],
+        # The probe's own log paths are the caller's to add: this function is
+        # handed the *points*, not the files, and a list of the points rendered
+        # as text (which is what stood here) is not a log — it doubled every
+        # staged results file and named nothing.
         # The stage's shape, not only its summary: a median over ninety seconds
         # is the same number for a stage that was flat and for one that began
         # fast and slowed, and the difference between those two is the whole
@@ -1374,6 +1377,12 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     # one number per metric, and the first-stage question is about a stage that
     # changes *inside* itself, so the shape is evidence and not a chart.
     built.evidence |= evidence
+    # The three logs this stage was read out of, by path: the numbers above are
+    # slices of them, and a reader who wants the shape at another resolution
+    # needs the file rather than a second summary.
+    built.evidence["series_logs"] = [
+        str(logs[mode]) for mode in ("interactive", "udp", "churn") if mode in logs
+    ]
     # The boundary's own answer, on every stage: a visitor's whole life through the
     # tool, asked before this stage's traffic started.
     built.evidence["echo_probe"] = boundary
