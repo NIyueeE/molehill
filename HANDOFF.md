@@ -2513,51 +2513,48 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
-### The tail is the small-flight timer on a fresh lane (2026-11-05)
+### The tail is a transport delay, and the timer only marks its boundary (2026-11-05)
 
 The accept queue is not the wait: a stream waits **p50 7 µs, p99 12–14 µs** between
 the datagram that names it and the loop that takes it (new instrument, reported as
-`a stream waiting for its accept`). So the second of the two uncovered intervals is
-also fast, and the arrival's tail had to be somewhere else.
+`a stream waiting for its accept`). So the second of the two intervals this carrier
+could not see is also fast.
 
-It is the **retransmission timer**, and the carrier says so in one line. Three lanes
-of one run, all at once:
+The first version of this entry read one log line as "a fresh lane pays the
+small-flight timer" — `window=13490` is `INITIAL_CWND`, so the lane had carried
+nothing. **That inference is wrong**: `window` is `cwnd − flight`, and a lane whose
+congestion window has stayed near its initial value reads the same number after a
+megabyte. What the whole population says is better, and is the reason this entry was
+rewritten rather than extended. Every slow open in one run, in order:
 
-```
-mhd slow stream open: lane=3 us=23141 hs_us=22949 ack_us=0
-  credit=16777113 window=13490 buffer=33554432 queued_streams=0 retransmits=1
-```
+| open | remaining window | retransmissions |
+|---|---|---|
+| 5.5 / 6.0 / 10.9 ms | 21 584 / 13 490 / 22 933 | **0** |
+| 15.2 / 15.8 / 16.7 / 20.6 ms | 13 490 each | **0** |
+| 23.1 / 23.4 / 23.4 / 23.6 ms | 13 490 each | **1** |
+| 27.6 / 33.4 / 39.7 / 45.6 / 66.4 / 83.4 ms | 13 404–20 144 | 1–3 |
 
-Read the numbers together. `window=13490` is exactly `INITIAL_CWND` — the remaining
-congestion window of a lane that has carried **nothing**, i.e. a fresh lane. `hs_us`
-is 99 % of `us`, so the whole open is the handshake. And `retransmits=1` says the
-handshake was sent **twice**. 23 ms is 20 ms plus the transit: that is
-`SMALL_FLIGHT_INITIAL_RTO`, the cheap floor a lane with no round-trip sample arms for
-a one-or-two-packet flight.
+Read down the middle: the opens climb from 5.5 to **20.6 ms with no retransmission at
+all**, and only then does a cluster appear at 23+ with exactly one. So the
+retransmission is not the cause of the tail — it is the *marker* of the 20 ms
+`SMALL_FLIGHT_INITIAL_RTO` boundary, adding a duplicate and three milliseconds to
+opens that were already late. **The delay itself is in the handshake's transport, and
+it happens before any timer fires.**
 
-So the arrival's tail in the slow rounds is not a slow stage of the carrier at all:
-it is the **first handshake packet of a brand-new lane either being lost or being
-answered later than 20 ms**, after which the retransmission completes and the open
-lands at ~23 ms. Four fresh lanes at once, which is what a pool establishment and a
-burst of visitors both look like.
+That is a smaller claim than the one it replaces and it is the one the numbers
+support: between 0.5 and 20 ms an open is slow with nothing lost and nothing refused
+(`credit` 16.7 MB, `queued_streams=0`, `retransmits=0`), while every instrument the
+carrier owns — dwell, post, accept, lock, park — reads microseconds.
 
-Why the first packet waits is the next question, and the shape of the answer is
-already visible in the dispatcher: a datagram for a lane the *listener* has never
-seen is handled **inside the receive callback** — registry lookup under a mutex, an
-admission check, `Conn::new`, a `Shared`, a **sender task spawned**, two map
-insertions — and all of it runs before the next `recv` in that batch. A dispatcher
-task busy with sixteen bulk datagrams therefore puts a new lane's first packet behind
-work that has nothing to do with it, and the client's 20 ms floor expires while it
-waits.
-
-**Pre-registered next experiment**: measure the batch's own processing time (the
-wall time inside `receive`'s callback loop, with the datagram count), then, if it
-spikes when a lane is created, move the new-lane setup off the receive path (hand the
-datagram to a task that admits and replays it) and re-measure the same interval. Gate:
-`accept_age` and the batch time stay in microseconds, and the arrival's p99 on the
-`cost` cell falls below the 20 ms floor it cannot currently get under — because on
-this evidence **no scheduling or handshake work can take an arrival below 20 ms while
-a fresh lane pays that timer**.
+**Pre-registered next experiment**: the remaining candidate is the dispatcher's own
+batch. A datagram for a lane the listener has never seen is handled *inside* the
+receive callback (registry lock, admission check, `Conn::new`, a `Shared`, a sender
+task spawned, two map insertions) before the next `recv` of that batch, so bulk
+traffic and a new lane's first packet share one task's critical section. Measure the
+batch's processing time with its datagram count; if it reaches tens of milliseconds,
+move the new-lane setup off the receive path and re-measure. Gate: the batch time
+stays in microseconds and the arrival's p99 on the `cost` cell falls below the 20 ms
+line that the timer cluster marks.
 
 ### Fewer wake-ups help, and do not touch the first stage (2026-11-05)
 
