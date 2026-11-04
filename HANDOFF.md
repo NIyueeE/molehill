@@ -26,25 +26,39 @@ numbers that say why are on this page.
 
 ### The plan's stages, as they actually stand (2026-11-04)
 
+The plan was re-cut this cycle: instead of one fixed chain (sealing → RACK/PTO →
+scheduler → BBR), it runs four independent work fronts and lets each measurement
+say which one is next. Everything below is judged by its own A/B against the
+run's own floor, and nothing is called a win because it is cleverer.
+
 | stage | state |
 |---|---|
-| 0 — converge this page | **done** (6 838 lines → this page + the archive) |
-| 1 — measurement baseline | **done** (per-stage attribution, the five-segment split, the committed windows) |
-| 2 — no per-visitor handshake (sealing) | **parked at 7 of 8 runs**; the design is proved (handshake 1 771 µs → 14), and the remaining failures are **unattributed again**: the echo backend was cleared as their cause by measurement (see "the backend cannot have blocked") |
-| 3 — RACK + PTO | not started; the refusal mix is now known honestly (credit 64 %, window 29 %, age gate 7.5 %) |
-| 4 — internal scheduling | **refuted before starting**: the first stage's arrivals are not queued anywhere (dwell 0 µs, reader park 54 µs, lock 3 µs), so there is no queue to schedule |
-| 5, 6 — rate/BDP window, memory | not started |
-| 7 — the release gate | **fails on one thing**: the first clean stage's p99, whose within-campaign spread (12× at the median, 20–281 ms at p99 across runs) is larger than the 50 ms limit. Coverage is complete: eight of eight stages measure |
+| **A1** load-generator health | **done.** The bench echo backend's two directions are decoupled (16–19 → 22–27 MiB absorbed while its peer reads nothing), and the change's *justification* was refuted on the way: 16 MiB of room means an 8 MiB echo cannot have blocked, so "the backend was the stall" is withdrawn. A permanent check runs it: `bench/src/bench/utils/echo_check.py` |
+| **A2** a stage's shape | **done.** Every staged cell now carries `interactive_per_s` (per-second n/p50/p99/max/failures), `interactive_cadence` (the probe's own intervals and missed cadences), the churn rate asked for beside the one achieved, and the window's edges in unix time. `series_logs` names the probes' files instead of pasting every sample into the results file as text |
+| **A3** what the gate can see | **done.** The SLO is judged on *held stages* only (`hold_s`), a clean stage with no round trip **fails** instead of passing silently, and a ramp that stops short of `streams_max` fails instead of printing a line. Re-checked against the published `v0.11.2` record, which still reads `gate: PASS` |
+| **B** position of the first stage | **done, and it is the carrier's.** One full-scale run, same binary, control and molehill together: control's first `clean` stage p99 **2.57 ms**, molehill's **112.85 ms** (44×), 38× its own p50. The server's `paired_p99_us` 112 454 agrees to 0.4 % |
+| **B2** the harness's four lost stages | **half done.** A failed bulk instrument no longer deletes its stage's arrivals (four cells per run were being discarded, including the last clean stage); the `iperf3` wedge itself after `loss5` is still open |
+| **C** no per-visitor handshake | **wired, tested, OFF.** The root is now the handshake's *secret* split salted with its transcript (not the transcript alone). Sealing deadlocks a four-stripe group: 3 of 6 runs pass with it on, 6 of 6 with it off, so it ships behind `MOLEHILL_MHD_SEAL` until that is fixed |
+| **D** fewer round trips per arrival | not started; `StartForward` speculation is the cheap half, a server-initiated visitor stream the large one |
+| **E** recovery and control | not started. The refusal mix is honest (credit 64 %, window 29 %, age gate 7.5 % at 0.3 scale), and the age gate has since been caught blocking a stream whose flight was ~0 |
+| **F** scheduling | **not refuted, and now the strongest remaining lever**: the tail was measured as a small record queueing on a lane carrying bulk (`us == hs_us`, share 1.000), which is what class-aware transmit order exists to prevent |
+| **G** release gate | **fails on one thing**: the first clean stage's p99, whose within-campaign spread is larger than the 50 ms limit. Coverage is complete when the harness cooperates |
 
-The gate, measured today: **a 0.3-scale sweep passes** (`bench gate: PASS`, both clean
-stages inside 50 ms with room); at full scale, seven of eight stages measure, `clean#2`
-reads 1.74 / 2.41 ms, and `clean` reads 22.0 / 135.3 — the first stage is the only SLO
-failure and the only thing standing between this branch and a release record.
+The gate, measured on the last full-scale run before this cycle's changes:
+eight of eight stages measured, `clean#2` 1.89 / 3.91 ms, `clean` 6.06 / **134.1** ms
+— the first stage is the only SLO failure and the only thing between this branch
+and a release record.
 
-**What the first stage costs, and where**: arrivals there pay 6 499 µs of handshake and
-12 115 µs of pairing against 1 030 and 1 166 later in the same run, with nothing queued in
-any send buffer. It is the *count* of round trips and task handoffs per arrival, and the
-one measured lever that removes them is the parked sealing design.
+**What the first stage costs, and where**: an arrival's channel spends **its whole
+open inside the per-stream Noise handshake** — `us == hs_us` with a share of
+1.000 at p50 and p90, `ack_us` zero, and on the server `hs_us == total_us` with
+the selector and hello at zero — while credit reads 16.5 MB and the buffer sits
+at its ceiling. On an idle lane that handshake is 1.8 ms; under bulk its median
+among the slow openings is **11.5 ms** and its p99 128.7, because two small
+records have to be scheduled on a lane that is carrying megabytes. The count of
+round trips is what sealing deletes, and *when* those records get the wire is
+what scheduling owns.
+
 
 ## The goal, and what may not change
 
