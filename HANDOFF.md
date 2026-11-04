@@ -1412,6 +1412,45 @@ the peer-side `arrived` from the last acknowledgement. A stream that closes with
 `sent > arrived` is this defect, named, on the exact stream — and it is one line per
 stream while the stats switch is on.
 
+### Two causes refuted, and the arithmetic that is left (2026-11-04)
+
+The close line landed and refuted the first candidate on three runs: **every stream
+closes with `unsent = 0`** — `written == next` — so nothing is dropped from a send
+buffer, and the close does not overtake its own queue.
+
+```
+mhd stream closed stream=5 written=2097800 next=2097800 unsent=0 reset=None
+    peer_fin=false local_fin=true
+```
+
+The second candidate was the FIN's ordering, and it is refuted by reading the code:
+`poll_transmit` tries credit, then **stream data**, then reset, then **fin** — so a
+finish cannot precede its own data, and `send_run` loops until every span of a run is
+accepted (`at += sent`), falling back from GSO to the batched syscall, so a partial send
+is not a silent loss either.
+
+That leaves the arithmetic, and it is now the only thing left to explain:
+
+| | bytes |
+|---|---|
+| request, into the client's backend | **8 388 608** (counted, `written`) |
+| response, frames the client sent | **257 × 32 KiB** |
+| response, frames the server's reader saw | **167** (`highest = delivered = 167`) |
+| response, the visitor received | **5 464 064** |
+
+The request crossed intact; the response lost ninety frames on the way, both ends
+reported clean, and the losing end — the sender — reports `written == next`, which means
+it believes every byte went out. **So the number that decides it is one nobody has
+printed yet: the carrier's `next` on the client's own streams.** If the client's four
+streams closed with `written ≈ 2.09 MB` each (8 MiB total), the carrier accepted the
+frames and lost them downstream; if they closed at ≈ 1.4 MB each, the stripe layer never
+handed the last ninety frames over despite logging 257.
+
+`local_fin=true, peer_fin=false` on every server-side stream also dates the close: the
+receiver finished its half before the peer finished sending, which is what let the rest
+of the response be dropped as "unknown stream" — the path that documents itself in
+`apply_datagram` as *"a retired stream"*.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
