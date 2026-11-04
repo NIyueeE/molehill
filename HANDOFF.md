@@ -1669,6 +1669,39 @@ compared at minute one and minute twenty, to find which one carries the factor o
 That is a measurement, not a theory, and the plan's ban stands untouched: no warmup stage,
 no deleted first stage.
 
+### The first minute is credit pressure; the twentieth is reader parks (2026-11-04)
+
+The same counters, from one full-scale run, at minute one and in its last ten minutes:
+
+| counter (server) | minute 1 | t = 600–1 200 s |
+|---|---|---|
+| send-buffer dwell p50 | 0 µs | 6 µs |
+| **reader park p99** | **434 µs** | **40 704 µs** (max **2 001 414**) |
+| connection lock p99 | 46 µs | 2 µs |
+| **writes refused by credit** | **8 489 / s** | **3 / s** |
+| writes refused by the age gate | 1 678 / s | 0 / s |
+
+**The two phases are opposite, and neither is the handshake.**
+
+- **Minute one**: credit refusals at eight and a half thousand per second, tiny parks, no
+  dwell. The bulk spine is filling the peer's window and every write — including an
+  arrival's — waits on it. That is the phase whose arrivals read 5–13 ms.
+- **Late**: almost no credit refusals, and readers parked **40 ms at p99 and two seconds at
+  worst**. The window is not the constraint any more; readers are waiting for bytes that
+  the peer has not sent yet.
+
+The earlier reading of the same run — "dwell 0, park 54 µs, so nothing is queued" — was
+taken from the *first* 120 seconds and averaged over a phase whose parking is genuinely
+tiny. It was the refusals, not the dwell, that carried the cost, and they were not in that
+comparison at all.
+
+**So the arrival's slowness in the first stage is credit pressure from the bulk spine**, and
+`OPEN_RESERVE` — the byte reserve that exists to keep an opening writable — is a *byte*
+reserve against a *connection-wide* credit, which is exactly the wrong shape for this. The
+next round's change is small and measurable: make the reserve big enough that one opening
+flight always fits, and watch `refused credit` at minute one and the first stage's
+`paired_p50` together.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
