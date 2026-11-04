@@ -489,6 +489,14 @@ pub(crate) fn note_pairing_done() {
 static GROUPS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GROUPS_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Read parks that outlasted their deadline: a flow whose source stopped delivering.
+static GROUP_PARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one read that waited past its deadline.
+pub(crate) fn note_group_park(_waited: Duration) {
+    GROUP_PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How long a group must have lived, and how little it must have carried, to count
 /// as starved. Five seconds and sixty-four kilobytes: a group that moved less than
 /// that was not slow, it was stopped.
@@ -721,10 +729,12 @@ fn report_starvation() {
     }
     let groups = GROUPS_DONE.swap(0, std::sync::atomic::Ordering::Relaxed);
     let starved_groups = GROUPS_STARVED.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if groups > 0 {
+    let parks = GROUP_PARKS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if groups + parks > 0 {
         info!(
             groups,
             starved = starved_groups,
+            read_parks = parks,
             "mhd-stats: groups finished, and how many carried almost nothing"
         );
     }

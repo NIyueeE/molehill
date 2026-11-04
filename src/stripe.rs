@@ -403,21 +403,39 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // Reserve the header room; the read appends behind it.
         frame.resize(STRIPE_HEADER_LEN, 0);
         let reading = std::time::Instant::now();
-        let n = match src.read_buf(&mut frame).await {
-            // **Why** the source ended is the whole question when a transfer
-            // truncates: an EOF from the visitor or the backend is the peer
-            // closing, an error is a broken socket, and the visitor's byte count
-            // cannot tell them apart. One line, on the group it belongs to.
-            Ok(0) => {
-                debug!(group, frames = seq, "stripe source ended: eof");
-                break;
-            }
-            Ok(n) => n,
-            Err(e) => {
-                debug!(group, frames = seq, "stripe source ended: {e}");
-                anyhow::bail!("stripe source read failed: {e}");
-            }
-        };
+        // A read that never returns is the one failure that logs nothing: every
+        // "read waited" line is written *after* the call comes back. A deadline turns
+        // silence into a sentence — which flow, how long, how far it had got.
+        let n =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), src.read_buf(&mut frame))
+                .await
+            {
+                Err(_) => {
+                    crate::transport::stats::note_group_park(reading.elapsed());
+                    debug!(
+                        group,
+                        frames = seq,
+                        bytes = sent,
+                        "stripe source read has not returned for two seconds"
+                    );
+                    continue;
+                }
+                Ok(got) => match got {
+                    // **Why** the source ended is the whole question when a transfer
+                    // truncates: an EOF from the visitor or the backend is the peer
+                    // closing, an error is a broken socket, and the visitor's byte count
+                    // cannot tell them apart. One line, on the group it belongs to.
+                    Ok(0) => {
+                        debug!(group, frames = seq, "stripe source ended: eof");
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(e) => {
+                        debug!(group, frames = seq, "stripe source ended: {e}");
+                        anyhow::bail!("stripe source read failed: {e}");
+                    }
+                },
+            };
         if seq == 0 {
             // A direction that never logs this was **never polled**: the whole
             // difference between a response that is slow and one that never starts,
