@@ -1092,6 +1092,13 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         ctx.topo.drain(ctx.leg)
         again = _measure_stage(ctx, stage, params, logs)
         again.evidence["retried_after"] = (first or "")[:200]
+        # The first attempt's own evidence is the one that describes the failure;
+        # the retried cell replaces it, so carry the facts across or they are lost
+        # with the cell they were recorded on.
+        if "reachable_after_failure" in cell.evidence:
+            again.evidence["reachable_after_failure"] = cell.evidence[
+                "reachable_after_failure"
+            ]
         return again
 
 
