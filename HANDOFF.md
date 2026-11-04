@@ -2068,6 +2068,38 @@ means the tool had stopped, and then the carrier's silence is the thing to expla
 is where it will be read first**, because that stage fails for being last and nothing inside it
 can say why.
 
+### The tool serves a new visitor while one flow stops delivering (2026-11-04)
+
+The boundary probe answered on its first full run, and the answer is not the one the exit was
+built for:
+
+| stage | outcome | boundary probe | stage |
+|---|---|---|---|
+| `clean` | measured | **ok, 5.84 ms** | 3.45 / 56.2 ms |
+| `rtt100` | measured | ok, 406 ms | 402 / 403 |
+| `loss1` | measured | ok, 45.4 ms | 42.1 / 1 092 |
+| `loss5` | measured | ok, 406 ms | 403 / 2 448 |
+| `rate100` | **lost** | **ok, 85.8 ms** | — |
+| `rate20` | **lost** | **ok, 167 ms** | — |
+| `jitter` | **lost** | **ok, 91.5 ms** | — |
+| `clean#2` | **lost** | **ok, 5.49 ms** | — |
+
+**Every failing stage answered a complete visitor round trip at its own boundary** — `clean#2` in
+5.5 ms on a clean path — and then carried nothing. So the tool was not wedged, its pool was not
+empty, and its listeners were not gone: **it served a fresh connection perfectly and then failed
+to carry one bulk flow.**
+
+That kills the last shape this file was carrying ("a lane that stops") and replaces it with a
+narrower one: **a flow whose source stops delivering while the tool keeps serving everyone else.**
+The send loop's own log could never say so, because every "read waited" line is written after the
+call returns — a read that never returns prints nothing. It now reads under a two-second deadline
+and records a park with the group, its frames and its bytes, so the next lost stage will name the
+flow instead of the silence.
+
+**Where the gate stands**: `clean` 3.45 / 56.2 ms (inside the SLO at the median and just outside
+at p99), four stages lost. The four are the ones after `loss5`, which is the run's shape whenever
+it goes wrong — and now the instrument to read them is in place.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
