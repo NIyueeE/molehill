@@ -753,24 +753,7 @@ impl Conn {
         // acknowledgement moves its stream's frontier past it, and a frontier
         // that stalls must cost the writer a wait rather than unbounded memory.
         let held = MAX_BUFFERED.saturating_sub(self.buffered);
-        // Decided before the stream's own borrow: the reserve and the age gate
-        // both need to know whether this stream is still opening, and the log
-        // needs `&self`.
-        let still_opening = self.streams.get(&stream).is_some_and(opening);
-        // **The reserve comes off every bound, and only for a stream that has
-        // already spent it.** Subtracting it from `min(credit, window, held)`
-        // reserves nothing at all when the binding bound is already smaller than
-        // the reserve — and the buffer is exactly that bound under load: measured
-        // at its 32 MiB ceiling in the same instant a slow stream open was stuck,
-        // with `credit` 16.5 MB to spare. An opening stream is the one that
-        // spends the reserve, so it sees every bound whole; that asymmetry is the
-        // whole reservation, and taking it from both classes would reserve twice
-        // as much as the constant says.
-        let reserve = if still_opening { 0 } else { OPEN_RESERVE };
-        let room = credit
-            .saturating_sub(reserve)
-            .min(window.saturating_sub(reserve))
-            .min(held.saturating_sub(reserve));
+        let room = credit.min(window).min(held);
         // The fourth bound, and the one this cycle needed: **the flight may not
         // outlive the retransmission timer.** A carrier that lets a flight grow
         // past the timeout supposed to find a hole inside it is asking two
@@ -783,6 +766,9 @@ impl Conn {
             .recovery
             .oldest_data_age(Instant::now())
             .is_some_and(|age| age >= self.recovery.current_rto());
+        // Decided before the stream's own borrow: the age gate needs to know
+        // whether this stream is still opening, and the log needs `&self`.
+        let still_opening = self.streams.get(&stream).is_some_and(opening);
         let refused_by_age = aged && !still_opening;
         let log_table =
             refused_by_age && crate::transport::stats::enabled() && self.table_log_due();
@@ -799,6 +785,13 @@ impl Conn {
         // with an empty table, and a measurement built on it said the age gate
         // refused 4.6 million writes when many of those were the congestion window.
         let room = if refused_by_age { 0 } else { room };
+        // A stream that has already written a reserve's worth stops short of it,
+        // so an opening stream always finds room (see `OPEN_RESERVE`).
+        let room = if opening(state) {
+            room
+        } else {
+            room.saturating_sub(OPEN_RESERVE)
+        };
         let take = usize::try_from(room).map_or(0, |room| room.min(bytes.len()));
         if take < bytes.len() {
             // The window took less than the caller offered, so from this instant
