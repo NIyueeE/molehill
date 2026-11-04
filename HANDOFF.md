@@ -2513,6 +2513,47 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
+### Every stage of the arrival is microseconds, so the tail is after it (2026-11-05)
+
+The dispatcher's admission of a new lane — registry lock, admission table, `Conn`, a
+`Shared`, a spawned sender task, two insertions — costs **p50 27 µs, p99 39 µs**. That
+was the last hypothesis about the receiving end, and with it every interval the
+arrival crosses now has a distribution:
+
+| interval | p50 | p99 |
+|---|---|---|
+| a datagram's wait for its stream's accept | 7–8 µs | 12–90 µs |
+| a lane admitted inside the receive callback | 27 µs | 39 µs |
+| a stream's first byte waiting for the wire (dwell) | 2–11 µs | 0.2–0.5 ms |
+| the pump's post to the socket | 10–25 µs | 20–104 µs |
+| the client's spawn → first poll (`started_us`) | **4–12 µs** | — |
+| the client's dequeue → prologue (`cmd_us − ready_us`) | ~0 | — |
+| the per-stream handshake, every open | 1.34–1.38 ms | 1.78 ms |
+| the server's pairing (`paired`) | 1.5–1.9 ms | 2–6 ms |
+| the server's first forwarded byte (`first`) | 19–22 µs | 37–46 µs |
+
+Add the medians and an arrival costs about **three milliseconds**. The cell it was
+measured in reports **p99 44.5, 50.7, 53.9 ms** in its three warm rounds (and 219 ms in
+the round that starts the process) — ten to a hundred times the sum of every stage.
+
+**So the tail is not in the arrival at all.** It is in what the probe does after its
+request has been forwarded: the 64-byte echo has to come back through the client, the
+backend and the carrier before the probe can stop its clock, and the probe's sample is
+the whole round trip. The instruments above stop at "the server forwarded the first
+byte" — which is why a cell can read tens of milliseconds while every one of them
+reads microseconds.
+
+That also reconciles the population sizes that have been nagging this file: the slow
+*opens* are rare (13 in four minutes, about one arrival in four hundred, at 5–83 ms),
+while the probe's p99 is slow in *every* round, so the two cannot be the same
+phenomenon. One is a rare handshake, the other is a common return path.
+
+**Pre-registered next instrument**: split the probe's own round trip at the boundary
+this cycle has never timed — from the forwarding of the request to the visitor's echo
+being read back. On the server that is `first_*` plus the return; on the client it is
+the response direction's own path. The gate is the same as always: the interval's
+distribution, then whatever it names, judged on its own A/B.
+
 ### The tail is a transport delay, and the timer only marks its boundary (2026-11-05)
 
 The accept queue is not the wait: a stream waits **p50 7 µs, p99 12–14 µs** between

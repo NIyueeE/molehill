@@ -1279,6 +1279,15 @@ fn spawn_dispatcher(
                         return;
                     }
                     {
+                        // How much of the *receive callback* goes into
+                        // admitting a lane: the registry lock, the admission
+                        // table, a `Conn`, a `Shared`, a spawned sender task and
+                        // two insertions. All of it runs before the next `recv`
+                        // of this batch, so bulk traffic and a new lane's first
+                        // packet share one task's critical section — which is the
+                        // last candidate for the handshake delay the slow-open
+                        // population shows below the retransmission floor.
+                        let admitting = Instant::now();
                         let mut table = registry.lock();
                         if !admit(&mut table, packet.id) {
                             return;
@@ -1312,6 +1321,7 @@ fn spawn_dispatcher(
                         // lane itself is dropped here, which closes its
                         // connection.
                         let _ = tx.send(lane);
+                        crate::transport::stats::note_lane_admit(admitting.elapsed());
                     }
                 }) => read,
             };

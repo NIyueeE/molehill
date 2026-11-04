@@ -253,6 +253,14 @@ static POSTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// timer — the handshake would read fast and the arrival would still be slow.
 static ACCEPTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// How long one lane's admission took inside the dispatcher's receive callback.
+///
+/// The receiving end's third hop, and the one that is not a hop so much as a
+/// critical section: while it runs, the next datagram of the same batch is not
+/// read. If this is milliseconds, a new lane's first handshake packet waits
+/// behind it and the client pays its own timer.
+static ADMITTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 /// The most dwell samples one reporting window keeps.
 const DWELL_WINDOW_MAX: usize = 65_536;
 
@@ -724,6 +732,30 @@ pub(crate) fn note_accept_age(age: Duration) {
     }
 }
 
+/// Record one lane's admission time, in microseconds.
+pub(crate) fn note_lane_admit(wait: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = ADMITTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's admission samples, sorted, and leave it empty.
+fn take_lane_admit() -> Vec<u32> {
+    let mut samples = ADMITTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Take the window's accept-age samples, sorted, and leave it empty.
 fn take_accept_age() -> Vec<u32> {
     let mut samples = ACCEPTED
@@ -941,6 +973,17 @@ fn report_send_path() {
             accept_p99_us = pct_us(&accepted, 99, 100),
             accept_max_us = accepted.last().copied().unwrap_or(0),
             "mhd-stats: a stream waiting for its accept"
+        );
+    }
+    let admitted = take_lane_admit();
+    if !admitted.is_empty() {
+        let n = admitted.len();
+        info!(
+            n,
+            admit_p50_us = pct_us(&admitted, 50, 100),
+            admit_p99_us = pct_us(&admitted, 99, 100),
+            admit_max_us = admitted.last().copied().unwrap_or(0),
+            "mhd-stats: a lane admitted inside the receive callback"
         );
     }
 }
