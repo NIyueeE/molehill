@@ -1736,6 +1736,10 @@ does not, the first stage is host-bound and this file says so.
 
 ### In flight: eight workers against sixteen (2026-11-04)
 
+**Progress while it runs**: at half scale the discriminating condition is present, so the
+comparison will mean something — arm A (eight workers) reads `open_p50` **18 108 µs** in its
+first ninety seconds and **1 151 µs** in its last.
+
 The A/B the previous entry calls for is running as this entry is written: two binaries
 built from the same tree, differing only in `DEFAULT_WORKERS` (8 and 16, both `min`-clamped
 to the core count), run as three arms in one campaign so the A/A twin measures the same
