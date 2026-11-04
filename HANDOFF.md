@@ -1865,6 +1865,38 @@ elapsed time on its first iteration, and again whenever it goes a second without
 direction that never logs its first iteration is a task that was never polled, and that is a
 different fix from one that reads and writes and loses the bytes.
 
+### The sealed path has more than one remaining defect, and that is the answer to "how far" (2026-11-04)
+
+The first-frame line answers the question it was built for, and the answer is *both*:
+
+```
+stripe send: first frame read group=4294967297 bytes=32768   <- request direction starts
+stripe send: first frame read group=2 bytes=32768            <- response direction starts
+Error: echo service closed after 3844608/8388608 bytes
+```
+
+In this run the response direction **did** start, read 32 KiB and carried 3.8 MB before the
+visitor's socket closed — where the previous run showed no response line at all. So the sealed
+path's remaining failure is not one defect: there is at least one in which a direction never
+starts and one in which it starts and stops early, and they appear in different runs of the
+same build.
+
+**That settles how far this arc is from landing**: not one fix away, and not measurable as a
+single rate until each shape is separated. The instrument to separate them exists now (role-
+tagged group ids, first-frame lines, per-direction frames/bytes, the grace's residue), and the
+work of chasing each shape is its own arc — one this cycle has already spent twenty-five
+rounds on and cannot finish by continuing to patch the same test.
+
+**The decision this file records, and why**: the sealed design stays parked. What it proved is
+real (handshake 1 771 µs → 14, `churn-16` p99 −63 %), its cost is real (bulk −62 %), and its
+blocker is a channel-lifecycle problem with at least two shapes. Landing it needs its own
+cycle with the instruments now in place, not another patch inside this one.
+
+**What this cycle leaves behind instead** is on the current tree, all measured and all
+independent of sealing: the credit-wedge fix (five stages restored, `clean` 78 → 3.5 ms), the
+grace fix, the per-stream sealing rule and prologue that made the diagnosis possible, the
+worker default, four harness fixes, and a 0.3-scale sweep that passes `bench gate`.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
