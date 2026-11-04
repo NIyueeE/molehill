@@ -1820,6 +1820,18 @@ If those agree, the layer read everything and its frames went elsewhere. If they
 reader stopped with bytes still available — and that is a reader-park or a wake problem in
 `lane.rs`, not in the carrier's close path. Either way the next entry quotes a line.
 
+### `just check` cannot run while the advisory database is unreachable (2026-11-04)
+
+`just check` stops at its first step: `cargo audit` fetches
+`github.com/RustSec/advisory-db` and the fetch fails. The audit itself passes offline —
+`cargo audit --no-fetch` loads 1 403 advisories from the cached copy and finds nothing — and
+the rest of the chain was run by hand: `cargo fmt --check` clean, `cargo clippy
+--all-targets` with no warnings, the library suite 344 passed, the tree clean.
+
+So the tree is sound and the gate is blocked by the network, which is what this file has
+recorded before. Nothing about the carrier depends on it, but no commit should be described
+as "gate-green" today without saying which half of the gate ran.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
