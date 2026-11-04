@@ -2051,6 +2051,23 @@ not a stage-level defect; it is something about the run's end, and the only inst
 see it is one placed at the *stage boundary* — the pool's state and a single served visitor —
 rather than inside the carrier, where every counter reads clean.
 
+### The boundary now asks the tool to serve a visitor (2026-11-04)
+
+Five rounds of instruments inside the carrier have each ended the same way: the counters read
+clean while the stage carries nothing, because a loop parked for ever logs nothing and a stage
+that never gets data never moves a counter. So the question moved outside the tool.
+
+Before every stage's condition and before its own traffic, the harness now connects to the
+**echo** service through the tool, sends one byte, reads the echo back, closes, and records the
+outcome and the time in the sample's evidence (`echo_probe`). One connection, three seconds at
+most, no effect on the stage it precedes.
+
+That is the instrument the last round's entry asked for: at the boundary, `ok` in milliseconds
+means the tool was serving visitors and the stage's own client is what failed; `fail` or `eof`
+means the tool had stopped, and then the carrier's silence is the thing to explain. **`clean#2`
+is where it will be read first**, because that stage fails for being last and nothing inside it
+can say why.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
