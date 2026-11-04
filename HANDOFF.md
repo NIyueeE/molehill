@@ -2164,6 +2164,36 @@ minute it was measured in. Two consequences the plan has to face:
 `clean#2`, for its part, is stable to 1 % at the median across the two rounds — so the *last*
 stage is not the noisy one. The noise belongs to the stage that starts a run.
 
+### The sealed failure is the *backend* stopping, not the carrier (2026-11-04)
+
+With the read deadline in place, the sealed striped test's failure finally names its own shape:
+
+```
+stripe send: first frame read group=2 bytes=32768
+stripe source read has not returned for two seconds group=2 frames=119 bytes=3844608   (x3)
+Error: echo service closed after 3844608/8388608 bytes
+```
+
+Two things match exactly: **the group read 119 frames / 3 844 608 bytes and then its source stopped
+delivering**, and **the visitor received 3 844 608 bytes**. The direction is the *client's* response
+path, whose source is the local **echo backend** — the bench's own Python service.
+
+So the flow did not stall inside the carrier: the carrier delivered every byte it was given, and
+then waited for a source that never sent the rest. The request side had already crossed in full
+(8 388 608 bytes, both counters agreeing), so the backend had eight megabytes to echo and stopped
+after 3.8.
+
+**That reframes the whole remaining investigation.** The "flow that never starts" the boundary
+probe left open is, at least in these runs, **a bench backend that stops echoing under load** —
+and the same backend serves the churn probe, whose thirty-six arrivals a second kept working
+because each connection is small and quick. A bulk echo through one core, with the run's own load
+on the same host, is a different matter.
+
+**The test that decides it is one line of grep away**: if `stripe write waited` never fires in the
+same failure, the client was not blocked writing into the stripes and was genuinely waiting for its
+backend; if it does fire, the frames had nowhere to go and the carrier is implicated again. That is
+the first thing the next round does, and it costs one nine-second run rather than a sweep.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
