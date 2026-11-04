@@ -480,6 +480,29 @@ pub(crate) fn note_pairing_done() {
     PAIRINGS_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Groups that lived long enough to carry something and carried almost nothing.
+///
+/// A flow can fail without a single counter moving: the visitor pairs, its first read
+/// returns bytes, no write is refused, nothing stalls — and the transfer carries
+/// kilobytes over seconds. Counting those groups is what turns "the stage lost its
+/// bulk" into a number per second.
+static GROUPS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GROUPS_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a group must have lived, and how little it must have carried, to count
+/// as starved. Five seconds and sixty-four kilobytes: a group that moved less than
+/// that was not slow, it was stopped.
+const STARVED_AFTER: Duration = Duration::from_secs(5);
+const STARVED_BYTES: u64 = 64 * 1024;
+
+/// Record one group's lifetime and what it carried.
+pub(crate) fn note_group(bytes: u64, alive: Duration) {
+    GROUPS_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if alive >= STARVED_AFTER && bytes < STARVED_BYTES {
+        GROUPS_STARVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Stripe groups the client gave up on, and pairings the server gave up on.
 ///
 /// Both ends of the same failure: a group that never gathered every stripe on the
@@ -685,6 +708,15 @@ fn report_starvation() {
         info!(
             accepted,
             paired, "mhd-stats: visitors that reached the pairing, and pairings that returned"
+        );
+    }
+    let groups = GROUPS_DONE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let starved_groups = GROUPS_STARVED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if groups > 0 {
+        info!(
+            groups,
+            starved = starved_groups,
+            "mhd-stats: groups finished, and how many carried almost nothing"
         );
     }
     let reaped = STRIPES_REAPED.swap(0, std::sync::atomic::Ordering::Relaxed);

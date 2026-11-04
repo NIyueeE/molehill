@@ -389,6 +389,8 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     group: u64,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let mut sent = 0u64;
     let mut seq = 0u64;
     // The two halves of a forwarded chunk, timed only while the switch is on.
     // They answer a question no carrier counter can: a stalled tunnel stream may
@@ -458,9 +460,16 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         activity.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
         seq += 1;
+        sent += n as u64;
     }
     sender.finish().await;
-    debug!(group, frames = seq, "stripe send direction finished");
+    crate::transport::stats::note_group(sent, started.elapsed());
+    debug!(
+        group,
+        frames = seq,
+        bytes = sent,
+        "stripe send direction finished"
+    );
     Ok(())
 }
 
