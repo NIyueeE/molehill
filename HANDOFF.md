@@ -1451,6 +1451,37 @@ receiver finished its half before the peer finished sending, which is what let t
 of the response be dropped as "unknown stream" — the path that documents itself in
 `apply_datagram` as *"a retired stream"*.
 
+### The acknowledgement covers bytes the visitor never got (2026-11-04)
+
+The close line with the peer's frontier answers it, and the answer is not in the layer:
+
+```
+mhd stream closed stream=7 written=2097800 next=2097800 acked=2097800 unsent=0
+    peer_fin=false local_fin=true      (x4 lanes, 8 390 020 bytes total)
+Error: echo service closed after 4791296/8388608 bytes
+```
+
+A stream only reaches that line when `unacked` is zero, so `acked == written` means **the
+peer said it had every byte of all four streams** — and the visitor received 4.8 MB of
+8.4. **The acknowledgement covered bytes the application never received.**
+
+The mechanism is in `Conn::release_unread`, and its own comment says why it exists: a
+stream that ends holding bytes nobody read must give the window back, or a lane narrows
+by one dead stream at a time. It calls `advance_read(held)`, which is honest for the
+**window** and a lie for **delivery**: the peer's frontier for that stream moves past
+bytes that were discarded, so the sender retires the stream believing they arrived.
+Nothing retransmits, nothing counts a gap, and the visitor simply gets less.
+
+**The fix is one rule**: bytes that are discarded rather than read must end the stream
+with a **reset**, not an acknowledgement. The peer then knows those bytes were not
+delivered, the sender's frontier stays behind them, and a repair or an error surfaces
+instead of a silent truncation.
+
+**This is not a sealed-path defect.** It is the plain carrier's rule, and the plain
+paths survive it only because their readers normally drain before a stream is released;
+the sealed design shifted that timing, which is why a nine-second test now fails a third
+of the time and the whole release gate has been chasing it for eighteen rounds.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
