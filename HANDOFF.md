@@ -1310,6 +1310,36 @@ receive direction now tallies frames seen and frames delivered, and the send dir
 tallies frames and bytes, so a group that ends after one frame while the visitor still
 has megabytes queued is a single line away.
 
+### Two failure modes, told apart by the group id (2026-11-04)
+
+With the group id on every lifecycle line, three runs of the sealed striped test say
+what one line could not:
+
+| run | outcome | what the groups did |
+|---|---|---|
+| 1 | **passed** | group 6 sent 258 frames / 8 388 608 bytes and received 258 |
+| 2 | failed at **465 920** | groups 1 and 2 each carried **one frame of 4 bytes** — the pool probes — and no group carried the transfer at all |
+| 3 | failed at **4 939 776** | group 3 sent 8 388 608 and group 4 received 257 frames, then group 4 sent 257 back; the response stopped at 4.9 MB |
+
+**So there are two defects, not one.**
+
+- **Mode A — the transfer's group never starts.** The visitor is accepted and its socket
+  buffer fills with 465 920 bytes while the only groups in the log are the pool probes.
+  Whatever the server paired is not the group that carries the visitor.
+- **Mode B — the response truncates part-way.** The request completes (8 388 608 bytes
+  across a group), and the response's own send direction stops at 4.9 MB with no gap in
+  its receive direction (`frames == seen`), so the *source* ended: the client's read of
+  the backend returned EOF early.
+
+Both are start-up ordering defects in the layer, both reproduce in nine seconds, and
+they need different instruments: mode A wants a line at the pairing's end carrying the
+group it spawned, and mode B wants the client's send direction to say *why* its source
+ended — EOF from the backend socket, or an error.
+
+**For the record**: this test passes about one run in three. It is not a broken design
+and it is not a fixed byte; it is a race with two outcomes, which is why single runs
+have misled this file twice.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
