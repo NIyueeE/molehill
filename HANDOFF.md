@@ -2194,6 +2194,37 @@ same failure, the client was not blocked writing into the stripes and was genuin
 backend; if it does fire, the frames had nowhere to go and the carrier is implicated again. That is
 the first thing the next round does, and it costs one nine-second run rather than a sweep.
 
+### The grep answered: the client was waiting for its backend (2026-11-04)
+
+The one-line test the previous entry asked for, on a failure caught in four runs of the rebased
+sealed tree:
+
+```
+stripe write waited                                  count: 0
+stripe send: first frame read group=2 bytes=32768
+Error: echo service closed after 793600/8388608 bytes
+```
+
+**Zero.** The client's send direction never blocked writing into the stripes, so the frames had
+somewhere to go and the loop was genuinely waiting for its **source** — the bench's local echo
+backend. That confirms the previous entry's reading rather than the carrier's.
+
+**So the sealed striped test's remaining failures are, in these runs, the bench backend stopping
+under load**, not the carrier failing to carry. That does not make the sealed design landable — it
+still needs the lifecycle shapes separated and its 8/8 — but it does mean the last several rounds
+were measuring the load generator.
+
+**PAUSED HERE at the user's request (round 72).** State as left:
+
+- branch `feat/v1.0.0`, tree clean, `just check` green, HEAD `810f913`;
+- the parked sealed tree is `~/tmp/stage3-sealing-parked.patch` and applies to today's HEAD with
+  one conflict in `stripe.rs`'s send tail, resolved by keeping `note_group` plus the group id;
+- the gate's last full-scale run: **eight of eight stages measured**, `clean` 6.06 / 134.1 ms,
+  `clean#2` 1.89 / 3.91 ms, **one gate failure — the SLO on `clean`'s p99** — with that cell's
+  within-campaign spread measured at **12× at the median**;
+- the next step, in one sentence: **give the bench's echo backend enough capacity that it is not
+  the load, then re-run the sealed test to see whether it is eight of eight.**
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
