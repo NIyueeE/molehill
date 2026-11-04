@@ -1734,6 +1734,22 @@ binaries in one campaign, interleaved**, judged on the first stage's p99 and `bu
 sixteen wins outside the paired noise, the default moves and the first stage improves; if it
 does not, the first stage is host-bound and this file says so.
 
+### In flight: eight workers against sixteen (2026-11-04)
+
+The A/B the previous entry calls for is running as this entry is written: two binaries
+built from the same tree, differing only in `DEFAULT_WORKERS` (8 and 16, both `min`-clamped
+to the core count), run as three arms in one campaign so the A/A twin measures the same
+run's noise. Scenario: full-scale `timeline`. Result file when it lands:
+`~/tmp/m61-workers.json`.
+
+The binaries are saved so the comparison can be repeated without rebuilding:
+`~/tmp/molehill-8w` and `~/tmp/molehill-16w` (distinct, verified by hash).
+
+**What decides it**: the first `clean` stage's p99 against the run's own A/A floor, with
+`bulk-n` inside 15 % as the throughput guard. If sixteen does not win outside that floor,
+the first stage is host-bound and the entry above stays as it is — the honest answer, and
+the one that has to be written rather than a change made anyway.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
