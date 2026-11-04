@@ -2513,6 +2513,47 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
+### The arrival's tail is not in the carrier's send path (2026-11-05)
+
+Every instrument the carrier owns now reads microseconds at full scale, and the
+arrival still reads a hundred:
+
+| what | client | server |
+|---|---|---|
+| a stream's first byte waiting for the wire (dwell) | p50 **2–4 µs**, p99 ~0.5 ms | p50 **9 µs**, p99 0.14 ms, max 12–70 ms |
+| the pump's post to the socket | p50 **11 µs**, p99 20 µs, max 0.18 ms | p50 20 µs, p99 **35 µs**, max 0.35 ms |
+| a stream's reader parked for bytes | p50 131 µs, p99 **46 ms**, max **2 s** | p50 64 µs, p99 45 ms, max 2 s |
+| the per-stream Noise handshake, every open | p50 **1.0–1.45 ms**, p99 **23–107 ms** | *(not kept on this side)* |
+
+Read together with the earlier attribution — `us == hs_us` for every slow open,
+share 1.000 — the handshake is still the whole of an arrival's cost, and its p99
+(107 ms) is the arrival's p99 (112.85) to within a few percent. What is new is
+that **the handshake's time is not being spent in either end's send path**: the
+buffers drain in microseconds and the pump's post never exceeds a third of a
+millisecond. So the wait is the interval between a handshake record being written
+and the peer's reply being *read* — two task crossings per message, and the reader
+parked across them (p99 46 ms, and a 2 s tail that is the keepalive interval to the
+microsecond, i.e. a reader that missed its wake-up and waited for the pump's own
+timer).
+
+The same asymmetry says it is not the wire: of 1 191 slow client opens, only **50**
+were slow on the server's own clock (its `selector + handshake + hello`, under 5 ms
+in the other 1 141). Both directions would be slow if the path were; one side is.
+
+Which makes the lever *fewer task crossings per arrival*, not a faster stage — and
+that is what sealing does (it deletes both handshake messages and the round trip
+they wait on), and why the scheduler work is secondary: a class-aware order cannot
+help a packet that is already on the wire while its reader sleeps.
+
+**And the second failed experiment is recorded.** The opening reserve, taken off
+every bound, was measured interleaved against the build without it on a quiet host
+(load 0.32): `clean` read **5.98 / 146.03 ms** with it and **2.35 / 25.79** without,
+while `clean#2` was identical to 0.3 %. The comparison is order-confounded — one
+round, two arms run one after the other, on a cell this file has measured at 25.79
+and 112.85 for the *same* binary — so it is not a claim about the mechanism. It was
+enough to revert, because a change with no demonstrated benefit and a large
+apparent harm does not get to stay while someone looks for a better measurement.
+
 ### The sealed deadlock is a repair loop, and the instrument was lying twice (2026-11-04)
 
 Two instrument defects came out of following the stall, and each of them had been
