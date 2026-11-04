@@ -1375,6 +1375,37 @@ instead of after a KK, so the window in which the writer blocks closes. The next
 should therefore **measure the gap between the server's first write and the client's
 `group started`** — one timestamp each — rather than add another theory.
 
+### The frames are all delivered, and the visitor still loses megabytes (2026-11-04)
+
+One run, both directions, group ids with the role bit:
+
+```
+stripe source ended: eof group=1 frames=257           <- client: its backend had 257 frames
+stripe send direction finished group=1 frames=257     <- client sent all 257, 8 388 608 bytes
+stripe receive direction finished group=2 frames=257 seen=257   <- server received all 257
+Error: echo service closed after 1892352/8388608 bytes
+```
+
+**Every frame was sent, every frame was received, and the visitor still saw 1.9 MB.**
+`recv_loop` writes its payloads with `write_all`, which cannot silently drop bytes, and
+no write or read parked for even twenty milliseconds (`stripe write waited` and
+`stripe read waited` are both absent from all three runs). So the loss is not in the
+layer and not in the carrier: it happens **after** the bytes are in the visitor's socket
+— which leaves one mechanism with a name: the connection is closed with unread data
+still on it, and TCP answers that with a reset, discarding everything the peer has not
+read yet.
+
+That fits every number this investigation has produced: the amount lost varies with how
+much was in flight (0.14–6.2 MB across runs), a retried run can pass because the timing
+differs, and the buffer the visitor *did* fill is a socket buffer, not a frame count.
+The request direction is the one with unread data — the server never reads the visitor
+when its group ends — so the reset lands on the response.
+
+**The fix to try is therefore not in the sealed design at all**: a group that ends must
+drain its source, or close the read half before the write half, so the peer is not reset
+with unread data. That is a rule the archive already states as binding — "FIN/reset/close
+must not overtake queued data" — and this is the second time this cycle has met it.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
