@@ -1646,16 +1646,28 @@ state and not the handshake's cost on a quiet lane: it is what a *cold* process 
 establish four lanes, a control session and its first channels while the churn probe is
 already arriving.
 
-That reframes the remaining work as a **cold-start** problem, which is legitimate to fix —
-the plan forbids adding a warmup *stage to pass the gate*, and this run is a measurement,
-not a gate result; it stays out of any record. What it licenses is the question the next
-rounds should answer: **where does a cold process spend its first second**, and can the
-four lanes be established concurrently rather than one after another, with the arrivals
-that are already waiting served by the first one instead of the fourth.
+**Two readings since then sharpen it, and both refute the obvious next step.**
 
-The measurement is in the logs already: `pool-stats: tunnel pool established tunnels=4
-established=4` is one line, and the time from process start to it is the number that must
-come down.
+1. **Establishment is not the cost.** The client's own log: control session at **+1.5 ms**,
+   `pool-stats: tunnel pool established tunnels=4 established=4` at **+46 ms**. Four lanes
+   in forty-six milliseconds, and `establish_initial` already spawns them concurrently in
+   one `JoinSet` — so "the lanes are built one after another" was never true, and there is
+   nothing there to win.
+2. **The first stage is not slow from the start.** Its first two windows read
+   `paired_p50` **1 111 and 1 094 µs** with 5 and 24 arrivals; from the third window on it
+   is **4 865–13 360 µs** at 34–37 arrivals a second and stays there for the whole stage.
+   The break happens about a second in, when the churn probe reaches full rate and the
+   bulk spine starts.
+
+So the slow phase is **load**, not cold start, and it is not the arrival rate either: the
+last stage carries the same 36 arrivals a second over the same bulk spine and reads
+1 166 µs. Something differs between the first minute of a run and the twentieth with the
+same offered load, and that difference — not the handshake, not establishment — is what
+the next round measures: the same counters (`dwell`, reader park, lock, `credit_blocked`)
+compared at minute one and minute twenty, to find which one carries the factor of ten.
+
+That is a measurement, not a theory, and the plan's ban stands untouched: no warmup stage,
+no deleted first stage.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
