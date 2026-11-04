@@ -2225,6 +2225,25 @@ were measuring the load generator.
 - the next step, in one sentence: **give the bench's echo backend enough capacity that it is not
   the load, then re-run the sealed test to see whether it is eight of eight.**
 
+### The bench's echo backend can deadlock, and that is what the sealed test measured (2026-11-04)
+
+The harness's echo service is one thread per connection, alternating `recv` and `sendall`. A
+**full-duplex bulk echo** deadlocks it as soon as both directions fill: the peer stops reading
+because it is writing, and the thread stops reading because it is writing. The signature is exactly
+what the last rounds chased — a transfer that stalls after a few megabytes and never resumes, while
+a small request is answered in milliseconds, and the carrier's own counters reading clean because
+the source simply stopped delivering.
+
+**Not yet fixed.** The fix is to give each connection a reader thread feeding a bounded queue and a
+writer thread draining it, so the two directions cannot block each other. It is written out here
+because the pause came first; the tree is clean and nothing half-applied was left behind.
+
+**Why this matters beyond the harness**: three rounds of carrier work — the read deadline, the
+first-frame line, the boundary probe — were all built to explain a stall that was, in the end, the
+load generator. They were worth building (they are what proved it), but the lesson is the one this
+file keeps earning: **check that the instrument is not the bottleneck before measuring the thing
+under it.**
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
