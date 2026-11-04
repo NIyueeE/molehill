@@ -1527,11 +1527,22 @@ datagrams was dropped, and `apply_datagram`'s own comment says why that is invis
 packet is still acknowledged, because a sender that keeps re-sending an unacknowledged
 packet counts ten unanswered retransmissions and declares the lane dead.
 
-**So the two ends disagree about whether the lane's first stream is finished.** That is
-Mode A, stated as an identity rather than a shape: on the client the first stream becomes
-a pooled data channel, on the server it is validation-only and is retired when the
-prologue is done. A visitor whose channel lands on it carries nothing, and the log says
-nothing except five lines at `debug`.
+Reading the carrier's own plumbing corrects the guess that stood here: `CarrierStream` is
+`Box<dyn CarrierIo>` and a data channel **is** a stream on the lane, so `stream=1` is
+simply the first channel the client ever opened — not a validation stream. And the server
+retired it because **its visitor finished**, which is the normal end of a channel: the
+server's side of a channel serves exactly one visitor, and when that visitor goes the
+stream is retired.
+
+**So the defect is channel reuse across visitors.** The client's pool takes a channel back
+after its visitor ends and hands it to the *next* visitor's group, while the server has
+already retired that stream. Every frame the new visitor's group writes into it is dropped
+by the receiver with five lines at `debug`, and the visitor carries nothing.
+
+That is Mode A as an identity: **a channel outlives its server-side stream**, and the
+second visitor — the one the back-to-back phase creates — is the one that pays. The fix is
+a rule about ownership: a channel must not return to the pool once its stream is closed;
+it must be replaced, and the two ends must agree on when that happens.
 
 **The next step is a decision, not an experiment**: either the first stream is a data
 channel on both ends (and the server must not retire it), or it is validation-only on
