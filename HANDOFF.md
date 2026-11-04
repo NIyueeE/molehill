@@ -1771,6 +1771,32 @@ The binaries are saved so the comparison can be repeated without rebuilding:
 the first stage is host-bound and the entry above stays as it is — the honest answer, and
 the one that has to be written rather than a change made anyway.
 
+### There is no channel reuse in the pool — the third wrong mechanism in a row (2026-11-04)
+
+`StreamLease` holds `stream: CarrierStream`: a **stream**, not a cached connection. Its
+`Drop` decrements a counter and wakes the capacity waiters; nothing goes back on an idle
+list, because there is no idle list. `open_stream` builds a new stream every time.
+
+So the entry two rounds ago — "the pool takes a channel back after its visitor ends and
+hands it to the next visitor" — **is wrong and is withdrawn**, and with it the contract
+that entry proposed. That is the third mechanism in this area to be refuted by reading the
+code after being written down as a finding (the validation stream, the false ack, and now
+reuse). The pattern is clear enough to state as a rule for this file: **an instrument
+finding names a symptom; only the code names a mechanism.**
+
+What the evidence actually says, with the reuse story gone: the server retires stream 1
+because its own group ended — `pair_striped_group` hands `read` and `write` to
+`spawn_group_tagged`, and when both directions finish the group's channels are dropped, each
+`StreamIo` calling `close_stream`. The client, still holding its side of that stream, writes
+into a stream whose peer is gone, and every such datagram is dropped with a debug line. So
+the question is not who *reused* the channel but **which side ended it first, and whether it
+was entitled to** — and that is a question about the stripe layer's two directions, which
+the frame and byte counters are already placed to answer.
+
+**No code change this round.** The next attempt starts from that corrected question, and it
+does not get to skip it: three wrong mechanisms in one area is enough evidence that the
+next sentence written here about the sealed path must quote a line of code.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
