@@ -1250,18 +1250,27 @@ stripe half-close grace expired; cutting the other direction      <- seven secon
 Error: echo service closed after 5184512/8388608 bytes
 ```
 
-**The layer carried all 257 frames and 8 388 608 bytes in both directions**, the readers
-ended cleanly at frame boundaries, and *then* the half-close grace expired and cut the
-other direction. So the bytes the visitor never saw were not lost in a frame, a stream
-or a credit path: they were discarded when a direction was **cut while it still had
-work**, which is a rule the archive already states as binding — "FIN/reset/close must
-not overtake queued data".
+Read carefully, that trace says less than it seems and something important:
 
-That makes the next attempt a small, local one: the grace's job is to stop a
-half-closed group waiting for ever, and it is currently allowed to cut a direction that
-has written frames the peer has not confirmed. Giving the grace a *drain* predicate —
-the peer's read has caught up with what this end wrote — is the fix to try, and it is
-testable in the one nine-second test that reproduces this.
+- **One** direction logged `seq=257 bytes=8388608`; the log does not say which, and the
+  other direction logged only `finished after 257 frames` with its readers ending at
+  `last_seq` 253–256. So at least one direction's readers ended **before the last
+  frame**, which is a gap the reorder queue cannot fill.
+- The grace is **10 s, started when the first direction ended** (17.93 → 28.04 in the
+  trace), and it does not drain: it aborts the other direction outright.
+
+So the two candidate mechanisms are now distinguishable and neither is guessed: a frame
+that never arrived on its stripe (leaving `last_seq` short), or a direction aborted at
+the grace with frames still buffered. What is certain is that a close overtook data,
+which the archive already states as binding — "FIN/reset/close must not overtake queued
+data".
+
+**The instrument that separates them is one counter per direction**: frames expected
+(the highest `seq` seen plus one) against frames delivered in order, logged when the
+grace fires. A gap in one stripe and a truncated direction look identical in the
+visitor's byte count and completely different in that number — and the fix differs
+with it: a drain predicate on the grace for the second, a missing-frame repair for the
+first.
 
 **And a correction this cycle has now made twice**, worth stating once: a single repeat
 is not a mechanism. Two runs at the same byte looked like determinism; a third run
