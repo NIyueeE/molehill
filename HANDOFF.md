@@ -1277,6 +1277,39 @@ is not a mechanism. Two runs at the same byte looked like determinism; a third r
 dissolved it. The instrument that would have shown it is a repeat count, and the rule
 is to run the failing test three times before naming a number.
 
+### The sealed striped failure is intermittent, and a direction ends after one frame (2026-11-04)
+
+Three runs of the same tree, in a row, on the nine-second test:
+
+| run | outcome |
+|---|---|
+| 1 | **passed**, 56 s |
+| 2 | failed at **465 920** of 8 388 608 |
+| 3 | failed at **465 920** |
+
+So it **can pass** — the design is not broken, the layer has a race — and when it fails
+it lands on the same byte. That is the shape of a start-up ordering defect, not of a
+missing feature, and it is the first time this work has produced a *pass*.
+
+What the trace adds:
+
+```
+stripe receive direction finished after 1 frames
+Error: echo service closed after 465920/8388608 bytes
+```
+
+A group's receive direction ends after **one frame**, and the visitor is left with
+465 920 bytes — which is a kernel socket buffer, not a coincidence: the tool read
+almost nothing before the group closed under it. The half-close grace never fired in
+these runs (no `grace` line at all), so the loss is not the grace and not a truncation
+this time: a direction reached its own clean end far too early.
+
+**465 920 is therefore the size of an untouched receive buffer**, and the number to chase
+is not it but *who ended the group after one frame*. The instrument is in place: the
+receive direction now tallies frames seen and frames delivered, and the send direction
+tallies frames and bytes, so a group that ends after one frame while the visitor still
+has megabytes queued is a single line away.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
