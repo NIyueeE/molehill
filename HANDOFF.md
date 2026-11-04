@@ -1340,6 +1340,41 @@ ended — EOF from the backend socket, or an error.
 and it is not a fixed byte; it is a race with two outcomes, which is why single runs
 have misled this file twice.
 
+### The visitor's group exists, and its send direction never carries a byte (2026-11-04)
+
+Both instruments landed, and one more thing was needed to read them: **the group id
+collided between the two ends**, because both processes count groups from one and this
+test runs both in one process. The server now tags its groups `(1 << 32) | group`, and
+with that the three runs say the same thing:
+
+```
+DEBUG stripe: stripe source ended: eof group=1 frames=1              <- client, 4 bytes
+DEBUG stripe: stripe receive direction finished group=4294967296 frames=1 seen=1
+DEBUG ...: pair_striped_group: Visitor paired with a striped group group=1 stripe_count=4
+Error: echo service closed after 138240/8388608 bytes
+```
+
+Read as roles rather than ids:
+
+- the **client's** group sent one 4-byte frame and its source — the backend socket —
+  reached EOF, so the backend had four bytes to echo and nothing more;
+- the **server's** group (`4294967296`) exists, was paired with the visitor, and its
+  receive direction saw **one** frame;
+- the server's send direction **never logged a finish**, and the visitor's socket held
+  138 240 / 990 208 bytes when the test gave up.
+
+So the server read nothing from the visitor: its send loop is parked on the first frame
+it tried to write into a stripe. That is a *bounded* statement — the pairing is done,
+the group exists, and the first write blocks — and it points at the one thing that can
+block it: the peer's group had not started reading yet, so the frame waits on a stream
+nobody is draining.
+
+**That is exactly what a lane-level root would fix**, and it is the last mile of the
+parked design: with the handshake removed the peer's group starts in microseconds
+instead of after a KK, so the window in which the writer blocks closes. The next attempt
+should therefore **measure the gap between the server's first write and the client's
+`group started`** — one timestamp each — rather than add another theory.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
