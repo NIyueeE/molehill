@@ -605,15 +605,33 @@ def _dial(ctx: Ctx, params: dict) -> iperf.IperfDial:
     )
 
 
-def _iperf_cell(spot: Spot, result: dict, metrics: dict) -> Cell:
+def _iperf_cell(spot: Spot, result: dict, metrics: dict, lenient: bool = False) -> Cell:
+    """One bulk measurement's cell.
+
+    `lenient` is for a **staged** cell, where the bulk spine is one of several
+    measurements the same stage carried. A dead `iperf3` there must not delete
+    the arrivals that were measured beside it: the failure becomes a typed
+    absence on `throughput_gbps`, the stage stays readable, and the runner
+    retries the stage for the number it lost. A standalone bulk scenario keeps
+    the strict shape, because there the bulk measurement *is* the cell.
+    """
     if result.get("ok") is False:
-        extra = {"cmd": result.get("artifact"), "exit": result.get("exit")}
-        return Cell(
-            cell=spot.cell,
-            ok=False,
-            reason=result.get("reason", "unknown iperf3 failure"),
-            evidence=_evidence(spot.ctx, spot.window, extra),
+        reason = result.get("reason", "unknown iperf3 failure")
+        if not lenient:
+            extra = {"cmd": result.get("artifact"), "exit": result.get("exit")}
+            return Cell(
+                cell=spot.cell,
+                ok=False,
+                reason=reason,
+                evidence=_evidence(spot.ctx, spot.window, extra),
+            )
+        built = _counter_cell(
+            spot,
+            metrics,
+            {"artifact": result.get("artifact"), "exit": result.get("exit")},
         )
+        built.evidence["iperf_failure"] = reason[:200]
+        return built
     if not result:
         # No bulk spine at all (`streams: 0`): the throughput metric is a typed
         # absence rather than a zero, because a run that carried nothing must
@@ -1282,9 +1300,14 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
     with _RestoresCondition(ctx.topo, ctx.leg):
         cell = _measure_stage(ctx, stage, params, logs)
-        if cell.ok or not _instrument_failure(cell.reason):
+        # What the instrument said, whether it took the whole cell down with it or
+        # only `throughput_gbps`: a stage measured leniently still deserves the
+        # number it lost, and the reason to retry is the instrument's, not the
+        # cell's shape.
+        failed = cell.evidence.get("iperf_failure") or cell.reason
+        if not _instrument_failure(failed):
             return cell
-        first = cell.reason
+        first = failed
         # **What the path looks like at the moment it failed**, before the retry
         # changes it: whether the tool still answers on the port it just failed to
         # carry on. A stage that fails and is still reachable is a carrier that
@@ -1327,36 +1350,55 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     # the run says so instead of dialling iperf3 with `-P 0`.
     streams = int(params.get("streams", 4))
     result: dict = {}
+    # A bulk instrument that fails must not delete the stage. The arrivals were
+    # measured whether or not `iperf3` survived, and returning a failed cell here
+    # is how four stages of a 2026-11-04 release run lost the very number the SLO
+    # is stated on — including the last clean stage, whose p99 nobody could quote
+    # afterwards. So the failure becomes a typed absence on one metric, the stage
+    # still runs for its own hold, and the runner still retries it (see
+    # `instrument_failed`).
+    bulk_failure = ""
+    # Bound up front so every path below is total: each branch overwrites them,
+    # and a reader can see that the window is one value rather than four.
+    t0 = t1 = 0.0
     if streams > 0:
         with (
             measured(ctx, topology.ECHO_PORT) as window,
             iperf_sink(ctx, f"stage-{label}", port) as sink,
         ):
             if not sink.ready():
-                return Cell(label, False, reason="the iperf3 sink never started")
-            if not wait_dial_port(ctx, port):
-                return Cell(
-                    label, False, reason="the tool never listened on the iperf port"
+                bulk_failure = "the iperf3 sink never started"
+            elif not wait_dial_port(ctx, port):
+                bulk_failure = "the tool never listened on the iperf port"
+            else:
+                t0 = time.time()
+                result = iperf.iperf_result(
+                    iperf.IperfDial(
+                        port,
+                        host=ctx.arm.dial_host,
+                        argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
+                        omit=min(2, max(0, int(secs) // 4)),
+                    ),
+                    streams,
+                    secs,
+                    iperf_timeout(secs + 20),
+                    ctx.work / "iperf-raw" / f"{ctx.arm.id}-stage-{label}",
                 )
-            t0 = time.time()
-            result = iperf.iperf_result(
-                iperf.IperfDial(
-                    port,
-                    host=ctx.arm.dial_host,
-                    argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
-                    omit=min(2, max(0, int(secs) // 4)),
-                ),
-                streams,
-                secs,
-                iperf_timeout(secs + 20),
-                ctx.work / "iperf-raw" / f"{ctx.arm.id}-stage-{label}",
-            )
-            t1 = time.time()
+                t1 = time.time()
     else:
         with measured(ctx, topology.ECHO_PORT) as window:
             t0 = time.time()
             time.sleep(max(0.0, secs))
             t1 = time.time()
+    if bulk_failure:
+        # The spine could not even be dialed: hold the stage for the length the
+        # schedule asked for, so its arrivals are measured over that window
+        # rather than over an empty one, and take a fresh counter window.
+        with measured(ctx, topology.ECHO_PORT) as again:
+            t0 = time.time()
+            time.sleep(max(0.0, secs))
+            t1 = time.time()
+        window = again
     interaction = read_series(logs["interactive"], t0, t1)
     datagrams = read_series(logs["udp"], t0, t1)
     churn = read_series(logs["churn"], t0, t1)
@@ -1369,8 +1411,13 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     # bulk spine's and a run without one records its absence, not a zero.
     if result:
         stage_metrics["throughput_gbps"] = result.get("gbps_received_own_window")
-    built = _iperf_cell(Spot(ctx, window, label), result, stage_metrics)
+    # `lenient`: a failed bulk instrument leaves one metric absent instead of
+    # discarding the stage (see the note where `bulk_failure` is set).
+    built = _iperf_cell(Spot(ctx, window, label), result, stage_metrics, lenient=True)
     built.unavailable |= unavailable
+    if bulk_failure:
+        built.absent("throughput_gbps", bulk_failure)
+        built.evidence["iperf_failure"] = bulk_failure
     # Everything the stage's own samples said about themselves — the counts, the
     # within-window shape (`interactive_per_s`), the probe's own cadence, and the
     # rate the churn probe was asked for beside the one it achieved. A stage is
