@@ -747,6 +747,51 @@ where
     spawn_inner(src, dest, streams, plan, None)
 }
 
+/// The half-close grace: cut the surviving direction once the group has stopped.
+fn spawn_grace(
+    other: tokio::task::AbortHandle,
+    frames: std::sync::Arc<Frames>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let last = alive.load(std::sync::atomic::Ordering::Relaxed);
+        wait_until_idle(alive, last).await;
+        let highest = frames.highest.load(std::sync::atomic::Ordering::Relaxed);
+        let delivered = frames.delivered.load(std::sync::atomic::Ordering::Relaxed);
+        debug!(
+            highest,
+            delivered,
+            missing = highest.saturating_sub(delivered),
+            "stripe half-close grace: what the receive direction had left"
+        );
+        debug!("stripe half-close grace expired; cutting the other direction");
+        other.abort();
+    })
+}
+
+/// Wait until a group has made **no progress** for ten seconds.
+///
+/// The grace is for a direction that has stopped, not for one that is working: a fixed
+/// wait after the other direction ended cut a receive direction that was still
+/// delivering frames, and the visitors' bytes were then dropped at close with nothing
+/// counted as lost. `activity` is where progress is already recorded.
+async fn wait_until_idle(alive: std::sync::Arc<std::sync::atomic::AtomicU64>, mut last: u64) {
+    let mut idle = 0u8;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let now = alive.load(std::sync::atomic::Ordering::Relaxed);
+        if now != last {
+            last = now;
+            idle = 0;
+            continue;
+        }
+        idle += 1;
+        if idle >= 10 {
+            return;
+        }
+    }
+}
+
 fn spawn_inner<R, D, S>(
     src: R,
     dest: D,
@@ -802,6 +847,7 @@ where
         ));
         let send_abort = send.abort_handle();
         let recv_abort = recv.abort_handle();
+        let activity_for_grace = std::sync::Arc::clone(&activity);
         let monitor = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -852,20 +898,11 @@ where
                 } else {
                     send.abort_handle()
                 };
-                let frames = std::sync::Arc::clone(&frames);
-                grace = Some(tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    let highest = frames.highest.load(std::sync::atomic::Ordering::Relaxed);
-                    let delivered = frames.delivered.load(std::sync::atomic::Ordering::Relaxed);
-                    debug!(
-                        highest,
-                        delivered,
-                        missing = highest.saturating_sub(delivered),
-                        "stripe half-close grace: what the receive direction had left"
-                    );
-                    debug!("stripe half-close grace expired; cutting the other direction");
-                    other.abort();
-                }));
+                grace = Some(spawn_grace(
+                    other,
+                    std::sync::Arc::clone(&frames),
+                    std::sync::Arc::clone(&activity_for_grace),
+                ));
             }
         }
         if let Some(grace) = grace {
