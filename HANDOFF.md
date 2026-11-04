@@ -2513,7 +2513,7 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
-### Every stage of the arrival is microseconds, so the tail is after it (2026-11-05)
+### Every stage of the arrival is microseconds, and a second population is not (2026-11-05)
 
 The dispatcher's admission of a new lane — registry lock, admission table, `Conn`, a
 `Shared`, a spawned sender task, two insertions — costs **p50 27 µs, p99 39 µs**. That
@@ -2536,8 +2536,8 @@ Add the medians and an arrival costs about **three milliseconds**. The cell it w
 measured in reports **p99 44.5, 50.7, 53.9 ms** in its three warm rounds (and 219 ms in
 the round that starts the process) — ten to a hundred times the sum of every stage.
 
-**So the tail is not in the arrival at all.** It is in what the probe does after its
-request has been forwarded: the 64-byte echo has to come back through the client, the
+**So in these runs the tail is not in the arrival.** It is in what the probe does
+after its request has been forwarded: the 64-byte echo has to come back through the client, the
 backend and the carrier before the probe can stop its clock, and the probe's sample is
 the whole round trip. The instruments above stop at "the server forwarded the first
 byte" — which is why a cell can read tens of milliseconds while every one of them
@@ -2546,7 +2546,12 @@ reads microseconds.
 That also reconciles the population sizes that have been nagging this file: the slow
 *opens* are rare (13 in four minutes, about one arrival in four hundred, at 5–83 ms),
 while the probe's p99 is slow in *every* round, so the two cannot be the same
-phenomenon. One is a rare handshake, the other is a common return path.
+phenomenon. One is a rare handshake, the other a common return path.
+
+It is a statement about the runs that were measured, not about the carrier in general:
+an earlier full-scale run had a server-side `paired_p99` of **112 ms**, i.e. a tail
+inside the arrival. The two runs disagree about *where* the tail is because the tail
+moves — which is the same lottery this file keeps meeting, seen from the other side.
 
 **Pre-registered next instrument**: split the probe's own round trip at the boundary
 this cycle has never timed — from the forwarding of the request to the visitor's echo
