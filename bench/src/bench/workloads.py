@@ -48,11 +48,36 @@ UDP_PROBE = HERE / "probes" / "udp.py"
 #: (the transparency evidence: on L3 the backend must see the *visitor*), and
 #: echoes both protocols so one process serves every arm and every workload —
 #: the same backend, by three addresses, is what makes the arms comparable.
+#:
+#: **One thread alternating `recv`/`sendall` deadlocks on a full-duplex bulk
+#: echo**, and it did: both directions' socket buffers fill, so the peer stops
+#: reading because it is writing and this loop stops reading because it is
+#: writing, and the transfer stops a few megabytes in with every instrument on
+#: the carrier reading clean — because the source of the bytes had simply
+#: stopped delivering. A reader thread and a writer thread joined by a bounded
+#: queue cannot do that: the queue is the backpressure, each direction has its
+#: own thread, and a stall in one cannot park the other. The end of the stream
+#: travels through the same queue, so the writer cannot finish ahead of the
+#: bytes that preceded it.
 ECHO_SRC = """
-import socket, sys, threading
+import queue, socket, sys, threading
+from contextlib import suppress
 
 port = int(sys.argv[1])
 udp_port = int(sys.argv[2])
+
+#: How much the writer may fall behind the reader before the reader parks. Deep
+#: enough to keep a bulk echo streaming, shallow enough that a stalled writer
+#: cannot let this process hold tens of megabytes per connection.
+QUEUE_DEPTH = 64
+
+#: A connection that carried more than this has its totals announced, so a
+#: stalled transfer can be attributed to the backend rather than guessed at.
+#: Small connections stay silent: at four thousand arrivals a second a line per
+#: connection would make the log the load.
+ANNOUNCE_OVER = 64 << 10
+
+EOF = object()
 
 
 def udp_echo():
@@ -73,12 +98,68 @@ threading.Thread(target=udp_echo, daemon=True).start()
 def serve(conn, addr):
     sys.stdout.write(f"PEER {addr[0]}:{addr[1]}\\n")
     sys.stdout.flush()
-    with conn:
+    q = queue.Queue(maxsize=QUEUE_DEPTH)
+    done = threading.Event()
+    taken = [0]
+    given = [0]
+
+    def read_direction():
+        try:
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    return
+                taken[0] += len(data)
+                while not done.is_set():
+                    try:
+                        q.put(data, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+                if done.is_set():
+                    return
+        except OSError:
+            pass
+        finally:
+            # The end rides the queue, so it cannot overtake the data.
+            while not done.is_set():
+                try:
+                    q.put(EOF, timeout=0.2)
+                    return
+                except queue.Full:
+                    continue
+
+    def write_direction():
         while True:
-            data = conn.recv(65536)
-            if not data:
-                break
-            conn.sendall(data)
+            item = q.get()
+            if item is EOF:
+                return
+            try:
+                conn.sendall(item)
+                given[0] += len(item)
+            except OSError:
+                done.set()
+                # Unblock the reader: it may be parked in recv on a peer that
+                # is already gone, and a leaked thread per dead visitor would
+                # eventually be the load this process cannot carry.
+                with suppress(OSError):
+                    conn.shutdown(socket.SHUT_RD)
+                return
+
+    reader = threading.Thread(target=read_direction, daemon=True)
+    writer = threading.Thread(target=write_direction, daemon=True)
+    reader.start()
+    writer.start()
+    reader.join()
+    writer.join()
+    done.set()
+    with suppress(OSError):
+        conn.close()
+    if taken[0] > ANNOUNCE_OVER or given[0] > ANNOUNCE_OVER:
+        # Never starts with `PEER `: that prefix is the transparency evidence
+        # and nothing else may be mistaken for it.
+        sys.stdout.write(f"ECHO DONE read={taken[0]} wrote={given[0]}\\n")
+        sys.stdout.flush()
 
 
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -30,7 +30,7 @@ numbers that say why are on this page.
 |---|---|
 | 0 — converge this page | **done** (6 838 lines → this page + the archive) |
 | 1 — measurement baseline | **done** (per-stage attribution, the five-segment split, the committed windows) |
-| 2 — no per-visitor handshake (sealing) | **parked at 7 of 8 runs**; the design is proved (handshake 1 771 µs → 14) and the remaining failures trace to the bench's echo backend deadlocking on a bulk echo, not to the carrier |
+| 2 — no per-visitor handshake (sealing) | **parked at 7 of 8 runs**; the design is proved (handshake 1 771 µs → 14), and the remaining failures are **unattributed again**: the echo backend was cleared as their cause by measurement (see "the backend cannot have blocked") |
 | 3 — RACK + PTO | not started; the refusal mix is now known honestly (credit 64 %, window 29 %, age gate 7.5 %) |
 | 4 — internal scheduling | **refuted before starting**: the first stage's arrivals are not queued anywhere (dwell 0 µs, reader park 54 µs, lock 3 µs), so there is no queue to schedule |
 | 5, 6 — rate/BDP window, memory | not started |
@@ -2214,6 +2214,10 @@ under load**, not the carrier failing to carry. That does not make the sealed de
 still needs the lifecycle shapes separated and its 8/8 — but it does mean the last several rounds
 were measuring the load generator.
 
+> **Retracted below.** The next entry measures the backend and finds it cannot have
+> blocked: it accepts 19 MiB with the peer reading nothing. The observation this
+> paragraph rests on stands; the inference from it does not.
+
 **PAUSED HERE at the user's request (round 72).** State as left:
 
 - branch `feat/v1.0.0`, tree clean, `just check` green, HEAD `810f913`;
@@ -2223,26 +2227,55 @@ were measuring the load generator.
   `clean#2` 1.89 / 3.91 ms, **one gate failure — the SLO on `clean`'s p99** — with that cell's
   within-campaign spread measured at **12× at the median**;
 - the next step, in one sentence: **give the bench's echo backend enough capacity that it is not
-  the load, then re-run the sealed test to see whether it is eight of eight.**
+  the load, then re-run the sealed test to see whether it is eight of eight.** *(Done, and it
+  refuted the premise: see the next entry.)*
 
-### The bench's echo backend can deadlock, and that is what the sealed test measured (2026-11-04)
+### The echo backend is decoupled, and it cannot have been the stall (2026-11-04)
 
-The harness's echo service is one thread per connection, alternating `recv` and `sendall`. A
-**full-duplex bulk echo** deadlocks it as soon as both directions fill: the peer stops reading
-because it is writing, and the thread stops reading because it is writing. The signature is exactly
-what the last rounds chased — a transfer that stalls after a few megabytes and never resumes, while
-a small request is answered in milliseconds, and the carrier's own counters reading clean because
-the source simply stopped delivering.
+The harness's echo service ran one thread per connection, alternating `recv` and
+`sendall`. That shape *couples its two directions* — it cannot accept a byte
+while it is blocked writing — and the previous entry read the sealed test's stall
+as exactly that. **The coupling is real; the attribution was not.** Measured on
+this host, both arms from their parsed source, one run each:
 
-**Not yet fixed.** The fix is to give each connection a reader thread feeding a bounded queue and a
-writer thread draining it, so the two directions cannot block each other. It is written out here
-because the pause came first; the tree is clean and nothing half-applied was left behind.
+| | bytes it accepts while the peer reads nothing (3 s) | full-duplex 8 MiB |
+|---|---|---|
+| old: one thread, `recv`/`sendall` | **16–19 MiB** | completes, 0.01 s |
+| new: reader → bounded queue (64 × 64 KiB) → writer | **22–27 MiB** | completes, 0.01 s |
 
-**Why this matters beyond the harness**: three rounds of carrier work — the read deadline, the
-first-frame line, the boundary probe — were all built to explain a stall that was, in the end, the
-load generator. They were worth building (they are what proved it), but the lesson is the one this
-file keeps earning: **check that the instrument is not the bottleneck before measuring the thing
-under it.**
+The number moves ±5 MiB between runs because it is socket autotuning, so the
+honest reading is the *floor*: **every run absorbed more than an 8 MiB transfer
+needs, in both shapes**. A backend that could have accepted the whole echo
+cannot have been blocked writing it, so "the backend stopped delivering because
+it was blocked" is refuted for this transfer — and with it the sentence that
+three rounds of carrier work had been spent on the load generator. What the
+sealed trace actually says is narrower: the client's response direction was
+*reading*, and its source returned nothing for two seconds. Why a source with
+that much room had nothing to give is open again.
+
+Three things are kept, each on its own merit rather than on that story:
+
+- the **decoupling**: the queue is worth 4–8 MiB of headroom in every run, and a
+  load generator that stalls when its peer is slow is one whose stall will
+  eventually be blamed on the carrier;
+- an **`ECHO DONE read=… wrote=…` line** for any connection over 64 KiB, so a
+  stalled transfer can be attributed by the backend's own counters instead of by
+  inference. Small connections stay silent: at four thousand arrivals a second a
+  line per connection would make the log the load;
+- a **re-runnable check**, `bench/src/bench/utils/echo_check.py` (outside the
+  gate, seconds, no root): full-duplex byte equality, the coupling bound, and
+  the presence of the announcement.
+
+Its first version reported a log-formatting defect that did not exist: it sliced
+`ECHO_SRC` out of the file's raw text instead of taking the parsed constant, so
+the child received `\\n` and printed a literal backslash. Fixed, and the reason
+is written into the function — it is the same mistake as measuring a copy of the
+thing instead of the thing.
+
+Neither is a claim that the sealed path is fixed. The check that would settle it
+is on the carrier's side and is still the next round's: for the failing direction,
+count bytes *read from the source* against bytes *queued into the group*, so a
+source that has nothing and a group that will not take it stop looking alike.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
