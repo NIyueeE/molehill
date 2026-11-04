@@ -784,15 +784,6 @@ impl Conn {
                     local_fin = state.local_fin,
                     "mhd stream closed"
                 );
-                // **A retirement has to be spoken.** With the state gone, the peer's
-                // next frame for this stream is dropped on the floor with one debug
-                // line, so a sender that still holds the channel keeps writing into
-                // nothing — which is a visitor that carries no bytes while both ends
-                // look healthy. A reset is what tells it; without one the queue below
-                // was write-only, because nothing ever pushed into it.
-                if !state.peer_fin {
-                    self.resets.push_back((stream, wire::ResetCode::Aborted));
-                }
                 // Its unacknowledged tail is no longer buffered by this end.
                 self.buffered = self
                     .buffered
