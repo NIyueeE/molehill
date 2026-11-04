@@ -261,6 +261,14 @@ static ACCEPTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// behind it and the client pays its own timer.
 static ADMITTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// How long a visitor's echo took to come back, per second.
+///
+/// From the request byte the server's forwarding loop read to the first byte it
+/// wrote back to that visitor: the whole of the carrier's two directions plus the
+/// client and the backend. Every other instrument stops at one end of it, which is
+/// why a cell can read tens of milliseconds while all of them read microseconds.
+static ECHOED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 /// The most dwell samples one reporting window keeps.
 const DWELL_WINDOW_MAX: usize = 65_536;
 
@@ -746,6 +754,30 @@ pub(crate) fn note_lane_admit(wait: Duration) {
     }
 }
 
+/// Record one visitor's echo round trip, in microseconds.
+pub(crate) fn note_echo(waited: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(waited.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = ECHOED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Take the window's echo samples, sorted, and leave it empty.
+fn take_echo() -> Vec<u32> {
+    let mut samples = ECHOED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = std::mem::take(&mut *samples);
+    taken.sort_unstable();
+    taken
+}
+
 /// Take the window's admission samples, sorted, and leave it empty.
 fn take_lane_admit() -> Vec<u32> {
     let mut samples = ADMITTED
@@ -984,6 +1016,17 @@ fn report_send_path() {
             admit_p99_us = pct_us(&admitted, 99, 100),
             admit_max_us = admitted.last().copied().unwrap_or(0),
             "mhd-stats: a lane admitted inside the receive callback"
+        );
+    }
+    let echoed = take_echo();
+    if !echoed.is_empty() {
+        let n = echoed.len();
+        info!(
+            n,
+            echo_p50_us = pct_us(&echoed, 50, 100),
+            echo_p99_us = pct_us(&echoed, 99, 100),
+            echo_max_us = echoed.last().copied().unwrap_or(0),
+            "mhd-stats: a visitor's echo after its own request"
         );
     }
 }

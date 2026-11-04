@@ -3908,6 +3908,9 @@ where
                         let arrival = Arrival {
                             accepted_at: std::time::Instant::now(),
                             stats: std::sync::Arc::clone(&arrival),
+                            first_byte_at: std::sync::Arc::new(
+                                std::sync::Mutex::new(None),
+                            ),
                         };
                         debug!("New visitor from {}", addr);
                         // The visitor socket gets the same latency-friendly
@@ -4034,6 +4037,13 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByte<R> {
                     u32::try_from(paired.as_micros()).unwrap_or(u32::MAX),
                     u32::try_from(after_pairing.as_micros()).unwrap_or(u32::MAX),
                 );
+                // The far end of the echo's round trip: the write half reads this
+                // to close the interval `EchoStamp` measures.
+                *self
+                    .arrival
+                    .first_byte_at
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
                 if after_pairing >= std::time::Duration::from_millis(100) {
                     debug!(
                         setup_us = u64::try_from(setup.as_micros()).unwrap_or(u64::MAX),
@@ -4046,6 +4056,73 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FirstByte<R> {
             }
         }
         poll
+    }
+}
+
+/// Times one visitor's echo: from the request byte the forwarding loop read to
+/// the first byte it wrote back to that same visitor.
+///
+/// The interval every other instrument in this file stops short of. `FirstByte`
+/// says when a request arrived and the group's send loop says when a frame left,
+/// but the visitor's own clock keeps running until the *reply* comes back through
+/// the client, the backend and the carrier — and a cell can read tens of
+/// milliseconds while every stage inside the arrival reads microseconds only if
+/// the time is in that return leg. Wrapping the write half is what puts a stamp
+/// on this side of it.
+struct EchoStamp<W> {
+    inner: W,
+    first_byte_at: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    logged: bool,
+}
+
+impl<W> EchoStamp<W> {
+    fn new(
+        inner: W,
+        first_byte_at: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    ) -> Self {
+        Self {
+            inner,
+            first_byte_at,
+            logged: false,
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for EchoStamp<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if !self.logged
+            && matches!(poll, std::task::Poll::Ready(Ok(n)) if n > 0)
+            && crate::transport::stats::enabled()
+        {
+            self.logged = true;
+            if let Some(at) = *self
+                .first_byte_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                crate::transport::stats::note_echo(at.elapsed());
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -4125,6 +4202,14 @@ fn report_arrivals(stats: &ArrivalStats) {
 struct Arrival {
     accepted_at: std::time::Instant,
     stats: std::sync::Arc<ArrivalStats>,
+    /// When this visitor's first request byte was read, once it has been.
+    ///
+    /// Shared with the visitor's *write* half so one arrival can be timed end to
+    /// end inside the server: from the byte the forwarding loop read to the byte
+    /// it wrote back. Everything else this file measures stops at one side of
+    /// that boundary — which is how a cell can report tens of milliseconds while
+    /// every stage inside the arrival reads microseconds.
+    first_byte_at: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// The two ways a pairing can stop before it forwards anything: the pool is
@@ -4388,9 +4473,10 @@ where
         // is this group telling the server that one more stripe would have
         // helped.
         // The layer's lines carry the pairing's group id: one story, not two.
+        let echo = EchoStamp::new(write, std::sync::Arc::clone(&arrival.first_byte_at));
         crate::stripe::spawn_group_tagged(
             FirstByte::new(read, arrival, paired_at),
-            write,
+            echo,
             gathered,
             Some(Arc::clone(&plan)),
             u64::from(group),
@@ -5731,6 +5817,7 @@ mod tests {
             Arrival {
                 accepted_at: std::time::Instant::now(),
                 stats: std::sync::Arc::new(ArrivalStats::default()),
+                first_byte_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             },
         )
         .await

@@ -2513,6 +2513,39 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
+### The carrier's whole round trip is fast, and the tail is outside it (2026-11-05)
+
+The interval every previous instrument stopped short of now has a distribution: from
+the request byte the server's forwarding loop read to the first byte it wrote back to
+that same visitor — the carrier's two directions plus the client and the backend.
+
+| | p50 | p99 | max |
+|---|---|---|---|
+| a visitor's echo after its own request | **538–708 µs** | 1.2–23.3 ms | 23.3 ms |
+
+In the same rounds the cell reads **p99 104.3, 37.7, 116.5 and 7.6 ms**. The echo's
+p99 never reaches the cell's, and its *maximum* in a second is below the cell's p99
+over thirty seconds — so for these runs **the carrier's round trip is not where the
+tail is**, and everything this cycle built for the arrival is confirmed as fast from
+the other side.
+
+What is left is the two boundaries the server cannot see, and they are the probe's own
+view of the tool:
+
+- **before the request byte**: the visitor's `connect()` and its `send`, i.e. the
+  *tool's* accept path. `accepted_at` is stamped after `accept()` returns, so a
+  connection that sat in the kernel's accept queue is invisible to every counter here;
+- **after the reply byte**: the probe's own read, which on this host is a Python
+  selector and a syscall.
+
+That is a smaller remaining question than the ones this file has been asking, and it is
+the first time the answer has been *outside* the carrier for a population this large.
+The next instrument follows from it: stamp the listener's accept boundary — the time
+between a connection being ready and this end taking it — and compare it with the
+probe's own measured round trip. If the accept path accounts for the rest, the SLO is
+being decided by the server's accept loop and not by mhd at all, which changes what
+the release claim can honestly say.
+
 ### Every stage of the arrival is microseconds, and a second population is not (2026-11-05)
 
 The dispatcher's admission of a new lane — registry lock, admission table, `Conn`, a
