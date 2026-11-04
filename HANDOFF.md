@@ -2018,28 +2018,38 @@ instrument is a per-visitor byte count with the worst one reported per window �
 visitor's first read returned *something*, and the question is now how much, and for how long it
 stops growing.
 
-### Thirteen groups in thirty-six thousand carry almost nothing (2026-11-04)
+### The starved-group counter names iperf3's control connection, not the defect (2026-11-04)
 
-The count that was missing, from a full-scale run:
+The counter found its thirteen groups and each now names itself:
 
 ```
-groups=36 445   starved=13
+mhd-stats: a group ended having carried almost nothing bytes=972 alive_ms=152079
+mhd-stats: a group ended having carried almost nothing bytes=963 alive_ms=123809
+mhd-stats: a group ended having carried almost nothing bytes=966 alive_ms=122305
 ```
 
-A group counts as starved when it lived five seconds or more and carried under sixty-four
-kilobytes — and **thirteen of thirty-six thousand did**. Four bulk connections per lost stage,
-four stages lost in this run: **thirteen is that number**, and it is the first time the defect
-has had a count rather than a description.
+**972 bytes over two and a half minutes is `iperf3`'s control connection**: the cookie
+handshake, and then an idle socket for the length of the test while the data flows on four
+other connections. So the counter is counting a connection that is *idle by design*, and its
+"13" was a coincidence of arithmetic, not the defect. **It is withdrawn as a defect signal**;
+it stays as a lifecycle count, which is all it ever was.
 
-Each starved group now logs its own bytes and lifetime at `INFO`, because thirteen lines in a
-run is cheap and each is a visitor whose transfer stopped while every other instrument read
-clean. That line is what the next lost stage will be read through.
+Two more readings from the same run, and both matter more than the counter:
 
-**Where the gate stands after this run**: `clean` 67.9 / 259.7 ms (the first stage again, on a
-busier host), `rtt100`, `loss1` and `loss5` measured, four stages lost from `rate100` onward.
-The run-to-run range on this host is still the dominant term in the first stage's p99 — 2.27 ms
-on one run and 67.9 on the next, with the same binary — which is why the SLO has passed and
-failed in consecutive runs and why no single run may be quoted as the state of the carrier.
+- **Zero** `stripe write waited`, **zero** `stripe source read waited`, zero `stripe receive
+  stalled` — and that is not evidence of health. Those lines are logged *after* a read or write
+  returns, so a loop parked for ever logs nothing at all. A silent instrument and a healthy
+  path look identical in a log read this way, which is the fourth time that has cost a round.
+- The gate is at **one or two failures depending on the run**: `clean#2` was lost again, and
+  `clean`'s p99 read **261.7 ms** on this run against 20.0 on the previous one, same binary.
+  The first stage's p99 across runs is now known to span **20 to 262 ms** on this host, so the
+  SLO verdict is a property of the host's moment, not of the carrier.
+
+**What the file should do next, and does not need another sweep to say**: `clean#2` is the
+*last* stage and has failed in nearly every full run. A stage that fails because it is last is
+not a stage-level defect; it is something about the run's end, and the only instrument that can
+see it is one placed at the *stage boundary* — the pool's state and a single served visitor —
+rather than inside the carrier, where every counter reads clean.
 
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
