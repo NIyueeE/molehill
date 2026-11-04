@@ -328,13 +328,37 @@ pub(crate) struct Stall {
     pub(crate) unacked_ms: u128,
     /// What this end's own readers owe the peer.
     pub(crate) backlog: Backlog,
-    /// The stream that is holding the wire back, with the facts that decide why:
-    /// `(id, unsent bytes, retransmits, next offset, written, its credit room)`.
+    /// The stream that is holding the wire back, with the facts that decide why.
     ///
-    /// The ages say *that* a stream stalled; these say *which* and whether it is
+    /// The ages say *that* a stream stalled; this says *which* and whether it is
     /// bytes nobody could send (no room), bytes that were lost and are owed again
-    /// (retransmits), or bytes the writer never produced.
-    pub(crate) worst: Option<(u32, u64, u32, u64, u64, bool, bool)>,
+    /// (retransmits), bytes the writer never produced, or a stream the scheduler
+    /// skips because it was reset.
+    pub(crate) worst: Option<WorstStream>,
+}
+
+/// The one stream whose owed bytes are holding a lane back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorstStream {
+    /// Which stream.
+    pub(crate) id: u32,
+    /// Bytes accepted from the writer and not yet on the wire.
+    pub(crate) unsent: u64,
+    /// How many times this stream's ranges have been declared lost.
+    pub(crate) retransmits: u32,
+    /// Where the send cursor stands.
+    pub(crate) next: u64,
+    /// How much the writer has handed over.
+    pub(crate) written: u64,
+    /// Whether an abort is what keeps this stream out of the scheduler.
+    pub(crate) reset: bool,
+    /// The repair it is owed, if it is owed one: `(offset, length)`.
+    ///
+    /// A stream that has put every byte on the wire and is still "owed" a range
+    /// is a stream in a repair loop, and *which* range it is re-sending is the
+    /// difference between a lost tail and a loss that is declared forever. This
+    /// field is why the sealed striped deadlock could finally be named.
+    pub(crate) repair: Option<(u64, u64)>,
 }
 
 /// Seal the payload `out[payload_at..]` in place and append its tag.
@@ -1686,28 +1710,28 @@ impl Conn {
     /// blocked on the far end's credit and a connection whose own reader owes
     /// the peer a megabyte were, until this, the same absence of log lines.
     /// The stream with the most bytes the wire has not taken, and its own facts.
-    fn worst_stream(&self) -> Option<(u32, u64, u32, u64, u64, bool, bool)> {
+    fn worst_stream(&self) -> Option<WorstStream> {
         self.streams
             .iter()
             .filter(|(_, state)| state.send.has_unsent())
             .max_by_key(|(_, state)| state.send.unacked())
-            .map(|(&id, state)| {
-                (
-                    id,
-                    state.send.unacked(),
-                    state.retransmits,
-                    state.send.next_offset(),
-                    state.send.written(),
-                    // Whether an abort is what keeps this stream out of the
-                    // scheduler, and whether it is owed a *repair* rather than
-                    // new data. Those two are the only ways a stream with
-                    // unsent bytes is passed over without a packet being built
-                    // for it, and without them a stalled lane reads as "bytes
-                    // waiting" with no reason attached — which is exactly how
-                    // the sealed striped deadlock stayed unexplained.
-                    state.reset.is_some(),
-                    state.send.has_repair(),
-                )
+            .map(|(&id, state)| WorstStream {
+                id,
+                unsent: state.send.unacked(),
+                retransmits: state.retransmits,
+                next: state.send.next_offset(),
+                written: state.send.written(),
+                // Whether an abort is what keeps this stream out of the
+                // scheduler, and which repair it is owed. Those two are the only
+                // ways a stream with unsent bytes is passed over without a packet
+                // being built for it, and without them a stalled lane reads as
+                // "bytes waiting" with no reason attached — which is exactly how
+                // the sealed striped deadlock stayed unexplained.
+                reset: state.reset.is_some(),
+                repair: state
+                    .send
+                    .next_repair(super::wire::MAX_STREAM_PAYLOAD)
+                    .map(|(offset, len)| (offset, len as u64)),
             })
     }
 

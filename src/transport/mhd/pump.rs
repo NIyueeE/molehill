@@ -298,13 +298,14 @@ async fn flush(
             backlog_worst_stream = stall.backlog.worst.map_or(0, |(id, _)| id),
             backlog_worst_bytes = stall.backlog.worst.map_or(0, |(_, held)| held),
             backlog_bytes = stall.backlog.total,
-            worst_stream = stall.worst.map_or(0, |(id, ..)| id),
-            worst_stream_unsent = stall.worst.map_or(0, |(_, unsent, ..)| unsent),
-            worst_stream_retransmits = stall.worst.map_or(0, |(_, _, retransmits, ..)| retransmits),
-            worst_stream_next = stall.worst.map_or(0, |(_, _, _, next, _, _, _)| next),
-            worst_stream_written = stall.worst.map_or(0, |(_, _, _, _, written, _, _)| written),
-            worst_stream_reset = stall.worst.is_some_and(|(.., reset, _)| reset),
-            worst_stream_repair = stall.worst.is_some_and(|(.., repair)| repair),
+            worst_stream = stall.worst.map_or(0, |w| w.id),
+            worst_stream_unsent = stall.worst.map_or(0, |w| w.unsent),
+            worst_stream_retransmits = stall.worst.map_or(0, |w| w.retransmits),
+            worst_stream_next = stall.worst.map_or(0, |w| w.next),
+            worst_stream_written = stall.worst.map_or(0, |w| w.written),
+            worst_stream_reset = stall.worst.is_some_and(|w| w.reset),
+            worst_repair_at = stall.worst.and_then(|w| w.repair).map_or(0, |(at, _)| at),
+            worst_repair_len = stall.worst.and_then(|w| w.repair).map_or(0, |(_, len)| len),
             "mhd stalled: bytes waiting"
         );
     }
