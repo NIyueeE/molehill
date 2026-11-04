@@ -1550,6 +1550,30 @@ both (and the client must never hand it to the pool). The measurement that picks
 them is already in place — the eight-run rate — and either choice must take it to eight
 of eight.
 
+### A retirement reset made it worse, and is reverted (2026-11-04)
+
+`Conn`'s reset queue was **only ever drained**: nothing pushed into it, so retiring a
+stream said nothing to the peer, whose next frames were dropped with a debug line. That is
+a real hole, and the fix looked obvious: queue a reset on retirement unless the peer had
+already finished.
+
+Measured on the instrument this investigation trusts — eight runs of the sealed striped
+test — **it made things worse: four of eight, against seven of eight before.** A reset
+tells the peer to forget the stream, and the peer here is a stripe group that is *still
+transferring*: the reset truncated transfers that would otherwise have finished.
+
+So it is reverted, per the plan's rule, and the numbers stay in this file. The queue being
+write-only is still a defect; the lesson is that "retired" is not one condition. A stream
+retired **after both ends finished** needs no reset — telling the peer anything is what
+breaks it — while one retired **while the peer may still write** needs a reset, and the
+two cases are distinguishable: `peer_fin` says which. The attempt that failed checked
+`peer_fin` and still cut live transfers, which means the *retirement itself* was happening
+too early in these runs, and that is the thing to fix, not the announcement.
+
+**Eight-run rates so far, all on the sealed striped test**: one of three before the grace
+fix, seven of eight after it, four of eight with the retirement reset. The instrument is
+that test and the number is the pass count; no other claim in this file depends on it.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
