@@ -2513,6 +2513,68 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
+### Fewer wake-ups help, and do not touch the first stage (2026-11-05)
+
+A lane carries four or five streams and a receive batch usually delivers bytes for
+one, so the pump was waking every parked reader on the lane for each batch. It now
+records which streams changed (`Conn::woke`) and wakes one reader per id; the
+blanket wake stays for the events that really are connection-wide.
+
+**On a staged cell with six bulk streams** (interleaved, three rounds, `--aa`):
+
+| metric | change |
+|---|---|
+| `rtt_p99_ms` | **−79.35 %** |
+| `rtt_p50_ms` | −51.70 % |
+| `rtt_worst_1s_ms` | −75.52 % |
+| `rtt_max_ms` | −66.27 % |
+| `throughput_gbps` | **+16.79 %** (CI 1.28..2.08, entirely beyond its floor) |
+
+Every latency metric moves the same way and throughput moves with them, which is
+what fewer spurious wake-ups should look like — but the verdict is `directional`,
+not `claim`, because at three rounds the cell's own A/A scatter is 48 % on p99.
+
+**On the cell that decides the release** it does not fix the first stage. Full
+scale, one arm, host quiet (load 0.24 / 0.75):
+
+| stage | n | p50 | p99 | max |
+|---|---|---|---|---|
+| `clean` (first) | 1 964 | **36.47** | **302.13** | 509.68 |
+| `clean#2` (last) | 2 396 | **2.48** | **22.54** | 24.77 |
+
+The last stage is the best it has ever read (22.54 against 23.60 and 23.65 in the
+two previous runs), so the change is worth keeping. The first stage is the worst it
+has ever read — and that is the finding: across four runs of near-identical code
+the first clean stage has now read **25.79, 112.85, 146.03 and 302.13 ms** while the
+last has read **22.5–23.7** every time. The *last* stage is a measurement; the
+first is a lottery, and every lever tried against it so far (credit reserve, worker
+count, scheduler order, wake scope) has left it a lottery.
+
+Two things the four numbers do establish, and they are not the same problem:
+
+- **the warm stage is 10× the control** — 22.5 ms against 2.28 — so even with no
+  cold start there is a tail: about one arrival in a hundred pays twenty
+  milliseconds inside a handshake whose own median is 1.0–1.45 ms;
+- **the first stage adds a further factor of one to thirteen**, and which one is
+  decided by something outside the arrival path: the same binary, the same host
+  class, four different answers.
+
+The intervals excluded by measurement so far are the send buffers (dwell p50 2–4 µs
+client, 9 µs server), the pump's post (p50 11–20 µs, p99 20–35 µs), the server's
+handshake processing (under 5 ms in 1 141 of 1 191 slow opens), the wire itself (the
+asymmetry above), the credit reserve, the worker count, and the scheduler's order.
+**What is left uninstrumented is the datagram's wait between the socket and the
+dispatcher, and the spawn-to-first-poll of the per-stream task** — the server's own
+clock starts *after* the stream exists, so neither interval appears in any counter
+this cycle built.
+
+**A discipline this cycle learned the hard way**, and it now costs a run each time
+it is forgotten: a bench record is only comparable with one whose host was as idle.
+The run that read 285.99 ms had a five-minute load average of 4.74 against 0.84 in
+its reference; the one killed before it started had 5.71 and would have been the
+same story. Check `meta.provenance.host.loadavg` before comparing two files, and
+before believing that a change moved a first stage.
+
 ### The arrival's tail is not in the carrier's send path (2026-11-05)
 
 Every instrument the carrier owns now reads microseconds at full scale, and the
