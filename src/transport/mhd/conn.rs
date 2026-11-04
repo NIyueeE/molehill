@@ -654,10 +654,16 @@ impl Conn {
                 Refusal::Window
             };
             self.last_refusal = Some(refusal);
-            crate::transport::stats::note_refused(match refusal {
-                Refusal::Aged => "aged",
-                Refusal::Credit => "credit",
-                Refusal::Window => "window",
+            // By bound **and** by class: an opening stream that is refused is the
+            // arrival path paying for the bulk spine, and the reserve exists to make
+            // that impossible. If this counter never moves, the reserve works and the
+            // first stage's cost is somewhere else entirely.
+            let opened = still_opening;
+            crate::transport::stats::note_refused(match (refusal, opened) {
+                (Refusal::Aged, _) => "aged",
+                (Refusal::Credit, true) => "credit_opening",
+                (Refusal::Credit, false) => "credit",
+                (Refusal::Window, _) => "window",
             });
             // What the recovery table is holding when the age gate refuses. A
             // record that is neither acknowledged nor declared lost never leaves

@@ -425,11 +425,13 @@ pub(crate) fn note_shared() {
 static REFUSED_CREDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_AGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REFUSED_CREDIT_OPENING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record one refused write, by the bound that refused it.
 pub(crate) fn note_refused(why: &str) {
     let counter = match why {
         "credit" => &REFUSED_CREDIT,
+        "credit_opening" => &REFUSED_CREDIT_OPENING,
         "window" => &REFUSED_WINDOW,
         _ => &REFUSED_AGED,
     };
@@ -662,10 +664,11 @@ fn report_starvation() {
     let credit = REFUSED_CREDIT.swap(0, std::sync::atomic::Ordering::Relaxed);
     let window = REFUSED_WINDOW.swap(0, std::sync::atomic::Ordering::Relaxed);
     let aged = REFUSED_AGED.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if credit + window + aged > 0 {
+    let opening = REFUSED_CREDIT_OPENING.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if credit + window + aged + opening > 0 {
         info!(
             credit,
-            window, aged, "mhd-stats: writes refused, by the bound that refused"
+            window, aged, opening, "mhd-stats: writes refused, by the bound that refused"
         );
     }
     let polled = VISITORS_POLLED.swap(0, std::sync::atomic::Ordering::Relaxed);
