@@ -416,6 +416,12 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 anyhow::bail!("stripe source read failed: {e}");
             }
         };
+        if seq == 0 {
+            // A direction that never logs this was **never polled**: the whole
+            // difference between a response that is slow and one that never starts,
+            // and the two want different fixes.
+            debug!(group, bytes = n, "stripe send: first frame read");
+        }
         if sampled {
             let waited = reading.elapsed();
             if waited >= std::time::Duration::from_millis(20) {
