@@ -484,6 +484,16 @@ pub(crate) struct Conn {
     arrived_stream: u32,
     /// How many of that stream's bytes arrived with no hole.
     arrived_prefix: u64,
+    /// Streams this connection touched on the receive path since the pump last
+    /// asked, so it can wake exactly those readers.
+    ///
+    /// A lane carries several streams and a batch usually delivers bytes for one
+    /// of them. Waking the whole lane scheduled every parked reader to find
+    /// nothing — the churn behind the wake-to-poll latency an arrival pays for
+    /// its handshake — so the receive path records *which* streams changed and
+    /// the pump wakes only those. Duplicates are harmless and cheap: a second
+    /// wake of an already-woken task is one atomic flag.
+    woke: Vec<u32>,
     /// Streams the peer opened that nothing has taken yet.
     inbound: VecDeque<u32>,
     /// When each of those was opened by the peer's first datagram.
@@ -648,6 +658,7 @@ impl Conn {
             read: 0,
             arrived_stream: 0,
             arrived_prefix: 0,
+            woke: Vec::new(),
             inbound: VecDeque::new(),
             inbound_at: BTreeMap::new(),
             stream_opened: BTreeMap::new(),
@@ -1795,6 +1806,15 @@ impl Conn {
     }
 
     /// Whether the last refusal was the peer's credit (see [`Conn::write`]).
+    /// The streams a receive batch touched, and forget them.
+    ///
+    /// The pump wakes one reader per id instead of every reader on the lane; see
+    /// [`Conn::woke`]. Answering an empty vector is the common case on a pass
+    /// that only sent, and it costs nothing.
+    pub(crate) fn take_woken(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.woke)
+    }
+
     pub(crate) fn credit_blocked(&self) -> bool {
         matches!(self.last_refusal, Some(Refusal::Credit))
     }
@@ -2023,6 +2043,10 @@ impl Conn {
                     // packet records that carried them (see `wire::ACK`).
                     self.arrived_stream = id;
                     self.arrived_prefix = state.recv.arrived();
+                    // The reader that owns this stream is the only one the pump
+                    // has to wake: it got bytes or an end, and the rest of the
+                    // lane's readers did not.
+                    self.woke.push(id);
                 }
                 self.ack_pending = true;
             }
@@ -2047,6 +2071,9 @@ impl Conn {
                         "mhd peer reset a stream"
                     );
                     state.reset = Some(code);
+                    // A parked reader has to learn that its stream is over, and
+                    // it is the one reader this datagram concerns.
+                    self.woke.push(id);
                 }
             }
         }

@@ -358,7 +358,7 @@ fn drain_ready(
             if crate::transport::stats::enabled() && datagrams > 0 {
                 crate::transport::stats::received_run(datagrams, bytes);
             }
-            shared.wake_readers();
+            wake_touched(shared);
             shared.wake_writers();
             shared.wake_streams();
         }
@@ -381,7 +381,7 @@ fn drain_ready(socket: &UdpSocket, _batch: &mut (), shared: &Arc<Shared>, peer: 
                 shared.with(|conn| {
                     let _ = conn.on_datagram(now, &buf[..len]);
                 });
-                shared.wake_readers();
+                wake_touched(shared);
                 shared.wake_writers();
                 shared.wake_streams();
             }
@@ -524,7 +524,7 @@ pub(crate) fn spawn(
                     // schedules the reader task, so waking it for each of a
                     // batch's thirty-two datagrams is thirty-two scheduler
                     // calls to hand out the same bytes.
-                    shared.wake_readers();
+                    wake_touched(&shared);
                     shared.wake_writers();
                     shared.wake_streams();
                 }
@@ -603,6 +603,20 @@ fn spawn_sender(
             }
         }
     })
+}
+
+/// Wake the readers of the streams a batch touched, and nobody else.
+///
+/// A lane carries several streams and a batch usually delivers bytes for one of
+/// them, so waking every parked reader schedules the rest to find nothing. The
+/// connection records which streams changed on its receive path; this drains that
+/// and wakes one reader per id. A stream that was missed by some future change
+/// still has the pump's timer as its net, which is where the two-second parks in
+/// the current numbers come from anyway.
+fn wake_touched(shared: &Arc<Shared>) {
+    for id in shared.with(super::conn::Conn::take_woken) {
+        shared.wake_stream(id);
+    }
 }
 
 /// One connection as the pool holds it: a shared state machine, the counters
@@ -1307,7 +1321,7 @@ fn spawn_dispatcher(
             // waiting reader can be paying.
             report_dispatch(&mut cadence);
             for shared in touched.drain(..) {
-                shared.wake_readers();
+                wake_touched(&shared);
                 shared.wake_writers();
                 shared.wake_pump();
                 shared.wake_streams();
