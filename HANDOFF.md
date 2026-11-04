@@ -2018,6 +2018,29 @@ instrument is a per-visitor byte count with the worst one reported per window �
 visitor's first read returned *something*, and the question is now how much, and for how long it
 stops growing.
 
+### Thirteen groups in thirty-six thousand carry almost nothing (2026-11-04)
+
+The count that was missing, from a full-scale run:
+
+```
+groups=36 445   starved=13
+```
+
+A group counts as starved when it lived five seconds or more and carried under sixty-four
+kilobytes — and **thirteen of thirty-six thousand did**. Four bulk connections per lost stage,
+four stages lost in this run: **thirteen is that number**, and it is the first time the defect
+has had a count rather than a description.
+
+Each starved group now logs its own bytes and lifetime at `INFO`, because thirteen lines in a
+run is cheap and each is a visitor whose transfer stopped while every other instrument read
+clean. That line is what the next lost stage will be read through.
+
+**Where the gate stands after this run**: `clean` 67.9 / 259.7 ms (the first stage again, on a
+busier host), `rtt100`, `loss1` and `loss5` measured, four stages lost from `rate100` onward.
+The run-to-run range on this host is still the dominant term in the first stage's p99 — 2.27 ms
+on one run and 67.9 on the next, with the same binary — which is why the SLO has passed and
+failed in consecutive runs and why no single run may be quoted as the state of the carrier.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
