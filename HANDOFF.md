@@ -2132,6 +2132,38 @@ spans 20 to 262 ms across runs of one binary on this host and is therefore a pro
 moment, not of the carrier — and the one thing that would remove it for good is the round trips
 that the parked sealing design deletes.
 
+### The first stage's own noise is bigger than the SLO (2026-11-04)
+
+Two rounds of one campaign, one arm, one binary, half scale — the closest thing to an A/A this
+harness can do for the timeline:
+
+| stage | round 0 | round 1 |
+|---|---|---|
+| `clean` p50 | **5.25 ms** | **65.97 ms** |
+| `clean` p99 | **171.5 ms** | **223.0 ms** |
+| `clean#2` p50 | 2.18 ms | 2.17 ms |
+| `clean#2` p99 | 3.46 ms | 22.53 ms |
+
+**The first stage's median moves by a factor of twelve between two consecutive rounds of the same
+binary**, and its p99 never comes near the 50 ms limit in either. Across every full-scale run this
+cycle has collected, `clean`'s p99 spans **20 to 281 ms** — a factor of fourteen — with the same
+code.
+
+**So the SLO cannot be decided by one run on this host, and that is a measurement, not an excuse.**
+A cell whose own within-campaign spread exceeds its threshold will pass or fail according to which
+minute it was measured in. Two consequences the plan has to face:
+
+1. **A defensible release needs the distribution moved, not the tail clipped.** The only lever
+   measured to move it is the round trips per arrival — the parked sealing design — because
+   everything else (establishment, credit reserve, worker count, scheduling) has been tested and
+   refused by its own numbers.
+2. **Until then, the honest record is what the gate says on a given run, plus this floor.** Quoting
+   a green SLO from one run, or a red one from another, would both be wrong: the file now carries
+   the spread, which is the only number that makes either verdict readable.
+
+`clean#2`, for its part, is stable to 1 % at the median across the two rounds — so the *last*
+stage is not the noisy one. The noise belongs to the stage that starts a run.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
