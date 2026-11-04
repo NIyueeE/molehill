@@ -1481,6 +1481,37 @@ mechanism that fits the numbers (`release_unread` lying) is not evidence that it
 mechanism. Reading `arrived()` took two minutes and would have saved the round. Read the
 code before naming the cause; measure before writing the entry.
 
+### The sealed striped test is seven in eight, and the failure is the second visitor (2026-11-04)
+
+With the grace fix in place, **eight runs of the sealed striped test**: **seven passed**,
+one failed. That is the first quantitative statement of the sealed path's health, and it
+replaces three rounds of "one in three" impressions.
+
+The failing run's trace says exactly where it goes:
+
+```
+stripe group started with 4 stripes group=1          <- first visitor, client side
+stripe receive direction finished group=2 frames=257 seen=257 written=8388608
+stripe receive direction finished group=1 frames=257 seen=257 written=8388608
+Visitor paired with a striped group group=2           <- SECOND visitor, server side
+stripe group started with 4 stripes group=2
+stripe group started with 4 stripes group=3
+stripe send direction finished group=2 frames=257
+Error: echo service closed after 1243136/8388608 bytes
+```
+
+**The first visitor's transfer completes in both directions — 257 frames and 8 388 608
+bytes each way.** The failure is in the second phase, the back-to-back visitors the test
+exists to check: the second visitor's group starts after the first one's streams have
+already closed, and its transfer stops at 1.2 MB.
+
+So the remaining defect is **a group whose stripes are recycled after a previous group's
+streams closed** — the pool hands the second visitor channels that were just retired, and
+their first frames go nowhere. That is a much narrower target than "the striped path is
+broken", and it has its own instrument already: the close line now prints `written`,
+`next`, `acked` and `peer_fin` for every stream, so a recycled channel shows as a stream
+that closed `peer_fin=false` shortly before the next group's first frame.
+
 ### Stage 4 — RACK plus PTO, instead of one timer for everything (latency)
 
 Split what one `MIN_RTO` decides today, following the shape MsQuic documents
