@@ -760,6 +760,23 @@ impl Conn {
             self.release_unread(stream);
             self.stream_opened.remove(&stream);
             if let Some(state) = self.streams.remove(&stream) {
+                // **A close must not overtake queued data.** The bytes this end
+                // accepted but never put on the wire are dropped with the stream, and
+                // nothing else counts them: no gap, no rejection, no retransmission.
+                // A stream that leaves with `written > next` is that defect, named on
+                // the stream that did it.
+                let written = state.send.written();
+                let next = state.send.next_offset();
+                tracing::debug!(
+                    stream,
+                    written,
+                    next,
+                    unsent = written.saturating_sub(next),
+                    reset = ?state.reset,
+                    peer_fin = state.peer_fin,
+                    local_fin = state.local_fin,
+                    "mhd stream closed"
+                );
                 // Its unacknowledged tail is no longer buffered by this end.
                 self.buffered = self
                     .buffered
