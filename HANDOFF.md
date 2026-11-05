@@ -67,6 +67,47 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The whole first-stage ledger, and the ratchet hypothesis refuted (2026-11-05)
+
+Every soak's first clean stage, by build, with the bulk rate beside it:
+
+| build | p99 | bulk | |
+|---|---|---|---|
+| flat 2 MiB ceiling | 290.6 | 8.39 | fail |
+| flat | 135.5 | 8.64 | fail |
+| flat | 23.5 | 6.84 | pass |
+| flat | 22.5 | 7.86 | pass |
+| flat | 17.0 | 7.08 | pass |
+| flat | 12.8 | 7.07 | pass |
+| path-scaled ceiling (smoothed) | 23.3 | 8.23 | pass |
+| path-scaled (smoothed) | 23.7 | 8.21 | pass |
+| path-scaled (smoothed) | 109.8 | 8.01 | **fail** |
+| path-scaled (smoothed) | 122.3 | 8.08 | **fail** |
+| path-scaled (smoothed) | 23.8 | 8.12 | pass |
+| path-scaled (**minimum** RTT) | 102.1 | 8.79 | **fail** |
+| path-scaled (**minimum** RTT) | 38.3 | 7.49 | pass |
+
+Three things this ledger says, and one it refuses to:
+
+- the flat ceiling **never** passed above 7.9 Gbit/s (0 of 2) and always passed below it (4 of
+  4). That separation is why the ceiling was changed;
+- after the change the fast regime passes **more often than not** (4 of 7 in 8.0–8.8) and the
+  good mode improved fivefold (23.5 against 135.5) — but the bad mode is still there, at 102
+  and 110 and 122;
+- **the minimum-RTT ceiling did not remove it** (102.1 at 8.79). The ratchet — a queue raising
+  the estimate that admits a deeper queue — was a real risk and is now ruled out as the cause
+  of the bimodality, by the intervention that would have removed it;
+- what it refuses to say is *which* runs fail. Rate alone does not decide it: 8.01 and 8.08
+  failed while 8.12, 8.21 and 8.23 passed. Something not yet instrumented sets the mode for a
+  whole stage, and every candidate tested so far — refusals, loss, runtime saturation, the
+  half-close grace, `FirstByte`, the accept queue, the queue's depth, the estimate's ratchet,
+  and now the minimum — has been measured and excluded.
+
+That is the state to hand over: the mechanism of the *good* mode is understood and the
+mechanism of the *bad* mode is not, and the SLO's first stage on this host fails for TCP too
+(120.0 ms in the same cell), which is why the remaining gate work moves ahead of it rather
+than behind it.
+
 ### Four runs after the ceiling: better in the fast regime, still bimodal (2026-11-05)
 
 Four `soak` campaigns on the path-scaled ceiling, all with a first-stage bulk rate between
