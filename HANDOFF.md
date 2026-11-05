@@ -67,6 +67,37 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### At 8.4 Gbit/s the runtime is idle and the handshake is ten times slow (2026-11-05)
+
+The slow-open line answers what "delivery, not admission" means, on the same 290 ms stage
+(3 006 of them):
+
+```
+mhd client slow data channel: group=32 started_us=6 open_us=13482 ready_us=13485 cmd_us=13494
+```
+
+- **`started_us = 6 µs`**: from the task being spawned to its first poll. The runtime is
+  *not* saturated — the dispatcher, the pool, the scheduler are all doing their work in
+  microseconds while eight gigabits a second of bulk flows past;
+- **`open_us = 13 482`**: the stream open — three round trips of tiny packets — takes 13.5 ms,
+  against 1.34–1.38 ms in the runs whose spine stays under 8 Gbit/s. A factor of ten, and it
+  accounts for the arrival's whole tail.
+
+So the delay is not the tool's scheduling and not its send path: it is that a small packet,
+on a lane carrying eight gigabits a second, waits about 4.5 ms per hop — which is the shape
+of a **socket receive queue** holding a few thousand bulk datagrams ahead of it. One
+connection, one UDP socket, one FIFO: the carrier's own round-robin cannot reach a packet
+that the kernel has not delivered yet.
+
+And one anomaly worth naming, because it says the flight is not actually bounded: in that
+stage the window line reads `cwnd=2097152` — the ceiling exactly — while the stall line
+reads `flight=3847348`. **A flight 1.75 MB wider than the window it is supposed to obey.**
+Writes are refused on `cwnd - flight`, so those bytes cannot have come through the ordinary
+path; either `cwnd` shrank after they were admitted, or the opening overdraft added them a
+reserve at a time. Either way a standing queue of that size is exactly what puts 4.5 ms in
+front of every small packet, so **the flight's real bound is the next thing to fix**, and it
+is the same fix for both problems.
+
 ### Six soaks: the arrival passes exactly when the bulk spine stays under 8 Gbit/s (2026-11-05)
 
 Six `soak` campaigns, the first clean stage's p99 against that same stage's bulk throughput:
