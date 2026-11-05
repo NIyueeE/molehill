@@ -191,6 +191,7 @@ fn report_window(shared: &Arc<Shared>) {
         conn.note_window_reported(now);
         let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
         let ceiling = conn.window_ceiling();
+        let (built, posted) = crate::transport::stats::take_datagrams();
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
         // stream whose bytes arrived and whose reader never took them was
@@ -225,10 +226,12 @@ fn report_window(shared: &Arc<Shared>) {
             worst_base = worst.map_or(0, |w| w.base),
             last_ack_prefix = conn.last_ack_prefix(),
             inserted_total = conn.inserted_total(),
+            built,
             worst_covering_number = worst.map_or(0, |w| w.covering_number),
             last_ack_below = conn.last_ack_marks().0,
             last_ack_bits = conn.last_ack_marks().1,
             last_ack_largest = conn.last_ack_marks().2,
+            posted_datagrams = posted,
             lane = conn.wire_id(),
             cwnd,
             flight,
@@ -271,6 +274,7 @@ async fn flush(
             break;
         };
         spans.push((off, len));
+        crate::transport::stats::note_built(1);
     }
     build.stop(&crate::transport::stats::PHASES.tx_build);
     if spans.is_empty() {
@@ -319,6 +323,7 @@ async fn flush(
     let sampled = crate::transport::stats::enabled();
     let before_wait = Instant::now();
     send_run(socket, peer, run, spans).await?;
+    crate::transport::stats::note_posted(spans.len());
     // The whole distribution, not only the extreme: a ten-millisecond post is
     // invisible to a hundred-millisecond bar, and ten milliseconds is the same
     // order as the arrival latency this pump is being measured for. Every pass

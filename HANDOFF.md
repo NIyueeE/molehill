@@ -608,6 +608,34 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Built equals posted, and the wider window does not help (2026-11-05)
+
+Two of the three candidates from the previous entry are now measured and both are out.
+
+**Nothing is built and thrown away.** Per-second datagram counts, summed over a failing run:
+**built 7 730, posted 7 730** — exactly equal. So every packet the sender recorded did reach the
+socket, and the pump's run handling is not the defect.
+
+**The `AHEAD` bound is not it either.** Raising the receiver's out-of-order window from 256 to
+16 384 — enough to cover the largest flight a 16 MiB buffer can hold in packets — changes the sealed
+striped pass rate from five of eight to **four of eight**. No improvement, inside noise, and it costs
+memory; reverted.
+
+So the facts that now have to be explained together are these, and they are narrower than ever:
+
+- every packet is posted (7 730 = 7 730);
+- the peer keeps **inserting** bytes (117 KB a second in the run before, up to 2 MB of total inserts
+  in this one);
+- the peer's `largest` and `below` stay **frozen hundreds of numbers** below the packet that covers
+  the frozen frontier, with its bitmap all ones;
+- `retx == posted`, so the repairs the sender sends are exactly the repairs it intends;
+- the hole sits at a byte offset that two live records cover, and neither is ever acknowledged.
+
+A peer that inserts bytes but never advances its marks is receiving packets whose numbers it does not
+record as new. With the window wide enough that cannot be the gap set. The next instrument is
+therefore on the *receive* side of the marks: how many packets `AckSet::arrived` accepted as **new**
+versus as **duplicates**, per second, beside the bytes inserted.
+
 ### The peer's `largest` is below the packet that carries the frozen bytes (2026-11-05)
 
 Reading `largest` — the one mark this cycle had never printed — settles what `Ack::contains` was

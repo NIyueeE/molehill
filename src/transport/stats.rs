@@ -717,6 +717,44 @@ fn take_dwell() -> Vec<u32> {
 ///
 /// Called once per pump pass, so its cost is one clock read behind the switch and
 /// nothing at all in a healthy run's hot path.
+/// Datagrams the pump built, and datagrams it posted.
+///
+/// Two counters rather than one because the difference answers a question no
+/// other number can: a packet the sender *recorded* and never put on the wire
+/// leaves a record whose bytes the peer will never acknowledge, and that looks
+/// identical to a packet the wire lost. Built minus posted is that difference,
+/// counted where each happens.
+static BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POSTED_DATAGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One datagram built by a pass.
+pub(crate) fn note_built(count: usize) {
+    if enabled() {
+        BUILT.fetch_add(
+            u64::try_from(count).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// One datagram the socket took.
+pub(crate) fn note_posted(count: usize) {
+    if enabled() {
+        POSTED_DATAGRAMS.fetch_add(
+            u64::try_from(count).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// This window's built and posted counts, for the per-second line.
+pub(crate) fn take_datagrams() -> (u64, u64) {
+    (
+        BUILT.swap(0, std::sync::atomic::Ordering::Relaxed),
+        POSTED_DATAGRAMS.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub(crate) fn note_post(wait: Duration) {
     if !enabled() {
         return;
