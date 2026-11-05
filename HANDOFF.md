@@ -608,6 +608,37 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The handshake's tail is neither a timer nor a queue (2026-11-05)
+
+Two mechanisms were tested against the slow opens and both are excluded.
+
+**Not an RTO.** `MIN_RTO_SMALL_FLIGHT` is 20 ms and the slow opens' p50 is 20.18 ms, which looked
+like a lost handshake packet repaired by the timer — a distribution quantised at 20, 40, 60 ms.
+It is not: the 763 slow opens decay smoothly (0–10 ms 194, 10–20 201, 20–30 158, 30–40 82,
+40–50 33, and a long tail to 190). A timer produces spikes at its own period; this is a wait
+proportional to something continuously varying.
+
+**Not a socket queue.** The receive queue of every UDP socket in the server's namespace, sampled
+thirty times a second apart during a load stage, read **0** every time. The receiver is keeping
+up; there is nothing piled in front of the handshake's datagram at the kernel.
+
+So the wait is inside the tool, not in the kernel: the open's three round trips are each fast
+(`accept → pairing` 0.058 ms, `paired → first byte` 0.022 ms, `resume` 4–14 µs), and yet the
+whole open occasionally takes 20 to 180 ms with nothing refused, nothing lost and no queue.
+
+One more fair pair, meanwhile — the second in the cycle, and both stages passing with bulk on
+both:
+
+| stage | p50 | p99 | bulk |
+|---|---|---|---|
+| `clean` | 2.51 ms | **23.03** | **6.89 Gbit/s** |
+| `clean#2` | 2.39 | **7.38** | **5.55 Gbit/s** |
+
+So the fair pair exists twice now, and both times the failing reading came from the run whose
+spine was faster (8.83 against 6.89). The relationship the six-run ledger found — pass below
+about 8 Gbit/s, fail above — still holds, and the handshake's unexplained 20–180 ms tail is what
+the failure is made of.
+
 ### The gate's one failing cell is the handshake's tail, and sealing is its fix (2026-11-05)
 
 The sweep's failing stage decomposes cleanly, and it is not the regime the earlier entries
