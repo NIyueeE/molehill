@@ -67,6 +67,35 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### Both ends of the lane dial now speak, and they say: the client dials, the server never joins (2026-11-05)
+
+Two `debug!` lines, one at each end of the claim's data channel — `open_data_channel` on the
+client (`service`, `claim`, whether it is a stripe) and `forward_transparent`'s join on the
+server (`claim`, `slot`, `lane`, `carrier`) — answer in one acceptance run what five rounds of
+reasoning could not:
+
+| end | what it printed |
+|---|---|
+| client | `dialling a data channel service=0 claim=Some(10.99.0.1:8443) stripe=false` **twice** |
+| server | `lane joined` — **never** |
+| server counters | `claim=10.99.0.1:8443 member=0 live=false lane=-` |
+
+So the client is not lazy: it dials the two lanes its `transparent_lanes: 2` asks for, at claim
+setup, before any packet exists. The server never accepts one, and `Routes::join` is never
+reached, which is why the routing table has no claim and the visitor's SYN is dropped as
+unclaimed.
+
+And the dial itself is silent in a way that is now specific: `spawn_data_channel` does log a
+failure (`debug!("{:#}", e)`), and the client's log has **no line after the two dials** — no
+error, no establishment, nothing. So the channel neither failed nor completed before the
+acceptance gave up: it is stuck inside `run_data_channel`, between the spawn and whatever the
+server would have seen.
+
+That is the whole question now, and it is one function wide: `run_data_channel`'s dial —
+the transport connect and the lane prologue write — needs the same two lines, one before each
+step. Then the acceptance says whether the client never gets a connection to the server's data
+listener, or gets one and never writes the prologue that names the claim.
+
 ### The eager first lane was tried and refuted; the instrument that would have said so (2026-11-05)
 
 The smallest no-protocol fix for the L3 deadlock was to have a claim dial its first lane at

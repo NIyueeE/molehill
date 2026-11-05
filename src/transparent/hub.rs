@@ -1608,6 +1608,15 @@ where
     let (tx, mut rx) = mpsc::channel::<(Instant, Bytes)>(QUEUE);
     let guard = hub.join(endpoint, tx, lane, carrier)?;
     let slot = guard.slot;
+    // One line per join: this is the moment a claim becomes **routable** on this
+    // end (`Routes::pick` consults the table that `join` fills), so the counters
+    // that read `live=true` and the frames that stop being dropped as unclaimed
+    // both start here. Without it, "the peer never dialled a lane" and "the peer
+    // dialled and this end refused it" are the same silence.
+    tracing::debug!(
+        target: "molehill::transparent",
+        "l3 lane joined claim={endpoint} slot={slot} lane={lane:?} carrier={carrier:?}"
+    );
 
     // The pump is one `write_all` per batch: the reader already framed every
     // packet, so a batch of N packets costs one syscall and one carrier

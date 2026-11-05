@@ -3768,6 +3768,24 @@ fn open_data_channel(
     stripe: Option<StripeOpen>,
     queued_at: std::time::Instant,
 ) {
+    // Every data channel this end dials, with the service it serves and whether
+    // it is a claim's lane. A dial that never happens and a dial that is refused
+    // before it reaches the wire look identical without this line, and the L3
+    // acceptance's failure was exactly that ambiguity: the claim had no lane, the
+    // counters said so, and nothing said whether this end ever asked for one.
+    #[cfg(mh_l3_client)]
+    debug!(
+        service = %active.args.service_id,
+        claim = ?active.lane,
+        stripe = stripe.is_some(),
+        "dialling a data channel"
+    );
+    #[cfg(not(mh_l3_client))]
+    debug!(
+        service = %active.args.service_id,
+        stripe = stripe.is_some(),
+        "dialling a data channel"
+    );
     #[cfg(feature = "multiplex")]
     let tunnel = active.tunnel.as_ref();
     #[cfg(not(feature = "multiplex"))]
