@@ -608,6 +608,29 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The reader was not waiting for ever — it was giving up first (2026-11-05)
+
+Every entry since round 43 assumed the group reader waited **for ever** for a missing frame. It does not.
+It waits `STRIPE_REORDER_DEADLINE`, and that constant was **two seconds** — shorter than a carrier stall
+this same cycle measured at **11.9 seconds**.
+
+So the sequence was never a deadlock in the reader: the reader failed the group, the carrier was still
+working on the frame it owed, and the failure looked like proof that the transport could not deliver it.
+The stripe layer was racing the transport and winning.
+
+Raising the deadline to thirty seconds — chosen against the transport's own bounds (keepalive 2 s, dead-path
+floor 5 s, longest measured recovery 12 s), so the layer that can still make progress is the one that
+decides — gives the first decisive result of this cycle:
+
+**eleven complete out of twelve**, against a baseline of thirteen in twenty-four (seven and six in the two
+batches that make it up). That is far outside the batch-to-batch scatter that has swallowed every previous
+candidate, and it is explained by a mechanism rather than a correlation.
+
+It also re-frames four earlier results, and this file should say so plainly: removing the pinned watermark,
+repairing the frontier, widening the bitmap and separating "held" from "delivered" were all attempts to
+make the transport deliver a frame *within two seconds*. They made the transport worse at a job it had less
+than two seconds to do. The reader had been given the wrong deadline all along.
+
 ### The held field, implemented properly, is worse than doing nothing (2026-11-05)
 
 The previous entry settled the design: carry `held` beside `prefix`, let the sender retire flight on

@@ -82,7 +82,27 @@ pub const MAX_STRIPES: usize = 64;
 /// tell a late frame from a task that was never polled again.
 const STRIPE_REORDER_KICK: std::time::Duration = std::time::Duration::from_millis(40);
 
-const STRIPE_REORDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a group waits for a frame that is overdue before giving up.
+///
+/// **It has to outlast the carrier's own recovery, not race it.** The deadline was
+/// two seconds, and two seconds is *shorter than a carrier stall*: measured, a
+/// writer parked 11.9 s waiting for a window that a pinned acknowledgement held
+/// shut, and then delivered. The group therefore failed at two seconds — every
+/// time — on a transfer the transport would have finished, and the failure looked
+/// like a proof that the transport could not finish it.
+///
+/// Thirty seconds is chosen against the transport's own bounds: the keepalive is
+/// two seconds, [`crate::transport::mhd::recovery`]'s dead-path floor is five, and
+/// the longest stall this carrier has been measured to recover from is twelve. The
+/// layer that can still make progress should be the one that decides a transfer has
+/// failed.
+///
+/// Twelve runs of the sealed striped integration test: **eleven complete**, against
+/// a baseline of thirteen in twenty-four (seven and six in the two batches that
+/// make it up). The one failure before this change that motivated the search is
+/// also its explanation: the reader was not waiting for ever, it was giving up
+/// first.
+const STRIPE_REORDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Frames one receive direction may hold out of order before its readers
 /// stall on the queue (the engine's per-stripe window is the real in-flight

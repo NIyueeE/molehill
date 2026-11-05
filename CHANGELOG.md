@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A striped data channel no longer gives up on a frame the carrier is still
+  recovering. The reorder deadline was two seconds, shorter than a carrier stall
+  measured at nearly twelve; a group now waits thirty, so the side that can still
+  make progress decides when a transfer has failed.
+
+### Fixed
+
 - **A transparent (L3) claim is reachable from the first packet.** A claim's first
   data lane was read twice on the server — once as a stream prologue and again as a
   lane prologue — so the second read blocked and the lane was dropped as "named no
