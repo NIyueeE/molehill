@@ -192,13 +192,14 @@ fn report_window(shared: &Arc<Shared>) {
         let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
         let ceiling = conn.window_ceiling();
         let (built, posted) = crate::transport::stats::take_datagrams();
-        let received = crate::transport::stats::take_received_datagrams();
+        let received = crate::transport::stats::take_received_datagrams_per_s();
         // Inside the same `with` as everything else: a second `with` here would
         // take the same lock and deadlock the pump (which is exactly what it did).
-        let (acks_applied, acks_attached) = conn.take_acks();
+        let (acks_applied_per_s, acks_attached_per_s) = conn.take_acks();
         let (issued, built_here) = conn.take_issued();
         let (process_posted, process_received) = crate::transport::stats::datagram_totals();
         let (posted_total, received_total) = conn.datagram_totals();
+        let (numbers_seen, numbers_acked) = conn.number_counts();
         let _ = (process_posted, process_received);
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
@@ -251,14 +252,16 @@ fn report_window(shared: &Arc<Shared>) {
             parked_oldest_ms = conn
                 .parked_writers(now, std::time::Duration::from_millis(50))
                 .1,
-            posted_datagrams = posted,
-            received_datagrams = received,
+            posted_datagrams_per_s = posted,
+            received_datagrams_per_s = received,
+            numbers_seen,
+            numbers_acked,
             posted_total,
             received_total,
-            numbers_issued = issued,
-            numbers_built = built_here,
-            acks_applied,
-            acks_attached,
+            numbers_issued_per_s = issued,
+            numbers_built_per_s = built_here,
+            acks_applied_per_s,
+            acks_attached_per_s,
             lane = conn.wire_id(),
             role = if conn.is_dialer() { "client" } else { "server" },
             cwnd,

@@ -562,6 +562,16 @@ pub(crate) struct Conn {
     /// re-dialled pool entry would leave behind.
     posted_total: u64,
     received_total: u64,
+    /// Packet numbers this end framed and identified as its own, and those it was
+    /// able to acknowledge.
+    ///
+    /// Acknowledgements are inserted only after a frame is accepted, so a refused
+    /// frame never advances the cumulative watermark. One such number can then pin
+    /// the peer's whole flight for the connection's life while the path underneath
+    /// is perfectly reliable — the difference between these two counts is that
+    /// number, counted where it is created.
+    numbers_seen: u64,
+    numbers_acked: u64,
     built: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
@@ -756,6 +766,8 @@ impl Conn {
             issued: 0,
             posted_total: 0,
             received_total: 0,
+            numbers_seen: 0,
+            numbers_acked: 0,
             built: 0,
             advertised: 0,
             read: 0,
@@ -1985,6 +1997,11 @@ impl Conn {
         self.dialer
     }
 
+    /// Numbers framed as this connection's own, and numbers acknowledged.
+    pub(crate) fn number_counts(&self) -> (u64, u64) {
+        (self.numbers_seen, self.numbers_acked)
+    }
+
     pub(crate) fn datagram_totals(&self) -> (u64, u64) {
         (self.posted_total, self.received_total)
     }
@@ -2270,6 +2287,9 @@ impl Conn {
             Rejected::Malformed
         })?;
         decode.stop(&stats::PHASES.decode);
+        if !packet.unnumbered {
+            self.numbers_seen = self.numbers_seen.saturating_add(1);
+        }
         if packet.id != self.id {
             stats::note_rejected("malformed_lane");
             return Err(Rejected::Malformed);
@@ -2391,6 +2411,7 @@ impl Conn {
         // the peer already used and is never retransmitted, so counting it would
         // acknowledge a data packet that may never have arrived.
         if !packet.unnumbered {
+            self.numbers_acked = self.numbers_acked.saturating_add(1);
             self.acks.insert(packet.number);
         }
         Ok(())

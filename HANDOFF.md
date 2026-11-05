@@ -608,6 +608,29 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Every number is acknowledged, and the counter names now say what they count (2026-11-05)
+
+Two solid results, then the process fix that should stop this file's recurring mistake.
+
+**`numbers_seen` equals `numbers_acked` on all eight connections, and the refusal count is zero** — a
+receiver frames every number as its own and inserts every one of them into its acknowledgement set. So a
+refused frame cannot be what pins a watermark, and acknowledgements are not being withheld.
+
+**The window line's counters now carry their convention in their names**:
+`numbers_issued_per_s`, `numbers_built_per_s`, `acks_applied_per_s`, `posted_datagrams_per_s` and
+`received_datagrams_per_s` for the per-second windows, and `*_total` for the lifetime counters that never
+reset. This is not cosmetic. Four rounds — 72 through 76, plus this one's first read — were spent on
+comparisons that were meaningless because one side of the subtraction was a window and the other a
+lifetime total, or because the two sides counted opposite directions. Each looked like evidence; none was.
+A field name that states the convention makes that class of error visible in the line itself, which the
+prose in this file demonstrably was not enough to do.
+
+So the confirmed state is: the path is reliable (kernel drops are zero), every framed number is
+acknowledged, no frame is refused, and the transfer still stops with a flight that will not retire. The
+next instrument has to be one whose two sides are the same kind of number — the per-second issued count
+against the per-second posted count on the *same* connection, which the renamed fields now make safe to
+compare.
+
 ### The kernel drops nothing at all, which retires the whole loss line (2026-11-05)
 
 `/proc/net/udp` ends every line with that socket's own **drops**, and it is kernel truth: nothing in this
