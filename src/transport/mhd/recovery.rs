@@ -582,36 +582,6 @@ impl Recovery {
         // Before anything is retired: a record whose hold has run out must not
         // shadow the number this acknowledgement names.
         self.reap(now);
-        // **Declare stale records lost here, not only in the timer.** The timer is
-        // armed from the newest activity, and a lane carrying four streams always
-        // has newer activity, so `on_timeout` may never fire while an old record
-        // sits unacknowledged. The bitmap below covers only `largest - 64`, and the
-        // cumulative path retires only numbers under `below` — which one lost first
-        // packet pins at zero for the connection's life. An old record is then in
-        // neither mechanism: it is never acknowledged, never declared lost, never
-        // re-sent, and its bytes hold the stream's frontier still. Measured: a
-        // writer parked for 11.9 s with `flight` eleven times its window.
-        let delay = self.rtt.loss_delay();
-        let stale: Vec<u32> = self
-            .in_flight
-            .iter()
-            .filter(|(number, sent)| {
-                // Only the records the bitmap below **cannot** reach: those older
-                // than its window. In-window records keep the existing
-                // three-gap rule, which is what keeps a reordered packet from
-                // being declared lost before it lands.
-                **number < ack.largest.saturating_sub(64)
-                    && sent.lost_at.is_none()
-                    && now.saturating_duration_since(sent.time) > delay
-            })
-            .map(|(number, _)| *number)
-            .take(8)
-            .collect();
-        for number in stale {
-            if let Some(sent) = self.declare_lost(now, number) {
-                result.lost.push(sent);
-            }
-        }
         // The newest packet this block proves arrived, which is what a round-trip
         // sample is taken from. Both retirement paths feed it: the cumulative
         // one carries most of a healthy acknowledgement, so a sample taken only

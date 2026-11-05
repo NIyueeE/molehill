@@ -608,6 +608,26 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The eager stale scan is withdrawn: age is not loss in a deep flight (2026-11-05)
+
+Round 61 added a scan on the acknowledgement path that declared a record lost when it was older than the
+loss delay **and** numbered below the bitmap's reach. Its premise was that such a record could never be
+declared lost otherwise, which is true — but it also assumed that being older than the loss delay means
+something is wrong. On a loopback lane with six hundred kilobytes in flight and a one-millisecond round
+trip, **every record in the flight is older than the loss delay all the time**: four hundred and fifty
+packets at five milliseconds of delay is a deep queue, not a hole. So the scan declared records lost for
+being queued, repaired them, and re-sent bytes the peer already had.
+
+Removing it entirely, on twelve runs: **seven complete**, exactly the baseline, with the partials at
+3 942 912 and 4 103 168 — the mid cluster, unchanged.
+
+So it is withdrawn rather than kept. It was neutral in measurement and wrong in reasoning: a rule that
+declares loss from age alone, on a path whose whole design is a deep flight, cannot be right, and keeping
+it "because it seemed principled" is the same error as keeping a change because it seemed right.
+
+That also closes the repair hypothesis the previous entry left open: the repair machinery's sixteen hundred
+repairs a run are not the limiter either, since removing the eager half of them changes nothing.
+
 ### The duplicate does reach number zero — and makes the transfer worse (2026-11-05)
 
 The mechanism was verified directly this time, with the receiver's own watermark on the window line:
