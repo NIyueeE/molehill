@@ -608,6 +608,29 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The sweep's clean stages are now 22.5 and 22.3 ms, and the sweep still aborted (2026-11-05)
+
+The first sweep after the deadline fix, and the headline number is the one the gate has been failing for
+two cycles:
+
+```
+[molehill] timeline  clean: 22.515 ms @ 8.29 Gbit/s   clean#2: 22.344 ms
+```
+
+**Both clean stages are under the fifty-millisecond SLO**, against the 81.83 ms that was the gate's single
+failure. For comparison in the same run: l3 reads 1.774 and 1.620 ms, so the carrier is thirteen times
+slower than a hand-written userspace tunnel on an idle loopback — but it is inside the contract now.
+
+The sweep itself did not finish: it ran `molehill` and `l3` and then exited **1** with no error line, and
+its own summary reads `run: -` for both (no throughput) and `L1..L8: -` for capacity, though the results
+file holds 36 samples including 18 capacity ones. So the summary's dashes are a display or metric-selection
+problem, not an absence of data — and the capacity verdict cannot be read from a run that stopped after two
+of five arms.
+
+That is where this stands: the SLO that blocked the gate is met, the run that would prove it did not
+complete, and the next step is one clean re-run of the same profile with the failure explained rather than
+assumed.
+
 ### The reader was not waiting for ever — it was giving up first (2026-11-05)
 
 Every entry since round 43 assumed the group reader waited **for ever** for a missing frame. It does not.
