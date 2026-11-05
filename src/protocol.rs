@@ -1236,24 +1236,6 @@ pub async fn write_lane_prologue<T: AsyncWrite + Unpin>(
 /// registered service before it reads (`read_channel_prologue` reads the
 /// service id, then the lane half). Both go through the same constants here,
 /// so the two cannot drift apart.
-/// Read the **lane half** of a prologue: the four bytes that follow the
-/// service id, and only they.
-///
-/// Split so the server can use it on the path it actually has: a direct data
-/// channel's prologue is the first thing on the channel, so its *width* has to
-/// be known before anything is read, and the width is a property of the
-/// registered service (`read_channel_prologue` looks the service up, reads its
-/// id, then calls this for the lane that follows). The whole-prologue form is
-/// what the round-trip test pins.
-#[cfg(mh_l3_server)]
-pub async fn read_lane_half<T: AsyncRead + Unpin>(conn: &mut T) -> Result<LaneId> {
-    let mut lane = [0u8; 4];
-    conn.read_exact(&mut lane)
-        .await
-        .with_context(|| "Failed to read the v4 lane prologue")?;
-    Ok(LaneId(lane))
-}
-
 #[cfg(all(test, mh_l3_client, mh_l3_server))]
 pub async fn read_lane_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<(ServiceId, LaneId)> {
     let mut buf = [0u8; 8];

@@ -67,6 +67,40 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### FIXED: the L3 acceptance passes end to end (2026-11-05)
+
+The prologue had been read twice. The fix is the small one from the entry below: the channel
+queue **carries the key it was delivered with** (`ChannelQueue::rx` is now
+`Receiver<(u32, C)>`, `push` takes the group), and the claim path uses that key as the lane id
+instead of reading four more bytes off the wire. `read_lane_half` is gone — it existed only for
+the doubled read.
+
+`just l3-accept` now passes every check it makes, exit status 0:
+
+```
+VISITOR OK
+REQUESTS n=3 size=65536 ok
+VISITOR OK
+REQUESTS n=2000 size=64 ok
+PASS an idle claim lends a lane to the claim carrying more flows than lanes
+PASS the busy claim stays byte-exact through the lane change
+PASS with [transparent.data].lend = false no lane moves, and the claim serves byte-exactly
+PASS the operator's valve refuses a claim's surplus lane, naming the cap
+PASS one claim on the same four lanes carries the same load
+PASS the claim serves byte-exactly on the lanes it got
+```
+
+So the transparent L3 path works end to end — the visitor reaches the claim, bulk and small
+requests are byte-exact, the lane-lending allocator moves a lane between claims without a byte
+lost, `lend = false` holds still, and the operator's valve refuses a surplus lane naming its
+cap. That is the first of the objective's conditions to move from failing to passing, and it
+moved by reading a key that was already in hand rather than by reading the wire again.
+
+The lesson is worth keeping: the defect was invisible because both halves of the prologue are
+**eight bytes and the same shape**, so the second read blocked rather than corrupting anything,
+and the only line that said so ("named no lane: Failed to read the v4 lane prologue") had been
+in the log for several rounds before it was read.
+
 ### The L3 deadlock's root cause: the prologue is read twice (2026-11-05)
 
 The server said it itself, in a line this file had not grepped for:

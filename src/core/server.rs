@@ -3255,7 +3255,13 @@ where
                 // decides can be told about the lane that actually carried the
                 // traffic (a slot index is this end's own bookkeeping and is
                 // reused by a replacement).
-                let Some(mut channel) = channel else {
+                // The key the queue carried with this channel is the lane the
+                // client named in the prologue's second half — the dispatcher read
+                // those four bytes as a "group" before this end knew the service
+                // was a claim, and they mean the same thing to both codecs. Reading
+                // them again, as this used to, waited for four bytes the client had
+                // no reason to write twice: every L3 claim died as "named no lane".
+                let Some((named_group, mut channel)) = channel else {
                     return Ok(());
                 };
                 // The lane the client named rides in the prologue's second
@@ -3266,13 +3272,9 @@ where
                 // parsed as frames, and a lane nobody can attribute is exactly
                 // what this is here to end.
                 #[cfg(mh_l3_server)]
-                let named_lane = match crate::protocol::read_lane_half(&mut channel).await {
-                    Ok(lane) => Some(lane),
-                    Err(e) => {
-                        debug!("Transparent channel for {endpoint} named no lane: {e:#}");
-                        continue;
-                    }
-                };
+                let named_lane = Some(crate::protocol::LaneId::new(named_group));
+                #[cfg(not(mh_l3_server))]
+                let _ = named_group;
                 #[cfg(not(mh_l3_server))]
                 let named_lane = None;
                 // The operator's valve counts these lanes too: a claim's channel
@@ -3587,8 +3589,17 @@ fn note_resume() {
 pub(crate) struct ChannelQueue<C> {
     /// The producer's half, held here so a push cannot be separated from its
     /// wake-up: a `send` without a `wake` leaves every waiting pairing asleep.
-    tx: mpsc::Sender<C>,
-    rx: std::sync::Mutex<mpsc::Receiver<C>>,
+    tx: mpsc::Sender<(u32, C)>,
+    /// The shared pool, each channel beside the key it arrived with.
+    ///
+    /// The key is the group a striped pairing names, and for a transparent
+    /// claim's lane it is the **lane id** — the same four bytes the prologue's
+    /// second half carries. It rides with the channel because the claim path
+    /// used to read it off the wire a second time, which cannot work: the
+    /// dispatcher had already consumed the prologue, so the claim's channel
+    /// blocked on a read the client had no reason to repeat and every L3 claim
+    /// died as "named no lane" (HANDOFF.md).
+    rx: std::sync::Mutex<mpsc::Receiver<(u32, C)>>,
     ready: tokio::sync::Notify,
     /// Pairings waiting for the channel their **own** group opened.
     ///
@@ -3619,8 +3630,8 @@ impl<C> ChannelQueue<C> {
     ///
     /// `notify_waiters` rather than `notify_one`: each waiter re-reads the queue,
     /// so the wake-up is a hint that the state changed, not a hand-off of one item.
-    async fn push(&self, channel: C) -> Result<(), ()> {
-        self.tx.send(channel).await.map_err(|_| ())?;
+    async fn push(&self, group: u32, channel: C) -> Result<(), ()> {
+        self.tx.send((group, channel)).await.map_err(|_| ())?;
         // Stamped here as well as in the claim path: on an `mhd` lane a visitor's
         // channel is a direct stream and arrives through this one, so a window
         // that only saw the other path measured nothing at all.
@@ -3663,7 +3674,7 @@ impl<C> ChannelQueue<C> {
                     // Full: the pairing has not taken its last one yet. Closed:
                     // it gave up. Both fall through to the shared queue.
                     Err(mpsc::error::TrySendError::Full(channel)) => {
-                        return self.push(channel).await;
+                        return self.push(group, channel).await;
                     }
                     // The pairing that named this group has gone, so nobody is
                     // waiting to read this channel. It is counted and given back
@@ -3672,13 +3683,13 @@ impl<C> ChannelQueue<C> {
                     // the release sweep's dead stages look like from the sender.
                     Err(mpsc::error::TrySendError::Closed(channel)) => {
                         crate::transport::stats::note_dead_group();
-                        return self.push(channel).await;
+                        return self.push(group, channel).await;
                     }
                 }
             }
         }
         crate::transport::stats::note_shared();
-        self.push(channel).await
+        self.push(group, channel).await
     }
 
     /// Whether no channel can arrive any more: the producer side is gone.
@@ -3692,7 +3703,7 @@ impl<C> ChannelQueue<C> {
 
     /// Lock, look, unlock. `Err` means the producer side is gone, so no channel
     /// can arrive again.
-    fn try_take(&self) -> Result<Option<C>, ()> {
+    fn try_take(&self) -> Result<Option<(u32, C)>, ()> {
         let mut rx = self
             .rx
             .lock()
@@ -3734,7 +3745,7 @@ impl<C> ChannelQueue<C> {
                 return Some(channel);
             }
             match self.try_take() {
-                Ok(Some(channel)) => {
+                Ok(Some((_, channel))) => {
                     self.unclaim(group);
                     return Some(channel);
                 }
@@ -3784,7 +3795,7 @@ impl<C> ChannelQueue<C> {
     }
 
     /// Take one channel, waiting for as long as the caller's own budget decides.
-    async fn take(&self) -> Option<C> {
+    async fn take(&self) -> Option<(u32, C)> {
         loop {
             let notified = self.ready.notified();
             tokio::pin!(notified);
@@ -4995,7 +5006,7 @@ where
                 break;
             }
             maybe_chan = data_ch_rx.take() => {
-                let Some(mut conn) = maybe_chan else {
+                let Some((_, mut conn)) = maybe_chan else {
                     shutting_down.store(true, Ordering::Relaxed);
                     break;
                 };
@@ -5669,7 +5680,7 @@ mod tests {
 
         // A stream that routed lands in *that* service's pool queue and in no
         // other, which is what the pool pairing later consumes.
-        routed.push(probe_data_channel().await).await.unwrap();
+        routed.push(0, probe_data_channel().await).await.unwrap();
         assert!(queues[1].try_take().is_ok_and(|o| o.is_some()));
         assert!(
             queues[0].try_take().is_ok_and(|o| o.is_none()),
