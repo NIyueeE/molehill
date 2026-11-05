@@ -67,6 +67,46 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The bulk bytes are not in the carrier at all (2026-11-05)
+
+The instrument pre-registered last round answers its first question on the first wedged
+stage it sees, and the answer is not the one the previous entry guessed. During a wedged
+`rtt100` (a hundred milliseconds of delay, four bulk flows, the interactive probe serving
+normally):
+
+| reading | client | server |
+|---|---|---|
+| receive backlog, all four lanes | **0 bytes, every second** | **0 bytes** |
+| in flight | — | **0**, with `cwnd` 9.8–15.9 MB and `slow_start=false` |
+| stall lines | none | none |
+| bulk first-frame reads in that window | **0** | **0** |
+| stripe groups started in that window | 600 (all 64-byte requests) | 600 |
+
+So nothing has arrived at the client because **nothing ever left the server**, and nothing
+left the server because it had nothing to send: `flight` is zero, its own receive backlog is
+zero, and it is not refusing anything. The four bulk connections' bytes are sitting in the
+**visitor's** socket, unread — while six hundred small connections through the same lanes are
+served normally, in microseconds, all through the same stage.
+
+That corrects round 13's sentence. The 697 bulk frames counted there were a **whole-run**
+count compared against a **per-stage** claim — the same population error this file keeps
+making, in the same direction — and in the wedged stage itself the count is zero on both
+sides. The wedge is **upstream of the carrier's data path**: the tool stops reading four
+bulk visitor connections, and everything after that is a consequence.
+
+The leading suspect is now in `stripe.rs` and not in the carrier at all: `spawn_grace` arms
+when **either** direction of a group ends and aborts the other after **ten seconds without
+activity**. A bulk visitor that has been idle for ten seconds — which is exactly what a
+hundred-millisecond shaped path produces — has its read side cut, and from then on the
+visitor's socket is never drained again. That would look precisely like this, on both
+carriers, and only for connections that outlive a shaped stage.
+
+It is a hypothesis with a mechanism and a test: instrument whether `spawn_grace` fires on a
+`send_loop` that is still owed bytes (the counters it prints already carry `highest` and
+`delivered`; it needs the visitor's read side and the group's own byte count), and if it
+does, the grace must be **conditioned on the dying direction's work being done** rather than
+on the survivor being busy.
+
 ### The fair pair, at last: both clean stages with bulk, both inside the SLO (2026-11-05)
 
 The same `soak` schedule, one hour later, does not wedge — and it is the first run in this
