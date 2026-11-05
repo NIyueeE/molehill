@@ -608,6 +608,40 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The release gate is one SLO cell short, and it says so itself (2026-11-05)
+
+A full-scale `sweep` on the product arm, then `just bench gate` on the record. The gate's own
+verdict, verbatim:
+
+```
+coverage: 18 measured arm/scenario/cell triples
+endpoint invariant: 16 samples carry a dialed endpoint
+SLO: 2 clean-stage cells gated
+drowned cells: 0 refused
+drift: checked the run cells' slopes and wedges
+capacity: l4 sustained 8 of 8 stream(s)
+gate: 1 FAILURE(S)
+  - SLO: l4 / timeline[clean] p99 81.8327 ms > 50.0 ms on a clean stage
+```
+
+So of everything the objective asks for, the gate now fails **one** item:
+
+- **coverage** — every declared cell measured, nothing refused or drowned;
+- **endpoint invariant** — every throughput sample dialled the tool, not the backend;
+- **drift and wedge axes** — checked, clean;
+- **capacity — 8 of 8**, with all eight levels inside the SLO (p99 23.4–24.4 ms on every one);
+- **SLO** — `timeline[clean#2]` **passes at 23.46 ms**; `timeline[clean]` fails at **81.83 ms**.
+
+And the run's own shape says what that failure is: the first stage carried **8.83 Gbit/s** of bulk
+and the last carried none (the wedge took it), so the stage that fails is the one with the fast
+spine — the same bimodality the last four soaks showed at 12.8, 16.0, 17.0 and 23.3–23.8 ms, and
+the same regime the path-scaled ceiling moved from 135–291 ms into the twenties.
+
+That is the whole of the release argument now: **one cell, in one regime, and the mechanism of
+that regime's bad mode is the last thing standing between this cycle and a gate pass.** The
+objective's own conditions are otherwise met in a single record for the first time — capacity,
+coverage, the endpoint invariant, drift, `just check` and the L3 acceptance.
+
 ### The wedge again, this time with the carrier's counters silent (2026-11-05)
 
 A `soak` on the build that carries the L3 fix. Its first stage is the best this cycle has
