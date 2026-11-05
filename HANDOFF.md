@@ -67,6 +67,39 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### Four runs after the ceiling: better in the fast regime, still bimodal (2026-11-05)
+
+Four `soak` campaigns on the path-scaled ceiling, all with a first-stage bulk rate between
+8.0 and 8.2 Gbit/s — the regime that failed every time before the change:
+
+| run | `clean` p99 | its bulk | `clean#2` p99 |
+|---|---|---|---|
+| m123 | **23.3 ms** | 8.23 Gbit/s | 13.3 |
+| m131 | **23.7** | 8.21 | 6.3 |
+| m132 | **109.8** | 8.01 | 4.1 |
+| m133 | **122.3** | 8.08 | 23.2 |
+
+So the change is **real but not sufficient**. What it bought is a frontier that moved: before
+it, every run at or above 8.3 Gbit/s failed and the best failing reading was 135.5; now the
+regime's *best* readings are 23.3 and 23.7 — a 5.7× improvement on the good side — while two
+of four runs still fail at 110 and 122. The distribution is bimodal with the two modes at
+about 23 and about 115, and the ceiling moved the good mode from "the slow side of the knee"
+to "inside the SLO" without collapsing the bad one.
+
+That is consistent with what the mechanism can and cannot do: shrinking the standing queue
+from 3.85 MB to 0.06–0.75 MB cuts the wait in front of a small packet by the same factor, and
+23 ms is what a 0.7 MB queue costs a three-round-trip handshake at eight gigabits. Cutting it
+further needs one of:
+
+- **fewer round trips in an open** — sealing, which deletes two of the three (and is still
+  blocked by the striped deadlock);
+- **a queue a handshake does not share**, i.e. small traffic on its own socket;
+- **a smaller floor** — 256 KiB is already the estimator's granularity, so this road is
+  nearly out of room at 8 Gbit/s.
+
+The first is the one the whole cycle has been pointing at, and it now has a number: two of
+three round trips are the difference between the passing mode and the failing one.
+
 ### The window ceiling was forty times the path, and now it is the path (2026-11-05)
 
 The ceiling is now the floor scaled by the measured round trip instead of a flat two
