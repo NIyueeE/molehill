@@ -608,6 +608,34 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The duplicate does reach number zero — and makes the transfer worse (2026-11-05)
+
+The mechanism was verified directly this time, with the receiver's own watermark on the window line:
+
+```
+before: server lane 0..3  own_below = 0     first_seen = 1
+after:  server lane 0..3  own_below = 3577, 4015, 5223, 5092   first_seen = 0
+```
+
+With the first data packet genuinely posted twice, **number zero arrives**: the watermark starts at zero
+and walks forward to thousands on every connection, which is the first time this cycle has seen it move at
+all. The mechanism the previous entry described is real and the cure works.
+
+The transfer, however, gets worse. Twelve runs: **three complete**, against a baseline of seven and six,
+with the partials clustering at 531 456 and 564 224 — an early stall that the previous twelve-run batch did
+not have. And the previous batch's eight-of-twelve came from a *broken* condition (the duplicate fired on
+the first build after one inbound number, not on the first post at all), so it measured nothing and its
+number is withdrawn.
+
+So the pinned watermark is **not** what limits this transfer: removing it entirely, and provably, makes the
+outcome worse. That is worth more than the fix would have been. It means the watermark's cost has been
+masked by something that the watermark itself was holding in check — the most likely candidate being the
+repair path, which in a pinned connection is spending its time on ranges that cannot help, and in an
+unpinned one starts re-sending the bytes it believes are missing.
+
+Reverted. The instruments stay: `own_below`, `first_posted`, `first_seen` and `first_seen_below` on the
+window line are what made this answerable in one run.
+
 ### Number zero is lost before the peer's socket exists, and one duplicate fixes it (2026-11-05)
 
 One line of logging on each side settles what thirty rounds of counters could not: the **first data

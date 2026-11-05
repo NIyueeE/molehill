@@ -572,6 +572,12 @@ pub(crate) struct Conn {
     /// number, counted where it is created.
     numbers_seen: u64,
     numbers_acked: u64,
+    /// The first data packet number posted, and the first seen with the watermark
+    /// it arrived under. The cumulative watermark advances only when the number
+    /// equal to it arrives, so these two say whether the first number ever left and
+    /// whether it ever landed.
+    first_posted: Option<u32>,
+    first_seen: Option<(u32, u32)>,
     built: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
@@ -768,6 +774,8 @@ impl Conn {
             received_total: 0,
             numbers_seen: 0,
             numbers_acked: 0,
+            first_posted: None,
+            first_seen: None,
             built: 0,
             advertised: 0,
             read: 0,
@@ -1271,7 +1279,13 @@ impl Conn {
     /// `out` is the run the pump is staging, so a stream frame's payload is
     /// appended from the stream's own buffer and never staged twice.
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
-        self.build_packet(now, out)
+        let before = self.built;
+        let packet = self.build_packet(now, out);
+        if self.built > before {
+            let number = self.recovery.last_number();
+            self.note_first_posted(number);
+        }
+        packet
     }
 
     /// Count datagrams this connection actually **posted**.
@@ -1280,6 +1294,29 @@ impl Conn {
     /// packet is not a posted one, and counting builds here made a per-lane "loss"
     /// that was really "built but never sent" — the exact confusion the global
     /// counters were introduced to end.
+    /// This end's own cumulative watermark: every packet number below it arrived.
+    pub(crate) fn own_below(&self) -> u32 {
+        self.acks.packet().map_or(0, |ack| ack.below)
+    }
+
+    /// The first number posted and the first seen (see [`Conn::first_seen`]).
+    pub(crate) fn first_numbers(&self) -> (Option<u32>, Option<(u32, u32)>) {
+        (self.first_posted, self.first_seen)
+    }
+
+    fn note_first_posted(&mut self, number: u32) {
+        if self.first_posted.is_none() {
+            self.first_posted = Some(number);
+        }
+    }
+
+    fn note_first_seen(&mut self, number: u32) {
+        if self.first_seen.is_some() {
+            return;
+        }
+        self.first_seen = Some((number, self.own_below()));
+    }
+
     pub(crate) fn note_posted(&mut self, count: usize) {
         self.posted_total = self
             .posted_total
@@ -2289,6 +2326,7 @@ impl Conn {
         decode.stop(&stats::PHASES.decode);
         if !packet.unnumbered {
             self.numbers_seen = self.numbers_seen.saturating_add(1);
+            self.note_first_seen(packet.number);
         }
         if packet.id != self.id {
             stats::note_rejected("malformed_lane");

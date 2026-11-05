@@ -119,23 +119,6 @@ async fn send_run(
     Ok(())
 }
 
-/// Push one built packet's span, twice when it is a lane's first data packet.
-///
-/// **The first data packet of a lane goes twice.** A lane's first datagram is
-/// posted before the far socket is associated — measured: the dialling end posts
-/// number 0 and the far end's first number seen is 1, twenty-two milliseconds
-/// later — and that single loss pins the peer's cumulative watermark at zero for
-/// the connection's life, which nothing in the carrier can then recover
-/// (`wire::ACK`). One duplicated datagram costs fourteen hundred bytes once and
-/// makes the race harmless.
-fn push_span(spans: &mut Vec<(usize, usize)>, span: (usize, usize), twice: bool) {
-    spans.push(span);
-    if twice {
-        spans.push(span);
-    }
-    crate::transport::stats::note_built(if twice { 2 } else { 1 });
-}
-
 /// The same, one datagram at a time (see the Linux version for the batched one).
 #[cfg(not(target_os = "linux"))]
 async fn send_run(
@@ -217,6 +200,8 @@ fn report_window(shared: &Arc<Shared>) {
         let (process_posted, process_received) = crate::transport::stats::datagram_totals();
         let (posted_total, received_total) = conn.datagram_totals();
         let (numbers_seen, numbers_acked) = conn.number_counts();
+        let (first_posted, first_seen) = conn.first_numbers();
+        let own_below = conn.own_below();
         let _ = (process_posted, process_received);
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
@@ -271,6 +256,10 @@ fn report_window(shared: &Arc<Shared>) {
                 .1,
             posted_datagrams_per_s = posted,
             received_datagrams_per_s = received,
+            own_below,
+            first_posted = first_posted.unwrap_or(0),
+            first_seen = first_seen.map_or(0, |(n, _)| n),
+            first_seen_below = first_seen.map_or(0, |(_, b)| b),
             numbers_seen,
             numbers_acked,
             posted_total,
@@ -316,14 +305,13 @@ async fn flush(
         let sampled =
             crate::transport::stats::enabled() && crate::transport::stats::PHASES.timing();
         let call = crate::transport::stats::Timing::start(sampled);
-        let before = shared.with(|conn| conn.number_counts().0);
         let filled = shared.with(|conn| conn.poll_transmit(now, run));
         call.stop(&crate::transport::stats::PHASES.tx_call);
         let Some(len) = filled else {
             break;
         };
-        let (seen, acked) = shared.with(|conn| conn.number_counts());
-        push_span(spans, (off, len), seen > before && acked == 1);
+        spans.push((off, len));
+        crate::transport::stats::note_built(1);
     }
     build.stop(&crate::transport::stats::PHASES.tx_build);
     if spans.is_empty() {
