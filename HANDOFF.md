@@ -608,6 +608,37 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The parked writer, and the record nothing could ever declare lost (2026-11-05)
+
+The per-stream instrument fires on the first failing run: **one writer parked for 11 880 ms**, and the
+line beside it names the bound:
+
+```
+lane=3 parked=1 oldest=11596ms cwnd=63403 flight=527868 base=ack=1533710 below=0 largest=5821
+```
+
+`window = cwnd − flight = 0`: the flight is eight to eleven times the window, so every write on that
+stream is refused and its loop parks. The flight cannot retire because **`below` is zero** — the
+cumulative path retires nothing at all — and the bitmap retires only `largest − 64 ..= largest`. The
+byte hole the frontier sits on corresponds to a packet number hundreds of numbers below the window, so
+it is **in neither mechanism**: never acknowledged, never declared lost, never re-sent.
+
+`on_timeout` does scan the whole flight for records older than the loss delay and declares them stale —
+but the timer is **armed from the newest activity**, and a lane carrying four streams always has newer
+activity. On a busy lane the timer may never fire, so the only loss declarations that happen are the
+bitmap's, which cannot reach the record that matters.
+
+The stale scan now also runs on the acknowledgement path, restricted to the records the bitmap cannot
+reach (`number < largest − 64`, older than the loss delay, eight per call). It is kept as a correctness
+fix: a record outside the window is otherwise unrecoverable by construction.
+
+Measured on twelve runs: **six complete**, with partials at 8 169 984 (the closest this cycle has come
+— 97.4 %), 4 103 168, 286 720 and three at 465 920. Six is the baseline, so no improvement is claimed.
+
+So declaring the record lost is not sufficient. The next question is one number: whether the range a
+stale declaration repairs actually **covers** the byte the frontier is stuck on, or sits above it — the
+same question the repair counters asked in round 43 and never answered for a declared-stale range.
+
 ### The stall instrument is blind to a parked writer on a busy lane (2026-11-05)
 
 Both ends' group lines are in one file and they show the freeze from the sending side:

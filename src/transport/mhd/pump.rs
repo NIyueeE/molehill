@@ -232,6 +232,12 @@ fn report_window(shared: &Arc<Shared>) {
             last_ack_bits = conn.last_ack_marks().1,
             last_ack_largest = conn.last_ack_marks().2,
             own_last_number = conn.last_number(),
+            parked_writers = conn
+                .parked_writers(now, std::time::Duration::from_millis(50))
+                .0,
+            parked_oldest_ms = conn
+                .parked_writers(now, std::time::Duration::from_millis(50))
+                .1,
             posted_datagrams = posted,
             lane = conn.wire_id(),
             cwnd,

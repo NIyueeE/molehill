@@ -211,6 +211,13 @@ struct StreamState {
     /// answers is about one stream: a Noise handshake that took five seconds is
     /// either a queue or eight lost packets, and only this says which.
     retransmits: u32,
+    /// Since when this stream has bytes nobody put on the wire.
+    ///
+    /// Per stream because the connection's own marker only fires a line when a
+    /// whole pass builds nothing — and a lane carrying four streams never has an
+    /// empty pass, so one parked writer stayed invisible for hundreds of seconds
+    /// in every failing run of this cycle.
+    unsent_at: Option<Instant>,
     /// Bytes inserted into this stream's receive buffer, which is what the peer's
     /// repairs are supposed to make grow. A lane whose repairs are posted and
     /// whose inserts stand still is a lane whose packets are not arriving.
@@ -871,6 +878,7 @@ impl Conn {
             // [`Conn::waiting`] reports. One clock read per short write, never
             // per packet — and a write the window accepted whole clocks nothing.
             self.unsent_at.get_or_insert_with(Instant::now);
+            state.unsent_at.get_or_insert_with(Instant::now);
             // Which bound refused, recorded because the two wait for different
             // things: the congestion window waits for an acknowledgement, the
             // peer's credit waits for its *reader*. A stream that stalls with
@@ -1454,6 +1462,9 @@ impl Conn {
                 state.repairs_sent = state.repairs_sent.saturating_add(1);
             } else {
                 state.send.mark_sent(len);
+                if !state.send.has_unsent() {
+                    state.unsent_at = None;
+                }
             }
         }
         self.advance_cursor();
@@ -1857,6 +1868,23 @@ impl Conn {
 
     pub(crate) fn inserted_total(&self) -> u64 {
         self.streams.values().map(|state| state.inserted).sum()
+    }
+
+    /// How many streams have been waiting to put bytes on the wire for at least
+    /// `after`, and how long the oldest has waited.
+    pub(crate) fn parked_writers(&self, now: Instant, after: std::time::Duration) -> (u32, u64) {
+        let mut count = 0;
+        let mut oldest = 0;
+        for state in self.streams.values() {
+            let Some(at) = state.unsent_at else { continue };
+            let waited = now.saturating_duration_since(at);
+            if waited < after {
+                continue;
+            }
+            count += 1;
+            oldest = oldest.max(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+        }
+        (count, oldest)
     }
 
     pub(crate) fn last_ack_prefix(&self) -> u64 {
