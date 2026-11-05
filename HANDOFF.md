@@ -608,6 +608,33 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### 99.4 % of the repairs cannot unblock the stream (2026-11-05)
+
+Two counters on the two places a declared loss becomes a repair — the acknowledgement path and the
+timer's — split every repair by which side of a stream's frontier it lands on. One failing run:
+
+```
+max repairs_at_base = 14        repairs that cover the frontier
+max repairs_above    = 2163     repairs that land above it
+```
+
+**Fourteen out of two thousand one hundred and seventy-seven.** The repair machinery is not idle and
+it is not broken: it re-sends, continuously, ranges that by construction cannot move the frontier the
+stalled stream is waiting on. That is why every counter this file has quoted since round 43 looked
+healthy — `retx` grows, `posted` equals it, the peer accepts everything — and the transfer still stops.
+
+It also explains the previous entry: the stale scan added to the acknowledgement path **never fires**,
+because the timer is doing the declaring (3 112 retransmits in that run came from there). The timer's
+scan takes records older than the loss delay in number order, and the records that cover a frontier
+sitting a megabyte into the stream are not the oldest ones — the oldest are their predecessors, whose
+bytes the peer already acknowledged by prefix, so their repairs are skipped as below the base (round
+53's fix). The one range that matters is neither the oldest nor the newest.
+
+So the next change is in the declaration's *choice*, not in its trigger: when the oldest records are
+all below the frontier, the scan has to reach the record that **covers** it — the range that starts at
+or before the base and ends after it — and declare that one, every time the frontier has not moved for
+a round trip.
+
 ### The parked writer, and the record nothing could ever declare lost (2026-11-05)
 
 The per-stream instrument fires on the first failing run: **one writer parked for 11 880 ms**, and the

@@ -526,6 +526,10 @@ pub(crate) struct Conn {
     last_ack_bits: u64,
     /// The highest packet number the peer reports having seen.
     last_ack_largest: u32,
+    /// Declared-loss ranges that covered a stream's frontier, and those that sat
+    /// above it. Only the first kind can unblock a stalled stream.
+    repairs_at_base: u64,
+    repairs_above: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
@@ -712,6 +716,8 @@ impl Conn {
             last_ack_below: 0,
             last_ack_bits: 0,
             last_ack_largest: 0,
+            repairs_at_base: 0,
+            repairs_above: 0,
             advertised: 0,
             read: 0,
             arrived_stream: 0,
@@ -1887,6 +1893,11 @@ impl Conn {
         (count, oldest)
     }
 
+    /// Declared-loss ranges that covered a frontier, and those above it.
+    pub(crate) fn repair_sides(&self) -> (u64, u64) {
+        (self.repairs_at_base, self.repairs_above)
+    }
+
     pub(crate) fn last_ack_prefix(&self) -> u64 {
         self.last_ack_prefix
     }
@@ -2328,9 +2339,26 @@ impl Conn {
                     self.pending_fins.push_back((range.stream, range.offset));
                     continue;
                 }
+                let mut at_base = false;
+                let mut above = false;
                 if let Some(state) = self.streams.get_mut(&range.stream) {
+                    // Which side of the frontier this declaration re-sends. A repair
+                    // that covers the frontier can unblock it; one above it cannot,
+                    // however often it is sent — the difference the counters below
+                    // keep, because every repair counter in this file until now
+                    // counted both as "a repair" (rounds 43 to 61).
+                    let base = state.send.base();
+                    let start = range.offset;
+                    let end = start.saturating_add(u64::from(range.len));
+                    at_base = start <= base && base < end;
+                    above = start > base;
                     state.send.repair(range.offset, usize::from(range.len));
                     state.retransmits = state.retransmits.saturating_add(1);
+                }
+                if at_base {
+                    self.repairs_at_base = self.repairs_at_base.saturating_add(1);
+                } else if above {
+                    self.repairs_above = self.repairs_above.saturating_add(1);
                 }
             }
         }
@@ -2390,9 +2418,21 @@ impl Conn {
                     self.pending_fins.push_back((range.stream, range.offset));
                     continue;
                 }
+                let mut at_base = false;
+                let mut above = false;
                 if let Some(state) = self.streams.get_mut(&range.stream) {
+                    let base = state.send.base();
+                    let start = range.offset;
+                    let end = start.saturating_add(u64::from(range.len));
+                    at_base = start <= base && base < end;
+                    above = start > base;
                     state.send.repair(range.offset, usize::from(range.len));
                     state.retransmits = state.retransmits.saturating_add(1);
+                }
+                if at_base {
+                    self.repairs_at_base = self.repairs_at_base.saturating_add(1);
+                } else if above {
+                    self.repairs_above = self.repairs_above.saturating_add(1);
                 }
             }
         }
