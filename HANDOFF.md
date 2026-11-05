@@ -608,6 +608,30 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Naming the laggard stream: no change either (2026-11-05)
+
+The stall's two clusters — 455 KiB and 3.5–6.9 MB — put the earliest one at frame 14, and fourteen
+mod four is stripe 2, which is the stripe on the lane whose watermark read zero. So the story this
+round tested was: one lane loses its first packet, its watermark is pinned at zero for the
+connection's life, its records retire only through the 64-bit window, and once the window passes a
+record that lane stops delivering.
+
+The escape from a pinned watermark is the byte prefix, and it names one stream per acknowledgement.
+Round-robin over the live streams made it worse (two of eight against five); naming the **laggard** —
+the stream whose frontier is furthest behind — is the version that always helps the stream that needs
+help. Measured on twelve runs: **six complete, and the partials at 465 920, 531 456, 3 185 664,
+4 365 312, 4 725 760 and 7 347 200**.
+
+The baseline is thirteen of twenty-four complete, and the two twelve-run batches that make it up read
+seven and six. **Six is the baseline.** No improvement, reverted.
+
+That is the sixth mechanism excluded for this stall — after the RTO, the socket queue, the retirement
+past the peer's word, the sealed-payload clamp, the `AHEAD` window and the round-robin prefix — and
+every one of them was excluded by a measurement rather than by an argument. The next thing to look at
+is not the acknowledgement at all: it is the stripe layer's own read loop, because every partial stop
+so far has been reported there (`stripe group stalled behind sequence N`) and the carrier's counters
+have been healthy or merely pinned in every case.
+
 ### The baseline's own scatter: 13 of 24 complete (2026-11-05)
 
 The twelve-run baseline was repeated on the same build, which is the first thing any A/B on this
