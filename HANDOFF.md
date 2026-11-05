@@ -67,6 +67,40 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The eager first lane was tried and refuted; the instrument that would have said so (2026-11-05)
+
+The smallest no-protocol fix for the L3 deadlock was to have a claim dial its first lane at
+service registration instead of waiting to be asked, at the point where the service becomes
+active (`open_channels(&active, slot.channels)` followed by `join_lane_pool`). It compiles, the
+352 unit tests pass, and **the acceptance still fails with the same counters**:
+
+```
+l3-stats: role=server claim=10.99.0.1:8443 member=0 live=false lane=- carrier=- …
+l3 device frame unclaimed proto=6 src=10.10.0.2:47886 dst=10.99.0.1:8443
+```
+
+The client's log for that run has eleven debug lines and **not one of them mentions a lane, a
+channel or a prologue**, so the dial either never ran (that activation site is not on this
+claim's path) or ran and was refused before anything reached the wire. Either way the change
+was not verified, so it is reverted rather than kept on the strength of its reasoning.
+
+The lesson is the same one this file keeps recording: the reasoning was sound — a routable claim
+needs a lane, and nothing asks for it — and the *site* was wrong, and only an instrument would
+have said which. `open_data_channel` writes no line of its own, so there is no way to tell a
+dial that never happened from a dial that was refused.
+
+So the next change is an instrument at each end of that dial, before another fix:
+
+- `open_data_channel`: one `debug!` naming the service, the endpoint when it is a claim, and
+  whether the request was queued — a dial that never happens and a dial that is refused look
+  identical today;
+- the server's accept path for a claim's data channel (`forward_transparent`): one line per
+  join, naming the endpoint and the slot — that is the other end of the same question, and it
+  is what `live=true` in the counters would mean.
+
+With those two lines the acceptance says which end is silent, and the fix is then a fact rather
+than a plausibility.
+
 ### Why L3 drops the first packet: a claim is routable only once a lane joins (2026-11-05)
 
 The two switches that already exist (`MOLEHILL_L3_STATS=1`, and the `debug` line the unclaimed
