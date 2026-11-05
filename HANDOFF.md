@@ -608,6 +608,42 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The peer's `largest` is below the packet that carries the frozen bytes (2026-11-05)
+
+Reading `largest` — the one mark this cycle had never printed — settles what `Ack::contains` was
+being asked and answers it in the negative:
+
+```
+lane=0 base=994110 num=1785 below=1760 largest=1759
+lane=1 base=983348 num=1761 below=1761 largest=1760
+lane=2 base=983348 num=1804 below=1779 largest=1778
+```
+
+**The peer's highest-seen packet number is below the number of the packet whose range covers the
+frozen frontier.** So that packet was recorded as sent by the sender, and the peer never received it
+— and because `largest` cannot advance past a number it has not seen, nothing above it can ever be
+acknowledged, and the sender's gap rule (which compares against `largest`) can never declare them
+lost either.
+
+Meanwhile the receive path is alive: 117 KB a second are being inserted, which by these numbers can
+only be duplicates of ranges at or below `largest` — the repairs of old data — while every packet
+numbered above it fails to arrive.
+
+Two candidate mechanisms, and this round did not separate them:
+
+- **the `AHEAD` bound.** `AckSet::AHEAD` is 256 and the gap set drops arrivals beyond it, by design,
+  so that a peer far ahead of a hole has its data re-sent rather than tracked. But a re-send takes a
+  *new* number from the same monotonic counter, so with the sender's numbers already thousands past
+  the hole, every re-send is discarded the same way. That is a deadlock by construction — and the
+  observed `largest` sitting *below* the hole is not quite its signature, so it is a candidate and
+  not a finding;
+- **a packet recorded and never posted.** `next == written`, `flight` holds hundreds of kilobytes,
+  and the pump logs no error — but nothing yet counts built datagrams against posted ones.
+
+The next instrument separates them in one run: **datagrams built versus posted per second**, beside
+the peer's `largest`. If built exceeds posted the discard is in the pump; if they are equal, the
+packets left the socket and the `AHEAD` trap is what took them.
+
 ### The receiver inserts 117 KB while its frontier stands still (2026-11-05)
 
 A per-stream counter of bytes inserted into the receive buffer, summed per lane, answers the last

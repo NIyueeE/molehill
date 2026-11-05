@@ -228,6 +228,7 @@ fn report_window(shared: &Arc<Shared>) {
             worst_covering_number = worst.map_or(0, |w| w.covering_number),
             last_ack_below = conn.last_ack_marks().0,
             last_ack_bits = conn.last_ack_marks().1,
+            last_ack_largest = conn.last_ack_marks().2,
             lane = conn.wire_id(),
             cwnd,
             flight,

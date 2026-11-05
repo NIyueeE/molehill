@@ -517,6 +517,8 @@ pub(crate) struct Conn {
     /// The peer's packet-number watermark and bitmap, for the same line.
     last_ack_below: u32,
     last_ack_bits: u64,
+    /// The highest packet number the peer reports having seen.
+    last_ack_largest: u32,
     /// The credit this end has already told the peer about.
     advertised: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
@@ -702,6 +704,7 @@ impl Conn {
             last_ack_prefix: 0,
             last_ack_below: 0,
             last_ack_bits: 0,
+            last_ack_largest: 0,
             advertised: 0,
             read: 0,
             arrived_stream: 0,
@@ -1853,8 +1856,12 @@ impl Conn {
     }
 
     /// The peer's packet-number watermark and bitmap, for the window line.
-    pub(crate) fn last_ack_marks(&self) -> (u32, u64) {
-        (self.last_ack_below, self.last_ack_bits)
+    pub(crate) fn last_ack_marks(&self) -> (u32, u64, u32) {
+        (
+            self.last_ack_below,
+            self.last_ack_bits,
+            self.last_ack_largest,
+        )
     }
 
     pub(crate) fn worst_stream(&self) -> Option<WorstStream> {
@@ -2235,6 +2242,7 @@ impl Conn {
         self.last_ack_prefix = ack.prefix;
         self.last_ack_below = ack.below;
         self.last_ack_bits = ack.bits;
+        self.last_ack_largest = ack.largest;
         let ack_timing = stats::Timing::start(sampled);
         let acked = self.recovery.on_ack(now, ack);
         for sent in acked.newly {
