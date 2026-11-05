@@ -352,6 +352,7 @@ async fn flush(
     let before_wait = Instant::now();
     send_run(socket, peer, run, spans).await?;
     crate::transport::stats::note_posted(spans.len());
+    shared.with(|conn| conn.note_posted(spans.len()));
     // The whole distribution, not only the extreme: a ten-millisecond post is
     // invisible to a hundred-millisecond bar, and ten milliseconds is the same
     // order as the arrival latency this pump is being measured for. Every pass

@@ -608,6 +608,36 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The per-connection counters cannot measure loss, and the kernel's own can (2026-11-05)
+
+The per-connection "posted" counter was incremented where a packet is **built**, not where it is posted —
+so the 2–14 % "loss" of the previous entry was partly "built but never sent". Moving the count to the
+post, where the socket accepted the run, gives:
+
+```
+lane 0: server posted 1652  client received 1828   (-176)
+lane 1: server posted 1722  client received 1854   (-132)
+lane 2: server posted 1899  client received 1855   ( +44)
+lane 3: server posted 1653  client received 1829   (-176)
+```
+
+The client now reads **more** than the server posted, on three of four lanes. Two counters that should
+differ only by loss differ by ten percent in **both** directions, which means they are not measuring the
+same events — a single `Shared` carries datagrams from more than one socket, and a lane id does not name
+one socket. That is the **third** population-style error on this question in three rounds (the first two
+were the direction subtraction and the build/post confusion), and the right response is to stop
+attributing loss with counters this code owns.
+
+The kernel keeps the authoritative number per socket: every line of `/proc/net/udp` ends with that
+socket's **drops**, and `RcvbufErrors` in `/proc/net/snmp` is the namespace total. Sampling
+`/proc/net/udp` once a second during a run gives each lane socket's own drop count, with no bookkeeping
+of ours in the path at all.
+
+That is the next measurement, and it needs no code: run one failing case and read the per-socket drops
+beside `ss -uan` during it. If the drops are zero, then the datagrams are not being dropped anywhere and
+the disagreement is entirely in what these two counters count — which is worth knowing too, because it
+would mean the carrier's own loss accounting has never measured loss either.
+
 ### Correcting it: the "loss" was two directions subtracted from each other (2026-11-05)
 
 With the end named, the asymmetry dissolves into a mirror:

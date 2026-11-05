@@ -1259,11 +1259,19 @@ impl Conn {
     /// `out` is the run the pump is staging, so a stream frame's payload is
     /// appended from the stream's own buffer and never staged twice.
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
-        let packet = self.build_packet(now, out);
-        if packet.is_some() {
-            self.posted_total = self.posted_total.saturating_add(1);
-        }
-        packet
+        self.build_packet(now, out)
+    }
+
+    /// Count datagrams this connection actually **posted**.
+    ///
+    /// Called by the pump after `send_run` returns, not by `poll_transmit`: a built
+    /// packet is not a posted one, and counting builds here made a per-lane "loss"
+    /// that was really "built but never sent" — the exact confusion the global
+    /// counters were introduced to end.
+    pub(crate) fn note_posted(&mut self, count: usize) {
+        self.posted_total = self
+            .posted_total
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
     }
 
     /// One pass of the scheduler, without the post accounting.
