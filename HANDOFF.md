@@ -2453,6 +2453,36 @@ Two consequences written down rather than discovered later:
   ~6 TB, which no test will reach — which is exactly why it has to be an
   explicit refusal and not an assumption.
 
+### The sealed failure is not the harness, and its signature was not what it looked like (2026-11-05)
+
+Two corrections, both from measuring with a detector that cannot be fooled by a
+debug line:
+
+- **`mhd transport selector timed out` is not the failure signature.** It appears in
+  *passing* runs too — four streams whose selector never arrives while the group still
+  gathers enough channels and carries the whole transfer. An earlier entry read it as
+  the server waiting on the streams that mattered; it does not say that.
+- **the test's echo is not the cause.** With a strict detector (`test result: ok`), the
+  sealed striped test passes **3 of 8** with the coupled `io::copy` echo and **2 of 8**
+  with the decoupled reader/queue/writer one. Reverted, for the second time and now
+  with a detector worth trusting.
+
+So the sealed path fails about five times in eight and nothing about the harness
+explains it. The trace of a failing run is consistent from run to run: the client's
+response direction — whose source is the local echo — reads a variable number of frames
+(123 / 3 975 680 bytes in one run; 455 KiB, 440 KiB, 826 KiB in others) and then
+`stripe source read has not returned for two seconds`, forever, while the visitor reads
+EOF at that byte. The number is not stable across runs (the three appearances of
+465 920 were one batch, not a law), so it is a stopping point rather than a boundary.
+
+What is now excluded for this path: the two never-sent packet numbers (fixed), the
+repair path itself (a sealed stream repairs a dropped packet correctly in a unit test),
+the harness's echo (measured twice), and the control plane and every arrival stage
+(measured in the rounds above). What is left is the stripe layer's own accounting over
+sealed streams — where `MAX_SEALED_PAYLOAD` clamps the packet but the frame is 32 KiB,
+and the reorder loop's `written` is the byte count the visitor's EOF is measured
+against.
+
 ### A second never-sent packet number, and the deadlock gets better but not gone (2026-11-05)
 
 The first leak was a refused packet consuming a number. There was a **second**, one
