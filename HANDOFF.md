@@ -608,6 +608,32 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Smaller send bursts are worse: the A/B, and its numbers (2026-11-05)
+
+The last hypothesis had a mechanism and a one-constant test: the sender builds up to `SEND_RUN`
+packets (44, about 61 KB) per syscall, so an interactive packet that arrives mid-run waits for
+the run. Reduce the run and the wait should shrink.
+
+Measured, same build otherwise, one `soak` each:
+
+| | `SEND_RUN = 44` | `SEND_RUN = 8` |
+|---|---|---|
+| slow opens in the run | **213** | **5 530** |
+| of those, p50 / p90 | 10.84 / 32.14 ms | 10.53 / **22.76** ms |
+| first stage p50 / p99 | **2.51 / 23.03** | **13.10 / 68.03** |
+| first stage bulk | 6.89 Gbit/s | 6.20 |
+
+So the tail's *shape* did improve — p90 32.14 to 22.76, which is the mechanism working as
+predicted — and everything else got worse: **twenty-six times as many opens were slow**, the
+stage's median rose fivefold and its p99 tripled. Five and a half times as many syscalls for the
+same bytes is more CPU per byte, and every small packet now queues behind more processing rather
+than less.
+
+Reverted. The hypothesis was half right (a shorter run does shorten the worst wait) and the trade
+is wrong by a wide margin, which is exactly what the objective's priority order — latency, then
+throughput, then memory, then processor — says to check rather than assume: a change can improve
+the statistic it was aimed at and lose on the metric that matters.
+
 ### The handshake's tail is neither a timer nor a queue (2026-11-05)
 
 Two mechanisms were tested against the slow opens and both are excluded.
