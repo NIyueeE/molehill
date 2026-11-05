@@ -2453,6 +2453,34 @@ Two consequences written down rather than discovered later:
   ~6 TB, which no test will reach — which is exactly why it has to be an
   explicit refusal and not an assumption.
 
+### A second never-sent packet number, and the deadlock gets better but not gone (2026-11-05)
+
+The first leak was a refused packet consuming a number. There was a **second**, one
+level further in and reachable only on the sealed path, which is why sealing alone
+deadlocked stripes: `seal_stream_payload` can fail after `encode_stream` has already
+written the header and after the number was taken, and the `?` there abandoned the
+packet with its number consumed — a hole in the peer's cumulative frontier that can
+never be filled, and every later acknowledgement re-declares everything above it lost.
+
+A lane that cannot seal is now **closed**, where the pool can rebuild it, instead of
+continuing with a hole: `note_no_key` counts it and `closed` is set with a reason of its
+own. A silent repair loop becomes one lane restart.
+
+Two more things were measured while looking:
+
+- a sealed stream **does** repair a dropped packet. `a_sealed_stream_repairs_one_dropped_packet`
+  drops one stream packet off the wire, fires the timer, and asserts every byte lands —
+  it passes, so the loop is not in the repair path itself;
+- with the fix, the sealed striped test improves from two-or-three of six to **four of
+  six**. Not cured. Two of the failures stopped at **465 920 bytes**, which is the same
+  number two runs reached earlier in the cycle — three times now for the same value, on
+  a transfer whose frame size is 32 KiB, so it is not a frame boundary and it is not yet
+  explained.
+
+So sealing is still off. What has changed is that a lane with a hole now says so
+instead of looking healthy, and the sealed path's failure rate is halved by a defect
+whose mechanism is understood rather than by luck.
+
 ### Sealing is wired, tested, and OFF: a striped group deadlocks with it (2026-11-04)
 
 The derivation is now plumbed end to end — `NoiseStream::session_roots`, a lane

@@ -1344,16 +1344,28 @@ impl Conn {
         // longer capped by the chunk boundary the send point happens to sit in.
         let payload_at = out.len();
         state.send.append_to(offset, len, out);
-        // A seal that cannot be produced must not become a plaintext packet.
-        seal_stream_payload(
+        // A seal that cannot be produced must not become a plaintext packet, and
+        // the packet number it already took must not become a **hole** either: a
+        // number that never reaches the wire pins the peer's cumulative frontier
+        // for the connection's life, and every later acknowledgement re-declares
+        // everything above it lost. That is the same defect the refusal path had,
+        // one level further in, and it exists only on the sealed path — which is
+        // why sealing alone deadlocks stripes. So a lane that cannot seal is
+        // closed here, where the pool can rebuild it, instead of continuing with
+        // a hole it can never fill.
+        if !seal_stream_payload(
             state.send_cipher.as_deref(),
             sealed,
             out,
             packet_start,
             payload_at,
             number,
-        )
-        .then_some(())?;
+        ) {
+            stats::note_no_key();
+            self.closed = Some(ResetCode::Aborted);
+            self.none_reason = Some("a packet could not be sealed");
+            return None;
+        }
         encode.stop(&stats::PHASES.tx_encode);
         let book = stats::Timing::start(sampled);
         self.recovery.on_sent(
@@ -2370,6 +2382,76 @@ mod tests {
             [[seed; 32], [seed.wrapping_add(1); 32]],
             [seed.wrapping_add(2); 32],
         )
+    }
+
+    /// A sealed stream repairs one dropped packet instead of looping on it.
+    ///
+    /// The sealed striped test fails about half the time with thousands of
+    /// retransmissions on one stream and every byte already on the wire, which is
+    /// the shape of a repair that is declared for ever. This is the smallest
+    /// reproduction that could produce one: a sealed stream, one packet taken off
+    /// the wire, and the timer that owes it again. If the loop needs something
+    /// else — four streams, a real socket, a wide flight — this test will pass and
+    /// say so, which is worth knowing before another integration round.
+    #[test]
+    fn a_sealed_stream_repairs_one_dropped_packet() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let root = secret(11);
+        link.a.set_lane_secret(&root);
+        link.b.set_lane_secret(&root);
+        let stream = link.a.open();
+        // Under one congestion window: a first write is bounded by
+        // `INITIAL_CWND`, and a short write here would be this test's business
+        // rather than the carrier's.
+        let bytes = payload(8 * 1024);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        // Take **one stream packet** off the wire and drop it. Counting packets
+        // rather than assuming the first one is a stream: the first is usually a
+        // credit frame, and dropping that would test something else entirely.
+        let mut dropped = 0;
+        for _ in 0..8 {
+            let mut buf = Vec::new();
+            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+                break;
+            };
+            let Some(packet) = super::wire::decode(&buf[buf.len() - len..]).ok() else {
+                unreachable!("every packet this end builds decodes")
+            };
+            let carries = matches!(
+                packet.frame,
+                super::wire::Frame::Stream { id, .. } if id == stream.id
+            );
+            if carries && dropped == 0 {
+                dropped += 1;
+                continue;
+            }
+            link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+        }
+        assert_eq!(dropped, 1, "one stream packet was dropped");
+
+        // The timer fires and the range is owed again.
+        let later = now + Duration::from_millis(30);
+        let (_, resent) = link.a.on_timeout(later);
+        assert!(
+            resent >= 1,
+            "the dropped packet is owed again, not forgotten"
+        );
+
+        // Everything else flows, and the stream completes.
+        let mut got: Vec<u8> = Vec::new();
+        for step in 0..64u64 {
+            link.pump(later + Duration::from_millis(step));
+            got.extend(take(&mut link.b, stream.id));
+            if got.len() == bytes.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            got, bytes,
+            "the sealed stream repaired the loss and delivered every byte"
+        );
     }
 
     /// Eight mebibytes over one sealed stream, written as the writer would.
