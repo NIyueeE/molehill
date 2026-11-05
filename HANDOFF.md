@@ -608,6 +608,37 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The wedge again, this time with the carrier's counters silent (2026-11-05)
+
+A `soak` on the build that carries the L3 fix. Its first stage is the best this cycle has
+recorded — **p50 2.54 ms, p99 16.03 ms at 8.0 Gbit/s** — and its last clean stage wedges
+exactly as before (`throughput_gbps` absent).
+
+The per-visitor line, in that stage's window, and the counters beside it:
+
+| reading | value |
+|---|---|
+| visitors forwarded and returned (`stop_pool=false`) | **9 486** — every probe and churn visitor |
+| visitors dropped at pairing | **0** |
+| pairing budgets expired | **0** |
+| `mhd stalled` lines in the window | **0** |
+
+So in this wedge the carrier is not merely quiet, it is **healthy by its own accounting**: no
+unsent bytes, no unacknowledged flight, no refusals, no dropped visitors, and sixty-odd
+micro-visitors a second served normally throughout. The four bulk connections are accepted,
+paired and forwarding — they simply never drain, and nothing in the carrier is holding their
+bytes.
+
+That eliminates the last carrier-side explanation this file had for the wedge. What remains is
+the path *before* the carrier: a forwarding loop that is neither reading its visitor (whose
+socket is full, which is why `iperf3` blocks) nor writing into the carrier (which would show as
+an unsent or a stall). A loop parked in neither of those places is parked on a queue between
+them, and that is where the next instrument goes.
+
+The first stage's 16.03 ms is worth recording on its own: with the path-scaled ceiling, a
+Gbit/s-8 run has now read 12.8, 16.0, 17.0 and 23.3–23.8 ms, against 135–291 ms before it. The
+bad mode (102–122) has not recurred in the last four runs, though four runs is not yet a claim.
+
 ### The bulk bytes are not in the carrier at all (2026-11-05)
 
 The instrument pre-registered last round answers its first question on the first wedged
