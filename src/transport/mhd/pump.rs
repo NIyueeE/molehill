@@ -190,6 +190,7 @@ fn report_window(shared: &Arc<Shared>) {
         }
         conn.note_window_reported(now);
         let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
+        let ceiling = conn.window_ceiling();
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
         // stream whose bytes arrived and whose reader never took them was
@@ -214,6 +215,14 @@ fn report_window(shared: &Arc<Shared>) {
             backlog_bytes = backlog.total,
             worst_stream,
             worst_ready_ms,
+            // The ceiling the window is actually allowed to reach, and the
+            // round trip it is derived from: a queue that inflates the estimate
+            // would raise its own ceiling, and that feedback has to be visible
+            // in the same line as the number it moves.
+            ceiling,
+            srtt_us = conn
+                .smoothed_rtt()
+                .map_or(0, |rtt| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX)),
             "mhd window"
         );
     });

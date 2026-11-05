@@ -110,16 +110,29 @@ const INITIAL_CWND: u64 = 10 * MAX_STREAM_PAYLOAD as u64;
 /// will take", or the flight becomes the credit window again.
 const MAX_CWND: u64 = 16 * 1024 * 1024;
 
-/// Where the doubling phase stops.
+/// The smallest window a lane may grow to, at the shortest path.
 ///
-/// Slow start doubles the flight per round trip, and this carrier has no pacer to
-/// space the result: a window that outgrows the peer's socket buffer makes the
-/// path drop *everything* for a while, and a sender that then hears nothing for
-/// ten timers declares a live lane dead (`reaped dead tunnels ... reason="dead"`
-/// in a bench arm's log, twice). Two megabytes is what a bulk transfer reaches in
-/// a few round trips anyway, and it is small enough that the peer's receive buffer
-/// absorbs the burst while the additive phase takes over.
-const SLOW_START_CEILING: u64 = 2 * 1024 * 1024;
+/// A congestion window exists to cover a bandwidth-delay product. Everything
+/// above the product is a **standing queue at the peer** that buys no throughput
+/// and costs every small packet its latency, so the ceiling is the floor scaled by
+/// the measured round trip rather than a flat number: a flat two mebibytes is
+/// forty times the product on loopback (fifty microseconds at eight gigabits is
+/// fifty kilobytes), and it built a queue that put 4.5 ms in front of every
+/// handshake packet — measured, the open went from 1.34 ms to 13.5 ms as the bulk
+/// spine crossed eight gigabits a second (`HANDOFF.md`, "at 8.4 Gbit/s the runtime
+/// is idle and the handshake is ten times slow").
+///
+/// The floor is also what a lane starts with, so a fresh connection cannot open
+/// over-wide before it has any round-trip sample at all.
+const WINDOW_FLOOR: u64 = 256 * 1024;
+
+/// The round trip the floor is calibrated at — one millisecond, which is the
+/// round-trip estimator's own granularity (`recovery::GRANULARITY`), so this is the
+/// shortest path the carrier can actually see. Calibrating at fifty microseconds
+/// would have put the floor twenty times out of reach: the estimate never goes
+/// below its granularity, so the smallest ceiling the formula can produce would have
+/// been five mebibytes — the flat ceiling this change exists to remove.
+const WINDOW_REFERENCE: u64 = 1_000;
 
 /// Why a frame could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1721,6 +1734,31 @@ impl Conn {
         });
     }
 
+    #[cfg(test)]
+    /// Put this lane on a path with the given round trip (see the ceiling).
+    pub(crate) fn seed_rtt(&mut self, rtt: std::time::Duration) {
+        self.recovery.seed_rtt(rtt);
+    }
+
+    /// The window this lane may grow to, given the path it is on.
+    ///
+    /// The floor scaled by the measured round trip, never above [`MAX_CWND`]. A
+    /// hundred-millisecond path's product really is megabytes, so a shaped lane
+    /// keeps the window it always had; a loopback lane — whose estimate is the
+    /// estimator's own one-millisecond granularity — keeps a quarter of a
+    /// mebibyte.
+    pub(crate) fn window_ceiling(&self) -> u64 {
+        let Some(smoothed) = self.recovery.smoothed_rtt() else {
+            return WINDOW_FLOOR;
+        };
+        let hops = u64::try_from(smoothed.as_micros())
+            .unwrap_or(u64::MAX)
+            .checked_div(WINDOW_REFERENCE)
+            .unwrap_or(1)
+            .max(1);
+        WINDOW_FLOOR.saturating_mul(hops).min(MAX_CWND)
+    }
+
     /// Move the cursor past the stream that was just served, wrapping to the
     /// smallest id so the walk starts again where it began.
     fn advance_cursor(&mut self) {
@@ -1811,6 +1849,11 @@ impl Conn {
     }
 
     /// What this end's readers have left unread, per the whole connection.
+    /// The smoothed round trip, for the window line.
+    pub(crate) fn smoothed_rtt(&self) -> Option<std::time::Duration> {
+        self.recovery.smoothed_rtt()
+    }
+
     pub(crate) fn backlog(&self) -> Backlog {
         let mut out = Backlog::default();
         for (&id, state) in &self.streams {
@@ -2183,8 +2226,8 @@ impl Conn {
                 // Doubling stops at the ceiling and the additive rule takes
                 // over, because an unspaced burst that outruns the peer's
                 // buffer costs the connection its liveness (see
-                // [`SLOW_START_CEILING`]).
-                self.cwnd = self.cwnd.saturating_add(bytes).min(SLOW_START_CEILING);
+                // [`WINDOW_FLOOR`]).
+                self.cwnd = self.cwnd.saturating_add(bytes).min(self.window_ceiling());
             } else {
                 self.acked_since_growth += bytes;
                 if self.acked_since_growth >= self.cwnd {
@@ -2192,7 +2235,7 @@ impl Conn {
                     self.cwnd = self
                         .cwnd
                         .saturating_add(MAX_STREAM_PAYLOAD as u64)
-                        .min(MAX_CWND);
+                        .min(self.window_ceiling());
                 }
             }
         }
@@ -2392,6 +2435,46 @@ mod tests {
             [[seed; 32], [seed.wrapping_add(1); 32]],
             [seed.wrapping_add(2); 32],
         )
+    }
+
+    /// The window ceiling is the path's, not a flat number.
+    ///
+    /// A flat two mebibytes is forty times the bandwidth-delay product of a
+    /// loopback path, and the standing queue it builds is what put 4.5 ms in front
+    /// of every handshake packet once a bulk spine crossed eight gigabits a second.
+    /// The ceiling is therefore the floor scaled by the measured round trip — and
+    /// this test pins all three regimes: the shortest path gets the floor, a shaped
+    /// path gets its product, and nothing gets more than the absolute cap.
+    #[test]
+    fn the_window_ceiling_scales_with_the_path() {
+        // A fresh lane per regime: the estimate is an average, so seeding 2 ms onto
+        // a lane that already smoothed 1 ms would test the averaging and not the
+        // formula.
+        let ceiling_at = |rtt: Duration| {
+            let mut link = Link::new();
+            link.a.seed_rtt(rtt);
+            link.a.window_ceiling()
+        };
+        assert_eq!(
+            ceiling_at(Duration::from_millis(1)),
+            WINDOW_FLOOR,
+            "a one-millisecond path gets the floor"
+        );
+        assert_eq!(
+            ceiling_at(Duration::from_millis(2)),
+            WINDOW_FLOOR * 2,
+            "a two-millisecond path gets two floors"
+        );
+        assert_eq!(
+            ceiling_at(Duration::from_millis(50)),
+            WINDOW_FLOOR * 50,
+            "a fifty-millisecond path gets fifty floors"
+        );
+        assert_eq!(
+            ceiling_at(Duration::from_secs(10)),
+            MAX_CWND,
+            "no path gets more than the absolute cap"
+        );
     }
 
     /// A sealed stream repairs one dropped packet instead of looping on it.

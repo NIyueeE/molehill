@@ -188,6 +188,27 @@ pub(crate) struct Sent {
     pub(crate) opening: bool,
 }
 
+impl Recovery {
+    #[cfg(test)]
+    /// Seed the estimate, so a test can put a lane on a path of its choosing.
+    ///
+    /// Only the ceiling's calibration uses it: production samples come from
+    /// acknowledgements, and a harness that sends and acknowledges inside one
+    /// instant reports a round trip of zero, which is not a path anyone runs on.
+    pub(crate) fn seed_rtt(&mut self, rtt: Duration) {
+        self.rtt.sample(rtt);
+        self.rtt.sample(rtt);
+    }
+
+    /// The smoothed round trip, once a sample exists.
+    ///
+    /// Read by the sender's window ceiling, which scales with the path (see
+    /// `Conn::window_ceiling`).
+    pub(crate) fn smoothed_rtt(&self) -> Option<Duration> {
+        self.rtt.smoothed
+    }
+}
+
 /// The round-trip estimate.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Rtt {
