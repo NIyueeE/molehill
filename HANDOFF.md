@@ -608,6 +608,39 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The sender repairs above the frontier and never the hole itself (2026-11-05)
+
+One line from the previous run had the answer in it and was read too quickly:
+
+```
+lane=3 base=196716 next=983388 ack=196716 repair_at=783236 pending=1
+```
+
+**The repair queue's head is 783 236 and the frontier is 196 716.** So the sender is not short of
+work — it is repairing a range **well above** the hole — and the hole at the frontier has **no
+obligation at all**. That is why the queue reads empty at the other samples: the range the peer is
+waiting for is never in it.
+
+So the mechanism narrows to the **declaration** of a loss, which happens in exactly two places: the
+timer (`on_timeout`, oldest tracked packet) and the acknowledgement path (the ranges a peer's
+`AckSet` says it is missing). Neither has ever declared the range that covers the frontier.
+
+Three facts now bound it:
+
+- the peer **refuses nothing**: `datagrams refused` sums all six reasons and never prints, so it is
+  not `over_window`, not a retired stream, not a seal failure;
+- the host's own UDP counters read **zero** `InErrors`, `RcvbufErrors` and `SndbufErrors`, so
+  nothing was dropped by a full receive buffer either;
+- `repair_sent` is called only where a packet is **built**, and `send_run(...).await?` aborts the
+  pump on a post error rather than discarding quietly — so a consumed obligation did reach the
+  socket.
+
+Which leaves the one place not yet measured: **why the range covering the frontier is never
+declared lost.** The next instrument is the peer's `Ack { prefix, blocks }` and the sender's
+`in_flight` keys, side by side for the stalled stream, for one second. If the peer's blocks cover
+the frontier's range while its prefix sits below it, the peer is telling the sender it *has* those
+bytes — and then the bug is in what the peer puts in `blocks`, not in what the sender does with it.
+
 ### The repair queue is empty while the frontier is stuck: obligations are consumed, not delivered (2026-11-05)
 
 The user chose to keep chasing it, so two more facts were added to the window line — the repair
