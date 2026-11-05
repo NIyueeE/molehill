@@ -608,6 +608,29 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Repairing the frontier itself makes it worse, which inverts the conclusion (2026-11-05)
+
+The natural fix for the previous entry's ratio — fourteen frontier repairs against two thousand one
+hundred above it — was to give the frontier its own clock: when a stream's frontier has not moved for a
+round trip, queue the range that covers it, chosen by offset rather than by packet number.
+
+Measured on twelve runs: **four complete**, against a baseline of six or seven. Worse, and reverted.
+
+That result is more informative than the ratio was. If re-sending the range that *covers* the frontier
+does not unblock the stream — and actively hurts, presumably because it floods the repair queue with a
+range the peer cannot use — then **the byte the frontier is stuck on is not in a range that can be
+re-sent**. It was never appended to a packet.
+
+Which moves the search entirely off the recovery machinery and onto the send buffer's own accounting:
+`SendBuf::append_to` decides which bytes of a stream go into a packet, `head`/`cursor` track what has
+been handed over, and `written` counts what the writer produced. A stream whose `written` is ahead of
+every range any packet ever carried would look exactly like this from every counter in the file: no
+gap in the reorder map, nothing unsent, nothing refused, the peer inserting bytes, and a frontier that
+cannot move because the bytes at it never left.
+
+That is the next thing to instrument, and it is one line: **how many bytes of a stream have been
+appended to packets** (`sent`, which the send buffer already tracks) beside `written` and `base`.
+
 ### 99.4 % of the repairs cannot unblock the stream (2026-11-05)
 
 Two counters on the two places a declared loss becomes a repair — the acknowledgement path and the
