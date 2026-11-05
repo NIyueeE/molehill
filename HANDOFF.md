@@ -67,6 +67,41 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The gate items, measured: `check` and `interop` pass; capacity reads 1 to 8 (2026-11-05)
+
+The objective's remaining conditions were untouched for twenty rounds while the first stage
+was chased. This round measured three of them.
+
+**`just check` passes** end to end on `71eef8f`: the heavy chain (audit, deny, outdated, the
+serial test suite, both clippy passes, fmt, machete, the python gates, docs alignment)
+reports `pre-push checks passed`.
+
+**`just interop` passes**: three tests — a new server refuses an old client and keeps
+serving, an old server refuses a new client and says so, and an old server rejects an unknown
+dialect and survives.
+
+**capacity does not yet read as a measurement.** Six ramps of the same scenario, three on an
+early-cycle build and three on the current one:
+
+| build | readings |
+|---|---|
+| pre-overdraft (round 12) | **3, 1, 1** |
+| current (`71eef8f`) | **1, 1, 8** |
+
+A single reading spans the whole ladder, so nothing can be concluded from one — including from
+the `3` this round began with, and including a claim of regression against the published
+`results-bench-v0.11.*`, whose `capacity_streams` is 8 for every arm. That baseline is not a
+like-for-like comparison in any case: its method fingerprint is `257343fa3fd158d3` and this
+cycle's runs carry `99a635024d8b174f`, because the probes, the workloads and the engine all
+changed while the first stage was being chased. The gate refuses a baseline whose method
+record does not match, which is the right behaviour and which this cycle has now triggered.
+
+What the six ramps *do* say is worth as much as the number they fail to produce: **one of them
+reached 8**, so eight concurrent bulk streams are attainable on this host, and the spread is
+the same bimodality the first stage has. The capacity condition and the SLO condition are one
+defect — an arrival's tail under bulk load, either ~23 ms or ~110 ms for a whole stage — and a
+capacity number measured while the mode is undamped is measuring the mode.
+
 ### The whole first-stage ledger, and the ratchet hypothesis refuted (2026-11-05)
 
 Every soak's first clean stage, by build, with the bulk rate beside it:
