@@ -67,6 +67,39 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The window ceiling was forty times the path, and now it is the path (2026-11-05)
+
+The ceiling is now the floor scaled by the measured round trip instead of a flat two
+mebibytes, and the change is verified *inside* the run that measured it rather than by the
+number it hoped to move. The server's own window line, in the first clean stage:
+
+```
+lane=3  cwnd=262144  flight=59356   ceiling=262144  srtt_us=1000
+lane=2  cwnd=262144  flight=356136  ceiling=262144  srtt_us=1000
+lane=1  cwnd=786432  flight=747580  ceiling=786432  srtt_us=3591
+```
+
+- **the ceiling binds**: `cwnd` stops at 262 144 on two lanes, exactly the floor;
+- **the flight is ten times smaller**: 59 KB to 747 KB, against the 3.85 MB that line used to
+  read — the standing queue in front of every small packet is a tenth of what it was;
+- **the feedback is bounded and visible**: when a lane's estimate rises to 3.6 ms its ceiling
+  rises to 786 432, which is the same floor times the path. An inflated estimate raises its
+  own ceiling, and that is now readable in the line that moves it.
+
+And the stage it was measured on is the first one in the fast regime that passes:
+
+| stage | p50 | p99 | bulk |
+|---|---|---|---|
+| `clean` | 2.57 ms | **23.32 ms** | **8.23 Gbit/s** |
+| `clean#2` | 2.38 | **13.25** | 6.47 Gbit/s |
+
+At 8.23 Gbit/s the six-run separation said this stage could not pass — every previous run at
+or above 8.3 read 135 to 291 ms. One run is not a claim, and 8.23 sits just under the old
+cohort's lowest failing rate; what is established is that the mechanism took effect exactly as
+designed, and that the stage passed on a draw that used to be a failure.
+
+The next run in the same regime decides whether that is the ceiling or the lottery.
+
 ### At 8.4 Gbit/s the runtime is idle and the handshake is ten times slow (2026-11-05)
 
 The slow-open line answers what "delivery, not admission" means, on the same 290 ms stage
