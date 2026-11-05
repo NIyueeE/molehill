@@ -67,6 +67,39 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The bulk wedge is inside the carrier: one second, then nothing (2026-11-05)
+
+Reproduced on a **fifteen-minute** schedule instead of the thirty-minute sweep — the
+`soak` timeline ends with a clean stage after `loss1`, `rtt100` and `loss5`, and its last
+clean stage loses the bulk exactly as the sweep's does (`gbps` absent,
+`control socket has closed unexpectedly`). That makes this defect reproducible in a
+quarter of an hour with debug traces on.
+
+Four instruments agree on the same minute, and they are the first set that does:
+
+| what | evidence |
+|---|---|
+| iperf3's own JSON, second by second | second 0–1: **4 063 232 bytes** across four streams; second 1 through 120: **0,0,0…**, then the sink's idle timeout closes the control socket |
+| the sink | `0.00 Bytes` on all four streams for the whole 180-second stage |
+| the server's stripe send loops | **697** first-frame reads of `bytes=32768` — the visitor's bulk was read and framed |
+| the client's stripe layer | **0** bulk frames ever; its largest `receive direction finished` in that window is `frames=4 written=167` |
+
+So ~3.9 MB is accepted by the tool, read by the server's forwarding loops, framed and
+handed to the carrier — and the client's stripe reader never sees a single bulk frame,
+while 64-byte requests through the same lanes are served continuously in microseconds.
+The bulk bytes are sitting unread on the client's streams (the earlier wedge read
+`credit=16` — the peer's window 16 bytes from exhausted — which is the same fact from the
+other side).
+
+**Where that leaves the search**: not the harness (measured twice), not the sink, not the
+server's forwarding, not the arrival path. It is between the server's stripe write and the
+client's stripe read, i.e. the carrier's own data path for four concurrent bulk streams
+after a lossy stage — and the client holds the bytes without a reader consuming them.
+The next instrument is the client's per-stream reader state for those four streams
+(`Conn::backlog`, `parked_at` and `wakes` already exist): a reader that is parked for
+120 seconds with a heap of bytes behind it names the defect that a park of two seconds
+did not.
+
 ### Found: an arrival could not write a byte while bulk held the window (2026-11-05)
 
 The first stage's tail has a counter of its own, and the full-scale debug run prints it:
