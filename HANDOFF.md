@@ -608,6 +608,29 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Correcting that entry: the timer was already armed from the oldest record (2026-11-05)
+
+The previous entry said the loss timer is armed "from the newest activity", and that is **wrong**.
+`Recovery::arm` computes `base = self.oldest_data_time().unwrap_or(now)` and sets `timer = base + rto`:
+the timer has been armed from the oldest packet that carries stream data since the round that fixed the
+seven-second reader. So the timer fires — the three thousand retransmits in these runs come from it —
+and it is not being pushed forward by a busy lane.
+
+Two more candidates are then excluded by the logs rather than by reasoning:
+
+- **`repair_sent` trimming before the packet is posted**: `encode_stream` failing would do exactly
+  that, and `"frame does not fit"` appears **zero** times in every failing run;
+- **the seal**: a failed seal closes the lane and counts `no_key`, which reads zero.
+
+So the last frame's record is declared stale, its range is queued, the pump builds it (built equals
+posted), and the peer still does not acknowledge it — or the peer holds the bytes and its `arrived()`
+cannot pass them. Those two are now the entire remaining question, and the difference is one field the
+receiver does not report yet: **whether its receive buffer holds any range at or above the frontier**.
+
+If it does, the frame arrived and the bug is in the receive-side contiguity walk; if it does not, the
+frame never arrived and the bug is in the send side's build. That is the next instrument, and it is on
+the peer, not on the sender every entry since round 43 has examined.
+
 ### The unacknowledged gap is exactly one stripe frame, and nothing follows it (2026-11-05)
 
 Three numbers side by side on a stalled stream settle what rounds 43 to 63 were circling:
