@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Every number taken is posted, and number zero is the one that never arrives (2026-11-05)
+
+Two cumulative per-connection numbers, which are the same kind of number on the same object:
+
+| connection | posted_total | own_last_number | difference |
+|---|---|---|---|
+| client 0–3 | 3 660 / 2 771 / 3 767 / 2 903 | 3 571 / 2 697 / 3 686 / 2 822 | 89 / 74 / 81 / 81 |
+| server 0–3 | 4 992 / 3 817 / 5 115 / 3 892 | 4 929 / 3 771 / 5 051 / 3 843 | 63 / 46 / 64 / 49 |
+
+`posted` exceeds `last number taken` on **every** connection, by 46 to 89 — and that surplus is exactly the
+control datagrams, which repeat a number and take none. So **no packet number is ever taken without a
+datagram being posted**: the "issued but not posted" reading two rounds ago was the global-versus-per-
+connection mismatch again, not a defect.
+
+What remains is one number: **`below` is zero on several lanes** while `own_last` is 3 510. `below` is the
+cumulative watermark — "every number under this one arrived" — so a value of zero says the receiver never
+got **packet number 0**, and its staying at zero for the connection's life is the pinned watermark `wire.rs`
+documents: the cumulative path retires nothing, the bitmap covers only `largest − 64 ..= largest`, and
+every record between them can never be retired, acknowledged or declared lost.
+
+So the defect is far smaller and far more specific than thirty rounds of search assumed: **the first packet
+of a lane never reaches the peer, or is never sent, and everything above it is then unretirable.** The next
+check is one line of logging — the first number posted on each lane, and whether the peer ever acknowledges
+number zero — which separates "burnt before the lane existed" from "posted and still not there".
+
 ### Every number is acknowledged, and the counter names now say what they count (2026-11-05)
 
 Two solid results, then the process fix that should stop this file's recurring mistake.
