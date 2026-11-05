@@ -211,6 +211,10 @@ struct StreamState {
     /// answers is about one stream: a Noise handshake that took five seconds is
     /// either a queue or eight lost packets, and only this says which.
     retransmits: u32,
+    /// Bytes inserted into this stream's receive buffer, which is what the peer's
+    /// repairs are supposed to make grow. A lane whose repairs are posted and
+    /// whose inserts stand still is a lane whose packets are not arriving.
+    inserted: u64,
     /// Repair packets actually posted by the scheduler for this stream.
     ///
     /// `retransmits` counts a range being *declared* lost, which is a decision; this
@@ -1836,6 +1840,14 @@ impl Conn {
     /// the peer a megabyte were, until this, the same absence of log lines.
     /// The stream with the most bytes the wire has not taken, and its own facts.
     /// The peer's last cumulative prefix, for the window line.
+    /// Bytes this end has inserted into every stream's receive buffer.
+    ///
+    /// Reported beside the send side because it is the other half of one
+    /// question: whether the repairs a peer posts are arriving at all.
+    pub(crate) fn inserted_total(&self) -> u64 {
+        self.streams.values().map(|state| state.inserted).sum()
+    }
+
     pub(crate) fn last_ack_prefix(&self) -> u64 {
         self.last_ack_prefix
     }
@@ -2158,6 +2170,9 @@ impl Conn {
                     stats::around(sampled, &stats::PHASES.append, || {
                         state.recv.insert(blocks, offset, &data);
                     });
+                    state.inserted = state
+                        .inserted
+                        .saturating_add(u64::try_from(data.len()).unwrap_or(0));
                     state.recv.note_ready(Some(now));
                     if fin {
                         state.recv.finish(offset + data.len() as u64);

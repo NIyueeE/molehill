@@ -608,6 +608,37 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The receiver inserts 117 KB while its frontier stands still (2026-11-05)
+
+A per-stream counter of bytes inserted into the receive buffer, summed per lane, answers the last
+ambiguity of the previous entry:
+
+```
+lane=0 inserted 1279698 -> 1397002 (+117304) | base 994110 -> 994110 | ack 994110 -> 994110 | retx 1820 -> 1996
+lane=2 inserted 1782126 -> 1899430 (+117304) | base 983348 -> 983348 | ack 983348 -> 983348 | retx 1526 -> 1834
+```
+
+So the repairs **are** arriving and being inserted — 117 KB between two samples, on two lanes with
+*identical* deltas, which is what re-sending the same fixed set of ranges every second looks like —
+and the byte frontier does not move. The receiver is confirming, from its own side, the conclusion
+the sender's counters reached in round 43: **the repairs land above the hole.**
+
+The packet marks say the same thing once more, with the numbers side by side:
+
+```
+lane=0 base=994110 ack=994110 below=1760 bits=ffffffffffffffff num=1785 covering=2 pending=1 at=1463326
+```
+
+The record covering the frozen frontier is packet **1785**, the peer's watermark is **1760**, and its
+bitmap is all ones — so by `Ack::contains` the peer *has* packet 1785, and the sender should have
+retired the range, absorbed it into `acked`, and advanced `base` through it. It did not. Two records
+cover the frontier and neither was absorbed; one repair is owed a megabyte higher.
+
+So the disagreement is now between two functions in one file: `Ack::contains` says the covering
+packet arrived, and the retirement path did not act on it. The next instrument is one line inside
+`Recovery::on_ack` for that number — whether it was still in `in_flight` when the ack arrived, and
+what `contains` answered — and it is one run away.
+
 ### One stream's prefix per acknowledgement, and the stream that needs it stops being named (2026-11-05)
 
 `wire.rs` documents this failure mode and its mitigation in the same paragraph: a packet number is
