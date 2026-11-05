@@ -608,6 +608,36 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The mid cluster is a deadlock between two layers, and the prefix cannot break it (2026-11-05)
+
+One failing run at 3 844 608 bytes, read from both layers at once:
+
+```
+group 1: written=3844608  highest=122  delivered=119      three frames missing
+server 1: parked=1  base=950570  ack=950570  flight=645172  cwnd=28329
+client 1: own_below=2567
+```
+
+The client's cumulative watermark is **2567 and moving**, so packets keep arriving and being acknowledged.
+The server's byte frontier for its stream stands at 950 570, exactly what the client's prefix reports, and
+its flight — six hundred and forty-five kilobytes, twenty-three times its window — cannot retire.
+
+The two facts are only consistent one way: the client **holds** the bytes, and cannot say so. Its prefix is
+`arrived()`, which is the run contiguous **from `read`**, and `read` is pinned by the group reader waiting
+for frame 119. A hole at frame 119 therefore pins the prefix no matter how much of the stream the receiver
+is holding behind it — and the sender, told nothing, keeps six hundred kilobytes in flight until its window
+closes and its writer parks.
+
+So the mid cluster is a deadlock across two layers: the group reader waits for a frame, the transport waits
+for the reader, and **the only instrument that could break it reports a quantity that conflates "not
+received" with "not yet read by the application"**.
+
+The fix is on the receiver's side of that number, and it does not need the wire changed: a receiver that
+holds bytes up to some offset is entitled to say so, because its own buffer is bounded by the window the
+sender respects. Reporting the **highest offset held**, beside the contiguous one, lets the sender retire
+what has arrived without pretending the application has read it — which is exactly the difference between
+the two numbers that has been missing since round 43.
+
 ### The eager stale scan is withdrawn: age is not loss in a deep flight (2026-11-05)
 
 Round 61 added a scan on the acknowledgement path that declared a record lost when it was older than the
