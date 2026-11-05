@@ -67,6 +67,41 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### Six soaks: the arrival passes exactly when the bulk spine stays under 8 Gbit/s (2026-11-05)
+
+Six `soak` campaigns, the first clean stage's p99 against that same stage's bulk throughput:
+
+| `clean` p99 | bulk | |
+|---|---|---|
+| **290.6 ms** | 8.39 Gbit/s | fails |
+| **135.5** | 8.64 | fails |
+| 23.5 | 6.84 | passes |
+| 22.5 | 7.86 | passes |
+| 17.0 | 7.08 | passes |
+| **12.8** | 7.07 | passes |
+
+**No overlap**: every run at or above 8.3 Gbit/s failed the 50 ms limit and every run at or
+below 7.9 passed it, with the worst passing reading 23.5 against the best failing one 135.5 —
+a gap of 5.8× between the groups. Six points is not a curve, but a separation with no
+overlap in six tries is the strongest quantitative statement this cycle has produced about
+the first stage, and it names the regime: the arrival is fine until the bulk spine crosses
+about 8 Gbit/s on this host.
+
+Two hypotheses about *why* it crosses were tested against the 290 ms run and both are dead:
+
+- **it is not refusal.** `opening=0` for the whole stage: not one opening write was refused by
+  any bound, so the reserve overdraft from the previous round is not what this stage needs;
+- **it is not loss.** The stall lines in that stage read `worst_stream_retransmits=0`,
+  `unacked_ms=0`, `credit_blocked=true` — nothing lost, nothing waiting for an
+  acknowledgement, and the queue is behind the peer's credit, not behind the network.
+
+So at 8.4 Gbit/s the carrier refuses nothing, loses nothing, and the arrival is still twelve
+times slower than the same arrival at 7.1. The delay is in **delivery**, not in admission: the
+next candidates are the ones that scale with rate — the runtime's own scheduling of the
+dispatcher under tens of thousands of datagrams a second, and the receive path's queueing —
+and both are measurable with instruments that already exist (`spawn → first poll` for the
+former, `backlog`/`parked_at` for the latter).
+
 ### Three suspects eliminated for the bulk wedge, and the instrument that names it (2026-11-05)
 
 The wedge is "four bulk visitor connections whose bytes never reach the tool's forwarding",
