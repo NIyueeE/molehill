@@ -608,6 +608,43 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### One stream's prefix per acknowledgement, and the stream that needs it stops being named (2026-11-05)
+
+`wire.rs` documents this failure mode and its mitigation in the same paragraph: a packet number is
+never retransmitted under the same number, so one real drop stops `below` for the life of the
+connection, everything that scrolls out of the 64-bit window is declared lost, its record is
+forgotten, and the acknowledgement it would have carried lands nowhere. The mitigation is the byte
+prefix: twelve bytes per packet naming one stream's frontier, monotonic across losses.
+
+Reading the sender of that field:
+
+```
+    /// The stream whose arrived prefix rides this end's acknowledgements.
+    arrived_stream: u32,
+    /// How many of that stream's bytes arrived with no hole.
+    arrived_prefix: u64,
+```
+
+and it is set to **whichever stream last received a frame**. On a lane carrying four stripes that
+means the acknowledgement names the stripe that moved most recently — and a stripe that has stopped
+receiving, which is exactly the one whose frontier is stuck, is **never named again**. Its last
+reported prefix is frozen, `advance_to(prefix)` becomes a no-op, and the only remaining mechanism is
+the 64-bit bitmap the paragraph above says cannot carry it.
+
+That is a real limitation of the current format rather than a bookkeeping slip, and it matches the
+observed shape: four stripes, three of them reporting a frontier that does not move, `retx == posted`
+because the repairs are of ranges the peer's prefix never mentions.
+
+It is not yet the whole cause, and this file should not claim it is: in the failing run the peer's
+reported prefix for the stalled stream **equals** the sender's frontier (48 bytes), so the peer
+genuinely holds nothing beyond that byte. Rotating the named stream would therefore not move it —
+the bytes are not there.
+
+So the last ambiguity is one counter, on the peer, per stream: how many bytes `RecvBuf` **inserts**
+per second, beside the sender's posted repairs for that stream. If inserts are zero while repairs go
+out, the packets are not arriving; if inserts are non-zero and `arrived()` does not move, the insert
+path has a hole. Either answer ends the inference.
+
 ### The watermark never leaves zero: the opening packet of a stream is never sent (2026-11-05)
 
 The stall line the stripe layer already writes names the frame
