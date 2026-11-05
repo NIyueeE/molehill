@@ -608,6 +608,36 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The frame never arrived, and both ends' counters are out of candidates (2026-11-05)
+
+The binary question the previous entry left is answered: **the peer's receive buffer holds nothing
+beyond its contiguous frontier** — `recv_beyond_pieces` and `recv_beyond_bytes` read **zero on every
+lane, in every sample**, of a run that stalled at 3 670 016 bytes. So the missing frame did **not**
+arrive and was not waiting to be walked; the "arrived but cannot pass it" branch is excluded.
+
+Everything on the send side has now been excluded by measurement, each in its own run:
+
+| candidate | how it was excluded |
+|---|---|
+| not built | `written == handed_over` (gap 0) |
+| built and dropped | `built == posted` (7 730 = 7 730) |
+| frame did not fit | `"frame does not fit"` — zero lines |
+| seal failed | `no_key = 0`, and a failure would close the lane |
+| never declared lost | the timer declares it; `retx` in the thousands |
+| repaired but not sent | `retx == posted` |
+| refused by the peer | `datagrams refused` never prints |
+| dropped by a full buffer | host `RcvbufErrors`, `InErrors`, `SndbufErrors` all zero |
+| arrived, cannot be walked | `recv_beyond_* = 0` |
+
+Ten instruments, ten negatives, and the packet still leaves a socket that says it posted it and does not
+arrive at a socket that says it received nothing. That is not a bookkeeping question any more: it needs
+an observation **at the wire**, between the two sockets, which no counter in this carrier can make.
+
+The next step is a different instrument class — a capture on the loopback path for one failing run
+(`tcpdump -i lo udp port 2333` into a pcap, filtered to the lane's ports), or a send/recv datagram pair
+counted at the socket boundary either side. Either answers in one run what ten counters could not: does
+the datagram leave, and does it arrive.
+
 ### Correcting that entry: the timer was already armed from the oldest record (2026-11-05)
 
 The previous entry said the loss timer is armed "from the newest activity", and that is **wrong**.

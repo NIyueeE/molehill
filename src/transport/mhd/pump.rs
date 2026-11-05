@@ -227,6 +227,8 @@ fn report_window(shared: &Arc<Shared>) {
             worst_handed_over = worst.map_or(0, |w| w.handed_over),
             last_ack_prefix = conn.last_ack_prefix(),
             inserted_total = conn.inserted_total(),
+            recv_beyond_pieces = conn.beyond_frontier().0,
+            recv_beyond_bytes = conn.beyond_frontier().1,
             built,
             worst_covering_number = worst.map_or(0, |w| w.covering_number),
             last_ack_below = conn.last_ack_marks().0,

@@ -1874,6 +1874,18 @@ impl Conn {
         self.recovery.last_number()
     }
 
+    /// Pieces every stream holds beyond its own contiguous frontier.
+    pub(crate) fn beyond_frontier(&self) -> (u32, u64) {
+        let mut pieces = 0u32;
+        let mut bytes = 0u64;
+        for state in self.streams.values() {
+            let (p, b) = state.recv.beyond_frontier();
+            pieces = pieces.saturating_add(p);
+            bytes = bytes.saturating_add(b);
+        }
+        (pieces, bytes)
+    }
+
     pub(crate) fn inserted_total(&self) -> u64 {
         self.streams.values().map(|state| state.inserted).sum()
     }

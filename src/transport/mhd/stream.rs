@@ -793,6 +793,28 @@ impl RecvBuf {
     /// is invisible in every other counter while it holds the window back. Each
     /// piece counts what the reader has not taken from it, so a piece the reader
     /// is part-way through contributes the rest of itself and nothing else.
+    /// Pieces of this stream that sit **beyond** its contiguous frontier, and
+    /// how many bytes they hold.
+    ///
+    /// The one field that separates "the frame never arrived" from "it arrived and
+    /// the walk cannot pass it": a stall whose frontier stands still while these
+    /// are non-zero is a receive-side walk defect, and one where they are zero is a
+    /// send-side delivery one. Every counter in this file before it could only say
+    /// that the frontier had stopped.
+    pub(crate) fn beyond_frontier(&self) -> (u32, u64) {
+        let frontier = self.arrived();
+        let mut pieces = 0u32;
+        let mut bytes = 0u64;
+        for (&at, piece) in &self.pieces {
+            if at <= frontier {
+                continue;
+            }
+            pieces += 1;
+            bytes = bytes.saturating_add(u64::try_from(piece.len).unwrap_or(0));
+        }
+        (pieces, bytes)
+    }
+
     pub(crate) fn held(&self) -> u64 {
         self.pieces
             .values()
