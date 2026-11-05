@@ -67,6 +67,34 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The L3 failure is in the product, and the counters say exactly where (2026-11-05)
+
+The acceptance's failure was attributed by injecting one TCP connect from the visitor into a
+running topology and differencing the two TUNs' counters. For a TUN, `tx_packets` is what the
+kernel handed to userspace (the product read it) and `rx_packets` is what userspace wrote back
+into the kernel (the product delivered it).
+
+| counter | before | after |
+|---|---|---|
+| server `l3srv0` tx_packets | 22 | **30** |
+| client `l3cli0` rx_packets | 0 | **0** |
+
+So the visitor's packets **do** reach the server's TUN and **are** read by the product — eight
+packets for one connect, which is the SYN and its retries — and **nothing is ever written into
+the client's TUN**. Both devices work in the direction the product uses them (the client's own
+`tx_packets` is 2, its stack wrote into the TUN and the product read it), the client has
+`10.99.0.1/32` on `l3cli0` with the device UP, and both namespaces have `ip_forward=1`.
+
+So this is not the container and not the routing: it is the **server → client relay inside the
+product**. The visitor's packet is read on the server and never arrives at the claim's own
+stack, and no log line names a drop — the L3 path is silent in both directions, which is why
+the acceptance could only report a timeout.
+
+The next places to look are the two ends of that relay: the server's L3 egress (does it frame
+the packet it read and send it toward the claim's group) and the client's L3 ingress (does it
+receive such a frame and write it to the TUN). Both are unlogged, so the first change is an
+instrument at each end rather than another guess.
+
 ### L3 acceptance fails at the first thing it checks (2026-11-05)
 
 `just l3-accept` builds the three-namespace topology with the real binaries and fails with:
