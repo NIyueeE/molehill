@@ -613,6 +613,56 @@ struct Frames {
 /// buffering is bounded by [`STRIPE_REORDER_QUEUE`]: when the queue is full
 /// the readers stall, which propagates through the stripes' windows as
 /// backpressure to the peer's sender.
+/// Watch one group: report its state once a second with the stats switch on, and
+/// close both directions when nothing has moved for the idle timeout.
+///
+/// Its own function because `spawn_inner` is at the line budget and because this is
+/// the only place that knows a group's *live* reorder state. The line at the end of
+/// a group cannot describe a stall: a stalled group never reaches its end, which is
+/// why the sealed striped failure went several rounds without one.
+fn spawn_group_monitor(
+    group_id: u64,
+    frames: std::sync::Arc<Frames>,
+    activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    send: tokio::task::AbortHandle,
+    recv: tokio::task::AbortHandle,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            // A second at a time while the stats switch is on, so a group that stops
+            // moving reports where it stopped: `highest` is the frame the readers
+            // have seen, `delivered` the one the reorder loop released, and
+            // `written` the bytes handed to the destination.
+            let stats = crate::transport::stats::enabled();
+            let nap = if stats { 1 } else { 30 };
+            tokio::time::sleep(std::time::Duration::from_secs(nap)).await;
+            let last = activity.load(std::sync::atomic::Ordering::Relaxed);
+            if stats {
+                let load = |counter: &std::sync::atomic::AtomicU64| {
+                    counter.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                tracing::debug!(
+                    target: "molehill::stripe",
+                    group = group_id,
+                    highest = load(&frames.highest),
+                    delivered = load(&frames.delivered),
+                    written = load(&frames.written),
+                    idle_ms = epoch_millis().saturating_sub(last),
+                    "stripe group state"
+                );
+            }
+            if epoch_millis().saturating_sub(last)
+                >= u64::try_from(crate::common::constants::FORWARD_IDLE_TIMEOUT.as_millis())
+                    .unwrap_or(u64::MAX)
+            {
+                send.abort();
+                recv.abort();
+                return;
+            }
+        }
+    })
+}
+
 async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>(
     reads: Vec<R>,
     mut dest: W,
@@ -883,23 +933,14 @@ where
             std::sync::Arc::clone(&frames),
             group_id,
         ));
-        let send_abort = send.abort_handle();
-        let recv_abort = recv.abort_handle();
         let activity_for_grace = std::sync::Arc::clone(&activity);
-        let monitor = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let last = activity.load(std::sync::atomic::Ordering::Relaxed);
-                if epoch_millis().saturating_sub(last)
-                    >= u64::try_from(crate::common::constants::FORWARD_IDLE_TIMEOUT.as_millis())
-                        .unwrap_or(u64::MAX)
-                {
-                    send_abort.abort();
-                    recv_abort.abort();
-                    return;
-                }
-            }
-        });
+        let monitor = spawn_group_monitor(
+            group_id,
+            std::sync::Arc::clone(&frames),
+            std::sync::Arc::clone(&activity),
+            send.abort_handle(),
+            recv.abort_handle(),
+        );
         // Wait for both directions. A failure in either aborts the other
         // (the group is broken and its missing sequence numbers will never
         // arrive); a direction that ended cleanly lets the other run to its

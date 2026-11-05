@@ -608,6 +608,37 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The stall is one stream, one frame: `highest` 254, `delivered` 122 (2026-11-05)
+
+A group's state is now reported once a second with the stats switch on
+(`spawn_group_monitor`), because the line at a group's *end* cannot describe a stall — a stalled
+group never reaches its end, which is why this took several rounds.
+
+The first sealed failure it caught:
+
+| group | highest | delivered | written | idle |
+|---|---|---|---|---|
+| 2 | **254** | **122** | **3 910 144** | 4.1 s → 6.2 s, growing |
+| 3 | 254 | 254 | 8 268 288 | finished |
+| 1 | 258 | 231 | 7 514 624 | still moving |
+
+So the readers of group 2 have **seen frame 254** and the reorder loop has **released frame 122**:
+frames 123 through 254 are sitting in the reorder map, and the loop is waiting for **one missing
+frame, sequence 123**, while `written` stays frozen.
+
+That is a precise statement and a new one: the stall is **one frame on one stripe**, and because a
+stripe is one mhd stream, it is **one mhd stream that stops delivering** while the other three on
+the same lane carry frames 124–254 without trouble. It also rules out the reorder loop itself: it
+is doing exactly what it should with a gap, and the bytes it is waiting for never arrive.
+
+So the defect is inside a single stream's delivery on a healthy lane — the same shape the
+production wedge has (four bulk connections, one or more of which stop while the rest move). The
+next instrument is that stream's own account at the stall: its `next`/`written`/`retransmits`,
+its `AckSet` frontier, and whether the peer's cumulative acknowledgement has advanced past the
+gap. If the frontier has passed it, the sender believes the missing bytes are delivered and no
+repair will ever be asked for; that is the one failure mode that explains a permanent stall with
+nothing reported.
+
 ### The sealed striped failure does not reproduce in-process, and the attempt taught a lesson (2026-11-05)
 
 Three tests were added, and the third one is an honest negative.
