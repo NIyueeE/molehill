@@ -67,6 +67,48 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### Why L3 drops the first packet: a claim is routable only once a lane joins (2026-11-05)
+
+The two switches that already exist (`MOLEHILL_L3_STATS=1`, and the `debug` line the unclaimed
+drop writes) name the mechanism without any new code.
+
+The server's own counters, one line per claim:
+
+```
+l3-stats: role=server claim=10.99.0.1:8443 member=0 live=false lane=- carrier=- flows=0
+          forwarded=0 no_channel=0 offered=0 enqueued=0 …
+```
+
+and the packet it dropped:
+
+```
+l3 device frame unclaimed proto=6 src=10.10.0.2:55630 dst=10.99.0.1:8443
+```
+
+So the server reads the visitor's SYN from its TUN, `Routes::pick` asks
+`EndpointTable::endpoint_for(info, Destination)` for `(10.99.0.1, 8443)`, and that lookup misses
+— because **a claim enters the routing table only when a lane joins it**
+(`Routes::join`, `hub.rs:715`), and no lane has joined (`live=false lane=-`).
+
+And no lane joins because a lane is opened *lazily*: the client mints one when it has traffic of
+its own to put into the tunnel, and this claim's first packet is **inbound**. So the packet that
+would create the lane is the packet that needs the lane:
+
+1. the visitor's SYN reaches the server's TUN and is read;
+2. the claim is not in the routing table (no lane ever joined), so the packet is dropped as
+   unclaimed and no LANE REQUEST is triggered;
+3. the client has nothing to send, so it never asks for a lane either;
+4. the counter stays at zero for the life of the topology.
+
+That is a deadlock at the first packet, not a routing bug and not the container, and it is why
+the acceptance reports only a timeout: every symptom downstream of step 2 is silence.
+
+The fix is a design choice and belongs in the L3 path, not here: a claim must have a lane
+**before** its first inbound packet — either the client opens one when the claim is registered,
+or the server can ask for one when a packet arrives for a claim it knows about but cannot route.
+The second is smaller and self-healing; the first is what the control plane already has the
+vocabulary for.
+
 ### The L3 failure is in the product, and the counters say exactly where (2026-11-05)
 
 The acceptance's failure was attributed by injecting one TCP connect from the visitor into a
