@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The sealed striped failure does not reproduce in-process, and the attempt taught a lesson (2026-11-05)
+
+Three tests were added, and the third one is an honest negative.
+
+- `four_sealed_streams_carry_thirty_two_kib_frames` — four sealed streams, each written a **32 KiB
+  frame at a time** (what the stripe layer does, and the shape no unit test had), 1 MiB per
+  stream: **passes**, byte-exact.
+- `frames_through_loss(sealed)` and its two tests — the same transfer with one datagram in five
+  hundred dropped in each direction, sealed and unsealed: **both pass**.
+
+The first version of the lossy test **failed** (stream 3 stopped at 165 293 of 262 144 bytes) and
+looked like the reproduction this cycle wanted — four streams, frames, loss, a stall. It was the
+harness: the loop advanced the clock but never called `on_timeout`, so a lost datagram was never
+re-sent. The carrier's own account at the stall said so plainly in hindsight — `cwnd=262144`,
+`flight=291384`, `backlog_streams=0`, three streams complete — a window closed by a flight that
+nothing was repairing. With the timer driven the same test passes in 0.01 s.
+
+So the lesson is the same family as the others in this file: **a stall is reproducible only if the
+harness does what the runtime does**, and the missing `on_timeout` was invisible because the
+transport still moved most of the bytes. Two of the twelve stalls this cycle chased could have
+been this shape.
+
+What that leaves for the sealed striped integration failure is exactly what the unit harness does
+not have: the stripe layer's own loop, the echo backend, real sockets, and eight mebibytes.
+
 ### The send run is a local optimum at 44, and the lever is somewhere else (2026-11-05)
 
 Both directions from the shipping constant were measured, one `soak` each, same build

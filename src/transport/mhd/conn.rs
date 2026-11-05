@@ -2327,6 +2327,48 @@ mod tests {
             }
         }
 
+        /// Move everything both ends want to send and drop every `drop_every`th
+        /// datagram in each direction, which is the one thing the clean `pump`
+        /// cannot do and the only difference between this harness and a real
+        /// socket under load.
+        fn pump_lossy(&mut self, now: Instant, drop_every: usize) -> usize {
+            let mut moved = 0;
+            let mut dropped = 0;
+            loop {
+                let mut progress = false;
+                let mut buf = Vec::new();
+                while let Some(len) = self.a.poll_transmit(now, &mut buf) {
+                    let datagram = buf[buf.len() - len..].to_vec();
+                    moved += 1;
+                    dropped += 1;
+                    if dropped % drop_every != 0 {
+                        self.a_to_b.push_back(datagram);
+                    }
+                    progress = true;
+                }
+                while let Some(len) = self.b.poll_transmit(now, &mut buf) {
+                    let datagram = buf[buf.len() - len..].to_vec();
+                    moved += 1;
+                    dropped += 1;
+                    if dropped % drop_every != 0 {
+                        self.b_to_a.push_back(datagram);
+                    }
+                    progress = true;
+                }
+                while let Some(datagram) = self.a_to_b.pop_front() {
+                    self.b.on_datagram(now, &datagram).unwrap();
+                    progress = true;
+                }
+                while let Some(datagram) = self.b_to_a.pop_front() {
+                    self.a.on_datagram(now, &datagram).unwrap();
+                    progress = true;
+                }
+                if !progress {
+                    return moved;
+                }
+            }
+        }
+
         /// Move everything both ends want to send, then deliver it, until both
         /// are quiet. Answers how many datagrams moved.
         fn pump(&mut self, now: Instant) -> usize {
@@ -2444,6 +2486,109 @@ mod tests {
         )
     }
 
+    /// The same four sealed streams and the same frames, with loss.
+    ///
+    /// `pump_lossy` drops one datagram in every `drop_every`, which is the only
+    /// difference between this harness and a real socket on a loaded host. If the
+    /// sealed striped integration test's failure lives in the stripe layer's
+    /// interaction with a sealed stream, this is the smallest place it can appear.
+    /// The lossy four-stream frame transfer, sealed or not: the control that says
+    /// whether a failure is the seal's or the harness's.
+    fn frames_through_loss(sealed: bool) -> Vec<Vec<u8>> {
+        const FRAME: usize = 32 * 1024;
+        let now = Instant::now();
+        let mut link = Link::new();
+        if sealed {
+            let root = secret(7);
+            link.a.set_lane_secret(&root);
+            link.b.set_lane_secret(&root);
+        }
+
+        let per = 256 * 1024;
+        let bodies: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; per]).collect();
+        let ids: Vec<u32> = (0..4).map(|_| link.a.open().id).collect();
+        let mut queued = vec![0usize; ids.len()];
+        for (index, id) in ids.iter().enumerate() {
+            queued[index] += link.a.write(*id, &bodies[index][..1]);
+        }
+        let mut later = now;
+        link.pump_lossy(later, 500);
+        while link.b.accept().is_some() {}
+
+        let mut got: Vec<Vec<u8>> = vec![Vec::new(); ids.len()];
+        let mut moved = 0;
+        for _ in 0..200_000 {
+            for (index, id) in ids.iter().enumerate() {
+                while queued[index] < per {
+                    let end = (queued[index] + FRAME).min(per);
+                    let n = link.a.write(*id, &bodies[index][queued[index]..end]);
+                    if n == 0 {
+                        break;
+                    }
+                    queued[index] += n;
+                }
+            }
+            // Time moves and **the timer is driven**, because a lost datagram is
+            // only re-sent when something decides it is owed again: a harness that
+            // advances the clock without calling `on_timeout` reproduces a stall
+            // that is the harness's own.
+            later += Duration::from_millis(1);
+            link.a.on_timeout(later);
+            link.b.on_timeout(later);
+            moved += link.pump_lossy(later, 500);
+            for (index, id) in ids.iter().enumerate() {
+                let out = take(&mut link.b, *id);
+                got[index].extend_from_slice(&out);
+            }
+            if got.iter().map(Vec::len).sum::<usize>() == per * ids.len() {
+                break;
+            }
+        }
+        assert!(moved > 0);
+        // The carrier's own account at the moment the transfer stopped moving, so
+        // a failure names why instead of only where.
+        let (cwnd, flight, slow_start, _) = link.a.window_state();
+        let backlog = link.a.backlog();
+        eprintln!(
+            "sealed={sealed} cwnd={cwnd} flight={flight} slow_start={slow_start} \
+             backlog_streams={} backlog_bytes={} worst={:?}",
+            backlog.streams, backlog.total, backlog.worst
+        );
+        for id in 0..4u32 {
+            eprintln!("  stream {id}: got={}", got[id as usize].len());
+        }
+        got
+    }
+
+    #[test]
+    fn four_unsealed_streams_carry_frames_through_loss() {
+        let per = 256 * 1024;
+        let bodies: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; per]).collect();
+        let got = frames_through_loss(false);
+        for (index, body) in bodies.iter().enumerate() {
+            assert_eq!(
+                got[index].len(),
+                body.len(),
+                "unsealed stream {index} delivered every byte through loss"
+            );
+        }
+    }
+
+    #[test]
+    fn four_sealed_streams_carry_frames_through_loss() {
+        let per = 256 * 1024;
+        let bodies: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; per]).collect();
+        let got = frames_through_loss(true);
+        for (index, body) in bodies.iter().enumerate() {
+            assert_eq!(
+                got[index].len(),
+                body.len(),
+                "sealed stream {index} delivered every byte through loss"
+            );
+            assert_eq!(&got[index], body, "sealed stream {index} is byte-exact");
+        }
+    }
+
     /// The window ceiling is the path's, not a flat number.
     ///
     /// A flat two mebibytes is forty times the bandwidth-delay product of a
@@ -2507,6 +2652,70 @@ mod tests {
             WINDOW_FLOOR,
             "the ceiling still belongs to the path, not to the queue"
         );
+    }
+
+    /// Four sealed streams carrying **32 KiB writes**, which is what the stripe
+    /// layer does.
+    ///
+    /// The passing four-stream test writes whatever `Conn::write` takes; the
+    /// stripe layer writes a whole frame at a time, so every write is longer than
+    /// the sealed packet's clamped payload (`MAX_SEALED_PAYLOAD`) and the sender
+    /// sees partial writes on every one. That is the shape the sealed striped
+    /// integration test fails in, and no unit test had it.
+    #[test]
+    fn four_sealed_streams_carry_thirty_two_kib_frames() {
+        const FRAME: usize = 32 * 1024;
+        let now = Instant::now();
+        let mut link = Link::new();
+        let root = secret(6);
+        link.a.set_lane_secret(&root);
+        link.b.set_lane_secret(&root);
+
+        let per = 1 << 20;
+        let bodies: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; per]).collect();
+        let ids: Vec<u32> = (0..4).map(|_| link.a.open().id).collect();
+        let mut queued = vec![0usize; ids.len()];
+        for (index, id) in ids.iter().enumerate() {
+            queued[index] += link.a.write(*id, &bodies[index][..1]);
+        }
+        link.pump(now);
+        let mut accepted = 0;
+        while link.b.accept().is_some() {
+            accepted += 1;
+        }
+        assert_eq!(accepted, 4, "four streams arrived");
+
+        let mut got: Vec<Vec<u8>> = vec![Vec::new(); ids.len()];
+        for _ in 0..400_000 {
+            for (index, id) in ids.iter().enumerate() {
+                // One frame at a time: the slice handed to `write` is a frame, not
+                // the rest of the stream.
+                while queued[index] < per {
+                    let end = (queued[index] + FRAME).min(per);
+                    let n = link.a.write(*id, &bodies[index][queued[index]..end]);
+                    if n == 0 {
+                        break;
+                    }
+                    queued[index] += n;
+                }
+            }
+            link.pump(now);
+            for (index, id) in ids.iter().enumerate() {
+                let out = take(&mut link.b, *id);
+                got[index].extend_from_slice(&out);
+            }
+            if got.iter().map(Vec::len).sum::<usize>() == per * ids.len() {
+                break;
+            }
+        }
+        for (index, body) in bodies.iter().enumerate() {
+            assert_eq!(
+                got[index].len(),
+                body.len(),
+                "stream {index} delivered every byte"
+            );
+            assert_eq!(&got[index], body, "stream {index} is byte-exact");
+        }
     }
 
     /// A sealed stream repairs one dropped packet instead of looping on it.
