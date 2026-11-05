@@ -608,6 +608,27 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The baseline's own scatter: 13 of 24 complete (2026-11-05)
+
+The twelve-run baseline was repeated on the same build, which is the first thing any A/B on this
+metric needs — the metric's own scatter:
+
+| batch | complete (8 388 608) | partials |
+|---|---|---|
+| first | 7 of 12 | 6 859 264 · 5 250 048 · 4 824 064 · 4 365 312 · 465 920 |
+| repeat | 6 of 12 | 3 942 912 · 3 844 608 · 3 702 784 · 3 578 880 · 465 920 · 465 920 |
+
+**Combined: 13 of 24 complete (54 %), eleven partials in two clusters — three at 465 920 bytes (455
+KiB) and eight between 3.5 and 6.9 MB.**
+
+So the floor for any change on this path is a completion rate that moves well outside 13/24: the
+binomial scatter of a 54 % rate over twenty-four runs is roughly ±20 points, which means a change has
+to take the path to the high seventies before it can be called an improvement, or the partials have to
+shift clearly — all eight of the middle cluster up, not two of them.
+
+That is the standard every stride change from here is judged by, and it is stricter than the eight-runs
+comparisons that produced three "no difference" verdicts in a row.
+
 ### The stride baseline is bytes delivered, not a pass rate (2026-11-05)
 
 Twelve runs of the sealed striped test — `MOLEHILL_MHD_SEAL=1 cargo test --test integration_test --
