@@ -260,6 +260,7 @@ fn report_window(shared: &Arc<Shared>) {
             acks_applied,
             acks_attached,
             lane = conn.wire_id(),
+            role = if conn.is_dialer() { "client" } else { "server" },
             cwnd,
             flight,
             slow_start,

@@ -1972,6 +1972,11 @@ impl Conn {
     /// Packet numbers taken and packets built since the last call, plus the
     /// reason the last refusal carried.
     /// Datagrams this connection has posted and read, cumulative.
+    /// Whether this end dialled the lane, for a log line that has to name a side.
+    pub(crate) fn is_dialer(&self) -> bool {
+        self.dialer
+    }
+
     pub(crate) fn datagram_totals(&self) -> (u64, u64) {
         (self.posted_total, self.received_total)
     }

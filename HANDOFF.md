@@ -608,6 +608,41 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Correcting it: the "loss" was two directions subtracted from each other (2026-11-05)
+
+With the end named, the asymmetry dissolves into a mirror:
+
+```
+server lane 0:  posted 2232  received  253
+client lane 0:  posted  297  received 2188
+```
+
+Server lane 0 posted 2 232 and the **client's** lane 0 received 2 188; the client posted 297 and the
+server received 253. So the earlier "gap" was **one end's send volume minus the same end's receive
+volume** — two unrelated directions — and every "lost datagram" this file has quoted since round 72 is
+that artefact, including the 3 306.
+
+The meaningful pair is **across ends, one direction**: server posted against client received, per lane:
+
+| lane | server posted | client received | missing |
+|---|---|---|---|
+| 0 | 2 232 | 2 188 | 44 (2 %) |
+| 1 | 2 255 | 2 211 | 44 (2 %) |
+| 2 | 2 206 | 1 898 | **308 (14 %)** |
+| 3 | 1 317 | 1 317 | **0** |
+
+So there *is* a real per-lane loss, and it is between zero and fourteen percent — not the fifty percent the
+wrong subtraction implied, and not enough to explain a wholesale stall on its own. Lane 2 loses 308 of
+2 206 and lane 3 loses none, so the loss is neither universal nor lane-symmetric.
+
+That is the second time this cycle a metric that looked decisive was a population mistake — the first was
+the hand-off median compared across different populations in round seven. Both are the same shape: two
+numbers that look comparable because they are the same field, and are not.
+
+The next measurement is the one this pair implies: **the loss rate per lane over time**, not its lifetime
+total — a lane that loses a fixed handful at start-up is a different defect from one that starts losing at
+a particular moment.
+
 ### The loss is not uniform: one lane posts twice what it reads (2026-11-05)
 
 Per-connection lifetime totals, from a run that stalled at 793 600 bytes:
