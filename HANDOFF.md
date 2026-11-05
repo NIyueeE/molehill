@@ -67,6 +67,38 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### Three suspects eliminated for the bulk wedge, and the instrument that names it (2026-11-05)
+
+The wedge is "four bulk visitor connections whose bytes never reach the tool's forwarding",
+and four things were checked against a run that has one (m111, wedged from `rtt100` on):
+
+- **the half-close grace is not it.** `spawn_grace` fires 40 times over the whole run and
+  **zero** times in the wedged window — so no bulk group had a direction cut after ten idle
+  seconds;
+- **no visitor was dropped at pairing.** `dropping the visitor` never appears in the run;
+- **`FirstByte` is not it.** The arrival wrapper is a pure pass-through — it delegates
+  `poll_read` and only observes the fill — so it cannot consume a visitor's bytes or report
+  an EOF that did not happen;
+- **the client's `frames=0 bytes=0` is not a symptom.** In a bulk *send* test the client's
+  source is `iperf3 -s`, which sends nothing; a source read that returns nothing there is
+  correct.
+
+What the log showed instead: in the wedged window the server has exactly one class of
+send loop waiting on a read — small groups (`frames=2 bytes=166`) — and **no send loop at
+all waiting on the four bulk visitors**, while the join of pairing lines to group lines
+lists six server groups that started and never finished their send direction, four of them
+consecutive (13687, 13690, 13691, 13694).
+
+So the bulk visitors are accepted, produce no pairing failure, and never get a running
+group. The path from "accepted" to "forwarding started" has exactly one silent exit in it:
+`pair_striped_group` returns `Ok` on more than one condition, and `serve_tcp_visitor`
+**ignored the value**. A visitor could therefore be accepted, wait, and be dropped without a
+single line naming it.
+
+That is now instrumented: every visitor logs its pairing outcome (`stop_pool` true or false,
+or the error) on the span that carries its address. The next wedged run will say whether the
+four bulk visitors were paired at all, and if not, which exit took them.
+
 ### Four soaks: the last stage is tight, the first is bimodal, and it tracks bulk rate (2026-11-05)
 
 Four `soak` campaigns on one build, one after another, with the arithmetic of both clean

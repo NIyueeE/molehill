@@ -4280,7 +4280,14 @@ async fn serve_tcp_visitor<C>(
     };
     // The boolean told the accept loop to stop; for one visitor both
     // outcomes are "nothing left to do here".
-    if let Err(e) = pair_striped_group(
+    // The outcome, per visitor, in the span that carries its address. Until this
+    // line existed a visitor could be accepted, wait, and be dropped without a
+    // single sentence naming it: the pairing logs a success and logs a failed
+    // attempt budget, and every other exit — the pool stopping, a channel that
+    // breaks mid-gather — was silent. That is the shape the bulk wedge has: four
+    // visitors with megabytes queued, no pairing failure in the log, no stall,
+    // no receive backlog on either side, and no send loop waiting on them.
+    let outcome = pair_striped_group(
         incoming,
         target,
         &pool.data_ch_rx,
@@ -4289,9 +4296,10 @@ async fn serve_tcp_visitor<C>(
         &mut stops,
         arrival,
     )
-    .await
-    {
-        debug!("Striped pairing failed: {e:#}");
+    .await;
+    match &outcome {
+        Ok(started) => debug!(stop_pool = started, "visitor forwarding returned"),
+        Err(e) => debug!("Striped pairing failed: {e:#}"),
     }
     crate::transport::stats::note_pairing_done();
 }
