@@ -2513,6 +2513,57 @@ the striped configuration deadlocks and stripe count grows under backpressure in
 production. The next round's first job is the deadlock, with the switch as its
 reproduction, not a re-derivation of the cipher.
 
+### The arrival's chain is closed, and it lands on the per-stream handshake (2026-11-05)
+
+Three stamps on one wall clock, joined by group id — one `SystemTime` read per event,
+gated on the stats switch, which is the only way to time an interval that crosses two
+processes. 1 201 groups of one staged cell, each with exactly one request:
+
+| interval | p50 | p90 | p99 |
+|---|---|---|---|
+| **control hop**: server sends the request → client's loop reads it | **0.056 ms** | 0.107 | **0.219** |
+| **hand-off**: client's loop reads it → server pairs the visitor | 1.611 ms | 8.376 | **47.513 ms** |
+
+And the server's own four stamps for the 188 pairings it calls slow:
+
+| phase | p50 | p99 |
+|---|---|---|
+| `accept → pairing started` | **0.058 ms** | 0.123 |
+| `pairing started → request enqueued` | 0.001 | 0.005 |
+| **`request enqueued → first channel taken`** | **13.933 ms** | **122.455** |
+| `first channel → forwarding command written` | 0.004 | 13.636 |
+| total, `accept → paired` | 14.206 | 122.481 |
+
+The two instruments agree to 0.4 % once the populations are matched — the cross-process
+hand-off on those same 187 groups reads p50 **13.875**, p99 **122.430**. (The first
+version of this entry called that a contradiction; it was comparing the hand-off's
+median over *all* pairings with the server's median over the *slow* ones, which is the
+population mistake this file keeps warning about and kept making.)
+
+So the whole chain, in one column, for arrivals that are slow:
+
+| | p50 |
+|---|---|
+| accept → pairing started | 0.058 ms |
+| → the request is on the wire | 0.001 |
+| → the client's control loop reads it | 0.056 |
+| **→ the client has opened the stream and written its prologue** | **11.5 ms** |
+| → the server takes the channel (prologue transit + push) | ~2 |
+| → the pairing is woken and takes it | **0.004** |
+| total | 14.2 |
+
+**Every term is now measured, and the 11.5 ms is the per-stream mhd handshake** — the
+same interval that reads `us == hs_us` with a share of 1.000, and the same one that
+sealing deletes. The wake is 4 µs, the control plane 56 µs, the accept 58 µs, the
+forwarding write 4 µs: none of them can be the tail any more, and no scheduling change
+can touch a term that is four microseconds.
+
+That closes the question this cycle spent four rounds on. The arrival is slow because
+it performs a Noise handshake per stream, on a lane that is carrying bulk, and every
+other explanation is now excluded by its own measurement. **The lever is sealing, and
+its only blocker is the striped deadlock** — 3 of 6 runs, a repair loop with
+`retransmits=1532`, narrowed but not yet cured.
+
 ### The tail is the pairing wait, and the arithmetic finally closes (2026-11-05)
 
 The probe now splits its own round trip at the send. 555 arrivals of one staged cell:

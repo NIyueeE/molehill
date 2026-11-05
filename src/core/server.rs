@@ -3468,6 +3468,22 @@ impl ControlChannel {
                                     &striped
                                 }
                             };
+                            // The arrival's first hop, stamped on the wall clock
+                            // so it can be joined to the client's own line for
+                            // the same group (see `stats::epoch_us`).
+                            if crate::transport::stats::enabled() {
+                                let group = match &request {
+                                    DataChannelRequest::Stripe { group, .. } => {
+                                        u32::from_be_bytes(*group)
+                                    }
+                                    _ => 0,
+                                };
+                                debug!(
+                                    group,
+                                    at_us = crate::transport::stats::epoch_us(),
+                                    "channel request sent to the client"
+                                );
+                            }
                             if let Err(e) = self.sink.send(framed) {
                                 // The client is gone: one session's end. Its
                                 // own log says why.
@@ -4336,10 +4352,8 @@ where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let stripes = u8::try_from(stripe_count).with_context(|| "stripe count exceeds u8")?;
-    // How long the visitor waited for its channels, whatever the outcome. The
-    // probe's p99 says a visitor was slow; this says whether the wait was here —
-    // and unlike the expiry line below it fires on the successful-but-slow case
-    // too, which is the one no counter saw.
+    // How long the visitor waited, whatever the outcome: the probe's p99 says a
+    // visitor was slow, and this says whether the wait was here.
     let pairing_started = std::time::Instant::now();
     // Each iteration is one gather attempt under a fresh group id.
     'gather: loop {
@@ -4448,24 +4462,21 @@ where
             }
         }
         let paired = pairing_started.elapsed();
-        // Five milliseconds and the stats switch, exactly like `note_slow_opening`,
-        // because the two halves of one wait must be readable at the same scale: a
-        // twenty-millisecond tail on a two-and-a-half-millisecond median is invisible
-        // to a hundred-millisecond threshold, and that is how this cell's tail stayed
-        // unattributed through every instrument aimed at it.
-        if paired >= std::time::Duration::from_millis(5) && crate::transport::stats::enabled() {
-            let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-            let paired_us = micros(paired);
-            let accept = pairing_started.duration_since(arrival.accepted_at);
-            let facts = (
-                micros(accept),
-                enqueue_us,
-                first_take_us.unwrap_or(paired_us),
-                paired_us,
-            );
-            note_slow_pairing(group, stripes, attempts, facts);
-        }
-        debug!(group, stripe_count, "Visitor paired with a striped group");
+        report_pairing(&PairingFacts {
+            group,
+            stripes: usize::from(stripes),
+            attempts,
+            accept_us: micros(pairing_started.duration_since(arrival.accepted_at)),
+            enqueue_us,
+            first_take_us: first_take_us.unwrap_or_else(|| micros(paired)),
+            paired_us: micros(paired),
+        });
+        // Joined to the client's line for this group (see `stats::epoch_us`).
+        let at_us = crate::transport::stats::epoch_us();
+        debug!(
+            group,
+            stripe_count, at_us, "Visitor paired with a striped group"
+        );
         let paired_at = std::time::Instant::now();
         let (read, write) = incoming.into_split();
         // The group reports its own stalls to the plan: a frame that sat
@@ -4497,6 +4508,50 @@ where
 /// `info!` at five milliseconds, like the two other slow-wait lines and behind
 /// the same stats switch: a line nobody captures cannot explain the gate that
 /// reports the SLO breach.
+/// One pairing's phases, as the line below reports them.
+struct PairingFacts {
+    group: u32,
+    stripes: usize,
+    attempts: usize,
+    accept_us: u64,
+    enqueue_us: u64,
+    first_take_us: u64,
+    paired_us: u64,
+}
+
+/// Report one pairing's wait, when it was long enough to matter.
+///
+/// Five milliseconds and the stats switch, exactly like `note_slow_opening`, because
+/// the two halves of one wait must be readable at the same scale: a twenty-millisecond
+/// tail on a two-and-a-half-millisecond median is invisible to a hundred-millisecond
+/// threshold, and that is how this cell's tail stayed unattributed through every
+/// instrument aimed at it.
+///
+/// Its own function because the caller is a hundred lines of gather logic that the lint
+/// counts, and this is the part that only reports.
+fn report_pairing(facts: &PairingFacts) {
+    if facts.paired_us < 5_000 || !crate::transport::stats::enabled() {
+        return;
+    }
+    note_slow_pairing(
+        facts.group,
+        u8::try_from(facts.stripes).unwrap_or(u8::MAX),
+        facts.attempts,
+        (
+            facts.accept_us,
+            facts.enqueue_us,
+            facts.first_take_us,
+            facts.paired_us,
+        ),
+    );
+}
+
+/// Microseconds, clamped: every timestamp in an arrival is a `Duration` that a
+/// debug build can be trusted not to overflow.
+fn micros(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn note_slow_pairing(group: u32, stripes: u8, attempts: usize, facts: (u64, u64, u64, u64)) {
     let (accept_us, enqueue_us, wait_us, paired_us) = facts;
     info!(

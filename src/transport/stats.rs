@@ -183,6 +183,20 @@ pub(crate) static PHASES: Phases = Phases::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static READ: Once = Once::new();
 
+/// The wall clock in microseconds, for correlating two processes' logs.
+///
+/// Every other stamp in this crate is a monotonic `Instant`, which is right for
+/// measuring an interval and useless for joining one process's line to another's.
+/// Both ends of a run share a host clock, so an arrival's control-plane round trip
+/// can be split by logging this on each side and subtracting — which is the only
+/// way to see the interval between "the server asked for a channel" and "the
+/// client's control loop read the request", because nothing carries it on the wire.
+pub(crate) fn epoch_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
 /// Whether `MOLEHILL_MHD_STATS` is set in this process.
 ///
 /// `0` means off, so a deployment that templates the switch can turn it off

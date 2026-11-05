@@ -3985,6 +3985,17 @@ impl ClientSession {
                     // A visitor's stripe group: the group is known, so the
                     // channel can be placed on a tunnel of its own (D24).
                     ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
+                        if crate::transport::stats::enabled() {
+                            // The same group the server stamped when it asked: the
+                            // difference is the control-plane hop, and its size
+                            // decides between deleting the request and deleting the
+                            // hand-off.
+                            debug!(
+                                group = u32::from_be_bytes(group),
+                                at_us = crate::transport::stats::epoch_us(),
+                                "channel request read by the client"
+                            );
+                        }
                         debug!(%id, group = %hex::encode(group), index, count, "client asked for a stripe");
                         self.open_stripe_channel(id, group, index, count, std::time::Instant::now());
                     }
