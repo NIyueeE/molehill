@@ -365,6 +365,8 @@ pub(crate) struct WorstStream {
     pub(crate) written: u64,
     /// Whether an abort is what keeps this stream out of the scheduler.
     pub(crate) reset: bool,
+    /// The delivery frontier: everything below it is acknowledged.
+    pub(crate) base: u64,
     /// The repair it is owed, if it is owed one: `(offset, length)`.
     ///
     /// A stream that has put every byte on the wire and is still "owed" a range
@@ -485,6 +487,11 @@ pub(crate) struct Conn {
     send_credit: u64,
     /// Bytes this end allows the peer, absolute.
     recv_credit: u64,
+    /// The last cumulative prefix the peer reported, kept only for reporting: at a
+    /// stall the question is whether the sender retired past the peer's word (it
+    /// believes bytes delivered that the peer never had) or the peer's word is
+    /// ahead of the retirement (the peer holds bytes the sender keeps re-sending).
+    last_ack_prefix: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
@@ -667,6 +674,7 @@ impl Conn {
             ack_pending: false,
             send_credit: WINDOW / 2,
             recv_credit: WINDOW,
+            last_ack_prefix: 0,
             advertised: 0,
             read: 0,
             arrived_stream: 0,
@@ -1803,10 +1811,20 @@ impl Conn {
     /// blocked on the far end's credit and a connection whose own reader owes
     /// the peer a megabyte were, until this, the same absence of log lines.
     /// The stream with the most bytes the wire has not taken, and its own facts.
+    /// The peer's last cumulative prefix, for the window line.
+    pub(crate) fn last_ack_prefix(&self) -> u64 {
+        self.last_ack_prefix
+    }
+
     pub(crate) fn worst_stream(&self) -> Option<WorstStream> {
         self.streams
             .iter()
-            .filter(|(_, state)| state.send.has_unsent())
+            // The stream with the most **unacknowledged** bytes, not the most
+            // unsent ones: a repair loop is a stream whose `next` has caught up with
+            // `written` and whose records still are not retired, and filtering on
+            // unsent hid exactly that stream — the instrument reported "no worst
+            // stream" at a stall that was one.
+            .filter(|(_, state)| state.send.unacked() > 0)
             .max_by_key(|(_, state)| state.send.unacked())
             .map(|(&id, state)| WorstStream {
                 id,
@@ -1814,6 +1832,7 @@ impl Conn {
                 retransmits: state.retransmits,
                 next: state.send.next_offset(),
                 written: state.send.written(),
+                base: state.send.base(),
                 // Whether an abort is what keeps this stream out of the
                 // scheduler, and which repair it is owed. Those two are the only
                 // ways a stream with unsent bytes is passed over without a packet
@@ -2163,6 +2182,7 @@ impl Conn {
     /// Apply the peer's acknowledgement: retire what it covers, rewind what
     /// it reports lost, and open the window on the progress it proves.
     fn apply_ack(&mut self, now: Instant, ack: wire::Ack, sampled: bool) {
+        self.last_ack_prefix = ack.prefix;
         let ack_timing = stats::Timing::start(sampled);
         let acked = self.recovery.on_ack(now, ack);
         for sent in acked.newly {

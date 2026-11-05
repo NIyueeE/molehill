@@ -608,6 +608,36 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The frontier and the peer's word are identical, so retirement is not the bug (2026-11-05)
+
+The window line now carries `worst_base` (the stream's delivery frontier) and
+`last_ack_prefix` (the peer's last cumulative word), and at a stall they read:
+
+```
+lane=3 cwnd=262144 flight=997084 worst_base=1309660 worst_next=2039422
+       worst_written=2039422 worst_retransmits=2108 last_ack_prefix=1309660
+```
+
+**`base` and `ack_prefix` are equal to the byte.** So the two candidates this file named
+are both excluded: the sender has not retired a range the peer lacks, and the peer has not
+reported bytes it does not hold. `next == written` says everything has been sent, `retx=2108`
+says repairs are still going out, `flight` is nearly a mebibyte — and the peer's word does not
+move past 1 309 660.
+
+So the peer's frontier is frozen at a point where **the sender believes it owes nothing there**:
+the repairs it does send are of *other* ranges. The bytes the peer is waiting for are not being
+re-sent, and the range that covers them is in the sender's live set (it is above `base`) without
+ever being declared lost.
+
+Two instrument errors were found and fixed on the way, both of the same family as the rest of this
+file: `worst_stream()` filtered on *unsent* bytes, so it reported "no worst stream" at a stall
+whose stream had caught `next` up with `written`; and the window line's default `0` could not be
+told from a real stream id `0`.
+
+The next question is narrow: which live range covers the frozen offset, why it is never declared
+lost, and whether its repair is being skipped by the scheduler's `next_repair` — the one place
+that decides what a stream with nothing unsent is still owed.
+
 ### The stalled lane repairs for ever and retires nothing (2026-11-05)
 
 The per-second window line now carries the worst stream's own numbers (`worst_next`,
