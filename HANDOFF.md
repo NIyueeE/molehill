@@ -24,6 +24,49 @@
 act (AGENTS.md §5); what is missing is a gate that passes every time, and the
 numbers that say why are on this page.
 
+### mhd's last clean stage has never carried bulk, so the pair never existed (2026-11-05)
+
+Every full-scale timeline record of this cycle, for mhd, has **no bulk throughput in its
+last clean stage**:
+
+| run | `clean` (first) | `clean#2` (last) |
+|---|---|---|
+| m88 | p99 285.99, **7.31 Gbit/s** | p99 23.51, **none** |
+| m90 (two builds) | 146.03 / 25.79, 6.54 / 6.61 Gbit/s | 23.65 / 23.60, **none** |
+| m95 | 302.13, 4.10 Gbit/s | 22.54, **none** |
+| m102 (**TCP**) | 120.00, 13.54 Gbit/s | 19.54, **12.20 Gbit/s** |
+
+So the sentence this file has been repeating — "the first stage is the SLO failure and
+the last stage is fine" — was comparing a stage with four bulk flows against a stage
+whose bulk instrument **had died**, every time. The `iperf3` cell reports
+`control socket has closed unexpectedly` in the original and in the retry, while the
+boundary echo probe answers in 5.5–6.0 ms, and my round-two lenient path kept the
+stage's *latency* while recording the loss as a typed absence — which is why the number
+looked fine and the row looked green.
+
+TCP's pair is fair (13.54 against 12.20 Gbit/s) and its gap is real: 120 against 19.5 ms.
+mhd's pair has to be re-measured before anything can be said about mhd's own first-versus-
+last gap, and before condition 1 can be attributed to either.
+
+What the wedged stage looks like from inside, on the server, during `clean#2` of m95:
+
+```
+mhd-stats: writes refused, by the bound that refused credit=16 window=269 aged=0 opening=0
+```
+
+— the response direction refused by the **peer's credit** sixteen bytes short of its
+window, and by its own congestion window, with the age gate silent and no stall line at
+all. On the client, in the same seconds, two or three datagrams a second are refused as
+`malformed` and one or two as `malformed_decode`, which on loopback with no corruption
+means a datagram was written that the decoder rejects. And the sink, for the whole 150
+seconds, reports `0.00 Bytes` on all four streams before its idle timeout.
+
+So the bulk flows are wedged end to end while a one-byte request through the same tool
+answers in six milliseconds: the server has bytes to send and a window that refuses it,
+the client has a stream that is not being read, and the backend has four connections with
+nothing arriving. That is the next reproduction to build, and it is a *throughput*
+defect in the carrier, not a harness one.
+
 ### The first clean stage fails for TCP too, so it is not mhd's (2026-11-05)
 
 The comparison objective condition 2 asks for, on the cell that decides the release,
