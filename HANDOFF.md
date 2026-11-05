@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The held offset cannot replace the prefix, and the test that says why (2026-11-05)
+
+The previous entry proposed that the receiver report the highest offset it **holds** instead of the
+contiguous prefix. Implemented as a straight replacement — `arrived_prefix` becomes `held_high()` — the
+unit suite refused it in one line:
+
+```
+a_loss_re_sends_the_hole_and_not_what_follows_it
+  left: None      the first frame re-sent is the hole itself
+```
+
+The reason is exact. The sender applies the prefix through `advance_to`, which moves **`base`** — and
+`base` means "everything below this was delivered **contiguously**". `next_repair` skips ranges ending at or
+below `base`, so a prefix that names held-but-not-contiguous bytes tells the sender the hole has been
+delivered and the hole is then never repaired. The test is the whole argument, and it is right.
+
+So the two numbers must travel separately: the contiguous prefix keeps its meaning and its effect on
+`base`, and a **new `held` field** — eight more bytes on the acknowledgement — is used by the sender only
+to retire flight, never to move a frontier. That is the version to implement, and it needs the recovery
+table to distinguish "delivered" from "no longer need to carry", which is a change of the same size as the
+acknowledgement's own.
+
+Worth recording because it is the closest this cycle has come to a fix aimed at a proven deadlock: the
+design is now settled, and the only thing between it and a measurement is the plumbing.
+
 ### The mid cluster is a deadlock between two layers, and the prefix cannot break it (2026-11-05)
 
 One failing run at 3 844 608 bytes, read from both layers at once:
