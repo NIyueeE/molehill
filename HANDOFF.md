@@ -608,6 +608,27 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The send run is a local optimum at 44, and the lever is somewhere else (2026-11-05)
+
+Both directions from the shipping constant were measured, one `soak` each, same build
+otherwise:
+
+| `SEND_RUN` | slow opens | of those p50 / p90 | first stage p50 / p99 | its bulk |
+|---|---|---|---|---|
+| 8 | 5 530 | 10.53 / **22.76** ms | 13.10 / 68.03 | 6.20 Gbit/s |
+| **44** | **213** | 10.84 / 32.14 | **2.51 / 23.03** | **6.89** |
+| 96 | 7 853 | 16.71 / **35.27** (max 1 619) | **58.78 / 165.64** | 3.32 |
+
+So 44 is a **local optimum on both sides** — twenty-six times fewer slow opens than eight
+packets a run, thirty-seven times fewer than ninety-six — and the first stage is three to
+twenty times better at 44 than at either neighbour. The burst geometry is not the lever, and the
+constant as shipped is the best of the three by a wide margin.
+
+That is the second hypothesis about the handshake's 20–180 ms tail to be tested and rejected
+(the first was an RTO, the third a socket queue). What is left is what the cycle started with:
+the open is three round trips of tiny packets, and the only way to make three into one is
+sealing — which is built, tested, and blocked by the striped path's deadlock.
+
 ### Smaller send bursts are worse: the A/B, and its numbers (2026-11-05)
 
 The last hypothesis had a mechanism and a one-constant test: the sender builds up to `SEND_RUN`
