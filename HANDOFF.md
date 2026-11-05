@@ -608,6 +608,35 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The watermark is at zero for the connection's life, and rotating the prefix is worse (2026-11-05)
+
+Two more results, one a structural fact and one a refuted fix.
+
+**Structural.** The sender's own highest issued number and the peer's `largest`, side by side:
+
+```
+lane=2 own_last=4639 peer_largest=4512 below=0 base=1925414 num=4596
+lane=1 own_last=3382 peer_largest=3357 below=0 base=2047664 num=3358
+lane=0 own_last=3900 peer_largest=3875 below=0 base=2089648 num=3876
+```
+
+`own_last` and `peer_largest` are close — the numbers *are* getting through — and **`below` is zero on
+every one of them**: the peer's cumulative packet watermark has never advanced past 0, for the
+connection's whole life. Numbering starts at 0, so `below = 0` means **packet 0 never arrived**: one
+lost first packet pins the watermark for ever, exactly as `wire::ACK` documents, and from then on
+every retirement depends on the 64-bit window sliding past each record.
+
+**Refuted fix.** The documented mitigation is the byte prefix, and it names one stream per
+acknowledgement. It is set to the stream that just received a frame, so a stream that has *stopped*
+receiving is never named again. Rotating the named stream round-robin across live streams looked like
+the obvious repair; measured, it takes the sealed striped pass rate from **five of eight to two of
+eight**. Naming a stream whose frontier has not changed is a no-op for the peer, and the stream that
+needed the update gets it one time in N. Reverted.
+
+So the prefix-starvation theory is out as well, and the mechanism that remains is the one the format
+documents: a single packet lost at the start of a connection, a watermark stuck at zero, and every
+stream's retirement leaning on a 64-bit window that cannot carry a long-lived hole.
+
 ### Built equals posted, and the wider window does not help (2026-11-05)
 
 Two of the three candidates from the previous entry are now measured and both are out.

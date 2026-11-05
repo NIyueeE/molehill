@@ -231,6 +231,7 @@ fn report_window(shared: &Arc<Shared>) {
             last_ack_below = conn.last_ack_marks().0,
             last_ack_bits = conn.last_ack_marks().1,
             last_ack_largest = conn.last_ack_marks().2,
+            own_last_number = conn.last_number(),
             posted_datagrams = posted,
             lane = conn.wire_id(),
             cwnd,

@@ -1847,6 +1847,14 @@ impl Conn {
     ///
     /// Reported beside the send side because it is the other half of one
     /// question: whether the repairs a peer posts are arriving at all.
+    /// The highest packet number this end has issued.
+    ///
+    /// Beside the peer's `largest` it answers one question exactly: whether the
+    /// numbers this end posted are the numbers the peer has seen.
+    pub(crate) fn last_number(&self) -> u32 {
+        self.recovery.last_number()
+    }
+
     pub(crate) fn inserted_total(&self) -> u64 {
         self.streams.values().map(|state| state.inserted).sum()
     }
