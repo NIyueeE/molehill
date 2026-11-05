@@ -608,6 +608,35 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Same build, same profile: `clean` reads 22.5 ms in one sweep and 92.0 in the next (2026-11-05)
+
+The second full sweep after the deadline fix was gated, and the two runs of the **same binary** disagree by
+four times on the number that blocks the gate:
+
+| run | `timeline[clean]` | `clean#2` |
+|---|---|---|
+| m22 | **22.515 ms** | 22.344 ms |
+| m23 | **91.984 ms** | 23.481 ms |
+
+Everything else in m23 is either green or unmeasured: **capacity L1–L8 all read 2.7–23.8 ms (8 of 8, ramp
+8)**, `clean#2` is 23.5 ms, and the coverage failures are only the arms that never ran — the sweep stops
+after two or three of its five arms, which is a runner problem this cycle has now seen twice.
+
+So the first-stage tail is **bimodal, not fixed**: the same code produces a clean p99 of 22 or of 92 ms
+depending on the run. That is what a per-stream handshake tail looks like — `open_us` p90 45.8 ms and max
+101.5 ms measured in an earlier cycle — and it means the deadline fix did what it claimed (the striped
+*stall* is gone: eleven of twelve integration runs) without touching the *latency* tail at all.
+
+Two things therefore stand between this tree and its gate, and they are independent:
+
+1. **the sweep must finish its arms** — coverage cannot be judged from two of five, and a run that dies
+   silently after the second arm wastes forty minutes and reports nothing about why;
+2. **the first-stage tail must come down** so the clean p99 is not a coin flip between 22 and 92.
+
+Also worth recording for whoever runs this next: the container was recreated between rounds (its `/tmp` is
+gone, load average reset), which is why the m23 file survives only in `/home/dsh/tmp` and the first thing to
+re-check on entry is that `str`, as `AGENTS.md` says.
+
 ### The sweep's clean stages are now 22.5 and 22.3 ms, and the sweep still aborted (2026-11-05)
 
 The first sweep after the deadline fix, and the headline number is the one the gate has been failing for
