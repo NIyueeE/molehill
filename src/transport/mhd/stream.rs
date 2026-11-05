@@ -284,13 +284,22 @@ impl SendBuf {
     /// The next repair to put on the wire, and how much of it one packet may
     /// carry.
     pub(crate) fn next_repair(&self, max: usize) -> Option<(u64, usize)> {
-        let (&start, &end) = self.repairs.iter().next()?;
-        let start = start.max(self.base);
-        if end <= start {
-            return None;
+        // **Skip past ranges the frontier has already passed**, do not stop at
+        // them. Clamping the lowest range up to `base` and answering `None` when
+        // nothing is left of it blocks every other range behind it — and `trim`
+        // only runs when an acknowledgement moves the frontier, which is exactly
+        // what a stalled lane is not doing. One stale entry then blocks all
+        // repair for ever: the acknowledgement that would prune it cannot arrive
+        // because the repair it blocks is the one that would produce it.
+        for (&start, &end) in &self.repairs {
+            let start = start.max(self.base);
+            if end <= start {
+                continue;
+            }
+            let len = usize::try_from(end - start).map_or(0, |len| len.min(max));
+            return (len > 0).then_some((start, len));
         }
-        let len = usize::try_from(end - start).map_or(0, |len| len.min(max));
-        (len > 0).then_some((start, len))
+        None
     }
 
     /// Record that a repair range went out, trimming what is still owed.
@@ -920,6 +929,31 @@ mod tests {
     /// The property this half exists for: pieces that arrive in any order
     /// reassemble into exactly the stream that was written, and the read offset
     /// advances only over contiguous bytes.
+    /// A stale repair must not block the ones behind it.
+    ///
+    /// `trim` prunes ranges the frontier has passed, but it only runs when an
+    /// acknowledgement moves the frontier — and a stalled lane is not moving it.
+    /// So `next_repair` may meet a range that ends below the base, and it has to
+    /// walk past it: answering `None` there blocks every later range, including
+    /// the one whose repair would produce the acknowledgement that prunes it.
+    #[test]
+    fn a_stale_repair_does_not_block_the_ones_behind_it() {
+        let mut send = SendBuf::default();
+        send.write(&[0u8; 4096]);
+        send.mark_sent(4096);
+        // Pretend the frontier has advanced past a range that is still queued as
+        // owed, exactly as a late loss declaration leaves it.
+        send.repair(0, 100);
+        send.advance_to(1000);
+        send.repair(0, 100);
+        // A range further on is owed and must be reachable.
+        send.repair(2000, 100);
+        let Some(head) = send.next_repair(1024) else {
+            unreachable!("the later range is still owed")
+        };
+        assert_eq!(head.0, 2000, "the stale range is skipped, not returned");
+    }
+
     #[test]
     fn a_stream_assembled_from_shuffled_pieces_is_the_original() {
         let original = stream_bytes(4096);
