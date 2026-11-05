@@ -608,6 +608,24 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The echo is excluded for the third time, now on a metric that can resolve it (2026-11-05)
+
+The previous entry's first candidate was the test's own echo: `io::copy` over both halves of a socket
+cannot read while it is blocked writing, so a carrier that applies backpressure could stall it against
+itself, and the symptom would be exactly what the group line shows — no gap, and a source that stopped
+producing.
+
+The decoupled echo (reader → bounded queue → writer) was measured on the bytes-delivered metric:
+**six complete of twelve**, with partials at 3 775 488, 4 398 080, 4 398 080, 1 481 728, 1 867 776 and
+302 080. The baseline is thirteen of twenty-four, whose two batches read seven and six.
+
+**Six is the baseline.** So the echo is not the cause — and this is the third time it has been
+measured, the first two on eight-run samples that could not have resolved it either way. Reverted.
+
+What that leaves is the previous entry's second candidate, one hop further out: the **client's** group
+stopped reading its source. The instrument for it is already installed — `sourced` per group — so the
+next run reads the client's own group state at the moment the server's group goes idle.
+
 ### The group is idle, not stuck: `delivered` equals `highest` (2026-11-05)
 
 A per-group counter of bytes read **from the group's source** settles the direction of the fault:
