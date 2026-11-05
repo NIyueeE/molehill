@@ -608,6 +608,33 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The early stall has a different signature: a group stuck at frame 124 and a watermark at zero (2026-11-05)
+
+After the `arrived()` fix the sealed striped test passes five of eight, and the three failures stop
+much earlier than the ones that fix addressed. Their instruments read:
+
+```
+group 1: highest=125 delivered=123 written=3975680 idle_ms=1848
+lane=0  base=1007974 next=1040752 covering=1 num=2228 below=0 bits=ffffffffffffffff pending=0
+```
+
+Three things are new here and none of them is the shape just fixed:
+
+- the group stalls at **frame 124** with only 125 frames ever written, so this is the *first*
+  megabyte of a transfer, not a long transfer's tail;
+- `idle_ms` 1 848 — the group stopped moving about two seconds before the last sample, and the
+  visitor's byte count froze at exactly `written`;
+- one lane's peer reports **`below = 0`** with all sixty-four bitmap bits set: it has acknowledged
+  sixty-four packets without ever advancing its cumulative packet watermark. Retirement by prefix is
+  impossible on that lane; only the bitmap path can retire anything, and `base` sits a megabyte
+  ahead of where prefix-based retirement would leave it.
+
+So this stall is not the same defect, or not only it. What is missing to finish the diagnosis is one
+mapping: **which lane and stream carry the frame the group is waiting for**. The group knows its
+stripe count and the reorder loop knows the gap; the lanes know their stream ids; nothing ties them
+together in a log line. The next change is that tie — one line at group start naming each stripe's
+stream, and one at a gap naming the frame and the stripe it should have come from.
+
 ### Fixed: the arrival frontier walked only its first piece (2026-11-05)
 
 `RecvBuf::arrived()` reported `max(first_piece_end, read)` — the first piece and nothing else. A
