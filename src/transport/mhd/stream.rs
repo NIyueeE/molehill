@@ -749,15 +749,23 @@ impl RecvBuf {
     /// every acknowledgement, so the peer's frontier moves on the bytes
     /// themselves rather than on the packet records that carried them.
     pub(crate) fn arrived(&self) -> u64 {
-        let Some((&at, piece)) = self.pieces.iter().next() else {
-            return self.read;
-        };
-        if at > self.read {
-            // The first piece starts beyond the read offset: a hole sits
-            // between them and nothing past it can be reported.
-            return self.read;
+        // **Walk the contiguous chain**, not just its first link. A frame's bytes
+        // arrive as many packets — a 32 KiB stripe frame is twenty-five of them —
+        // and a frontier that advanced by one piece per read could not move at
+        // all while the reader waited for a frame the reorder loop would not
+        // release. That is the sealed striped stall's shape: the peer's packet
+        // bitmap reports the covering packet as arrived (`below` at its number, all
+        // sixty-four bits set) while this number stood still, so both ends agreed
+        // on the packet and disagreed on the bytes in it.
+        let mut frontier = self.read;
+        for (&at, piece) in &self.pieces {
+            if at > frontier {
+                // A hole: nothing past it can be reported.
+                break;
+            }
+            frontier = frontier.max(at + piece.len as u64);
         }
-        (at + piece.len as u64).max(self.read)
+        frontier
     }
 
     /// Bytes that have arrived and not yet been read out of this stream.

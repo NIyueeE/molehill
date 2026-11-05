@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Fixed: the arrival frontier walked only its first piece (2026-11-05)
+
+`RecvBuf::arrived()` reported `max(first_piece_end, read)` — the first piece and nothing else. A
+32 KiB stripe frame arrives as twenty-five sealed packets, so the frontier advanced by one piece per
+read and could not move at all while the reader waited for a frame the reorder loop would not
+release. That is the shape the marks described: the peer's bitmap said the covering packet had
+arrived (`below` at its number, all sixty-four bits set) while the byte frontier stood still.
+
+It now walks the contiguous chain from `read`, stopping at the first hole.
+
+Measured on the sealed striped test, eight runs each way:
+
+| | pass | fail |
+|---|---|---|
+| before | **3 of 8** (this cycle, after the two packet-number fixes) | 5 |
+| after | **5 of 8** | 3 |
+
+and the unsealed path is unchanged at 5 of 5.
+
+Not cured: the three remaining failures stop at 465 920 / 433 152 / 465 920 bytes — the *earliest*
+stopping point this file has recorded, from the very first round of the cycle — so they are a
+different stall from the one this fix addressed, and the next run should be read with the same
+instruments already installed (the group state line, the covering packet number, and the peer's
+marks).
+
 ### The peer says the covering packet arrived, and its byte prefix does not move (2026-11-05)
 
 Two facts added — the packet number of the record covering the stalled frontier, and the peer's
