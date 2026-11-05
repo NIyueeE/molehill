@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Numbers are never taken without a build, and the window counters cannot see a loss (2026-11-05)
+
+Two counters that had never been compared — packet numbers taken and packets built — close one exit and
+open a measurement question:
+
+```
+issued = 17 652   built = 17 652   (gap 0)
+posted = 18 273   received = 17 097
+```
+
+**Issued equals built**, so the previous entry's thousand-and-seventy-six unseen numbers are not numbers
+consumed without a packet: `encode_stream` failing after `next_number` would show here and does not.
+(`posted` is larger than `built` because acknowledgements and credit updates repeat a packet number by
+design and are posted without taking one.)
+
+But `posted − received = 1 176`, and that is the first time this cycle has seen a gap in that pair. It is
+**not yet evidence**: both are per-second windows that reset, so the last window's datagrams are counted
+as posted and never as received when the run ends under them. A boundary artifact and a real loss look
+identical in window counters.
+
+So the next change is to make that pair **cumulative** rather than per-window — two monotonic counters,
+reported once a second without being reset, and compared at the end of a run. `posted_total −
+received_total` is then exactly the datagrams that left a socket and were never read, with no boundary
+ambiguity, and it is the last quantity on this path that has not been measured cleanly.
+
 ### Acks arrive at 132 a second and the peer is 1 076 numbers behind (2026-11-05)
 
 The acknowledgement counters answer the previous entry's question, and the answer is neither of its

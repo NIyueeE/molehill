@@ -547,6 +547,14 @@ pub(crate) struct Conn {
     /// Acknowledgements this end applied and attached, for the window line.
     acks_applied: u64,
     acks_attached: u64,
+    /// Packet numbers taken, and packets actually built from one.
+    ///
+    /// The difference is the one exit no line names on a busy lane: `next_number`
+    /// is taken before the header is framed, and a frame that does not fit returns
+    /// without posting — leaving a number consumed and, if the peer never sees it,
+    /// a frontier pinned under it for the connection's life.
+    issued: u64,
+    built: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
@@ -737,6 +745,8 @@ impl Conn {
             repairs_above: 0,
             acks_applied: 0,
             acks_attached: 0,
+            issued: 0,
+            built: 0,
             advertised: 0,
             read: 0,
             arrived_stream: 0,
@@ -1386,6 +1396,7 @@ impl Conn {
             (sealed, len, state.send.ends_at(offset, len))
         };
         let number = self.recovery.next_number();
+        self.issued = self.issued.saturating_add(1);
         // The dwell: from the write that made this stream non-empty to the packet
         // that carries its oldest owed byte. Stamped out here rather than above,
         // because a refusal does not carry the bytes and must not clear the
@@ -1447,6 +1458,7 @@ impl Conn {
         };
         // The payload follows its header, drawn chunk by chunk: a packet is no
         // longer capped by the chunk boundary the send point happens to sit in.
+        self.built = self.built.saturating_add(1);
         let payload_at = out.len();
         let copied = state.send.append_to(offset, len, out);
         debug_assert_eq!(copied, len, "the framing length matches what is copied");
@@ -1938,6 +1950,16 @@ impl Conn {
 
     /// Declared-loss ranges that covered a frontier, and those above it.
     /// Acknowledgements applied and attached since the last call.
+    /// Packet numbers taken and packets built since the last call, plus the
+    /// reason the last refusal carried.
+    pub(crate) fn take_issued(&mut self) -> (u64, u64) {
+        let issued = self.issued;
+        let built = self.built;
+        self.issued = 0;
+        self.built = 0;
+        (issued, built)
+    }
+
     pub(crate) fn take_acks(&mut self) -> (u64, u64) {
         let applied = self.acks_applied;
         let attached = self.acks_attached;
