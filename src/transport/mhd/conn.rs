@@ -211,6 +211,13 @@ struct StreamState {
     /// answers is about one stream: a Noise handshake that took five seconds is
     /// either a queue or eight lost packets, and only this says which.
     retransmits: u32,
+    /// Repair packets actually posted by the scheduler for this stream.
+    ///
+    /// `retransmits` counts a range being *declared* lost, which is a decision; this
+    /// counts one being *put on the wire*, which is the fact. A stream whose
+    /// declarations grow while this stands still is owed bytes that nothing picks,
+    /// and the difference is invisible in every other counter.
+    repairs_sent: u32,
 }
 
 /// One open stream the connection is holding.
@@ -365,6 +372,8 @@ pub(crate) struct WorstStream {
     pub(crate) written: u64,
     /// Whether an abort is what keeps this stream out of the scheduler.
     pub(crate) reset: bool,
+    /// Repair packets this stream has actually posted.
+    pub(crate) repairs_sent: u32,
     /// The delivery frontier: everything below it is acknowledged.
     pub(crate) base: u64,
     /// The repair it is owed, if it is owed one: `(offset, length)`.
@@ -1421,6 +1430,7 @@ impl Conn {
                 // forced to wait behind a repair, and a repair must not be
                 // forgotten because the send point moved past it.
                 state.send.repair_sent(offset, len);
+                state.repairs_sent = state.repairs_sent.saturating_add(1);
             } else {
                 state.send.mark_sent(len);
             }
@@ -1830,6 +1840,7 @@ impl Conn {
                 id,
                 unsent: state.send.unacked(),
                 retransmits: state.retransmits,
+                repairs_sent: state.repairs_sent,
                 next: state.send.next_offset(),
                 written: state.send.written(),
                 base: state.send.base(),

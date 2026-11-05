@@ -608,6 +608,40 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Repairs are posted, the peer accepts everything, and the missing byte is never in them (2026-11-05)
+
+Two more counters separate "declared lost" (a decision) from "repair packet posted" (a fact), and
+at a stall they read:
+
+```
+lane=2 base=950570 next=2032244 written=2032244 retx=2030 posted=1120 ack=950570 flight=469216
+```
+
+So the repairs *are* going out — 1 120 of them against 2 030 declarations — the peer refuses
+nothing, and:
+
+- **`base` equals `ack` again**, to the byte, on a different run and lane: the frontier matches the
+  peer's word, so retirement is not retiring anything the peer lacks;
+- **`next == written`**: nothing is left to send;
+- **`flight` is 469 KB**: the sender still holds records the peer has not acknowledged.
+
+Put together, the picture is now narrow enough to state as a contradiction: the peer's first
+missing byte is at 950 570, the sender posts repairs continuously, and the peer's frontier never
+moves — so **the byte at 950 570 is not in any repair packet that goes out**. Nothing is lost on
+the wire (the peer refuses nothing) and nothing is misretired; the repair *selection* is offering
+ranges that do not include the one byte everything is waiting for.
+
+That is the last place in this path that has not been measured, and it is one function:
+`next_repair` takes the lowest key in `SendBuf::repairs`, clamps it up to `base`, and returns
+`None` when the clamped range is empty — without ever removing that entry. A `repairs` map whose
+lowest key sits *below* `base` therefore returns `None` for ever while higher repairs are trimmed
+away by `repair_sent`, which is exactly a stream that keeps posting repairs and never fills its
+frontier's hole.
+
+The next change is to make `next_repair` skip entries that are entirely below `base` (and drop
+them), and to count the times it had to skip: a number that is non-zero at a stall confirms the
+hole was unreachable by construction.
+
 ### The frontier and the peer's word are identical, so retirement is not the bug (2026-11-05)
 
 The window line now carries `worst_base` (the stream's delivery frontier) and

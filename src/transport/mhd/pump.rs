@@ -217,6 +217,7 @@ fn report_window(shared: &Arc<Shared>) {
             worst_written = worst.map_or(0, |w| w.written),
             worst_unsent = worst.map_or(0, |w| w.unsent),
             worst_retransmits = worst.map_or(0, |w| w.retransmits),
+            worst_repairs = worst.map_or(0, |w| w.repairs_sent),
             worst_base = worst.map_or(0, |w| w.base),
             last_ack_prefix = conn.last_ack_prefix(),
             lane = conn.wire_id(),
