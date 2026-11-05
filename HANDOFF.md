@@ -67,6 +67,39 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### Four soaks: the last stage is tight, the first is bimodal, and it tracks bulk rate (2026-11-05)
+
+Four `soak` campaigns on one build, one after another, with the arithmetic of both clean
+stages and the bulk spine beside each:
+
+| run | `clean` p99 | its bulk | `clean#2` p99 | its bulk |
+|---|---|---|---|---|
+| m107 | **135.5 ms** | 8.64 Gbit/s | 3.5 | none |
+| m108 | **23.5** | 6.84 | 3.5 | 5.95 |
+| m111 | **22.5** | 7.86 | 3.5 | none |
+| m112 | **290.6** | 8.39 | 3.6 | 2.58 |
+
+Two facts, both new and both sharp:
+
+- **the last clean stage is 3.5 ms at p99 in all four runs, within a tenth of a
+  millisecond.** Whatever the arrival path's problem is, it is not there: a warm stage with
+  no shaped history behind it inside the same process reads the same number every time.
+  That is the tightest distribution this file has ever recorded for an arrival metric;
+- **the first stage is bimodal, and the split tracks the bulk spine's rate.** The two runs
+  whose first stage passed carried 6.84 and 7.86 Gbit/s of bulk; the two that failed carried
+  **8.64 and 8.39**. Four for four, in the direction that says an arrival gets slow when the
+  bulk spine is fast — which is the same sentence this cycle started from, now with a number
+  attached to "fast" (about 8 Gbit/s on this host) and with the arrival path's own stability
+  measured separately.
+
+That also explains why the last stage's bulk sometimes dies without hurting it: when the
+spine does not reach that rate, the arrival does not queue behind it. The two observations
+are one observation.
+
+The relationship is across runs, not a controlled experiment — the next one to run is a
+sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
+turns a correlation into a curve and says where the knee is.
+
 ### The bulk bytes are not in the carrier at all (2026-11-05)
 
 The instrument pre-registered last round answers its first question on the first wedged
