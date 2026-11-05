@@ -67,6 +67,36 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The fair pair, at last: both clean stages with bulk, both inside the SLO (2026-11-05)
+
+The same `soak` schedule, one hour later, does not wedge — and it is the first run in this
+cycle where **both clean stages carried bulk and both met the SLO**:
+
+| stage | p50 | p99 | throughput |
+|---|---|---|---|
+| `clean` (first) | 2.52 ms | **23.51** | **6.84 Gbit/s** |
+| `clean#2` (last) | 2.24 ms | **3.51** | **5.95 Gbit/s** |
+
+That is the pair the previous entry said had never existed, and it changes two sentences in
+this file:
+
+- **mhd's own first-versus-last gap is 23.5 → 3.5 ms at p99**, a factor of 6.7, with both
+  inside the 50 ms limit — not the 302 → 22 and 146 → 23 this file has been quoting, which
+  compared a stage with four bulk flows against one whose bulk instrument had died;
+- **the target is reachable on this carrier.** Two clean stages, one run, real bulk both
+  times, both passing. What is not reachable is *stability*: the wedge appears in about
+  half of these runs, and when it does the stage loses its whole bulk spine.
+
+So the objective's condition 1 is not blocked by a design flaw in the arrival path; it is
+blocked by an intermittent loss of the bulk spine after a shaped stage, which is the
+defect the previous entry localised between the server's stripe write and the client's
+stripe read.
+
+The instrument the previous entry pre-registered is in this build — the per-second `mhd
+window` line now carries `backlog_streams`, `backlog_bytes`, `worst_stream` and
+`worst_ready_ms`, the receive-side mirror of the send-side numbers — and this run has no
+wedged stage to show it. It stays installed for the next one.
+
 ### The bulk wedge is inside the carrier: one second, then nothing (2026-11-05)
 
 Reproduced on a **fifteen-minute** schedule instead of the thirty-minute sweep — the

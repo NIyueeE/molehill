@@ -190,12 +190,30 @@ fn report_window(shared: &Arc<Shared>) {
         }
         conn.note_window_reported(now);
         let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
+        // The *receive* side of the same picture, once a second. The send side has
+        // had a line since this file began and the receive side had none, so a
+        // stream whose bytes arrived and whose reader never took them was
+        // invisible: the stall line needs a *sender* with bytes it cannot post,
+        // and in the wedge the sender is fine — the reader is not. `held` is what
+        // the peer's credit paid for and nobody consumed, and `ready_ms` is how
+        // long the oldest of it has been waiting.
+        let backlog = conn.backlog();
+        let (worst_stream, worst_ready_ms) = backlog
+            .worst
+            .and_then(|(id, _)| conn.ready_for(id, now).map(|waited| (id, waited)))
+            .map_or((0, 0), |(id, waited)| {
+                (id, u64::try_from(waited.as_millis()).unwrap_or(u64::MAX))
+            });
         tracing::debug!(
             lane = conn.wire_id(),
             cwnd,
             flight,
             slow_start,
             acked_since_growth,
+            backlog_streams = backlog.streams,
+            backlog_bytes = backlog.total,
+            worst_stream,
+            worst_ready_ms,
             "mhd window"
         );
     });
