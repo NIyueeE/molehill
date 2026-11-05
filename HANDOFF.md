@@ -608,6 +608,27 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The kernel drops nothing at all, which retires the whole loss line (2026-11-05)
+
+`/proc/net/udp` ends every line with that socket's own **drops**, and it is kernel truth: nothing in this
+code can inflate or hide it. Sampled once a second across four complete runs of the striped test:
+
+**every socket, every sample, `drops` = 0.**
+
+So no datagram was lost, dropped, or discarded by any UDP socket in any of those runs — and the "loss"
+this file chased from round 72 through 75 was, in all three of its forms, an artefact of comparing two
+counters that measure different events (a direction against its opposite, a build against a post, one
+socket's count against another socket's).
+
+That is worth having closed decisively, because it constrains where the stall can be. Every mechanism the
+loss line implied — retransmission failures, repair loops that send nothing, acks that never arrive — is
+now excluded **by the kernel**, not by our bookkeeping. The stall is therefore not a transport-loss
+problem at all: it is a *progress* problem, inside the carrier, with a reliable path underneath.
+
+Twelve runs of the sealed striped test after these fixes read **seven complete** — the baseline — so none
+of the instrumentation rounds changed the behaviour they measured. The partials are 3 942 912 (three
+times) and 465 920, plus one run that failed before the transfer started.
+
 ### The per-connection counters cannot measure loss, and the kernel's own can (2026-11-05)
 
 The per-connection "posted" counter was incremented where a packet is **built**, not where it is posted —
