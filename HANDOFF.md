@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Both forms of frontier repair are harmful, and the second is catastrophic (2026-11-05)
+
+The pinned watermark has one obvious cure: re-send the bytes the frontier is stuck under. It has now been
+tried twice, and both times the measurement refused it.
+
+| form | gate | twelve-run result |
+|---|---|---|
+| repair the frontier range every round trip, every stream | none | **4 complete** (round 63) |
+| the same, only while the flight has closed the window | `flight > cwnd` | **0 complete** |
+
+The second is not merely worse than the baseline (six or seven of twelve): it is the worst result this
+cycle has recorded, with every partial stopping below one megabyte. The mechanism is not mysterious in
+hindsight — `next_repair` answers the **lowest** offset it holds, so queuing the frontier range puts it
+permanently at the head of the repair queue and the pump serves it on every pass, starving every other
+stream. The more precisely the repair is aimed, the more completely it starves the connection.
+
+So the frontier cannot be repaired from the sender, and the search has to move to the receiver's side of
+the acknowledgement: the byte prefix and the cumulative watermark are both pinned by the same hole, and
+the only way out is an acknowledgement that can say "I have everything except this one number" — which is
+what the bitmap already says, and what its sixty-four-number width is too narrow to carry.
+
+That is a wire change, and this dialect is still unreleased, so it may be made in place: **widen the
+acknowledgement's bitmap from 64 to 512 numbers**, which covers six hundred kilobytes of flight — the
+size the measurements keep stalling at — instead of eighty.
+
 ### Every number taken is posted, and number zero is the one that never arrives (2026-11-05)
 
 Two cumulative per-connection numbers, which are the same kind of number on the same object:
