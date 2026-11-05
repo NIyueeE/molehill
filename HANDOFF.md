@@ -608,6 +608,33 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### A killed run poisons every later one, and the symptom looks like a product failure (2026-11-05)
+
+The acknowledgement counters were installed and then produced **no valid measurement**, because the
+first two batches were void — and the way they were void is worth recording, since it can silently waste
+any batch in this file.
+
+A `cargo test` that is killed (by a timeout, or by cancelling a background loop) leaves its **test
+binary alive**, and that binary **holds the test's fixed ports** (2333 and 2334) in `LISTEN`. Every later
+run then fails at startup with
+
+```
+Failed to run the control session: Failed to connect to 127.0.0.1:2333: Failed to connect TCP socket
+```
+
+which reads exactly like the product failing to come up, while the server process is fine and the test
+never started. Three runs were discarded that way before the ports were checked; `ss -ltn | grep :2333`
+and `pgrep -af 'deps/integration_test-'` name the culprit in one line each.
+
+Two rules for this harness, learned the hard way twice (round 7 was the same trap in the bench topology):
+
+- after killing a test or a bench run, **verify the fixed ports are free before the next sample**;
+- `pkill -f` on a pattern that also appears in the loop's own command line kills the loop — the pattern
+  must match only the child (`target/debug/deps/integration_test-<hash>`, not `integration_test`).
+
+Once cleaned, the first valid run stalls at **138 240 bytes** — earlier than the 465 KiB cluster, so a
+third stop point exists. The acknowledgement counters are in place and unmeasured.
+
 ### A parked writer whose peer has acknowledged everything it ever saw (2026-11-05)
 
 The early cluster's first instrumented stall shows two things at once. The group is short **three

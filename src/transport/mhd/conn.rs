@@ -544,6 +544,9 @@ pub(crate) struct Conn {
     /// above it. Only the first kind can unblock a stalled stream.
     repairs_at_base: u64,
     repairs_above: u64,
+    /// Acknowledgements this end applied and attached, for the window line.
+    acks_applied: u64,
+    acks_attached: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
@@ -732,6 +735,8 @@ impl Conn {
             last_ack_largest: 0,
             repairs_at_base: 0,
             repairs_above: 0,
+            acks_applied: 0,
+            acks_attached: 0,
             advertised: 0,
             read: 0,
             arrived_stream: 0,
@@ -1240,10 +1245,13 @@ impl Conn {
             self.snapshot_none("connection closed");
             return None;
         }
-        let ack = self.acks.packet().map(|block| wire::Ack {
-            stream: self.arrived_stream,
-            prefix: self.arrived_prefix,
-            ..block
+        let ack = self.acks.packet().map(|block| {
+            self.acks_attached = self.acks_attached.saturating_add(1);
+            wire::Ack {
+                stream: self.arrived_stream,
+                prefix: self.arrived_prefix,
+                ..block
+            }
         });
         if self.credit_due() {
             return self.transmit_credit(now, out, ack);
@@ -1929,6 +1937,15 @@ impl Conn {
     }
 
     /// Declared-loss ranges that covered a frontier, and those above it.
+    /// Acknowledgements applied and attached since the last call.
+    pub(crate) fn take_acks(&mut self) -> (u64, u64) {
+        let applied = self.acks_applied;
+        let attached = self.acks_attached;
+        self.acks_applied = 0;
+        self.acks_attached = 0;
+        (applied, attached)
+    }
+
     pub(crate) fn repair_sides(&self) -> (u64, u64) {
         (self.repairs_at_base, self.repairs_above)
     }
@@ -2322,6 +2339,7 @@ impl Conn {
     /// Apply the peer's acknowledgement: retire what it covers, rewind what
     /// it reports lost, and open the window on the progress it proves.
     fn apply_ack(&mut self, now: Instant, ack: wire::Ack, sampled: bool) {
+        self.acks_applied = self.acks_applied.saturating_add(1);
         self.last_ack_prefix = ack.prefix;
         self.last_ack_below = ack.below;
         self.last_ack_bits = ack.bits;

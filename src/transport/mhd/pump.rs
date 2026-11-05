@@ -193,6 +193,7 @@ fn report_window(shared: &Arc<Shared>) {
         let ceiling = conn.window_ceiling();
         let (built, posted) = crate::transport::stats::take_datagrams();
         let received = crate::transport::stats::take_received_datagrams();
+        let (acks_applied, acks_attached) = shared.with(super::conn::Conn::take_acks);
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
         // stream whose bytes arrived and whose reader never took them was
@@ -246,6 +247,8 @@ fn report_window(shared: &Arc<Shared>) {
                 .1,
             posted_datagrams = posted,
             received_datagrams = received,
+            acks_applied,
+            acks_attached,
             lane = conn.wire_id(),
             cwnd,
             flight,
