@@ -67,6 +67,44 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### Found: an arrival could not write a byte while bulk held the window (2026-11-05)
+
+The first stage's tail has a counter of its own, and the full-scale debug run prints it:
+**18 492 `mhd opening refused` in the first two minutes** of the run, of 18 496 in the whole
+run, and every one of them names the same bound:
+
+```
+opening refused: credit=11726577 window=0 held=28962992
+                 flight=3847348 cwnd=2097152
+```
+
+`window` is `cwnd - flight`: the ceiling is `SLOW_START_CEILING` (2 MiB), the bulk spine's
+flight is **3.85 MB**, so the difference is **zero** — and at zero an arriving stream cannot
+write its handshake, whatever its credit (11.7 MB) or the buffer (28 MB) would allow. The
+reserve that exists for exactly this case could not help, because it was a *share* of the
+minimum and the minimum was already zero.
+
+An opening now **overdraws the congestion window by `OPEN_RESERVE`**: the reserve is a lane
+budget it can spend, not a fraction of what happens to be left. Measured on the short
+timeline, which reproduces the state in three minutes:
+
+| | `mhd opening refused` |
+|---|---|
+| before | **2 410** |
+| after | **1** |
+
+That counter is the honest evidence for this change, and it is the first one in this cycle
+that moved by three orders of magnitude on the mechanism it names. What it does **not**
+establish is latency: the paired A/B on that cell is **unresolvable** — the run's own A/A
+twin differs by **+133.65 %** on `timeline[clean] rtt_p99_ms` and the other arm by
++115.59 %, and the model's planning line says about **53 rounds** would be needed to resolve
+its 15 % floor. So the change is kept because an arrival that cannot write is a defect by
+construction, and the latency is recorded as *not measured* rather than as improved.
+
+Also worth recording, because it is cheap and it discriminates: the refusal line itself,
+counted, is a better first-stage instrument than the probe's p99 — it is a carrier counter
+with no probe in it.
+
 ### The first clean stage fails for TCP too, so it is not mhd's (2026-11-05)
 
 The comparison objective condition 2 asks for, on the cell that decides the release,

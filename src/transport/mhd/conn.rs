@@ -798,8 +798,18 @@ impl Conn {
         let room = if refused_by_age { 0 } else { room };
         // A stream that has already written a reserve's worth stops short of it,
         // so an opening stream always finds room (see `OPEN_RESERVE`).
+        //
+        // **And an opening may overdraw the congestion window by the reserve.**
+        // Stopping bulk a reserve short of the minimum is not enough, because the
+        // minimum can be *zero* while a flight is already wider than the window:
+        // measured on the run's first two minutes, the ceiling at 2 MiB with the
+        // bulk flight at 3.85 MB left `window = cwnd - flight = 0`, and 18 492
+        // openings were refused with nothing wrong with either bound they could
+        // see — credit 11.7 MB, buffer 28 MB. The reserve has to be a *lane*
+        // budget an opening can spend, not a share of whatever is left, or it
+        // reserves nothing exactly when it is needed.
         let room = if opening(state) {
-            room
+            credit.min(window.saturating_add(OPEN_RESERVE)).min(held)
         } else {
             room.saturating_sub(OPEN_RESERVE)
         };
