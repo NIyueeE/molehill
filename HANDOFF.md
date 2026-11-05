@@ -608,6 +608,38 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The stall instrument is blind to a parked writer on a busy lane (2026-11-05)
+
+Both ends' group lines are in one file and they show the freeze from the sending side:
+
+```
+group 1: sourced 4073984 -> 4139520 -> 4172288 (frozen) | written 160768 -> ... -> 3670016 (frozen)
+```
+
+`sourced` — bytes this group read **from its source** — freezes at 4.17 MB while the visitor still has
+eight mebibytes to give. So the fault is in the `send_loop`, not in the receiving side that every
+earlier entry examined: the loop stopped reading its source.
+
+The loop parks in `StripeSender::poll_send`, whose `poll_write` reaches `Conn::write`, and `write`
+answers 0 when `room = credit.min(window).min(held)` is zero — the congestion window or the peer's
+credit. `write` does set `unsent_at` on a short write, which is what `Conn::waiting` reports… and the
+stall line still never printed in any of these runs.
+
+**That is a blind spot in the instrument, not in the counter.** The pump's stall line needs a pass that
+built *nothing* while bytes were queued. A lane carrying four streams is never idle: three of them keep
+producing packets, so the pass always builds something, and the one parked writer is invisible — for
+hundreds of seconds, in every failing run this cycle.
+
+So the loop closes as a fixed point: a pinned watermark means records do not retire, a flight that does
+not retire keeps `window` at zero, a zero window parks the send loop, a parked loop reads no source, no
+source means no new data, no new data means no new acknowledgements, and no acknowledgements leave the
+watermark pinned. Every counter in the carrier is consistent with that and every instrument pointed at
+the wire agrees there is nothing wrong with the wire.
+
+The next instrument is the missing one: **a line for a strand's writer parked while the lane is still
+building packets** — `Conn::waiting` already knows the age; what is missing is reporting it per stream
+rather than only when the whole pass is empty.
+
 ### The echo is excluded for the third time, now on a metric that can resolve it (2026-11-05)
 
 The previous entry's first candidate was the test's own echo: `io::copy` over both halves of a socket
