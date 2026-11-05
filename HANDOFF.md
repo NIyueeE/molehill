@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The held field, implemented properly, is worse than doing nothing (2026-11-05)
+
+The previous entry settled the design: carry `held` beside `prefix`, let the sender retire flight on
+`held` **without moving any frontier**. It was implemented exactly that way — the acknowledgement grew from
+28 to 36 bytes, `Recovery::release_held` stopped counting the records whose bytes the peer holds, the
+frontier stayed where it was, and the unit suite was green.
+
+Twelve runs: **one complete**. And the partials are not scattered — they are stacked at **450 560 and
+483 328**, four hundred and forty kilobytes, an early stop this cycle has never seen before.
+
+So freeing the flight on what the peer holds is worse than leaving it pinned, and much worse than the
+baseline. The reason is not hard to see in hindsight and is worth recording: the flight total was doing
+work beyond congestion control. It was the only thing keeping the sender's write rate near what the far
+reader could consume, and a reader that has stopped consuming was, in effect, protected by a window that
+counted bytes it had *received* rather than bytes it had *read*. Releasing that proxy floods the far
+buffer, and the far buffer is where the deadlock starts.
+
+Reverted.
+
+That is the fourth structural proposal this cycle to be measured and refused — the pinned watermark's
+removal, the repair of the frontier, a wider bitmap, and now the separation of "held" from "delivered" —
+and each was aimed at a mechanism that had been *proved*, not guessed. The deadlock is real. What these
+four results say together is that its cure is not in the acknowledgement at all: it is in the reader that
+stops.
+
 ### The held offset cannot replace the prefix, and the test that says why (2026-11-05)
 
 The previous entry proposed that the receiver report the highest offset it **holds** instead of the
