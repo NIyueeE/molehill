@@ -608,6 +608,29 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Fixed: a packet could claim bytes it did not hold, and they were skipped for ever (2026-11-05)
+
+The wire question was answered first and it pointed inward: **posted 37 417, received 37 432** — every
+datagram one end posted was read by a socket, and the refusal counters stayed silent even after the two
+places that discarded `on_datagram`'s result began counting. So nothing was lost between sockets and
+nothing was refused: the bytes were **never in a datagram**.
+
+`SendBuf::append_to` copies from the stream's chunk list and **stops at the first chunk it does not
+have**, answering nothing; the caller had already framed the packet with the *requested* length and
+then advanced the send point by that same length. When `trim` had dropped chunks the frontier passed,
+the packet therefore claimed more bytes than it carried, and the difference was skipped **for ever**:
+in no packet, covered by no acknowledgement, and waiting at the stream's frontier while every counter
+in this file read zero.
+
+`SendBuf::present(offset, len)` now answers how many bytes are really in the chunk list, and the header,
+the seal and the send point all take that number. `append_to` returns what it copied and the caller
+asserts the two agree.
+
+Measured on twelve runs: **seven complete**, which is the baseline — and the partials are **all in the
+early cluster** (465 920 four times, 564 224 once), where the baseline's eleven partials had **eight in
+the middle cluster** between 3.5 and 6.9 MB. The mid-cluster stalls are gone; the early one remains,
+and it is the next target.
+
 ### The frame never arrived, and both ends' counters are out of candidates (2026-11-05)
 
 The binary question the previous entry left is answered: **the peer's receive buffer holds nothing

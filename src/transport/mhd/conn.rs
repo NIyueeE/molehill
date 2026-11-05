@@ -150,6 +150,18 @@ pub(crate) enum Rejected {
     Unsealed,
 }
 
+impl Rejected {
+    /// The name this refusal is counted under (see `stats::note_rejected`).
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::OverWindow => "over_window",
+            Self::UnknownStream => "unknown",
+            Self::Unsealed => "unsealed",
+        }
+    }
+}
+
 /// One stream, as the connection sees it.
 #[expect(
     clippy::struct_excessive_bools,
@@ -1400,6 +1412,14 @@ impl Conn {
         // `out[..payload_at]` makes every packet after the first sign a header
         // that contains its predecessors — which no receiver can reproduce, so
         // exactly one packet per run opens and the rest fail their tag.
+        // The length this packet can actually carry: the header, the seal and the
+        // send point all take this number, or a packet claims bytes it does not
+        // hold and they are skipped for ever.
+        let len = state.send.present(offset, len);
+        if len == 0 {
+            self.none_reason = Some("nothing to copy at the requested offset");
+            return None;
+        }
         let packet_start = out.len();
         let Some(packet_len) = wire::encode_stream(
             out,
@@ -1420,7 +1440,8 @@ impl Conn {
         // The payload follows its header, drawn chunk by chunk: a packet is no
         // longer capped by the chunk boundary the send point happens to sit in.
         let payload_at = out.len();
-        state.send.append_to(offset, len, out);
+        let copied = state.send.append_to(offset, len, out);
+        debug_assert_eq!(copied, len, "the framing length matches what is copied");
         // A seal that cannot be produced must not become a plaintext packet, and
         // the packet number it already took must not become a **hole** either: a
         // number that never reaches the wire pins the peer's cumulative frontier

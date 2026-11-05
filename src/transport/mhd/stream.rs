@@ -208,7 +208,51 @@ impl SendBuf {
     }
 
     /// Append `len` bytes starting at `offset` to `out`, walking the chunks.
-    pub(crate) fn append_to(&self, offset: u64, len: usize, out: &mut Vec<u8>) {
+    /// How many of `len` bytes at `offset` are **actually in the chunk list**.
+    ///
+    /// Asked before a packet is framed, because the header, the seal and the send
+    /// point must all agree with what is there: `chunks` can be shorter than the
+    /// range asks for (`trim` drops what the frontier passed), and a packet that
+    /// claims more than it carries skips the difference for ever — the bytes are in
+    /// no packet, no acknowledgement ever covers them, and the stream's frontier
+    /// waits on them while every counter in this file reads zero.
+    pub(crate) fn present(&self, offset: u64, len: usize) -> usize {
+        let from_cursor = offset >= self.cursor_at && self.cursor < self.chunks.len();
+        let (mut index, mut at) = if from_cursor {
+            (self.cursor, self.cursor_at)
+        } else {
+            (0, self.head)
+        };
+        let mut skip = usize::try_from(offset.saturating_sub(at)).unwrap_or(0);
+        let mut left = len;
+        while left > 0 {
+            let Some(chunk) = self.chunks.get(index) else {
+                break;
+            };
+            let end = at + chunk.len() as u64;
+            if offset >= end {
+                skip = skip.saturating_sub(chunk.len());
+            } else if skip < chunk.len() {
+                let take = left.min(chunk.len() - skip);
+                left -= take;
+                skip = 0;
+            }
+            at = end;
+            index += 1;
+        }
+        len - left
+    }
+
+    /// Copy the bytes of `[offset, offset + len)` into `out`, answering how many
+    /// bytes were actually there.
+    ///
+    /// The answer matters: `chunks` can be shorter than the range asks for — `trim`
+    /// drops what the frontier has passed — and the packet's header, its seal and
+    /// the send point all have to agree with what was copied. Advancing the send
+    /// point by the *requested* length after copying less skips those bytes for
+    /// ever: they are never in a packet, never acknowledged, and the stream's
+    /// frontier waits on them while every counter in this file reads zero.
+    pub(crate) fn append_to(&self, offset: u64, len: usize, out: &mut Vec<u8>) -> usize {
         let from_cursor = offset >= self.cursor_at && self.cursor < self.chunks.len();
         let (mut index, mut at) = if from_cursor {
             (self.cursor, self.cursor_at)
@@ -233,6 +277,7 @@ impl SendBuf {
             at = end;
             index += 1;
         }
+        len - left
     }
 
     pub(crate) fn finish(&mut self) {

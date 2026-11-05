@@ -192,6 +192,7 @@ fn report_window(shared: &Arc<Shared>) {
         let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
         let ceiling = conn.window_ceiling();
         let (built, posted) = crate::transport::stats::take_datagrams();
+        let received = crate::transport::stats::take_received_datagrams();
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
         // stream whose bytes arrived and whose reader never took them was
@@ -244,6 +245,7 @@ fn report_window(shared: &Arc<Shared>) {
                 .parked_writers(now, std::time::Duration::from_millis(50))
                 .1,
             posted_datagrams = posted,
+            received_datagrams = received,
             lane = conn.wire_id(),
             cwnd,
             flight,
@@ -419,7 +421,15 @@ fn drain_ready(
                 datagrams += 1;
                 bytes += data.len();
                 shared.with(|conn| {
-                    let _ = conn.on_datagram(now, data);
+                    if let Err(refused) = conn.on_datagram(now, data) {
+                        // The result used to be discarded here, so the one refusal
+                        // class that is not counted inside `on_datagram` — a
+                        // datagram this carrier cannot parse at all — was invisible.
+                        // It is the class that would explain a packet leaving one
+                        // socket, arriving at the other (posted equals received) and
+                        // never reaching a stream.
+                        crate::transport::stats::note_rejected(refused.label());
+                    }
                 });
             }
             if crate::transport::stats::enabled() && datagrams > 0 {
@@ -446,7 +456,9 @@ fn drain_ready(socket: &UdpSocket, _batch: &mut (), shared: &Arc<Shared>, peer: 
                 }
                 let now = Instant::now();
                 shared.with(|conn| {
-                    let _ = conn.on_datagram(now, &buf[..len]);
+                    if let Err(refused) = conn.on_datagram(now, &buf[..len]) {
+                        crate::transport::stats::note_rejected(refused.label());
+                    }
                 });
                 wake_touched(shared);
                 shared.wake_writers();

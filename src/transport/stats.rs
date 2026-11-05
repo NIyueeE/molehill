@@ -212,6 +212,15 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// Count one run received and what it carried.
+/// Datagrams this window read off the socket, and the bytes they carried.
+///
+/// The peer of `take_datagrams`' posted count: a packet one end posted and the other
+/// never read has vanished between two sockets, which nothing inside either one can
+/// see.
+pub(crate) fn take_received_datagrams() -> u64 {
+    PHASES.rx_datagrams.swap(0, Relaxed)
+}
+
 pub(crate) fn received_run(datagrams: usize, bytes: usize) {
     PHASES.rx_runs.count();
     PHASES
