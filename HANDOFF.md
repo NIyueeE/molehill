@@ -67,6 +67,38 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### L3 acceptance fails at the first thing it checks (2026-11-05)
+
+`just l3-accept` builds the three-namespace topology with the real binaries and fails with:
+
+```
+FAIL the service never became reachable from the visitor
+VISITOR FAIL timed out
+```
+
+The server and client both come up correctly, which is why this is not a startup problem: the
+client logs `Running as a transparent (L3) client`, attaches to its TUN
+(`Transparent data path attached to the TUN device tun=l3cli0 direction=Source`), establishes
+the control session, and registers the claim — `Registered, exposed at 10.99.0.1:8443
+service=web`. What fails is the only thing that matters: a visitor in the third namespace
+cannot reach that address.
+
+So one of two things is true, and this round did not distinguish them:
+
+- **the claim's forwarding is broken** — the visitor's packets arrive at the client's TUN and
+  are not carried, which is a product defect on the L3 path;
+- **this container cannot run the topology's TUN devices** to the standard the acceptance
+  needs — the devices are created (the client attached to one) but packets do not traverse
+  them, which is an environment limitation that no code change fixes.
+
+The distinction is one command away and is the next thing to run: `ping`/`tcpdump` on
+`tun=l3cli0` inside the client namespace while the visitor sends, and a `sysctl` read of
+`net.ipv4.ip_forward` in the client's namespace. A device that receives nothing points at the
+environment; a device that receives and does not forward points at the claim.
+
+This is the first of the objective's conditions to fail outright rather than read as unstable,
+and it is recorded as failing rather than skipped.
+
 ### The gate items, measured: `check` and `interop` pass; capacity reads 1 to 8 (2026-11-05)
 
 The objective's remaining conditions were untouched for twenty rounds while the first stage
