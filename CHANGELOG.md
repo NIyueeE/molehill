@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transparent (L3) claim is reachable from the first packet.** A claim's first
+  data lane was read twice on the server — once as a stream prologue and again as a
+  lane prologue — so the second read blocked and the lane was dropped as "named no
+  lane". The claim never became routable and a visitor's connection to a claimed
+  `ip:port` timed out. The lane id now travels with the channel: `just l3-accept`
+  passes end to end, including lane lending between claims, `lend = false`, and the
+  operator's lane cap.
+- **A refused packet no longer consumes a packet number**, and a lane that cannot
+  seal one closes instead of carrying on with a hole. An unspent number leaves a
+  permanent gap in the peer's cumulative frontier, which the sender then repairs for
+  ever.
+
+### Changed
+
+- **The congestion window's ceiling follows the path** rather than sitting at a flat
+  2 MiB. A loopback path's bandwidth-delay product is a small fraction of that, and
+  the difference was a standing queue every small request waited behind: the first
+  clean stage of the staged sweep reads 12.8–23.8 ms at p99 in the good case, where
+  the flat ceiling read 135–291 ms once the bulk spine passed eight gigabits a
+  second. A shaped path keeps its old window, because its product really is
+  megabytes.
+
 ## [1.0.0] - 2026-11-01
 
 ### Known gaps
