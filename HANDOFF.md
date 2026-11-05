@@ -608,6 +608,39 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Acks arrive at 132 a second and the peer is 1 076 numbers behind (2026-11-05)
+
+The acknowledgement counters answer the previous entry's question, and the answer is neither of its
+options:
+
+```
+lane=2  applied=132  recv=178  cwnd=26980  flight=351912
+        own_last=2610  largest=1534  base=950570  repairs_at_base=4  repairs_above=1621
+```
+
+- **acks are applied** — 132 a second, alongside 178 datagrams a second, so the peer is answering and
+  the answers are landing;
+- **the flight is thirteen times the window and does not retire**, so those answers retire nothing;
+- **`own_last` is 2 610 and `largest` is 1 534**: the sender has issued a thousand and seventy-six
+  packet numbers the peer has never seen.
+
+That last pair is the whole of it. The bitmap covers `largest − 64 ..= largest`; the cumulative path is
+pinned at zero by the lost first packet; so every record numbered above 1 534 — which is every record in
+the flight — is **in neither mechanism**: never acknowledged, never declared lost, never retired. The
+window stays at zero, the writer stays parked, and the peer keeps answering with the only number it can
+still see.
+
+And the earlier instruments now read consistently with that: `posted == received` counts *datagrams*,
+most of which carry acknowledgements and credit (they repeat a packet number, by design), and
+`recv_beyond = 0` says the peer's buffer holds nothing beyond a frontier that its own reader cannot
+advance.
+
+So the defect is not that acknowledgements stop and not that they are dropped: it is that the sender can
+issue a thousand numbers beyond anything the peer has seen while every acknowledgement it applies is
+about the numbers *below* that gap. The next step follows directly: **the acknowledgement's `largest`
+must advance** — and if the peer's receive path is not seeing those datagrams, the place to look is what
+`largest` is computed from when the peer's own reader is stuck.
+
 ### A killed run poisons every later one, and the symptom looks like a product failure (2026-11-05)
 
 The acknowledgement counters were installed and then produced **no valid measurement**, because the

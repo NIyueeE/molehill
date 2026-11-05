@@ -193,7 +193,9 @@ fn report_window(shared: &Arc<Shared>) {
         let ceiling = conn.window_ceiling();
         let (built, posted) = crate::transport::stats::take_datagrams();
         let received = crate::transport::stats::take_received_datagrams();
-        let (acks_applied, acks_attached) = shared.with(super::conn::Conn::take_acks);
+        // Inside the same `with` as everything else: a second `with` here would
+        // take the same lock and deadlock the pump (which is exactly what it did).
+        let (acks_applied, acks_attached) = conn.take_acks();
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
         // stream whose bytes arrived and whose reader never took them was
