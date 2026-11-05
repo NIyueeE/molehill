@@ -608,6 +608,40 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The watermark never leaves zero: the opening packet of a stream is never sent (2026-11-05)
+
+The stall line the stripe layer already writes names the frame
+(`stripe group stalled behind sequence 123 with 1 frame(s) parked`, and 123 mod 4 is stripe 3), and
+the window line names the stream:
+
+```
+lane=2 stream=5 base=48 next=32826 covering=3 num=10 below=0 pending=0 retx=50 posted=50
+lane=0 stream=5 base=48 next=24634 covering=3 num=10 below=0 retx=38 posted=38
+lane=1 stream=5 base=48 next=32826 covering=3 num=10 below=0 retx=25 posted=25
+```
+
+Three readings, and together they name a defect this cycle has already fixed twice on other paths:
+
+- **`below = 0` while all sixty-four bitmap bits are set.** The peer has acknowledged sixty-four
+  packets and its cumulative packet watermark has never advanced past zero. That is only possible if
+  the packet numbered at the very start of these streams **never arrived** — the bitmap covers the
+  64 most recent, so everything older is invisible, and retirement leans entirely on that window;
+- **`base = 48`** on all three lanes: the byte frontier stopped after 48 bytes while `next` is thirty
+  thousand. So the peer holds 48 bytes and nothing more;
+- **`retx == posted`** on every one (50/50, 38/38, 25/25): each declaration produced its repair, so
+  the repair machinery is working — it is repairing ranges the peer cannot use, because the hole
+  sits below the bitmap's reach.
+
+So this is the same class as the two never-sent packet numbers already fixed (a refused packet and a
+failed seal each consuming a number), one level further out: **a number is consumed without a packet
+going out, at a stream's opening.** That poisons the watermark for the connection's life, and once
+64 packets have passed, the hole is out of the bitmap's reach and the stream can never be
+acknowledged again — a stall that no repair can fix, which is exactly what the counters show.
+
+The next check is one counter: per stream, packet numbers **consumed** versus packets **posted**. The
+two never-sent-number bugs were both found by reasoning about that identity; measuring it directly
+would find the third without another round of inference.
+
 ### The early stall has a different signature: a group stuck at frame 124 and a watermark at zero (2026-11-05)
 
 After the `arrived()` fix the sealed striped test passes five of eight, and the three failures stop
