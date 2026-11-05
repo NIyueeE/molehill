@@ -218,6 +218,8 @@ fn report_window(shared: &Arc<Shared>) {
             worst_unsent = worst.map_or(0, |w| w.unsent),
             worst_retransmits = worst.map_or(0, |w| w.retransmits),
             worst_repairs = worst.map_or(0, |w| w.repairs_sent),
+            worst_repair_at = worst.map_or(0, |w| w.repair_at),
+            worst_repairs_pending = worst.map_or(0, |w| w.repairs_pending),
             worst_base = worst.map_or(0, |w| w.base),
             last_ack_prefix = conn.last_ack_prefix(),
             lane = conn.wire_id(),

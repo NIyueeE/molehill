@@ -374,6 +374,10 @@ pub(crate) struct WorstStream {
     pub(crate) reset: bool,
     /// Repair packets this stream has actually posted.
     pub(crate) repairs_sent: u32,
+    /// The repair range the scheduler would send next, if any.
+    pub(crate) repair_at: u64,
+    /// How many repair ranges are still owed.
+    pub(crate) repairs_pending: usize,
     /// The delivery frontier: everything below it is acknowledged.
     pub(crate) base: u64,
     /// The repair it is owed, if it is owed one: `(offset, length)`.
@@ -1841,6 +1845,8 @@ impl Conn {
                 unsent: state.send.unacked(),
                 retransmits: state.retransmits,
                 repairs_sent: state.repairs_sent,
+                repair_at: state.send.repair_head().map_or(0, |(offset, _)| offset),
+                repairs_pending: state.send.repairs_pending(),
                 next: state.send.next_offset(),
                 written: state.send.written(),
                 base: state.send.base(),

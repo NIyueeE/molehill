@@ -608,6 +608,33 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The repair queue is empty while the frontier is stuck: obligations are consumed, not delivered (2026-11-05)
+
+The user chose to keep chasing it, so two more facts were added to the window line — the repair
+queue's **head** and its **length** — and they answer the question the previous entry could not:
+
+```
+lane=3 base=957748 next=2013484 ack=957748 repair_at=0 pending=0 posted=538 retx=1032
+lane=2 base=954164 next=2009900 ack=954164 repair_at=0 pending=0 posted=560 retx=1076
+```
+
+- `base == ack` again, frozen at the peer's word;
+- `next` a megabyte ahead: everything was sent;
+- **`pending=0` and `repair_at=0`**: the repair queue is **empty** — the sender believes it owes
+  nothing at all;
+- and **`retx` (1 032 declarations) is twice `posted` (538 repair packets)**: obligations are being
+  created and then consumed without a packet reaching the wire for them.
+
+So the mechanism is no longer a mystery of selection: **an obligation is spent without the bytes
+being posted.** `repair_sent` trims a range when a packet for it is *built*; if that packet never
+reaches the socket — a built packet discarded before the post — the range is gone, the peer never
+sees it, and its frontier can never move past it.
+
+That is the last thing to confirm, and it is one counter: **packets built versus packets posted**,
+per second, on the lane. `stats::note_post` already counts the post; the build side needs the same.
+If built exceeds posted during a stall, the discard is the bug and it lives in the pump's run
+handling — a much smaller place than the twelve the cycle has searched.
+
 ### Stop and ask: the stall has outlived three attempts and every named suspect (2026-11-05)
 
 `AGENTS.md` §9 says to stop after three failed attempts on one problem, write the findings down

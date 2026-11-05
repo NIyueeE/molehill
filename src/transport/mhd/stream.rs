@@ -308,6 +308,21 @@ impl SendBuf {
         }
     }
 
+    /// How many repair ranges are still owed.
+    pub(crate) fn repairs_pending(&self) -> usize {
+        self.repairs.len()
+    }
+
+    /// The head of the repair queue: what `next_repair` would send right now.
+    ///
+    /// Reported beside the frontier because the two together are the whole
+    /// question at a stall: a stream whose frontier has not moved and whose repair
+    /// head is `None` believes it owes nothing, and whatever the peer is waiting
+    /// for can never be sent.
+    pub(crate) fn repair_head(&self) -> Option<(u64, usize)> {
+        self.next_repair(crate::transport::mhd::wire::MAX_STREAM_PAYLOAD)
+    }
+
     /// Whether a declared loss is still owed to the peer.
     pub(crate) fn has_repair(&self) -> bool {
         self.next_repair(1).is_some()
