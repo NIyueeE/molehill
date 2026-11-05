@@ -608,6 +608,42 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The peer says the covering packet arrived, and its byte prefix does not move (2026-11-05)
+
+Two facts added — the packet number of the record covering the stalled frontier, and the peer's
+`Ack { below, bits }` — and the previous entry's conclusion had to be corrected on the way: in the
+failing run there was **no** sample with a stalled frontier and nothing covering it. Every stalled
+sample had two to four records covering the frontier, so something *is* owed there.
+
+What the marks say, in a stalled sample:
+
+```
+lane=0 base=1247424 next=2035838 covering=2 num=4477 below=4477 bits=ffffffffffffffff
+```
+
+- **`num = 4477`**, the packet whose range covers the frozen frontier;
+- **`below = 4477`**: every packet numbered below it arrived, by the peer's own word;
+- **`bits = 0xffff…f`**: all sixty-four numbers below the watermark arrived too.
+
+So the peer reports the covering packet as **arrived**, while its byte-space prefix (`arrived()`)
+stays frozen at `base`, and the sender never retires that range. Both ends agree on the packet and
+disagree on the bytes in it.
+
+That is a much sharper statement than the last one and it moves the search into one seam: how an
+arrived packet's `SentRange` becomes a byte-space acknowledgement. On the sender that is
+`SendBuf::ack(offset, len)`, which absorbs `[offset, offset+len)` and then advances `base` while
+`acked` covers it contiguously; on the receiver it is `RecvBuf::arrived()`, which reports
+`max(first_piece_end, read)` — **only the first piece**, never walking a contiguous chain of them.
+
+`arrived()` is the more suspicious of the two now: a frame's bytes arrive in many pieces (a 32 KiB
+stripe frame is twenty-five sealed packets), and a frontier that advances by one piece per *read*
+cannot move while the reader is waiting for a frame the reorder loop will not release — which is
+exactly the stall's shape.
+
+The next change is to make `arrived()` walk the contiguous chain from `read` and count every piece
+it passes, then measure the sealed striped pass rate again: before this cycle's fixes it was two to
+three of eight, and after them three to four.
+
 ### The sender repairs above the frontier and never the hole itself (2026-11-05)
 
 One line from the previous run had the answer in it and was read too quickly:

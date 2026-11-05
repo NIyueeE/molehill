@@ -474,6 +474,34 @@ impl Recovery {
     /// tolerates can still deliver the original) and count (`MAX_LOST`), so a
     /// path that drops everything cannot grow the table before the dead-link
     /// rule ends it.
+    /// How many tracked records cover one byte of one stream, and how many the
+    /// stream has in total.
+    ///
+    /// At a stall the question is whether anything is still *owed* at the frozen
+    /// frontier: a record covering it is what a loss declaration and a repair both
+    /// start from, and a frontier with no record under it can never move again.
+    pub(crate) fn covering(&self, stream: u32, offset: u64) -> (u32, u32, u32) {
+        let mut covering = 0;
+        let mut total = 0;
+        let mut number = 0;
+        for sent in self.in_flight.values() {
+            let Some(range) = sent.range else { continue };
+            if range.stream != stream {
+                continue;
+            }
+            total += 1;
+            let start = range.offset;
+            let end = start.saturating_add(u64::from(range.len));
+            if start <= offset && offset < end {
+                if covering == 0 {
+                    number = sent.number;
+                }
+                covering += 1;
+            }
+        }
+        (covering, total, number)
+    }
+
     fn reap(&mut self, now: Instant) {
         let cutoff = now.checked_sub(LOST_HOLD);
         while let Some(&(at, number)) = self.lost.first() {

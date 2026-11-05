@@ -378,6 +378,11 @@ pub(crate) struct WorstStream {
     pub(crate) repair_at: u64,
     /// How many repair ranges are still owed.
     pub(crate) repairs_pending: usize,
+    /// Tracked records covering the frontier, and the stream's records in total.
+    pub(crate) covering: u32,
+    pub(crate) tracked: u32,
+    /// The packet number of the record covering the frontier.
+    pub(crate) covering_number: u32,
     /// The delivery frontier: everything below it is acknowledged.
     pub(crate) base: u64,
     /// The repair it is owed, if it is owed one: `(offset, length)`.
@@ -505,6 +510,9 @@ pub(crate) struct Conn {
     /// believes bytes delivered that the peer never had) or the peer's word is
     /// ahead of the retirement (the peer holds bytes the sender keeps re-sending).
     last_ack_prefix: u64,
+    /// The peer's packet-number watermark and bitmap, for the same line.
+    last_ack_below: u32,
+    last_ack_bits: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
     /// Bytes the reader has taken, which is what `recv_credit` follows.
@@ -688,6 +696,8 @@ impl Conn {
             send_credit: WINDOW / 2,
             recv_credit: WINDOW,
             last_ack_prefix: 0,
+            last_ack_below: 0,
+            last_ack_bits: 0,
             advertised: 0,
             read: 0,
             arrived_stream: 0,
@@ -1830,6 +1840,11 @@ impl Conn {
         self.last_ack_prefix
     }
 
+    /// The peer's packet-number watermark and bitmap, for the window line.
+    pub(crate) fn last_ack_marks(&self) -> (u32, u64) {
+        (self.last_ack_below, self.last_ack_bits)
+    }
+
     pub(crate) fn worst_stream(&self) -> Option<WorstStream> {
         self.streams
             .iter()
@@ -1847,6 +1862,9 @@ impl Conn {
                 repairs_sent: state.repairs_sent,
                 repair_at: state.send.repair_head().map_or(0, |(offset, _)| offset),
                 repairs_pending: state.send.repairs_pending(),
+                covering: self.recovery.covering(id, state.send.base()).0,
+                tracked: self.recovery.covering(id, state.send.base()).1,
+                covering_number: self.recovery.covering(id, state.send.base()).2,
                 next: state.send.next_offset(),
                 written: state.send.written(),
                 base: state.send.base(),
@@ -2200,6 +2218,8 @@ impl Conn {
     /// it reports lost, and open the window on the progress it proves.
     fn apply_ack(&mut self, now: Instant, ack: wire::Ack, sampled: bool) {
         self.last_ack_prefix = ack.prefix;
+        self.last_ack_below = ack.below;
+        self.last_ack_bits = ack.bits;
         let ack_timing = stats::Timing::start(sampled);
         let acked = self.recovery.on_ack(now, ack);
         for sent in acked.newly {
