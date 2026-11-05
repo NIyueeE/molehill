@@ -207,6 +207,11 @@ impl Recovery {
     pub(crate) fn smoothed_rtt(&self) -> Option<Duration> {
         self.rtt.smoothed
     }
+
+    /// The path's own length: the smallest round trip ever measured.
+    pub(crate) fn min_rtt(&self) -> Option<Duration> {
+        self.rtt.min
+    }
 }
 
 /// The round-trip estimate.
@@ -218,6 +223,16 @@ pub(crate) struct Rtt {
     pub(crate) variance: Duration,
     /// The most recent sample.
     pub(crate) latest: Option<Duration>,
+    /// The smallest sample ever seen: the path's own length, without any queue.
+    ///
+    /// The window ceiling is derived from this rather than from the smoothed
+    /// estimate, because a ceiling derived from a queued estimate raises its own
+    /// ceiling: a deeper queue makes the estimate larger, the larger estimate
+    /// admits a deeper queue, and the lane latches into a regime where every small
+    /// packet pays for it. Measured: the bad mode of the first stage has a median
+    /// four times the good mode's with the same bulk rate, and 98 of its 183
+    /// seconds above 60 ms against the good mode's 8.
+    pub(crate) min: Option<Duration>,
 }
 
 /// The floor under any round-trip sample and the reordering window.
@@ -234,6 +249,8 @@ impl Rtt {
     fn sample(&mut self, sample: Duration) {
         let sample = sample.max(GRANULARITY);
         self.latest = Some(sample);
+        // The smallest ever seen, which is the path and nothing else.
+        self.min = Some(self.min.map_or(sample, |min| min.min(sample)));
         match self.smoothed {
             None => {
                 self.smoothed = Some(sample);

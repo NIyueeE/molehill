@@ -1748,7 +1748,14 @@ impl Conn {
     /// estimator's own one-millisecond granularity — keeps a quarter of a
     /// mebibyte.
     pub(crate) fn window_ceiling(&self) -> u64 {
-        let Some(smoothed) = self.recovery.smoothed_rtt() else {
+        // The **minimum** round trip, not the smoothed one: a ceiling derived from a
+        // queued estimate raises its own ceiling, and the lane then latches into a
+        // regime where every small packet pays for the queue that set it.
+        let Some(smoothed) = self
+            .recovery
+            .min_rtt()
+            .or_else(|| self.recovery.smoothed_rtt())
+        else {
             return WINDOW_FLOOR;
         };
         let hops = u64::try_from(smoothed.as_micros())
@@ -2474,6 +2481,31 @@ mod tests {
             ceiling_at(Duration::from_secs(10)),
             MAX_CWND,
             "no path gets more than the absolute cap"
+        );
+    }
+
+    /// A queue cannot raise its own ceiling.
+    ///
+    /// The ceiling is derived from the smallest round trip ever measured, so a lane
+    /// that has seen a quiet path keeps that path's ceiling however long its queue
+    /// grows afterwards. Deriving it from the smoothed estimate does the opposite:
+    /// the queue inflates the estimate, the estimate raises the ceiling, and the
+    /// lane latches into a regime where every small packet pays for the queue that
+    /// set it — which is what the first stage's bad mode looks like from outside
+    /// (median four times the good mode's at the same bulk rate).
+    #[test]
+    fn a_queue_does_not_raise_its_own_ceiling() {
+        let mut link = Link::new();
+        link.a.seed_rtt(Duration::from_millis(1));
+        assert_eq!(link.a.window_ceiling(), WINDOW_FLOOR, "a quiet path");
+        // Twenty milliseconds of standing queue, four times over.
+        for _ in 0..4 {
+            link.a.seed_rtt(Duration::from_millis(20));
+        }
+        assert_eq!(
+            link.a.window_ceiling(),
+            WINDOW_FLOOR,
+            "the ceiling still belongs to the path, not to the queue"
         );
     }
 
