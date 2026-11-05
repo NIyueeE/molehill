@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The stride baseline is bytes delivered, not a pass rate (2026-11-05)
+
+Twelve runs of the sealed striped test — `MOLEHILL_MHD_SEAL=1 cargo test --test integration_test --
+--test-threads=1 striped_data_channels`, eight runs a side is not enough to resolve anything around
+fifty percent — give a distribution rather than a coin:
+
+| delivered | runs |
+|---|---|
+| 8 388 608 (the whole transfer) | **7** |
+| 6 859 264 | 1 |
+| 5 250 048 | 1 |
+| 4 824 064 | 1 |
+| 4 365 312 | 1 |
+| 465 920 | 1 |
+
+So the baseline is **seven of twelve complete, and five partials spread from 0.47 MB to 6.9 MB**. That
+is the right metric for this work from here on: the byte count carries about four bits of information
+per run instead of one, so a change can be judged on the same twelve runs that a pass rate cannot
+resolve. Fisher's exact test on eight runs a side, which is what the last few rounds used, can only
+resolve differences of about forty-five points — which is why three separate changes were each
+measured as "three of eight against five of eight" and none of them could be told apart from noise.
+
+Every stride measurement from here states both numbers: how many runs completed, and where the
+partials stopped.
+
 ### The watermark is at zero for the connection's life, and rotating the prefix is worse (2026-11-05)
 
 Two more results, one a structural fact and one a refuted fix.
