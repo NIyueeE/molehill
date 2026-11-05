@@ -554,6 +554,14 @@ pub(crate) struct Conn {
     /// without posting — leaving a number consumed and, if the peer never sees it,
     /// a frontier pinned under it for the connection's life.
     issued: u64,
+    /// Datagrams this connection has posted and read, cumulative.
+    ///
+    /// Per connection because the process-wide pair cannot say *which* lane loses
+    /// them: a lane posting into an address nothing reads keeps its `posted`
+    /// growing while its `received` stands still, and that is the shape a
+    /// re-dialled pool entry would leave behind.
+    posted_total: u64,
+    received_total: u64,
     built: u64,
     /// The credit this end has already told the peer about.
     advertised: u64,
@@ -746,6 +754,8 @@ impl Conn {
             acks_applied: 0,
             acks_attached: 0,
             issued: 0,
+            posted_total: 0,
+            received_total: 0,
             built: 0,
             advertised: 0,
             read: 0,
@@ -1249,6 +1259,15 @@ impl Conn {
     /// `out` is the run the pump is staging, so a stream frame's payload is
     /// appended from the stream's own buffer and never staged twice.
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
+        let packet = self.build_packet(now, out);
+        if packet.is_some() {
+            self.posted_total = self.posted_total.saturating_add(1);
+        }
+        packet
+    }
+
+    /// One pass of the scheduler, without the post accounting.
+    fn build_packet(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
         self.none_reason = None;
         if self.closed.is_some() {
             self.none_reason = Some("connection closed");
@@ -1952,6 +1971,11 @@ impl Conn {
     /// Acknowledgements applied and attached since the last call.
     /// Packet numbers taken and packets built since the last call, plus the
     /// reason the last refusal carried.
+    /// Datagrams this connection has posted and read, cumulative.
+    pub(crate) fn datagram_totals(&self) -> (u64, u64) {
+        (self.posted_total, self.received_total)
+    }
+
     pub(crate) fn take_issued(&mut self) -> (u64, u64) {
         let issued = self.issued;
         let built = self.built;
@@ -2205,6 +2229,7 @@ impl Conn {
     /// the three phases inside are timed from a single sampling decision so they
     /// describe the same datagram (see [`crate::transport::stats`]).
     pub(crate) fn on_datagram(&mut self, now: Instant, buf: &[u8]) -> Result<(), Rejected> {
+        self.received_total = self.received_total.saturating_add(1);
         let sampled = stats::enabled() && stats::PHASES.timing();
         let total = stats::Timing::start(sampled);
         let outcome = self.apply_datagram(now, buf, sampled);

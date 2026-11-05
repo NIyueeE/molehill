@@ -608,6 +608,30 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The loss is not uniform: one lane posts twice what it reads (2026-11-05)
+
+Per-connection lifetime totals, from a run that stalled at 793 600 bytes:
+
+| lane id | posted | received | difference |
+|---|---|---|---|
+| 0 | 4 926 | 2 593 | **+2 333** |
+| 1 | 3 852 | 4 907 | −1 055 |
+| 2 | 2 606 | 3 324 | −718 |
+| 3 | 2 683 | 3 228 | −545 |
+
+One lane id posts nearly twice what it reads while the others read more than they post — which is what a
+lane sending into an address nothing reads looks like, with the other lanes' surpluses being the packets
+they *do* receive from their own peers.
+
+It is not yet conclusive, and this file should say why: both daemons run in one process in this test, so a
+lane id names **two** `Conn`s (one per end) that share the number, and the last line for an id is whichever
+end printed last. The attribution needs one more field — **which end** — beside the lane id.
+
+That is a one-line addition and it closes a search that began in round 43 with a stalled reorder loop and
+has since excluded every mechanism inside the carrier in favour of one outside it: the kernel drops
+datagrams posted to a socket nobody reads, and the carrier's own counters cannot see a drop that happens
+after `sendto` returns success.
+
 ### 3 306 datagrams are posted and never read, against 315 in a passing run (2026-11-05)
 
 The lifetime counters remove the boundary ambiguity of the window pair, and they show a real loss for the
