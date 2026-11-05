@@ -608,6 +608,29 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### A five-hundred-and-twelve-number bitmap is not better either (2026-11-05)
+
+The previous entry's conclusion was that the seventy-two-hundred-byte flight needs an acknowledgement
+that can name more than sixty-four numbers, so the bitmap was widened to **512 numbers** — eight words,
+the acknowledgement growing from 28 to 84 bytes — with the wire codec, the set, the slide across words and
+the window test all updated and the unit suite green.
+
+Twelve runs: **five complete**, against a baseline of seven and six. Not a improvement, and inside the
+noise of a twelve-run batch; the acknowledgement also costs fifty-six more bytes on every packet, which on
+a full datagram is four percent of the wire.
+
+So it is reverted. The rule this cycle has applied to every other candidate applies to this one: a change
+kept only because it seemed right is a change nobody measured. The width of the acknowledgement is
+therefore **not** the lever, and the pinned watermark has now survived every mechanism that could explain
+it — a refused frame, a withheld acknowledgement, an unposted packet, a kernel drop, a frontier repair
+from the sender, and an acknowledgement too narrow to name the hole.
+
+What is left is the one thing none of those instruments looked at: **the receiver's own `below` when its
+reader is stuck**. `below` advances only when a number arrives *equal to it*, and its walk is what turns
+the acknowledgement's cumulative field into progress. If the receiver's `below` never advances past a hole
+even though every number above the hole has arrived, then the sender is told the truth about the bitmap
+and a lie about the frontier — and every retirement path in the sender trusts the frontier first.
+
 ### Both forms of frontier repair are harmful, and the second is catastrophic (2026-11-05)
 
 The pinned watermark has one obvious cure: re-send the bytes the frontier is stuck under. It has now been
