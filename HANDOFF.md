@@ -608,6 +608,35 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The group is idle, not stuck: `delivered` equals `highest` (2026-11-05)
+
+A per-group counter of bytes read **from the group's source** settles the direction of the fault:
+
+```
+group 1: sourced=4172288 written=3670016 highest=114 delivered=114 idle_ms=860
+group 2: sourced=3702784 written=3844608 highest=122 delivered=118 idle_ms=3635
+```
+
+Group 1 has **no gap at all**: `delivered` equals `highest` (114), so the reorder loop has released
+every frame it has seen and is waiting for a frame that has not been sent. The visitor's byte count at
+the stop was 3 670 016, which is exactly `written` — so the visitor stopped reading because the group
+stopped writing, and the group stopped writing because nothing more arrived.
+
+So the stall is **upstream of the receiving group**: the peer's `send_loop` — whose source is the echo
+backend — stopped producing. Group 1's own `sourced` (4.17 MB) is its *other* direction and was still
+moving.
+
+That is a different shape from every entry before it in this file, which all assumed a *gap* in the
+reorder map. There is no gap: the pipeline is simply empty.
+
+Two candidates, and the next run separates them:
+
+- **the echo backend stopped**: the test's `io::copy` echo cannot read while it is blocked writing, so
+  a carrier that applies backpressure can stall it against itself. This file has "refuted" that twice
+  on eight-run samples — comparisons that could not resolve anything, as the last two rounds showed —
+  so it deserves a proper A/B on the bytes-delivered metric;
+- **the client's group stopped reading its source**: the same question one hop further out.
+
 ### All four stripes stop together, so the stall is the source (2026-11-05)
 
 The stall line carries a number that had not been read carefully:

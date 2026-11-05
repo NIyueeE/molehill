@@ -387,6 +387,7 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut src: R,
     mut sender: StripeSender<W>,
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sourced: std::sync::Arc<std::sync::atomic::AtomicU64>,
     group: u64,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
@@ -436,6 +437,12 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                 },
             };
+        // What the source has given this group, which is the number that says
+        // whether a stalled group stopped because its source stopped producing.
+        sourced.fetch_add(
+            u64::try_from(n).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if seq == 0 {
             // A direction that never logs this was **never polled**: the whole
             // difference between a response that is slow and one that never starts,
@@ -624,6 +631,7 @@ fn spawn_group_monitor(
     group_id: u64,
     frames: std::sync::Arc<Frames>,
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sourced: std::sync::Arc<std::sync::atomic::AtomicU64>,
     send: tokio::task::AbortHandle,
     recv: tokio::task::AbortHandle,
 ) -> tokio::task::JoinHandle<()> {
@@ -647,6 +655,7 @@ fn spawn_group_monitor(
                     highest = load(&frames.highest),
                     delivered = load(&frames.delivered),
                     written = load(&frames.written),
+                    sourced = sourced.load(std::sync::atomic::Ordering::Relaxed),
                     idle_ms = epoch_millis().saturating_sub(last),
                     "stripe group state"
                 );
@@ -913,10 +922,13 @@ where
         // EITHER direction for FORWARD_IDLE_TIMEOUT is closed, exactly like
         // the unstriped copy's watchdog. A slow trickle keeps it alive.
         let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(epoch_millis()));
+        let sourced = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sourced_for_monitor = std::sync::Arc::clone(&sourced);
         let mut send = tokio::spawn(send_loop(
             src,
             StripeSender::new(writes, plan),
             activity.clone(),
+            sourced,
             group_id,
         ));
         // What the receive direction has seen and what it has delivered, shared
@@ -938,6 +950,7 @@ where
             group_id,
             std::sync::Arc::clone(&frames),
             std::sync::Arc::clone(&activity),
+            sourced_for_monitor,
             send.abort_handle(),
             recv.abort_handle(),
         );
