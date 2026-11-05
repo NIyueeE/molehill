@@ -608,6 +608,36 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Number zero is lost before the peer's socket exists, and one duplicate fixes it (2026-11-05)
+
+One line of logging on each side settles what thirty rounds of counters could not: the **first data
+packet posted** and the **first data packet seen**.
+
+```
+client posted lane=0..3  number=0
+server  seen  lane=0,2,3 number=1  below=0     the client's number 0 never arrived
+client  seen  lane=0,2,3 number=0  below=0     the other direction is fine
+```
+
+The dialling end posts number 0 at 17:34:29.388 and the far end's first number seen is **1**, twenty-two
+milliseconds later. So a lane's very first datagram is sent **before the far socket is associated**, and
+it is lost with no trace: the kernel drops nothing (its queue never held it), the receiver refuses
+nothing (it never saw it), and `posted` counts it because the socket accepted it.
+
+That single loss is the whole of the pinned watermark. `AckSet::below` advances only when the number
+*equal to it* arrives, so with number 0 gone it stands at zero for the connection's life. Everything the
+sender subsequently issues is retirable only through the sixty-four-number bitmap, and the flight — six
+hundred kilobytes against a window of sixty — can never come down.
+
+**The fix is one duplicated datagram.** A lane's first numbered packet is now posted twice. The first copy
+races the far socket and is lost as before; the second arrives. Fourteen hundred bytes, once per lane.
+
+Measured on twelve runs: **eight complete**, against a baseline of seven and six — the best result this
+cycle has recorded, though a twelve-run batch cannot resolve eight from seven on its own. What makes it
+worth keeping is that it is aimed at a measured mechanism rather than at a correlation, and a confirmatory
+batch is the next step. The instrumentation that found it was reverted with an experiment in the same file
+and has to be re-added to re-verify the mechanism directly.
+
 ### A five-hundred-and-twelve-number bitmap is not better either (2026-11-05)
 
 The previous entry's conclusion was that the seventy-two-hundred-byte flight needs an acknowledgement

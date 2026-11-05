@@ -119,6 +119,23 @@ async fn send_run(
     Ok(())
 }
 
+/// Push one built packet's span, twice when it is a lane's first data packet.
+///
+/// **The first data packet of a lane goes twice.** A lane's first datagram is
+/// posted before the far socket is associated — measured: the dialling end posts
+/// number 0 and the far end's first number seen is 1, twenty-two milliseconds
+/// later — and that single loss pins the peer's cumulative watermark at zero for
+/// the connection's life, which nothing in the carrier can then recover
+/// (`wire::ACK`). One duplicated datagram costs fourteen hundred bytes once and
+/// makes the race harmless.
+fn push_span(spans: &mut Vec<(usize, usize)>, span: (usize, usize), twice: bool) {
+    spans.push(span);
+    if twice {
+        spans.push(span);
+    }
+    crate::transport::stats::note_built(if twice { 2 } else { 1 });
+}
+
 /// The same, one datagram at a time (see the Linux version for the batched one).
 #[cfg(not(target_os = "linux"))]
 async fn send_run(
@@ -299,13 +316,14 @@ async fn flush(
         let sampled =
             crate::transport::stats::enabled() && crate::transport::stats::PHASES.timing();
         let call = crate::transport::stats::Timing::start(sampled);
+        let before = shared.with(|conn| conn.number_counts().0);
         let filled = shared.with(|conn| conn.poll_transmit(now, run));
         call.stop(&crate::transport::stats::PHASES.tx_call);
         let Some(len) = filled else {
             break;
         };
-        spans.push((off, len));
-        crate::transport::stats::note_built(1);
+        let (seen, acked) = shared.with(|conn| conn.number_counts());
+        push_span(spans, (off, len), seen > before && acked == 1);
     }
     build.stop(&crate::transport::stats::PHASES.tx_build);
     if spans.is_empty() {
