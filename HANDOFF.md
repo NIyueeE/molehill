@@ -608,6 +608,35 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The gate's one failing cell is the handshake's tail, and sealing is its fix (2026-11-05)
+
+The sweep's failing stage decomposes cleanly, and it is not the regime the earlier entries
+chased:
+
+| cell | p50 median | p99 median | p99 p90 | verdict |
+|---|---|---|---|---|
+| `clean` | **3.0 ms** | **51.4** | 116.0 | fails (81.8 for the cell) |
+| `clean#2` | 2.5 | 3.2 | 23.8 | passes (23.5) |
+
+So the *median* arrival is the same in both stages — three milliseconds — and only the **tail**
+differs. The earlier "bad mode" (p50 8.8–11.3, the ratchet hypothesis) is a different phenomenon
+and is not what the gate is failing on.
+
+The tail is the handshake, counted by the client's own INFO line: in that stage **102 slow
+opens**, `open_us` p50 **20.18 ms**, p90 45.82, max 101.45, against three thousand arrivals —
+3.4 % of them paying a 20-to-100 ms stream open, which is what a p99 of 51 ms is made of.
+
+That closes the loop this cycle opened in round seven: the arrival's cost is its per-stream
+handshake (three round trips), the handshake's tail is what pushes the first stage's p99 over
+the line, and **sealing deletes two of those three round trips**. It is built, tested, and off by
+default because enabling it deadlocks the striped path in about five runs out of eight — and
+that deadlock is now the single bug between this cycle and a gate pass.
+
+Two of its causes are already fixed (a refused packet and a failed seal each consuming a packet
+number for ever). What remains is inside the stripe layer over sealed streams, where the packet
+is clamped to `MAX_SEALED_PAYLOAD` while the frame is 32 KiB, and the reorder loop's `written`
+is the byte count the visitor's EOF is measured against.
+
 ### The release gate is one SLO cell short, and it says so itself (2026-11-05)
 
 A full-scale `sweep` on the product arm, then `just bench gate` on the record. The gate's own
