@@ -608,6 +608,31 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### A parked writer whose peer has acknowledged everything it ever saw (2026-11-05)
+
+The early cluster's first instrumented stall shows two things at once. The group is short **three
+frames** this time (`highest` 122, `delivered` 119) — a gap, not the tail — and beside it:
+
+```
+lane=2  parked=1  base=175964  ack=175964  below=142  largest=141
+lane=0  parked=1  base=58660   ack=58660   below=53   largest=52
+```
+
+`below = largest + 1` is the healthy value: every packet number the peer has seen, it has. `base =
+ack` says its byte prefix matches the sender's frontier. And the writer is nevertheless **parked**,
+which means `cwnd - flight` is zero — and if every number the sender issued had been acknowledged, the
+flight would be empty and the window wide open.
+
+The two states cannot both be current, so the pair reported is **stale**: the acknowledgement fields are
+the *last one received*, and if acknowledgements have stopped arriving, they freeze at the last good
+value while the flight behind them grows. That is a third flavour of this stall, distinct from the tail
+frame the framing fix addressed and from the pinned watermark before it: **the acknowledgements stop**.
+
+The next instrument is the obvious one and it is small: **count acknowledgements received per second**,
+beside the datagrams received and the stream's `ack_pending` state. If acknowledgements stop while the
+peer still holds arrived bytes, the defect is in the peer's decision to send one — and `ack_pending` is
+the field that decides it.
+
 ### Fixed: a packet could claim bytes it did not hold, and they were skipped for ever (2026-11-05)
 
 The wire question was answered first and it pointed inward: **posted 37 417, received 37 432** — every
