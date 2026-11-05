@@ -67,6 +67,46 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The L3 deadlock's root cause: the prologue is read twice (2026-11-05)
+
+The server said it itself, in a line this file had not grepped for:
+
+```
+Transparent channel for 10.99.0.1:8443 named no lane: Failed to read the v4 lane prologue
+```
+
+twice, sixteen seconds after the client's dial.
+
+Both halves of the prologue are eight bytes — four of service id and four of either a stream's
+group or a claim lane's id — and the two codecs double as each other:
+
+- `read_stream_prologue` reads **all eight** bytes and returns `(ServiceId, group)`;
+- `read_lane_half` reads the **second four** and returns the lane id.
+
+And the server calls **both** on one channel: the `DataChannelHello` arm of the dispatcher
+reads the whole prologue with `read_stream_prologue`, and then the claim path
+(`run_transparent_service`) calls `read_lane_half` for four bytes the client never wrote a
+second time. So the claim's channel blocks on that read, fails, is dropped with `continue`, and
+`Routes::join` is never reached — which is the whole of the symptom: `member=0 live=false`, the
+visitor's SYN unclaimed, no lane ever joined.
+
+The comment above the dispatcher already describes the intended design and names a function that
+does not exist: "a direct data channel names its service right after the hello; a transparent
+lane names itself beside it (see `read_channel_prologue`)". That lookup — read the service id,
+find out whether the service is a claim, then read the right second half — was never written,
+so the server reads eight bytes and then four more.
+
+Two ways to fix it, and the second is smaller:
+
+- write `read_channel_prologue` as described: read four bytes, look the service up, then read
+  the second half as a lane or a group. That is the design the comments promise;
+- or hand the second half through: `do_v4_data_channel` already *has* it as `group`, and for a
+  claim those four bytes **are** the lane id, so the claim path can be given
+  `LaneId::new(group)` instead of reading anything. No wire change, no new lookup, and the
+  prologue is read exactly once.
+
+The second is what the next change does, and `just l3-accept` is the one command that decides it.
+
 ### The claim's lane reaches the right address over mhd, and the server never dispatches it (2026-11-05)
 
 Two more lines — the handshake's start and finish, and the dial's resolved address — narrow it
