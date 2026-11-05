@@ -608,6 +608,40 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### Stop and ask: the stall has outlived three attempts and every named suspect (2026-11-05)
+
+`AGENTS.md` §9 says to stop after three failed attempts on one problem, write the findings down
+and ask. This is that point, and this entry is the account.
+
+What is **established** about the stall (sealed striped, and the production wedge — same shape):
+
+- the reorder loop of one stripe group sits on **one missing frame** while the readers have seen
+  up to fifty frames beyond it (`highest` 254, `delivered` 122);
+- that stripe is one mhd stream, and it stops delivering while the other three on the same lane
+  carry on (frames 124–254 arrive);
+- the stalled stream's frontier `base` equals the peer's last cumulative `ack` **to the byte**, on
+  two different runs and two different lanes — so nothing is misretired and the peer's word is
+  honest;
+- `next == written`: nothing is left unsent;
+- repairs are **posted** (1 120 of 2 030 declarations) and the peer **refuses nothing**;
+- `flight` stays at hundreds of kilobytes the peer never acknowledges.
+
+What has been **refuted**, each by its own measurement: an RTO (the slow-open distribution is not
+quantised), a socket receive queue (`Recv-Q` 0 across thirty samples), a retirement past the
+peer's word (`base == ack`), a peer reporting bytes it lacks (same), the sealed-payload clamp
+(the range is recorded with the clamped length), `SendBuf::trim` failing to prune stale repairs
+(it prunes them), and the receiver dropping the frames as retired-stream traffic (four such drops
+in a whole run, all on one id at startup).
+
+So the remaining contradiction is exact and I have not found its cause: **the peer's first missing
+byte is at `base`, the sender posts repairs continuously, the peer refuses nothing, and the
+peer's frontier never moves** — therefore the byte at `base` is not in the repairs that go out,
+and nothing in the sender's bookkeeping says so.
+
+Three attempts on this have failed (the frontier pair, the posted-vs-declared pair, and the
+`next_repair` pruning read). Per the rule, this stops here and asks the human which way to spend
+the next rounds.
+
 ### Repairs are posted, the peer accepts everything, and the missing byte is never in them (2026-11-05)
 
 Two more counters separate "declared lost" (a decision) from "repair packet posted" (a fact), and
