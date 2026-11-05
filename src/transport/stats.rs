@@ -222,6 +222,10 @@ pub(crate) fn take_received_datagrams() -> u64 {
 }
 
 pub(crate) fn received_run(datagrams: usize, bytes: usize) {
+    RECEIVED_TOTAL.fetch_add(
+        u64::try_from(datagrams).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     PHASES.rx_runs.count();
     PHASES
         .rx_datagrams
@@ -746,9 +750,31 @@ pub(crate) fn note_built(count: usize) {
     }
 }
 
+/// Datagrams this process has posted and read since it started, never reset.
+///
+/// The per-window pair above answers "what is happening now"; this pair answers "did
+/// anything go missing at all", which a window cannot: the last window's datagrams
+/// are counted as posted and never as received when a run ends under them, so an
+/// artifact and a loss look identical there. `total_posted - total_received` is
+/// exactly the datagrams that left a socket and were never read.
+static POSTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RECEIVED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The lifetime totals, for the per-second line and for a run's last word.
+pub(crate) fn datagram_totals() -> (u64, u64) {
+    (
+        POSTED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        RECEIVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// One datagram the socket took.
 pub(crate) fn note_posted(count: usize) {
     if enabled() {
+        POSTED_TOTAL.fetch_add(
+            u64::try_from(count).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         POSTED_DATAGRAMS.fetch_add(
             u64::try_from(count).unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed,

@@ -608,6 +608,35 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### 3 306 datagrams are posted and never read, against 315 in a passing run (2026-11-05)
+
+The lifetime counters remove the boundary ambiguity of the window pair, and they show a real loss for the
+first time this cycle:
+
+| run | posted total | received total | **never read** |
+|---|---|---|---|
+| passed | 37 272 | 36 957 | **315** |
+| failed at 3.94 MB | 39 000 | 35 694 | **3 306** |
+
+So a failing run loses **8.5 % of its datagrams between two sockets**, and a passing run loses 0.8 %. That
+is not a bookkeeping artefact: the totals are monotonic, they count the same events on both sides, and
+the difference is exactly the datagrams that left a socket and were never read.
+
+It also reconciles every instrument that came before. The host's `RcvbufErrors`, `SndbufErrors` and
+`InErrors` are all zero, so these are **not receive-buffer overflows**: at loopback a datagram sent to a
+port nothing is listening on is dropped with an ICMP unreachable while `sendto` returns success, and a
+socket whose send queue is full at the moment of a non-blocking send the same way. The sender cannot see
+either — `posted` counts what the socket *accepted*.
+
+That is the shape the whole search kept hitting from the other side: a peer whose `largest` never
+advances while the sender posts, a flight that cannot retire, a window that stays at zero, a writer that
+parks, and a frontier that cannot move — with every counter inside the carrier reading healthy, because
+the loss happens **outside** the carrier, in the kernel, on the way to a socket that is not there.
+
+The next measurement is per lane: `posted − received` attributed to each `Conn`, and each `Conn`'s peer
+address over time. A lane whose peer port changed — a re-dialled pool entry — would send to an address
+nothing reads, and that is the first thing to check.
+
 ### Numbers are never taken without a build, and the window counters cannot see a loss (2026-11-05)
 
 Two counters that had never been compared — packet numbers taken and packets built — close one exit and

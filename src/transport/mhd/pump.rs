@@ -197,6 +197,7 @@ fn report_window(shared: &Arc<Shared>) {
         // take the same lock and deadlock the pump (which is exactly what it did).
         let (acks_applied, acks_attached) = conn.take_acks();
         let (issued, built_here) = conn.take_issued();
+        let (posted_total, received_total) = crate::transport::stats::datagram_totals();
         // The *receive* side of the same picture, once a second. The send side has
         // had a line since this file began and the receive side had none, so a
         // stream whose bytes arrived and whose reader never took them was
@@ -250,6 +251,8 @@ fn report_window(shared: &Arc<Shared>) {
                 .1,
             posted_datagrams = posted,
             received_datagrams = received,
+            posted_total,
+            received_total,
             numbers_issued = issued,
             numbers_built = built_here,
             acks_applied,
