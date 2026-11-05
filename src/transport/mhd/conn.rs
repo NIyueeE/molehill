@@ -396,6 +396,8 @@ pub(crate) struct WorstStream {
     pub(crate) covering_number: u32,
     /// The delivery frontier: everything below it is acknowledged.
     pub(crate) base: u64,
+    /// Bytes this stream has handed to packets.
+    pub(crate) handed_over: u64,
     /// The repair it is owed, if it is owed one: `(offset, length)`.
     ///
     /// A stream that has put every byte on the wire and is still "owed" a range
@@ -1934,6 +1936,7 @@ impl Conn {
                 next: state.send.next_offset(),
                 written: state.send.written(),
                 base: state.send.base(),
+                handed_over: state.send.handed_over(),
                 // Whether an abort is what keeps this stream out of the
                 // scheduler, and which repair it is owed. Those two are the only
                 // ways a stream with unsent bytes is passed over without a packet

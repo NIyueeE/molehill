@@ -66,6 +66,15 @@ impl SendBuf {
     }
 
     /// One past the last byte the writer has queued.
+    /// How many bytes of this stream have been handed to a packet.
+    ///
+    /// Beside `written` and `base` it answers one question no counter in this file
+    /// has asked: whether the byte the frontier is stuck on ever left. `written`
+    /// ahead of `sent` is bytes the writer produced and no packet carried.
+    pub(crate) fn handed_over(&self) -> u64 {
+        self.sent
+    }
+
     pub(crate) fn written(&self) -> u64 {
         self.tail
     }

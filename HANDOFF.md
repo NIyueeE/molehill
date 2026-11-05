@@ -608,6 +608,35 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The unacknowledged gap is exactly one stripe frame, and nothing follows it (2026-11-05)
+
+Three numbers side by side on a stalled stream settle what rounds 43 to 63 were circling:
+
+```
+written = 1016126   handed_over = 1016126   (gap 0)
+handed_over - base = 32778                  (= 32768 + 10: one stripe frame and its header)
+base = ack = 983348
+```
+
+So every byte the writer produced was handed to a packet — **nothing was left unsent, and nothing was
+built and dropped** — and the peer acknowledges all but **exactly one frame**, the *last* one that
+stream sent.
+
+That is the whole mechanism, and it explains every failed fix in this file. A packet number is declared
+lost either by the cumulative watermark (pinned at zero by one lost first packet) or by the bitmap,
+which needs a **newer** number to have arrived. The missing frame is the newest thing on its stream:
+there is nothing after it, so no gap can ever form, so it is never declared lost — and its bytes are
+never re-sent. The only thing that could declare it is the timer, and the timer is **armed from the
+newest activity** on a lane that four streams keep busy.
+
+That is why repairing the frontier on its own clock made things worse (four of twelve against six): it
+fired every round trip for every stream, flooding the repair queue, instead of firing once for the one
+frame nothing else can reach.
+
+The next change is precise and small: **arm the loss timer from the oldest unacknowledged record, not
+from the newest activity.** A record at the end of a flight that nothing follows then ages out and is
+repaired, which is the one case the whole mechanism misses.
+
 ### Repairing the frontier itself makes it worse, which inverts the conclusion (2026-11-05)
 
 The natural fix for the previous entry's ratio — fourteen frontier repairs against two thousand one

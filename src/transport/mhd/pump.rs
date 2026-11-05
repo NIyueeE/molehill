@@ -224,6 +224,7 @@ fn report_window(shared: &Arc<Shared>) {
             worst_covering = worst.map_or(0, |w| w.covering),
             worst_tracked = worst.map_or(0, |w| w.tracked),
             worst_base = worst.map_or(0, |w| w.base),
+            worst_handed_over = worst.map_or(0, |w| w.handed_over),
             last_ack_prefix = conn.last_ack_prefix(),
             inserted_total = conn.inserted_total(),
             built,
