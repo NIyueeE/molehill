@@ -24,6 +24,54 @@
 act (AGENTS.md §5); what is missing is a gate that passes every time, and the
 numbers that say why are on this page.
 
+### The first clean stage fails for TCP too, so it is not mhd's (2026-11-05)
+
+The comparison objective condition 2 asks for, on the cell that decides the release,
+and the first time this cycle has run it: the same full-scale timeline, the same host
+(load 0.73), with `MOLEHILL_DATA_CARRIER=tcp`.
+
+| stage | p50 | p99 |
+|---|---|---|
+| `clean` (first) | 29.83 ms | **120.0 ms** |
+| `clean#2` (last) | **1.22 ms** | **19.54 ms** |
+
+**TCP misses the 50 ms SLO on the first clean stage by the same factor mhd does**, with
+the same first-versus-last gap. A yamux-over-TCP data path and an mhd lane share almost
+nothing except the topology, the probes and the fact that *a tool is in the path at all*
+— so the first stage's tail is not a property of either carrier's design.
+
+Where TCP's version of it lives is measured, because the probe's split was in this run:
+
+| window | connect p50 | echo p50 |
+|---|---|---|
+| t = 0–25 s | 0.223 ms | 3.036 ms |
+| t = 25–50 s | 0.281 | **31.999** |
+| t = 50–150 s | 0.28–0.30 | 32.5–34.4 |
+
+`connect` never moves — so this is not the accept queue, not ephemeral-port exhaustion,
+not the listener. The **wait for the echo steps up tenfold at t ≈ 25 s and stays there**,
+which is a small request queueing behind the bulk spine: the same sentence this file
+wrote about mhd, in a different carrier, an order of magnitude larger.
+
+Two consequences for the objective, and they are uncomfortable but they are what the
+data says:
+
+- **condition 1 as stated — both clean stages at or under 50 ms — is not currently
+  reached by either carrier on this host**, so it cannot be used to judge mhd until it
+  is reached by TCP as well. "mhd must pass a cell that TCP fails" is not a carrier
+  property;
+- the first stage measures **cold start plus the bulk spine**, which the earlier
+  `--warmup-rounds 1` diagnostic already showed (34.7 ms against 135.3), and which the
+  archive records as a method property. The honest options are to state the SLO on a
+  stage that is not the run's first, or to make the *product* avoid accepting visitors
+  until it can serve them promptly — and the second is a real change, not a
+  measurement, because it is the same for both carriers.
+
+What is mhd's own, and remains: on the warm stage it reads 22.5 ms at p99 against TCP's
+19.5, and its arrival performs a per-stream handshake that TCP does not — which is the
+11.5 ms term the accounting closed last round, and the reason sealing is still the lever
+worth unblocking.
+
 ### The plan's stages, as they actually stand (2026-11-04)
 
 The plan was re-cut this cycle: instead of one fixed chain (sealing → RACK/PTO →
