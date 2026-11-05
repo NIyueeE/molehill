@@ -608,6 +608,30 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### All four stripes stop together, so the stall is the source (2026-11-05)
+
+The stall line carries a number that had not been read carefully:
+`stripe group stalled behind sequence 123 with 1 frame(s) parked`. One frame parked, and `highest`
+125 — so the reorder loop is missing **one** frame and has only **one** frame waiting behind it.
+With four stripes that means the group's source stopped after 125 frames in total: the other stripes
+did not run ahead and pile up, they stopped too.
+
+That dismantles the last version of the story in this file. It is not one stripe whose carrier
+stalled while the rest carried on; at the moment of every partial stop the whole group is at the same
+frame, which means **the thing feeding it stopped producing**.
+
+The feeder is the forwarding loop: it reads the visitor (on the server) or the backend (on the client)
+and writes frames into the group. For it to stop producing while the carrier is healthy — built equals
+posted, the peer inserts bytes, nothing is refused, and **no stall line ever fires** — it must be
+parked on its source read, and the source must be a socket with nothing in it. A visitor that wants to
+send 8 MiB and whose socket is empty is a visitor whose bytes the tool has already read… or a visitor
+the tool has stopped reading, which is the same thing from the counters' point of view.
+
+So the next instrument is on the feeder: **bytes read from the group's source per second**, per group,
+under the stats switch. If that number is zero at a stall while the visitor still has bytes to send,
+the tool stopped reading its visitor; if it is zero and the visitor has nothing left, the visitor
+stopped writing and the question moves to the harness's own writer.
+
 ### Naming the laggard stream: no change either (2026-11-05)
 
 The stall's two clusters — 455 KiB and 3.5–6.9 MB — put the earliest one at frame 14, and fourteen
