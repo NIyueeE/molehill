@@ -1803,7 +1803,7 @@ impl Conn {
     /// blocked on the far end's credit and a connection whose own reader owes
     /// the peer a megabyte were, until this, the same absence of log lines.
     /// The stream with the most bytes the wire has not taken, and its own facts.
-    fn worst_stream(&self) -> Option<WorstStream> {
+    pub(crate) fn worst_stream(&self) -> Option<WorstStream> {
         self.streams
             .iter()
             .filter(|(_, state)| state.send.has_unsent())

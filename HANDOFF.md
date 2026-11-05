@@ -608,6 +608,38 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### The stalled lane repairs for ever and retires nothing (2026-11-05)
+
+The per-second window line now carries the worst stream's own numbers (`worst_next`,
+`worst_written`, `worst_unsent`, `worst_retransmits`), and the first sealed failure it caught
+reads:
+
+```
+lane=1 cwnd=20235 flight=788414 worst_next=2065022 worst_written=2065022
+       worst_unsent=1081674 worst_retransmits=1928
+writes refused, by the bound that refused credit=0 window=0..14 aged=9 opening=0
+```
+
+Four facts, and together they name the mechanism:
+
+- **the flight is thirty-nine times the window** (788 KB against 20 KB), so the lane refuses every
+  write: `next == written` says the writer has nothing more to give, and what it did give is
+  stuck in flight;
+- **the stream has repaired 1 928 times** — a repair loop, not a stall for want of work;
+- **the age gate is closed** (`aged=9` refusals a second), which is the gate doing its job on a
+  flight that never drains, and is also why no *new* data could paper over the hole;
+- **the peer rejects nothing** — `datagrams refused` never prints in the whole run — and sealing
+  is healthy throughout (`sealed_sent` 1 300/s, `unsealed_tags=0`, `no_key=0`).
+
+So the sender re-sends, the peer accepts every datagram it receives, and **no record retires**.
+The fault is therefore not the wire and not the seal: it is either the peer's acknowledgement —
+its `AckSet` not covering ranges it has accepted — or the sender's retirement, which fails to
+clear a record whose bytes the peer reports having.
+
+The next instrument is that pair, for the stuck stream: the oldest unretired range (offset, len)
+on the sender and the peer's last `Ack { prefix, blocks }`. Whichever of the two is wrong will say
+so in one line, and it is the same pair the production wedge needs.
+
 ### The stall is one stream, one frame: `highest` 254, `delivered` 122 (2026-11-05)
 
 A group's state is now reported once a second with the stats switch on

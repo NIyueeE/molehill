@@ -205,7 +205,18 @@ fn report_window(shared: &Arc<Shared>) {
             .map_or((0, 0), |(id, waited)| {
                 (id, u64::try_from(waited.as_millis()).unwrap_or(u64::MAX))
             });
+        // The stream that is furthest behind, once a second: at a stall the lane's
+        // own numbers are healthy — nothing unsent, nothing unacknowledged — and the
+        // question is which stream stopped and where its cursor sits. The stall line
+        // carries this too, but it only fires on a *sender* with bytes it cannot
+        // post, and the sealed striped stall has neither.
+        let worst = conn.worst_stream();
         tracing::debug!(
+            worst_stream = worst.map_or(0, |w| w.id),
+            worst_next = worst.map_or(0, |w| w.next),
+            worst_written = worst.map_or(0, |w| w.written),
+            worst_unsent = worst.map_or(0, |w| w.unsent),
+            worst_retransmits = worst.map_or(0, |w| w.retransmits),
             lane = conn.wire_id(),
             cwnd,
             flight,
