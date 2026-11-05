@@ -67,6 +67,35 @@ the client has a stream that is not being read, and the backend has four connect
 nothing arriving. That is the next reproduction to build, and it is a *throughput*
 defect in the carrier, not a harness one.
 
+### The claim's lane reaches the right address over mhd, and the server never dispatches it (2026-11-05)
+
+Two more lines — the handshake's start and finish, and the dial's resolved address — narrow it
+again, one acceptance run each:
+
+| step | evidence |
+|---|---|
+| the claim resolves its dial address | `data channel: resolving the dial address service=0 addr=10.10.0.254:2333` **twice** |
+| the handshake completes | `data channel: handshake done service=0` **twice**, within a millisecond |
+| the server accepts it | `Handshaking a control session` **once** — the control session, and nothing else |
+| the server joins a lane | `lane joined` **never**, `member=0 live=false` |
+
+So the address is right, the dial succeeds, and the server logs **no data channel at all**. The
+resolution is not the bug and the client is not silent any more.
+
+What that leaves is specific: the claim's lanes are **mhd lanes over UDP on the same port**, so
+they never appear as a TCP accept — they arrive on the server's UDP dispatcher as a lane, whose
+first bytes are the prologue naming the claim. The client's side of that handshake completes;
+the server's side must then hand the lane to `forward_transparent` for the named claim, and it
+does not — `Routes::join` is never reached, so the claim is never routable and the visitor's SYN
+is dropped as unclaimed.
+
+That is now one dispatch wide on the server, and it has no line of its own: the mhd lane path
+logs its own progress (`mhd lane admitted`, window lines, stall lines) and none of it names the
+claim the lane was opened for. The next change is a line where a claim's prologue is read on the
+server — before and after the claim is looked up — and it will say whether the prologue is
+refused (unknown claim, wrong service, a dialect mismatch) or accepted and then dropped between
+the lookup and `forward_transparent`.
+
 ### Both ends of the lane dial now speak, and they say: the client dials, the server never joins (2026-11-05)
 
 Two `debug!` lines, one at each end of the claim's data channel — `open_data_channel` on the

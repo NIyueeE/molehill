@@ -1203,6 +1203,15 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
     if args.carrier.try_mhd() {
         let remote_addr = {
             let mut probe = args.remote_addr.clone();
+            // The address a claim's lane actually dials. The acceptance's claim
+            // lane completes its handshake in a millisecond without the server
+            // ever accepting a connection, so *where* it dials is the fact that
+            // decides whether this is a routing bug or a resolution one.
+            debug!(
+                service = %args.service_id,
+                addr = %probe.addr,
+                "data channel: resolving the dial address"
+            );
             probe
                 .resolve()
                 .await
@@ -1309,8 +1318,15 @@ async fn do_data_channel_handshake(
 }
 
 async fn run_data_channel(args: Arc<RunDataChannelArgs>, group: u32) -> Result<()> {
+    // The dial, in two steps and two lines: a channel that never reaches the
+    // server leaves no trace today, and the L3 acceptance's claim dial is exactly
+    // that shape — the client logs the intent, the server logs nothing, and the
+    // dial itself says neither "connected" nor "failed". One line before the
+    // handshake and one after it name the step that stops.
+    debug!(service = %args.service_id, "data channel: handshake starting");
     // Do the handshake
     let (conn, lane) = do_data_channel_handshake(args.clone(), group).await?;
+    debug!(service = %args.service_id, "data channel: handshake done");
 
     // Forward
     forward_data_channel(
