@@ -26,6 +26,11 @@ not merely one that passes a gate. Priorities are fixed:
 **latency > throughput > memory > processor**. Nothing about the configuration
 model moves: no key is added, removed or renamed, and no default changes.
 
+**Where the plan lives.** This file is the durable copy of the plan (§4 open
+problems, §5 decisions and order). The session's goal objective carries the same
+order in one paragraph so that it survives a long context; §5 says how the two are
+kept in step. If they ever disagree, this file wins and the objective is corrected.
+
 ---
 
 ## 2. Decision and invariants
@@ -150,10 +155,12 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 - **Unknown.** Where inside `open_channel_carrying` the time goes: the first
   Noise message's write, the pump's post of it, or the wait for the reply. The
   instrument that answers it is three timestamps inside that call.
-- **Next experiment.** Instrument `open_channel_carrying` — message written,
-  packet posted, reply arrived — then run the same `dev` A/B. Phase A below
-  follows and is expected to remove most of the 20 ms, because the handshake
-  *is* the 20 ms.
+- **Next experiment (A0b).** Instrument `open_channel_carrying` — message written,
+  packet posted, reply arrived — then run the same `dev` A/B. It splits the 20 ms
+  into a wake-up path that does not reach the pump (a scheduler bug) or a peer
+  that answers late (an ACK-timing one), and either answer is smaller than phase
+  A. Phase A follows and is expected to remove most of the 20 ms, because the
+  handshake *is* the 20 ms.
 - **Pass.** `churn-16` p99 moves toward the peers' ~2.6 ms; both clean stages
   improve; bulk stays within 15 %; peak RSS does not change class.
 - **Rollback.** No gain beyond the run's own noise, or bulk/capacity regression,
@@ -249,10 +256,23 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order.** A0 → A → B → C → D. **A0 is done** (§4.1): it refuted the two
-small-flight timers and located the cost in `hs_us`, the per-visitor handshake —
-which is 21.8 ms of a 22.5 ms clean p99. Phase A therefore targets essentially
-the whole tail, not a fraction of it.
+**Order, as of this commit.** The next step is **A0b**: three timestamps inside
+`open_channel_carrying` — the first Noise message written, the packet posted by
+the pump, the reply arrived — judged on the `dev` profile's `churn-16` with a
+same-round A/A. It decides between two small fixes: a wake-up path that does not
+signal the pump (a scheduler bug), or a peer that answers late (an ACK-timing
+one). Either is smaller than phase A and is tried first.
+
+After that, in order: **A** (lane-root keys, which removes the handshake that is
+21.8 ms of a 22.5 ms tail) → **B** (RACK + PTO) → **C** (priority scheduling) →
+**D** (delivery-rate controller) → **phase 6** (memory and CPU, only once the
+above hold) → **phase 7** (full verification, then the release record).
+
+**Keep this order in two places, and update both together.** `HANDOFF.md` is the
+durable copy; the session's goal objective is the copy that is re-read every round,
+and a stale objective re-asserts a plan that has already been refuted. When a
+result changes the order — a step finished, a hypothesis refused, a phase
+promoted — the same commit updates this section *and* the objective.
 
 **Reading list for B–D.** Four implementations are checked out under
 `~/tmp/mhd-references/`; each is cited where the plan uses it:
@@ -286,6 +306,8 @@ spending a day.
 | 9 | Round-robin or laggard-named byte prefix | 2/8 and 6/12 against 5/8 and 7/12 |
 | 10 | Decoupled echo in the test harness | 6/12 — the harness was never the cause |
 | 11 | Per-visitor Noise record layer, mux-over-mhd, more lanes / window / threads, static warm pool | rejected earlier; reasoning in the archive |
+| 12 | `MIN_RTO_SMALL_FLIGHT` 20 → 2 ms | `churn-16` 10.2 → 9.95 ms, inside the ±0.5 ms A/A noise — the 20 ms open is not this clamp |
+| 13 | `SMALL_FLIGHT_INITIAL_RTO` 20 → 2 ms | `churn-16` 10.2 → 9.5–10.7 ms, no change — not the unmeasured small-flight timer either |
 
 One row is **not** in this table because it worked: the striped group's reorder
 deadline was **2 s**, shorter than an 11.9 s carrier stall, so the reader failed
