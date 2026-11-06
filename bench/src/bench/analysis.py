@@ -681,26 +681,25 @@ def verdict(cmp: Comparison) -> dict:
     """
     metric = model.METRICS[cmp.metric]
     if not cmp.values_a or not cmp.values_b:
-        return {
-            "metric": cmp.metric,
-            "unit": metric.unit,
-            "a": cmp.label_a,
-            "b": cmp.label_b,
-            "verdict": "unavailable",
-            "delta_pct": None,
-            "delta_abs": None,
-            "median_a": None,
-            "median_b": None,
-            "threshold": None,
-            "sign_agreement": None,
-            "rounds": [len(cmp.values_a), len(cmp.values_b)],
-            "better": None,
-            "reason": (
-                f"{cmp.label_a}: {len(cmp.values_a)} samples, "
-                f"{cmp.label_b}: {len(cmp.values_b)}"
-            ),
-        }
+        return _unavailable_verdict(
+            metric,
+            cmp,
+            f"{cmp.label_a}: {len(cmp.values_a)} samples, "
+            f"{cmp.label_b}: {len(cmp.values_b)}",
+        )
     pairs = _aligned(cmp.values_a, cmp.rounds_a, cmp.values_b, cmp.rounds_b)
+    if not pairs:
+        # Both arms have the metric, but no **round** has both. A metric one arm
+        # carries and the other only carries in other rounds cannot be paired, and
+        # a paired test needs the pairing: this used to reach `statistics.median`
+        # with an empty list and take the whole report down, which is how a run of
+        # two arms with different stage coverage crashed instead of saying so.
+        return _unavailable_verdict(
+            metric,
+            cmp,
+            f"{cmp.label_a}: rounds {sorted(set(cmp.rounds_a))}, "
+            f"{cmp.label_b}: rounds {sorted(set(cmp.rounds_b))} — no shared round",
+        )
     base = _verdict_base(pairs, metric, cmp.noise, cmp.seed)
     base |= {"metric": cmp.metric, "a": cmp.label_a, "b": cmp.label_b}
     base["verdict"] = _verdict_state(base)
@@ -709,6 +708,31 @@ def verdict(cmp: Comparison) -> dict:
         base["better"] = cmp.label_a if improved else cmp.label_b
     base["fragile"] = _fragile(pairs, metric, cmp.noise, cmp.seed, base)
     return base
+
+
+def _unavailable_verdict(metric: model.Metric, cmp, reason: str) -> dict:
+    """A comparison that cannot be made, in the shape every reader already knows.
+
+    `unavailable` is a *verdict*, not an error: the run says which two things were
+    not comparable and why, instead of crashing the report or printing a difference
+    computed over unequal populations.
+    """
+    return {
+        "metric": cmp.metric,
+        "unit": metric.unit,
+        "a": cmp.label_a,
+        "b": cmp.label_b,
+        "verdict": "unavailable",
+        "delta_pct": None,
+        "delta_abs": None,
+        "median_a": None,
+        "median_b": None,
+        "threshold": None,
+        "sign_agreement": None,
+        "rounds": [len(cmp.values_a), len(cmp.values_b)],
+        "better": None,
+        "reason": reason,
+    }
 
 
 def _verdict_base(

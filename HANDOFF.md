@@ -244,6 +244,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.52 The abandon hold passes its guard: no cost on `clean`/`rtt100`, and the leak's signature is gone (2026-11-06)
+
+The two-arm guard §4.51 owed: the patched binary against the pre-fix build (`git show
+99ca30a:src/transport/mhd/conn.rs`, built and kept at `~/tmp/bin/molehill-nofix`), one
+scaled timeline, two rounds each, in one run.
+
+| stage | patched (median) | pre-fix (median) | change |
+|---|---|---|---|
+| `clean` | **7.95 Gbit/s** | 7.47 | +6.4 % |
+| `rtt100` | **3.400** | 2.505 | +36 % |
+| `clean#2` | **3.64** | 2.10 | +73 % |
+| `throughput_gbps`, all cells | — | — | **+72.7 %** (directional, n=[2,2]) |
+
+And the leak's own signature: the **pre-fix** arm carried **zero bytes** in `jitter`,
+`rate100` and `rate20` in round 1, which the patched arm did in neither round. The
+pre-registered pass was "the patched arm at or above the pre-fix arm on `clean` and
+`rtt100`" and its rollback was the opposite; **the guard passes and the rollback did not
+fire**.
+
+**The latency numbers go the other way, and that is the point, not a regression.**
+`clean#2`'s `rtt_p99_ms` is **+293 %** for the patched arm and `rtt_max_ms` **+475 %**.
+Those stages are now *carrying bulk* where they carried nothing: a loaded stage has a
+longer tail than an empty one, and comparing them is the comparison §4.49 was about. The
+honest statement is that the fix trades "an empty stage that looked fast" for "a stage
+that measures". Anyone reading §3.1's `clean#2` 23.08 ms against a future run must expect
+that number to be larger and to mean more.
+
+**One bench defect came out of this run and is fixed with it.** The report crashed with
+`StatisticsError: no median for empty data`, because `verdict` guarded against an *empty
+arm* but not against two arms whose samples share **no round**: `_aligned` then returned
+nothing and `statistics.median([])` took the whole report down. A comparison that cannot
+be paired is now an `unavailable` verdict whose reason names both arms' rounds, which is
+the shape every reader of this file already knows.
+
 ### 4.51 The bounded abandon works: `buffered` stops being monotone and the last stage carries 6.28 Gbit/s again (2026-11-06)
 
 §4.50's fix was built and measured in the same round: `StreamState.abandoned_at`, a
