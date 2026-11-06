@@ -244,6 +244,64 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.44 The window is the queue, and both bounds now show it (2026-11-06)
+
+The second attempt — `held = 2 × max(cwnd, WINDOW_FLOOR) − buffered`, i.e. size the
+send buffer by the window instead of the flat 32 MiB — was measured against its own
+pre-registration and **also reverted**. One number passed, one failed.
+
+| | baseline (15 rounds) | attempt A (admission) | attempt B (bounded buffer) |
+|---|---|---|---|
+| throughput, median | 7.87 Gbit/s | **5.86** ✗ | **8.99** ✓ |
+| interactive p99 | 13–133 | 14.9–24.6 | 12.9–27.5 |
+| interactive p50 | 2.5–11.8, bimodal | 2.5–11.3 | **5.4–7.4 in 3 of 4** |
+| slow seconds | 29 % | 69 % ✗ | **70 %** ✗ |
+| `buffered` peak | 33.5 MB | 251 352 | 513 547 |
+
+So bounding the buffer *by the window* keeps the throughput (better than baseline,
+because the queue no longer competes with the ACK path) and keeps the p99 tight —
+and still lands the median at 6 ms in most rounds. The pre-registered share is ≤ 5 %
+and it read 70 %, so the change goes, and the interesting part is why.
+
+**The decomposition says the carrier's two round trips lengthened together, not one
+stage.** Server histograms, same cell, good round against slow round:
+
+| round | cell p50 | `paired` p50 (accept → channel taken) | `echo` p50 (request read → reply written) | `first` p50 |
+|---|---|---|---|---|
+| `bufcap` r2 | 2.45 | **1 486 µs** | **593 µs** | 25 µs |
+| `bufcap` r1 | 7.41 | **4 931 µs** | **2 531 µs** | 26 µs |
+
+Both intervals scale by 3–4× while the visitor's own first-byte delay does not move
+(25 µs). `paired` is the client's channel open — spawn, lane open, prologue,
+delivery — and `echo` is a request and its reply across the carrier. **One
+round trip each.** So the mode is a property of the path's round-trip time, not of a
+stage, and the round trip is the standing queue.
+
+**Which puts the tradeoff on the table with numbers.** Throughput tracks the window
+(256 KiB → 5.9 Gbit/s, 512 KiB → 9.0) and latency tracks the window too, because a
+window that is kept full *is* a queue: `RTT ≈ min_rtt + W / rate`, and
+`rate = W / RTT` is satisfied at every W, so no window size is both. The way out is
+not a third window size — it is **pacing**: keep the window large enough to cover the
+path and bound what is *in flight at any instant* to `rate × (min_rtt + a small
+budget)`, so the queue never forms. On this cell the budget is the whole 4–6 ms.
+
+**Next experiment, pre-registered before it runs.** A delay-bounded ceiling, no new
+constant beyond the queue budget: the window may grow only while
+`smoothed_rtt ≤ min_rtt + 1 ms`; the ceiling is `rate_estimate × (min_rtt + 1 ms)`
+with `rate_estimate = cwnd / srtt`. At its fixed point that is `srtt = min_rtt +
+1 ms`, so the cell should read a median near the path plus one millisecond, and the
+rate is unchanged because the window still covers `rate × srtt`.
+
+- **Pass**: `timeline[clean]`-shaped cell p50 ≤ 3.5 ms and p99 ≤ 15 ms over four
+  rounds, **and** throughput ≥ 7.5 Gbit/s with an A/A twin in the same run.
+- **Guard**: `rr-1`, `rr-16`, `bulk-1`, `bulk-pair` inside that A/A; `rss_peak_mib`
+  lower; the shaped cells (`loss1`, `loss5`, `rtt100`) not worse — a delay-based
+  ceiling on a path whose *own* RTT is 100 ms must not become a lock-out, so the
+  budget is added to `min_rtt` and never replaces it.
+- **Rollback**: throughput below the A/A floor, a shaped-cell regression, or a
+  ceiling that collapses to the floor (visible as `ceiling` = 262 144 in the window
+  line while a shaped stage is running).
+
 ### 4.43 The pre-registered admission fix failed its own guards, and it separates the two defects (2026-11-06)
 
 §4.42's one-line change — `Conn::write` subtracting `self.buffered` instead of
@@ -283,20 +341,34 @@ raising the ceiling without bounding admission gives the buffer more room (more
 tail), and bounding admission without raising the ceiling gives a quarter of the
 throughput away.
 
-**Next experiment, pre-registered before it runs.** One commit, two lines, one
-mechanism: `window_ceiling` scales from `max(min_rtt, smoothed_rtt)` **and**
-`Conn::write` subtracts `self.buffered`.
+**And the ceiling's own term turns out to be inert, which rules out the obvious
+pair.** The first draft of the next experiment was "scale the ceiling from
+`max(min_rtt, smoothed_rtt)` as well" — it cannot work, and the arithmetic is worth
+writing down because it saves a run. If the ceiling were `256 KiB × hops` with
+`hops = smoothed / 1 ms`, and the queue is `q = W / rate`, then `hops = q / 1 ms`,
+so at a fixed point `W = 256 KiB × W / (rate × 1 ms)`, i.e. `rate = 256 KiB / 1 ms =
+2.1 Gbit/s per lane` and `hops = 0`. **The estimate cannot leave the floor unless the
+queue already exceeds the floor**, so on a fast path the smoothed term is inert by
+construction: it is the same 256 KiB, and the throughput comes back no higher.
 
-- **Pass**: the slow-second share falls to **≤ 5 %** (baseline 29 %) *and* throughput
-  stays inside the run's own A/A spread of **≥ 7.5 Gbit/s** (the pre-change median is
-  7.87; the fix's own reading was 5.86, so this is the number that failed). A/A in
-  the same run, not a remembered floor.
-- **Guard**: `rr-1`/`rr-16`, `bulk-1`/`bulk-pair` inside that A/A; `rss_peak_mib` not
-  higher; the shaped stages (`loss1`, `loss5`, `rtt100`) not worse — those have a
-  real multi-millisecond RTT already, so the ceiling there changes by the *smoothed*
-  term only, and a shaped regression means the term is wrong.
-- **Rollback**: throughput below the A/A floor, or the share unchanged, or any
-  shaped-cell regression.
+**Next experiment, pre-registered before it runs.** One line in `Conn::write`: keep
+the old admission test (`flight`) and bound the *buffer ceiling* by the path instead
+of the flat 32 MiB — `held = 2 × max(cwnd, WINDOW_FLOOR) − buffered`. The buffer
+exists to hold what the window cannot yet carry, so its size belongs to the window
+and not to a constant; on this cell that is **512 KiB instead of 33.5 MB, and a
+standing queue of ~0.5 ms instead of 34 ms**, while still holding two windows' worth
+so the pump never runs dry waiting for an acknowledgement (which is what cost the
+previous attempt its 25 %).
+
+- **Pass**: slow-second share ≤ 5 % (baseline 29 %) **and** throughput ≥ 7.5 Gbit/s
+  (the pre-change median is 7.87; the failed attempt read 5.86).
+- **Guard**: an A/A twin in the same run for both numbers; `rr-1`/`rr-16` and
+  `bulk-1`/`bulk-pair` inside it; `rss_peak_mib` lower, not higher (a smaller buffer
+  can only help, so a rise means something else moved).
+- **Rollback**: throughput below the A/A floor, or the share above 10 %, or any
+  shaped-cell regression — `MAX_BUFFERED`'s flat value also protects a frontier that
+  stalls, and the dynamic one must keep that protection (`2 × cwnd` is still a hard
+  ceiling per write, never a target).
 
 ### 4.42 The window bounds packetised bytes, not admitted ones, so 32 MiB queues behind a 256 KiB window (2026-11-06)
 
@@ -1542,13 +1614,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Size the window from the measured path, and bound admission by what is
-   unacknowledged** (§4.42–§4.43, pre-registered there). One mechanism, two lines:
-   `window_ceiling` scales from `max(min_rtt, smoothed_rtt)` instead of `min_rtt`
-   (which cannot leave the estimator's 1 ms floor), and `Conn::write` subtracts
-   `self.buffered`. Each alone is a regression — measured, §4.43 — so they travel
-   together. Pass: slow seconds ≤ 5 % with throughput back inside the run's own A/A
-   (≥ 7.5 Gbit/s); rollback on either, or on any shaped-cell regression.
+1. **Bound the queue, not the window: a delay-bounded ceiling** (§4.42–§4.44,
+   pre-registered there). Three measurements now agree that the cell's latency *is*
+   its standing queue: `buffered` reached 33.5 MB against a 256 KiB window and the
+   p99 paid 100 ms; bounding admission removed the tail but cost a quarter of the
+   throughput; bounding the buffer by the window restored the throughput and left a
+   6 ms median. The way out is pacing — a window that covers `rate × srtt` while the
+   admitted and in-flight data is bounded to `rate × (min_rtt + 1 ms)`. Pass: p50
+   ≤ 3.5 ms, p99 ≤ 15 ms, throughput ≥ 7.5 Gbit/s with an A/A twin; rollback on any
+   shaped-cell regression or a collapsed ceiling.
 2. **One stream, one hop** (the first *structural* change after that). A visitor
    starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
    whole group machinery: coordinator task, send loop, receive loop, one reader task
