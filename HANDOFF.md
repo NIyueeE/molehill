@@ -244,9 +244,21 @@ The last unexplained piece was the five to six milliseconds a visitor waits for 
 to exist. The obvious model — the server asks, the client opens — has an instrument: the request
 is written by `ask_missing`, and a stamp there joins, by group, with the client's arrival stamp.
 
-**It never fired.** `ask_missing` is called only from the pairing loop's **timeout** arm, and
-never being called means every pairing found a channel waiting inside its budget without asking
-for one.
+**It never fired — and that was the instrument, not the system.** `ask_missing` is only the
+pairing's **retry** path; the first request is sent directly, a few lines before the gather loop
+(`data_ch_req_tx.send(stripe_request(...))` in a `for index in 0..stripes`). The stamp sat on the
+retry and nothing ever retried, so it proved only that the first attempt succeeded.
+
+**So the pairing *is* a request and a response**, as it always looked: request written, the client
+opens a channel, the channel arrives, the visitor pairs. The five to six milliseconds contain
+that open (1.7 ms, §4.9) plus whatever the request and the arrival cost, and the question the
+section asked — how deep the client's inventory is — does not arise, because there is no
+inventory: the channel is opened on demand.
+
+The stamp belongs on the first request, in absolute epoch milliseconds so it joins with the
+client's stamps for the same group. It was moved there and then reverted: the change kept landing
+between `pair_striped_group`'s attribute and its body, and the function is at its line budget. The
+next round makes it in one piece, as a helper above the attribute.
 
 So the pairing is not a request and a response. The client keeps a speculative inventory of
 data channels — unclaimed, opened ahead of demand — and `take_for(group)` adopts the next one that
