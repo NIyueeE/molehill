@@ -244,6 +244,49 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.47 One stream, one hop: a 24 % throughput win and a latency null the cell cannot resolve (2026-11-06)
+
+§5's first item was built: `spawn_single` drives a one-stripe group's two directions
+from **one** task (`spawn_inner` dispatches to it when `streams.len() == 1`), over the
+same 10-byte frame and the same `StripeSender`, with no reorder buffer, no reader task,
+no bounded channel and no coordinator. Four rounds of the same cell, debug logging,
+against the same-day baseline (`wake.json`):
+
+| | throughput (Gbit/s) | p50 (ms) | p99 (ms) | idle-wait events |
+|---|---|---|---|---|
+| baseline | 7.11 / 7.22 / 9.18 / 7.05 | 2.52 / 2.81 / 21.80 / 2.50 | 22.7 / 35.1 / 99.1 / 19.5 | 830–5 458 |
+| one hop | **9.96 / 8.16 / 8.01 / 9.60** | 2.73 / 3.15 / 21.85 / 11.83 | 22.4 / 57.9 / 83.5 / 81.0 | 807–4 333 |
+
+**Throughput is a clean win and the latency is a null.** Every one-hop round is above
+8.0 Gbit/s against a baseline where one round in four is; the medians are 8.9 against
+7.2, **+24 %**, from deleting four tasks per visitor and the channel between two of
+them. Latency is *not* separable at this n: the baseline's own p99 spans 19.5–99.1 ms
+across four rounds, and the one-hop p99 (22.4–83.5) sits inside that span. Three rounds
+above the pre-registered 25 ms is a fail against the criterion as written, and the
+criterion cannot certify a win or a loss here — it can only refuse.
+
+**So the change is held out of the tree, not rejected.** The patch is kept at
+`~/tmp/patches/single-hop.patch` (323 lines, applies cleanly to `0315df9`), the
+measurement is above, and the question is left open with its own pre-registration
+rather than answered with four samples of a bimodal cell.
+
+**Next experiment, pre-registered before it runs.** The powered comparison this cell
+needs: **eight rounds per configuration**, baseline and one-hop in the *same* run as
+two arms (`--ab-arm` needs two binaries, so the patch is built into a second binary
+and the run carries both), stats on, same conditions.
+
+- **Pass**: the one-hop arm's throughput median at least 10 % above the baseline arm's
+  **in the same run**, and its p99 median not above the baseline arm's by more than the
+  run's own A/A spread on the same cell. Both arms' slow-second shares reported.
+- **Guard**: `bulk-1`/`bulk-pair` and `rr-1`/`rr-16` between the two arms inside the
+  run's A/A; `rss_peak_mib` lower for one-hop (four fewer tasks per visitor must not
+  cost memory, and cannot).
+- **Rollback**: the throughput median not clearing 10 %, or a p99 median beyond the
+  A/A spread. If it clears both, the patch lands as its own commit with this
+  measurement as its evidence.
+- **Cost**: 2 arms × 8 rounds × ~64 s ≈ 17 minutes. That is the price of a claim on
+  this cell, and it is the first time this investigation pays it.
+
 ### 4.46 The wake is exonerated, and the reserve does not cover the buffer ceiling (2026-11-06)
 
 §4.45's instrument was built and run: the interval from `wake_pump()` to the pass
@@ -1774,18 +1817,13 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **One stream, one hop** (the first *structural* change, and now the first item).
-   A visitor starts on one stripe (`initial_stripes()` is 1 in production) and still runs
-   the whole group machinery: coordinator task, send loop, receive loop, one reader task
-   per stripe, a bounded channel between them, a grace timer and a monitor. A single
-   stripe needs none of it. `spawn_single_group` drives both directions from one task
-   over the same 10-byte frame and the same `StripeSender`, so the first version changes
-   no wire byte. It comes first because **every tunable in front of it has now been
-   measured and closed**: three send-queue bounds (§4.43–§4.44), three give policies
-   (§4.46), the wake (§4.46), the scheduler class (§4.45, withdrawn) and the smoothed-RTT
-   ceiling (§4.43, inert by arithmetic). Pass: the four-round cell at p50 ≤ 3.5 ms and
-   p99 ≤ 25 ms with throughput ≥ 7.0 Gbit/s, and `churn-16` beyond the run's own A/A;
-   rollback: any rr, bulk, capacity, RSS or CPU regression.
+1. **One stream, one hop, decided with enough rounds** (§4.47, pre-registered there).
+   Built and measured: four tasks per visitor became one, throughput 7.2 → 8.9 Gbit/s
+   median (+24 %, and four rounds in four above 8.0 against one in four), latency not
+   separable because the baseline's own p99 spans 19.5–99.1 ms at four rounds. The patch
+   is at `~/tmp/patches/single-hop.patch`; the next step is a two-arm, eight-round
+   comparison (baseline against the patched binary, A/A inside the run) before it lands.
+   Pass: +10 % throughput median *in the same run*, p99 median inside the A/A spread.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
