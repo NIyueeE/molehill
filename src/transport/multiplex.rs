@@ -2093,6 +2093,12 @@ impl TunnelPool {
     /// take while it can take another (only a stripe group passes a non-empty
     /// list — see [`Self::open_stream_on_distinct`]).
     async fn open_avoiding(&self, avoid: &[usize]) -> Result<StreamLease, OpenError> {
+        // Where a visitor's five to eight milliseconds actually go. The stream
+        // open itself is measured on the lane (`hs_us`) and stays under five; this
+        // interval is everything **in front of** it — reserving a slot in the pool,
+        // and waiting for one to retire when every tunnel is at its ceiling.
+        let placing = std::time::Instant::now();
+        let mut waited = std::time::Duration::ZERO;
         if self.size() == 0 {
             self.grow(GrowReason::Repair).await;
             // The repair above is a no-op when another task already holds the
@@ -2124,7 +2130,9 @@ impl TunnelPool {
             // between would be lost and this open would sleep out the budget.
             freed.as_mut().enable();
             if self.reserve(&[], &avoid, ceiling).is_none() {
+                let before = std::time::Instant::now();
                 let _ = tokio::time::timeout(crate::transport::pool::CAPACITY_WAIT, freed).await;
+                waited = before.elapsed();
             }
             let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
                 // The final refusal: every serving tunnel is at the ceiling,
@@ -2135,9 +2143,34 @@ impl TunnelPool {
                 }
                 return Err(OpenError::AtCapacity);
             };
-            return self.complete(reservation, &avoid).await;
+            return self.place(placing, waited, reservation, &avoid).await;
         };
-        self.complete(reservation, &avoid).await
+        self.place(placing, waited, reservation, &avoid).await
+    }
+
+    /// Complete one placement, reporting it when it was slow.
+    ///
+    /// `wait_us` is time spent waiting for a stream to retire because every tunnel
+    /// was at its ceiling; `place_us` is the whole reservation. Both are evidence
+    /// for the one question the visitor's setup asks — is the cost in front of the
+    /// stream open or inside it — and neither is read on a healthy open.
+    async fn place(
+        &self,
+        placing: std::time::Instant,
+        waited: std::time::Duration,
+        reservation: Reservation,
+        avoid: &[usize],
+    ) -> Result<StreamLease, OpenError> {
+        let elapsed = placing.elapsed();
+        if elapsed >= std::time::Duration::from_millis(1) && crate::transport::stats::enabled() {
+            tracing::info!(
+                pool = %self.inner.shared.key,
+                place_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                wait_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                "mhd pool placement"
+            );
+        }
+        self.complete(reservation, avoid).await
     }
 
     /// The concurrent streams one tunnel of this pool may carry.

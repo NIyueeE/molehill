@@ -273,10 +273,22 @@ produce. A0e and A0f between them say the visitor's wait is the client's
 milliseconds. So the time sits **in front of** `open_stream`: in pool placement or
 in the stripe request.
 
-The next step is **A0g**: one stamp in `client.rs` splitting `open_us` into
-`open_stripe_stream` and `open_stream`. That decides whether a fix touches
-placement or the stripe request; the archive's rejected warm pool is re-read after
-it, because the fix for a five-millisecond *placement* is not obviously a pool.
+**A0g is done, and it removes the last obvious candidate.** Two instruments went
+in: pool placement (`place_us`, with `wait_us` for the capacity path) and the
+open's own round trip (`hs_us` with `reply_age_us`). Over a `churn-16` run:
+
+- **no placement reached a millisecond** — the pool never waited for a slot;
+- **no open round trip reached a millisecond** — `hs_us` < 1 ms every time;
+- yet the client's `open_us` is still 5–8 ms (§4.1).
+
+So the time is inside `open_stripe_stream` but **outside** both the pool and the
+lane open: the group's placement map (`entry` / `used` / `record` / `finish`) and
+the bookkeeping around `open_stream_on_distinct`. That is the only interval left.
+
+The next step is **A0h**: four stamps inside `open_stripe_stream`, around those
+four calls and around `open_stream_on_distinct`, at a millisecond threshold. One
+of them is holding five milliseconds, and a placement map under a `std::sync::Mutex`
+is not obviously innocent when sixteen fresh connections arrive at once.
 
 After A0g, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which also carries the contended open measured at 21.8 ms) → **D**

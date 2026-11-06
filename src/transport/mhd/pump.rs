@@ -1116,13 +1116,15 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
             (id, stream, ack, hs)
         };
         // **Where a slow open's round trip went.** `hs_us` is the whole wait for
-        // the channel to be usable; `reply_age_us` is how long the bytes that
-        // ended it had already been sitting in this end's buffer. Equal numbers
-        // mean the far end answered at once and the **waiter was woken late**; a
-        // small age means the answer itself was late. Every hop on either side is
-        // measured in microseconds (`accept_p50` 6, `post_p50` 12), so a twenty
-        // millisecond open is one of these two and nothing else.
-        if hs_us >= 5_000
+        // the channel to be usable; `reply_age_us` is how long the bytes that ended
+        // it had already been sitting in this end's buffer when the caller was
+        // handed them — the **wake-up latency**, the one interval no hop
+        // measurement can see. Equal numbers mean the far end answered at once and
+        // the waiter was woken late; a small age means the answer itself was late.
+        // Every hop on either side is measured in microseconds (`accept_p50` 6,
+        // `post_p50` 12, placement under a millisecond), so a millisecond-scale
+        // round trip on loopback is one of these two and nothing else.
+        if hs_us >= 1_000
             && crate::transport::stats::enabled()
             && let Some(ready) = self.shared.with(|conn| conn.reader_ready_at(stream_id))
         {
