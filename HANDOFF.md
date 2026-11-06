@@ -279,14 +279,24 @@ handshake and hello, and 0.54 ms of prologue and delivery. Against the pairing's
 | the server's per-stream setup | 1.04 ms |
 | **unaccounted** | **~2.6 ms** |
 
-The residual sits between *the client finishing its open* and *the server's stream task starting*:
-the carrier's delivery of the stream's first packets, the pump's accept, and the task spawn. On an
-established group the same carrier hop costs 0.2 ms (§4.12), so either a **first** packet on a new
-stream costs an order of magnitude more than a later one, or the measurement's two ends are not
-the two events they name.
+**The residual is one effect, and this cycle has now measured it from three directions.** The
+line that would have said which branch the open took is silent, and its silence is the answer it
+was built for: `log_slow_open` requires `reader_ready_at`, which is `None` when the acknowledgement
+arrives **inside** the handshake rather than as stream data — so the carrying branch is the one in
+use, its `hello_ack` is zero by construction, and the 2.6 ms cannot be a hello round trip.
 
-That is where this cell's investigation now stands: two and a half milliseconds, on the path
-between a client's open and a server's task start, with every other term measured.
+That leaves one term in the whole cell: **a new stream's first exchange costs two to three
+milliseconds, while the same carrier's later data costs 0.2.** The measurement has now hit that
+same shape three times without ever naming a mechanism:
+
+- the open's own round trip: 1.7 ms (§4.9) where an idle lane's is 0.1;
+- the pairing's residual: 2.6 ms (§4.15) between a client's open and a server's task start;
+- and, earlier, the 5–8 ms opens that sent twenty rounds after the handshake (§4.7).
+
+Three independent intervals, all "the first thing on a new stream", all an order of magnitude
+above the established path. That is a property of how this carrier starts a stream, not of any one
+hop, and it is where the next experiment belongs: **first packet against second packet on the same
+stream**, on the data path, with no handshake involved.
 
 The whole cell, with every number now measured rather than inferred:
 
