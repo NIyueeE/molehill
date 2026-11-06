@@ -267,16 +267,36 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** **A0d is done** (§4.1): the churn probe now states
-the connect/echo split, and `churn-16` turned out to be an `rr` scenario whose
-cell is the **first request on a fresh connection** (10.4 ms). The carrier's share
-of that is bounded on both ends — no open reached 5 ms, the server accepts in
-6 µs and posts in 12 µs — so the residual sits in the **forward and echo path**.
+**Order, as of this commit.** **A0d and A0e are done** (§4.1): the churn probe states
+the connect/echo split; `churn-16` turned out to be an `rr` scenario whose cell is
+the **first request on a fresh connection** (10.4 ms); and the server's pairing
+instrument already splits it — **`wait_us` 5.0–6.9 ms** is the visitor waiting for
+a data channel to *exist*, while `accept_us`, `enqueue_us` and `write_us` are
+microseconds.
 
-The next step is **A0e**: timestamp the first request's forward and echo legs on
-the server (`visitor accepted → first byte to the backend`, `first byte from the
-backend → written back to the visitor`), so the ~10 ms has an owner before any
-carrier change is attempted. Only then does a fix get designed.
+**A0e is done, and it named the owner — it was already instrumented.** The
+server's `PairingFacts` has carried `accept_us / enqueue_us / wait_us / write_us /
+paired_us` since an earlier cycle; it prints at five milliseconds under the stats
+switch. Twelve samples from a `churn-16` run:
+
+```
+accept_us=14..24   enqueue_us=0   wait_us=5001..6885   write_us=1..4   paired_us=5003..6888
+```
+
+**The visitor waits five to seven milliseconds for a data channel to exist**, and
+every other leg of the pairing is microseconds. That wait is the whole of the
+clean tail's head: the visitor is accepted, the server asks the client for a
+channel over the control session, the client opens one (under 5 ms, §4.1 point 3),
+and only then does the pairing finish. There is **no channel waiting when the
+visitor arrives**.
+
+So the next step is **A0f: measure what `wait_us` is made of** — the control-session
+hop against the client's open — before deciding. If the hop dominates, it is a
+control-path latency problem; if the open dominates, a warm channel would remove
+it. The archive records a warm pool as *rejected earlier*; that rejection must be
+re-read with this number in hand rather than assumed to still hold, because five
+milliseconds per visitor is a large prize and the earlier decision was made without
+this attribution.
 
 The 21.8 ms open A0 found is **contention, not the clean path** (§4.1): it
 reproduces while bulk runs and does not appear in `churn-16` at all. It belongs
