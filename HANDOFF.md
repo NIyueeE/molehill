@@ -238,6 +238,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.29 The bracket already existed, and the cell's p99 is a tail in two places (2026-11-06)
+
+A0ae was going to add a bracket from the visitor's accept to the group's write-back. The bracket was
+already there — `FirstByte` records `accept → paired` and `paired → first byte`, `EchoStamp` records
+`first byte → reply`, and both feed un-gated histograms that print every ten seconds. The data was
+in the log of the round before:
+
+```
+visitor arrival, split at the pairing   n=36   paired_p50 1 501 µs   paired_p99 80 231 µs
+                                              first_p50    16 µs   first_p99     34 µs
+a visitor's echo after its own request  n=35   echo_p50   661 µs   echo_p99  21 656-63 778 µs
+```
+
+**Every median on the release cell is 0.6–1.5 ms. The p99 of the cell is a tail, and the tail is in
+two places at once**: the pairing's own completion (80 ms at p99, 1.5 ms at p50) and the echo
+(22–64 ms at p99, 0.66 ms at p50).
+
+That rules out what §4.28 was about to test and sharpens the question. The cell's 99 ms is not a
+constant cost spread over every visitor — it is a small number of visitors that each lose tens of
+milliseconds, and they lose them in the carrier rather than in the probe, because both halves are
+ours and both have the tail.
+
+This is the shape the cycle opened with: an occasional multi-ten-millisecond stall in this carrier
+that a median never shows. §4.6's reorder-deadline bug was one of these; §4.10's sealing deadlock was
+another. The next step is **A0af**: find what the slow visitors have in common — the same lane, the
+same group, a pump pass that ran long, or a channel that arrived from the pool bell — by reading the
+per-second lines at the timestamps where `paired_p99` or `echo_p99` spikes.
+
 ### 4.28 The gap is cold start, and it is not in any interval we instrument (2026-11-06)
 
 Two more candidates fell in one run. `accept_us`, un-gated and validated on `churn-16` first (p50
