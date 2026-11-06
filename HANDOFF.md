@@ -238,6 +238,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.8 Bulk has no published baseline, and is not behind where it was measured (2026-11-06)
+
+The objective asks that `bulk-n` stay within fifteen percent of "the baseline". There is no such
+baseline in the record: `benches/records/results-bench-v0.11.2.json` holds **only timeline and
+capacity cells** — the `sweep` profile does not include bulk at all — and its method fingerprint
+(`257343fa3fd158d3`) differs from the current one (`1421e66cb2be72f0`), because this cycle changed
+the bench probes. So the criterion has never had a number to be measured against, and a
+comparison against that record would be refused by the gate's own comparability rule.
+
+What can be measured is a same-round comparison, and it says the opposite of "behind":
+
+| cell | molehill | frp (a TCP tunnel) |
+|---|---|---|
+| `bulk-1` | 5.35 / 5.37 Gbit/s (one A/A sample read **1.75**) | 4.58 / 4.78 |
+| `bulk-n`, eight streams | 6.55 / 6.69 / 9.18 / **10.73** | 6.14 / 6.01 |
+| `bulk-pair` | 8.47 / 8.32 / 5.57 | 5.96 / 5.90 |
+
+The medians are at or above the TCP tunnel's; the **spread is several times as wide** — the same
+shape as the latency cells, where the median is at parity and the tail is ours.
+
+This run becomes the bulk baseline for this tree: `~/tmp/baseline-dev-bulk-111.json`, dev profile,
+two arms, A/A arm included. A future release compares against it (or against a freshly measured
+one), not against a published record that has no bulk cells.
+
 ### 4.7 The clean cell, measured end to end (A0i–A0k)
 
 One connection's path, from three histogram instruments on both ends of a group
@@ -420,6 +444,11 @@ measurement cannot separate them further with stamps on the caller's side, becau
 both waits are inside the callee and both are dominated by time this task is simply
 not running.
 
+**4.8 is a separate front and it closed too**: bulk has no published baseline
+(the record holds only timeline and capacity), and where it was measured it is at
+or above a TCP tunnel's median with a much wider spread. That baseline is now
+stored as `~/tmp/baseline-dev-bulk-111.json`.
+
 **A0s rules out the runtime as well.** The binary runs a multi-threaded runtime
 with `min(cores, 8)` workers, and sixteen visitors against four to eight workers is
 exactly where queueing would live. Raising it to sixteen:
@@ -443,10 +472,12 @@ Before spending more rounds on it, the cheap experiment is a **clock sanity chec
 time a `sleep(0)`-free no-op loop and a second `Instant::now()` pair inside the same
 function during the churn, to confirm the timestamps themselves behave.
 
-The alternative, and it is a real choice: the tail is 3 ms on a cell where the
-median is at parity, while **bulk-n within 15 % and the TCP comparison have never
-been measured on this tree at all**. The objective names both. This document should
-not keep choosing the tail by default merely because it was already being chased.
+The alternative was taken in the same round: §4.8 measured `bulk-n` against a TCP
+tunnel in one round — parity or better at the median, several times the spread — and
+found that the objective's "within fifteen percent of the baseline" has **no
+published baseline to compare with**, because the record has no bulk cells.
+Closing that gap is a documentation-and-ritual question, not a carrier one, and it
+is now recorded with a stored baseline to compare against next time.
 
 ---
 
