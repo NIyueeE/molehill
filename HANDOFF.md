@@ -244,6 +244,73 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.41 The clean cell is bimodal, and the probe set is below its own noise (2026-11-06)
+
+§5's first item asked whether the staged tail is inter-probe contention. It is not:
+**the cell has two modes, and the spread between them dwarfs any probe effect.**
+
+One cell, four probe sets, the same binary, `cost` = one `clean` stage of 60 s with
+four bulk streams, `MOLEHILL_MHD_STATS=1`, host otherwise idle:
+
+| probe set | round | interactive n | p50 | p99 | max | err | churn p50 | churn p99 |
+|---|---|---|---|---|---|---|---|---|
+| interactive | 0 | 1 188 | **9.60** | **104.5** | 198.7 | 0 % | — | — |
+| all three | 0 | 1 235 | 2.96 | 45.5 | 152.1 | 0 % | 3.08 | 47.5 |
+| all three | 1 | 1 192 | **9.43** | **109.7** | 212.3 | 0 % | 8.71 | 121.1 |
+| interactive + churn | 0 | 1 238 | 2.61 | 14.7 | 70.1 | 0 % | 2.69 | 23.9 |
+| interactive + churn | 1 | 1 227 | 2.81 | 39.2 | 306.8 | 0 % | 2.90 | 39.6 |
+| churn | 0 | — | — | — | — | — | 8.09 | **111.9** |
+| churn | 1 | — | — | — | — | — | 2.63 | **7.5** |
+| all three (repeat) | 0, 1 | 1 237 / 1 234 | 2.60 / 2.53 | 20.2 / 24.2 | — | 0 % | — | — |
+
+**One configuration read p99 7.5 ms in one round and 111.9 in the next.** The best
+cell in the table is `interactive + churn` at 14.7 and the worst is `all` at 109.7 —
+so a probe-set effect, if it exists, is far inside the round-to-round scatter. The
+honest reading is that **this cell cannot compare two configurations in one round
+each**, which is how the last twenty rounds compared everything.
+
+**The per-second shape separates the modes**, and it is in every cell's evidence
+(`interactive_per_s`):
+
+```
+all r0      p50 3.1 3.2 2.8 3.0 3.0 3.2 … 3.0 3.7 3.0 2.8 62 s   (flat)
+ichurn r0   p50 3.0 2.8 2.7 2.6 2.7 2.7 … 2.7 2.6 2.5 2.5 63 s   (flat)
+all r1      p50 10.0 6.0 5.1 7.4 5.1 4.9 13.5 11.3 27.9 21.6 …   (oscillating)
+interactive p50 8.2 11.5 4.9 5.0 6.4 5.5 12.5 13.4 5.2 13.4 …    (oscillating)
+```
+
+A flat ≈2.6–3.0 ms mode and an oscillating 5–28 ms mode, ten times apart at p99.
+
+**What is excluded, and how.** Host load does not explain it: the runs recorded
+`loadavg` at start, and the **quietest** run (0.86) is the 9.60 ms one while the
+**busiest** (7.58) read 2.61 and 2.81. The probe set does not explain it (both modes
+appear with one probe and with three). And the window ceiling is not latched: in the
+healthy rounds every lane reads `ceiling = 262 144` (the floor, `srtt_us = 1000`)
+with `cwnd` at that ceiling and a total bulk flight of ~400 KB, so the
+`window_ceiling` feedback §4.4 describes is behaving in that mode. **The bad mode has
+no window line in any existing log** — it is a `debug!` line and every run so far
+logged at `info!` — so the same measurement on a bad round is the next step, with
+`RUST_LOG=info,molehill=debug`.
+
+**And the artifact §4.39 quoted is not a latency reading at all.** Counting the
+surviving files of that run by kind:
+
+```
+series-molehill-interactive.ndjson   44 226 error   3 036 rtt_ms      (93.5 % failed)
+series-molehill-churn.ndjson         35 758 error  38 525 setup_ms   (92.8 % failed)
+series-molehill-udp.ndjson              502 loss    2 220 rtt_ms      (18.4 % lost)
+```
+
+So its "interactive p99 3.52 ms" was a percentile over the 6.5 % of attempts that
+finished, in a run whose tool stopped answering after its first stage. The same
+applies to §4.39's caveat, which called the rest of the window "clean#2 reading
+42–1097 ms": that window was a wedge, not a shaper that had not settled.
+
+**What follows for the plan.** The comparison unit has to be *several rounds with a
+recorded per-round mode*, not one cell per configuration, and any claim about the
+release cell must state the mode it was measured in. This is the same lesson as
+`bulk-n`'s two-fold A/A (§4.36), now on the number the release is gated on.
+
 ### 4.40 The staged cell can be measured one probe at a time, and its absences are typed (2026-11-06)
 
 §4.39's next step needed a switch that did not exist: the staged runner always
@@ -1351,14 +1418,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **One series at a time** (§4.39, instrumented in §4.40). The staged cell's p99
-   is the interactive series alone, and the interactive and churn probes are the
-   same code at nearly the same rate. Run the timeline three ways — interactive
-   only, churn only, both — with everything else equal (`--series`). If the
-   interactive p99 rises when churn shares the host, the tail is inter-probe
-   contention; if it does not, the 22.5 ms is not the tail this file has been
-   chasing and needs a different account. **Nothing below starts before that is
-   answered.**
+1. **What sets the mode** (§4.41, instrumented in §4.40). Running the cell with one,
+   two and three probes showed the probe set is below the cell's own noise; what
+   separates a 2.6 ms round from a 9.6 ms one is not yet measured, and the bad mode
+   has no `mhd window` line in any existing log. Capture one with
+   `RUST_LOG=info,molehill=debug` and compare `ceiling`, `cwnd`, `flight`, `srtt_us`
+   and the request queue between the modes. **Every comparison from here on is
+   several rounds per configuration with each round's mode recorded** — one round per
+   arm cannot separate two configurations on this cell, which is how the previous
+   twenty rounds compared them.
 2. **One stream, one hop** (the first structural change). A visitor starts on one
    stripe (`initial_stripes()` is 1 in production) and still runs the whole group
    machinery: coordinator task, send loop, receive loop, one reader task per
