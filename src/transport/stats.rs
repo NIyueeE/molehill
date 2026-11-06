@@ -1443,6 +1443,27 @@ pub(crate) fn note_pair_wait(us: u64) {
 }
 
 /// Report this second's pairing waits.
+/// How many tasks this carrier has spawned, and how many are still alive.
+///
+/// The premise §4.34 rests on — "several thousand tasks on eight workers" — has
+/// never been a number. This makes it one, and it also shows what the monitor's
+/// gating saves when the stats switch is off.
+static TASKS_SPAWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Note one spawned group task.
+pub(crate) fn note_task_spawned() {
+    TASKS_SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Report this second's spawned-task count.
+fn report_tasks() {
+    let spawned = TASKS_SPAWNED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if spawned == 0 {
+        return;
+    }
+    info!(spawned_per_s = spawned, "mhd-stats: group tasks spawned");
+}
+
 /// One pump pass, and how much of it was `flush` waiting on the socket.
 ///
 /// The tail's last two candidates (§4.32): a pass that takes milliseconds is the
@@ -1800,6 +1821,7 @@ fn report_all() {
         report_pump_wakes,
         report_idle_passes,
         report_pump_loop,
+        report_tasks,
         report_open_steps,
         report_open_phases,
     ] {

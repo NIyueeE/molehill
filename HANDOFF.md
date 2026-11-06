@@ -238,6 +238,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.37 The task count is a number now, and it weakens the premise (2026-11-06)
+
+A0ak's verdict (§4.36) rested on a premise this file had only ever asserted: that this carrier puts
+"several thousand tasks" on eight workers. A counter on every group task spawned — reader, send,
+receive, monitor — makes it a measurement:
+
+```
+group tasks spawned   p50 52/s   p99 144/s   max 160/s      (timeline[clean], scale 0.05)
+```
+
+Four tasks per group, so about thirteen groups a second at the median. A group's own life is about a
+millisecond (turnaround 0.5 ms, §4.33), which puts the **live** population in the *tens*, not the
+thousands. **The premise is wrong**, and with it the simplest reading of §4.34: doubling the workers
+did not help because the task table was overflowing.
+
+Two readings survive, and they are distinguishable:
+
+1. **the long-lived tasks** — the bulk spine's groups and the churn series' visitors live for a whole
+   stage, not a millisecond, and they are the ones that compete with the pump when an interactive
+   probe arrives. A spawn *rate* cannot see them; a live *count* would.
+2. **not a task-count effect at all** — sixteen workers also change how the *harness's own* series
+   progress, and the first stage's p99 is measured while bulk, UDP and churn all run.
+
+One change was kept from this round because it is monotone and cannot affect any instrumented run:
+the group monitor is diagnostics, and with `MOLEHILL_MHD_STATS` off a group now spawns three tasks
+instead of four. Every cell in this file is measured with the switch **on**, so this neither
+improves nor invalidates any number here — and saying so is the point: an unmeasured change is
+recorded as unmeasured.
+
+The next step is **A0al**: live task count, not spawn rate — an atomic incremented on spawn and
+decremented on drop (a guard inside each loop), reported per second. If the live count is in the
+hundreds, reading 1 stands and the fix is fewer long-lived tasks; if it is in the tens, the
+sixteen-worker win has another cause and the next experiment is the same cell at 12 workers, to see
+whether the effect is monotone in the worker count or a threshold.
+
 ### 4.36 A0ak verdict: the pre-registration did its job — revert the global default (2026-11-06)
 
 The four cells at `TOKIO_WORKER_THREADS=16`, two rounds with the A/A arm:

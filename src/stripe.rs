@@ -885,6 +885,7 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
     let mut readers = ReaderTasks::with_capacity(reads.len());
     for r in reads {
         let tx = tx.clone();
+        crate::transport::stats::note_task_spawned();
         readers.push(tokio::spawn(stripe_reader(r, tx)));
     }
     drop(tx); // only the readers hold senders now: their exit closes the channel
@@ -1159,6 +1160,7 @@ where
             spawned_us: crate::transport::stats::epoch_us(),
             ..Frames::default()
         });
+        crate::transport::stats::note_task_spawned();
         let mut send = tokio::spawn(send_loop(
             src,
             StripeSender::new(writes, plan),
@@ -1173,6 +1175,7 @@ where
         // a grace that fires with a *gap* (`highest + 1 > delivered` and no reader
         // left to fill it) is a frame that never arrived. The visitor's byte count
         // cannot tell those apart.
+        crate::transport::stats::note_task_spawned();
         let mut recv = tokio::spawn(recv_loop(
             reads,
             dest,
@@ -1181,14 +1184,22 @@ where
             group_id,
         ));
         let activity_for_grace = std::sync::Arc::clone(&activity);
-        let monitor = spawn_group_monitor(
-            group_id,
-            std::sync::Arc::clone(&frames),
-            std::sync::Arc::clone(&activity),
-            sourced_for_monitor,
-            send.abort_handle(),
-            recv.abort_handle(),
-        );
+        // Diagnostics only: with the switch off a group spawns three tasks, not
+        // four, and four thousand visitors is four thousand fewer idle timers on
+        // a runtime that is already the bottleneck (§4.34).
+        let monitor = if crate::transport::stats::enabled() {
+            crate::transport::stats::note_task_spawned();
+            Some(spawn_group_monitor(
+                group_id,
+                std::sync::Arc::clone(&frames),
+                std::sync::Arc::clone(&activity),
+                sourced_for_monitor,
+                send.abort_handle(),
+                recv.abort_handle(),
+            ))
+        } else {
+            None
+        };
         // Wait for both directions. A failure in either aborts the other
         // (the group is broken and its missing sequence numbers will never
         // arrive); a direction that ended cleanly lets the other run to its
@@ -1235,7 +1246,9 @@ where
         if let Some(grace) = grace {
             grace.abort();
         }
-        monitor.abort();
+        if let Some(monitor) = monitor {
+            monitor.abort();
+        }
         // A group that lived a long time and then ended is a *visitor's connection*
         // ending, and which side ended it is otherwise invisible: the release run's
         // records show `control socket has closed` from the probe's side with nothing
