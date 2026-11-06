@@ -238,6 +238,26 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.35 A0ak, pre-registered before the numbers (2026-11-06)
+
+`DEFAULT_WORKERS` is 8 in `src/main.rs`, and `min(cores, 8)` is what any machine gets. §4.34 shows
+that doubling it takes 71 % off the release cell's p99 and halves both medians — but that was measured
+through `TOKIO_WORKER_THREADS`, on **one** cell, and a default is a global act: it applies to every
+carrier and both roles, and it spends threads and memory, which the objective ranks *below* latency
+and therefore permits only if nothing else moves.
+
+**Written before the measurement, so the numbers cannot choose the rule:**
+
+- **Pass** — with `TOKIO_WORKER_THREADS=16` in the same round, `churn-16` p50 and p99, `rr-1`, `rr-16`
+  and `bulk-n` all stay inside the run's own A/A spread (or inside 5 % of the 8-worker baseline
+  where that spread is tighter), **and** the release cell's echo p99 improves by at least 30 %
+  (measured: −39 %).
+- **Revert** — any of those four cells regresses materially, or `rss_peak_mib` grows by more than a
+  third. A latency win paid for with a throughput or memory regression is not a win under this
+  objective's own ordering.
+
+The four-cell measurement follows in the same round.
+
 ### 4.34 A0aj confirmed: the tail is runtime saturation, and the cell moves 71 % (2026-11-06)
 
 The pre-registered test: the same cell, twice, with the only difference the runtime's worker count
