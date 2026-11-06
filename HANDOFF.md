@@ -238,6 +238,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.12 The five-times disagreement was the join key; joined properly, the carrier's hops are 0.2 ms (2026-11-06)
+
+The previous entry's two ends could not be compared because their group ids were **different
+counters**: both ends called `spawn_group` without a tag, so the layer numbered its groups
+locally. The protocol already carries a group id — the server names it and sends it to the client
+— and the server was already passing it as the tag; the client was not. One line fixed it, and
+then both ends' absolute stamps join on the group.
+
+Six thousand four hundred groups, every one matched on both ends:
+
+```
+hop1  (request handed to the carrier -> arrives at the far side)   p50 0.0 ms  mean 0.2  max 5
+echo  (far side: arrives -> echo read from the backend)            p50 5.0 ms  mean 4.8  max 9
+hop2  (echo handed back -> reply arrives at the near side)         p50 0.0 ms  mean 0.3  max 5
+```
+
+**The carrier's two hops are a fifth of a millisecond each.** Everything the plan has been
+chasing in the transport — the handshake, the timers, the scheduler, the acknowledgement — is
+0.2 ms against a five-millisecond backend echo that every arm pays, TCP tunnels included.
+
+The cell's ten milliseconds therefore decompose as: **~4.8 ms of backend echo (shared), ~1.7 ms
+of per-visitor open (ours, and removable by sealing as §4.10 measured), ~0.2 + 0.3 ms of carrier
+hops, and the rest in the visitor's own connect and pairing.** Against a TCP peer's 7.2 ms the
+3.2 ms difference is almost exactly our open plus our pairing — not our transport.
+
+That is the most complete accounting of this cell so far, and it is also the least flattering to
+the plan: the transport was never the bottleneck at this cell.
+
 ### 4.11 The data path's two ends disagree by five times, and that is the finding (2026-11-06)
 
 The cell is the data path under concurrency (§4.10), so the next step was to split the server's

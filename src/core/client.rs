@@ -1869,7 +1869,15 @@ async fn forward_data_channel(
                 let (read, write) = local.into_split();
                 // The client does not size groups: no plan, so a stall here
                 // reports to nobody.
-                crate::stripe::spawn_group(read, write, done.streams, None);
+                // The protocol's group id, not this end's own counter: the two
+                // ends' stamp lines can only be joined if they name the same group.
+                crate::stripe::spawn_group_tagged(
+                    read,
+                    write,
+                    done.streams,
+                    None,
+                    u64::from(group),
+                );
             }
         }
         DataChannelCmd::StartForwardTransparent(wire) => {

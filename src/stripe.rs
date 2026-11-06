@@ -420,6 +420,31 @@ fn note_first_source(frames: &Frames, first: bool) {
         "echo",
         std::time::Duration::from_millis(epoch_millis().saturating_sub(arrived)),
     );
+    log_group_roundtrip(frames, frames.group, "echo");
+}
+
+/// One line per group with **every** stamp this end holds, as absolute times.
+///
+/// Durations from two processes cannot be cross-checked; timestamps can. The four
+/// events of one round trip are: the request handed to the carrier (near side), the
+/// request arriving from it (far side), the echo handed back (far side), the reply
+/// arriving from it (near side). Two ends that log the same events in absolute
+/// epoch milliseconds can be joined on the group id and the arithmetic checked —
+/// which is what the previous round's five-times disagreement needed.
+fn log_group_roundtrip(frames: &Frames, group: u64, end: &'static str) {
+    if !crate::transport::stats::enabled() {
+        return;
+    }
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        group,
+        end,
+        first_in_ms = load(&frames.first_in_ms),
+        sent_ms = load(&frames.sent_ms),
+        got_ms = load(&frames.got_ms),
+        now_ms = epoch_millis(),
+        "mhd group roundtrip stamps"
+    );
 }
 
 async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -659,6 +684,8 @@ struct Frames {
     /// Epoch milliseconds when this group first read a byte from its source, and
     /// whether the first byte has been written back since — together they are the
     /// visitor's first round trip, which is what the churn cell prices.
+    /// This group's layer id, so both ends' stamp lines can be joined on it.
+    group: u64,
     first_in_ms: std::sync::atomic::AtomicU64,
     /// Epoch milliseconds when the first frame was handed to the carrier and when
     /// the first reply frame came back. With `first_in_ms` and the reply's own
@@ -733,6 +760,7 @@ fn note_first_reply(frames: &Frames) {
     let now = epoch_millis();
     let millis = |from: u64, to: u64| std::time::Duration::from_millis(to.saturating_sub(from));
     crate::transport::stats::note_first_roundtrip(millis(started, now));
+    log_group_roundtrip(frames, frames.group, "reply");
     // The three legs, each only when both of its ends exist: a missing stamp is a
     // frame that never crossed that boundary, and reporting it as zero would be a
     // fabricated measurement.
@@ -968,6 +996,12 @@ where
     spawn_inner(src, dest, streams, plan, Some(tag))
 }
 
+/// A group with no tag, which numbers itself.
+///
+/// Test-only since the client started tagging its groups with the protocol's id:
+/// production always knows which group it is building, and the tag is what lets
+/// the two ends' stamp lines be joined (see `log_group_roundtrip`).
+#[cfg(test)]
 pub fn spawn_group<R, D, S>(
     src: R,
     dest: D,
@@ -1065,7 +1099,10 @@ where
         // Created before either loop: the send loop stamps the visitor's first
         // byte and the receive loop notes the first reply, so the two share one
         // set of counters (see `note_first_reply`).
-        let frames = std::sync::Arc::new(Frames::default());
+        let frames = std::sync::Arc::new(Frames {
+            group: group_id,
+            ..Frames::default()
+        });
         let mut send = tokio::spawn(send_loop(
             src,
             StripeSender::new(writes, plan),
