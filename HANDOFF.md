@@ -238,6 +238,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.23 The release cell is not the request's transit, it is the wait before it (2026-11-06)
+
+A new instrument, the first in this file that is **per request** and not per group: a stripe group
+sets an anchor when it reads the visitor's bytes and releases it when the answer is written back.
+That is the interval a `timeline` visitor's latency is made of inside the carrier, and it is
+readable on a long-lived cell where every per-group leg spans the whole connection (§4.22).
+
+```
+churn-16         turnaround   p50 4.3-5.3 ms   p90 ~6.2   p99 7.5-8.1     (matches the echo)
+timeline[clean]  turnaround   p50 807-924 µs   p90 ~1 000 p99 949-1 022    (one 20.7 ms outlier)
+```
+
+**On the release cell a request crosses this carrier in nine tenths of a millisecond**, and the cell
+reports a p99 of 22.5.
+
+So the 22.5 ms is **not** the request's transit through a stripe group. It is the time **before** a
+request can flow at all: no turnaround sample exists while a visitor is still waiting for its
+channel, and that wait is what the cell is timing. This is the same constraint §4.18 found from the
+other direction — the pool holds nothing, and a channel is opened on demand — arriving, at last, on
+the cell that decides the release.
+
+The instrument is kept: it is four stamps and a histogram, it costs nothing when the stats switch is
+off, and it is the first number in this file that can be compared with a `timeline` cell directly.
+
+The next step is **A0ab**: the same anchor on the *pre-flow* interval — the visitor's accept to the
+first byte the group reads — which is where the 21 ms must be.
+
 ### 4.22 The release cell cannot be read with the group instruments (2026-11-06)
 
 The release criterion is `timeline[clean]`, whose p99 is 22.5 ms against a TCP tunnel's 2–3.5, and

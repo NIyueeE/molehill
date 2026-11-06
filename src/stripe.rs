@@ -447,6 +447,23 @@ fn log_group_roundtrip(frames: &Frames, group: u64, end: &'static str) {
     );
 }
 
+/// Anchor a per-request turnaround: this group now has bytes to carry.
+///
+/// Only the first read of an outstanding request is kept, so a burst of reads does
+/// not keep pushing the start forward. Its own function because `send_loop` is at
+/// its line budget.
+fn anchor_turnaround(frames: &Frames, n: usize) {
+    if n == 0 || !crate::transport::stats::enabled() {
+        return;
+    }
+    let _ = frames.pending_us.compare_exchange(
+        0,
+        crate::transport::stats::epoch_us(),
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut src: R,
     mut sender: StripeSender<W>,
@@ -508,6 +525,7 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             u64::try_from(n).unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed,
         );
+        anchor_turnaround(&frames, n);
         note_first_source(
             &frames,
             frames
@@ -686,6 +704,13 @@ struct Frames {
     /// visitor's first round trip, which is what the churn cell prices.
     /// This group's layer id, so both ends' stamp lines can be joined on it.
     group: u64,
+    /// When this group read the bytes a reply will answer, in epoch microseconds.
+    ///
+    /// Zero when nothing is outstanding. See `note_turnaround_release`: the read
+    /// that carries a request sets it, the write of the answer clears it, and the
+    /// difference is a **per-request** interval rather than the per-group ones
+    /// above — which, under a long-lived stage, span the whole connection.
+    pending_us: std::sync::atomic::AtomicU64,
     first_in_ms: std::sync::atomic::AtomicU64,
     /// Epoch milliseconds when the first frame was handed to the carrier and when
     /// the first reply frame came back. With `first_in_ms` and the reply's own
@@ -909,6 +934,7 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
                     .fetch_max(seq + 1, std::sync::atomic::Ordering::Relaxed);
                 if seq == next {
                     write_dest(&mut dest, &bytes).await?;
+                    note_turnaround_release(&frames);
                     note_first_reply(&frames);
                     frames
                         .written
@@ -963,6 +989,23 @@ async fn write_dest<W: AsyncWrite + Unpin>(dest: &mut W, bytes: &[u8]) -> anyhow
     dest.write_all(bytes)
         .await
         .map_err(|e| anyhow::anyhow!("stripe destination write failed: {e}"))
+}
+
+/// Close one per-request turnaround: the reply has reached the visitor.
+///
+/// The anchor is the read that carried the request (`pending_us`), so this is the
+/// interval a `timeline` visitor's latency is actually made of inside the carrier
+/// — every other leg in this file starts at the group's first frame and therefore
+/// spans the whole connection under a long-lived stage.
+fn note_turnaround_release(frames: &Frames) {
+    let started = frames
+        .pending_us
+        .swap(0, std::sync::atomic::Ordering::Relaxed);
+    if started != 0 {
+        crate::transport::stats::note_turnaround(
+            crate::transport::stats::epoch_us().saturating_sub(started),
+        );
+    }
 }
 
 /// Forward one stripe group: the send direction copies `src` into the
