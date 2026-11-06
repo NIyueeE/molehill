@@ -239,6 +239,34 @@ pub(crate) fn take_timer_passes() -> (u64, u64) {
     )
 }
 
+/// The server's own per-stream setup: task start to the hello being decoded, and
+/// task start to the channel being delivered to a pairing.
+///
+/// The difference is the rest of a fresh visitor's three-and-a-half milliseconds
+/// after the control hop (0.02 ms) and the client's open (1.7 ms) are removed.
+static SERVE_HELLO: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static SERVE_DELIVER: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one server-side stream setup: `delivered` false is the hello, true is the
+/// whole path to delivery.
+pub(crate) fn note_serve(delivered: bool, age: Duration) {
+    if !enabled() {
+        return;
+    }
+    let slot = if delivered {
+        &SERVE_DELIVER
+    } else {
+        &SERVE_HELLO
+    };
+    let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
 pub(crate) fn take_received_datagrams_per_s() -> u64 {
     PHASES.rx_datagrams.swap(0, Relaxed)
 }
@@ -1354,6 +1382,32 @@ fn report_timer_passes() {
     );
 }
 
+/// Report the server's per-stream setup: hello, and the whole path to delivery.
+fn report_serve() {
+    for (name, slot) in [("hello", &SERVE_HELLO), ("deliver", &SERVE_DELIVER)] {
+        let samples = {
+            let mut guard = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = std::mem::take(&mut *guard);
+            drop(guard);
+            let mut sorted = taken;
+            sorted.sort_unstable();
+            sorted
+        };
+        if samples.is_empty() {
+            continue;
+        }
+        info!(
+            stage = name,
+            n = samples.len(),
+            p50_us = pct_us(&samples, 50, 100),
+            p99_us = pct_us(&samples, 99, 100),
+            "mhd-stats: server per-stream setup"
+        );
+    }
+}
+
 fn report_growth() {
     let growth = {
         let mut samples = POOL_GROWTH
@@ -1388,6 +1442,7 @@ fn report_send_path() {
     report_growth();
     report_opens();
     report_timer_passes();
+    report_serve();
     report_open_steps();
     report_open_phases();
     let roundtrip = {

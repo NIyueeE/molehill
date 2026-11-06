@@ -2509,6 +2509,11 @@ async fn serve_mhd_stream(
             .await
             .with_context(|| "mhd hello timed out")??,
     };
+    // **This end's share of a fresh visitor's wait.** `opened` is the task's
+    // start, so this is the selector, the handshake and the hello together; the
+    // deliver stamp below adds the prologue and the delivery to a pairing.
+    crate::transport::stats::note_serve(false, opened.elapsed());
+    let opened_for_deliver = opened;
     match hello {
         Hello::DataChannelHello(_, nonce) => {
             let (service_id, group) = read_stream_prologue(&mut io).await?;
@@ -2560,7 +2565,11 @@ async fn serve_mhd_stream(
             note_slow_opening(total_us, sel_us, hs_us);
             let (service_id, _tunnel, group) = read_tunnel_prologue(&mut io).await?;
             debug!(%service_id, "mhd tunnel stream routed");
-            route_mhd_stream(io, &registry, &nonce, service_id, group).await
+            {
+                let served = route_mhd_stream(io, &registry, &nonce, service_id, group).await;
+                crate::transport::stats::note_serve(true, opened_for_deliver.elapsed());
+                served
+            }
         }
         other @ Hello::ControlChannelHello(..) => {
             bail!("Expected a data-plane hello on the mhd stream, got {other:?}")

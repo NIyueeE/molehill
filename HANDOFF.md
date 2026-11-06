@@ -260,12 +260,33 @@ client queueing before it starts                                        p50 0.00
 
 **The control session is not slow.** A command crosses it in twenty microseconds.
 
-So the pairing wait of 5.4 ms is: **~0 ms of command, ~1.7 ms of open (§4.9), and ~3.7 ms of the
-new channel getting from the client's open to the server's pairing queue** — the server's own
-per-stream setup: accepting the stream, reading its hello and prologue, and delivering it.
+**The server's own share is smaller than that arithmetic predicted, and the rest has no owner.**
+Two histograms inside `serve_mhd_stream` — task start to the hello decoded, and task start to the
+channel delivered:
 
-That is the last term of this cell and the only one never measured: three and a half
-milliseconds on the server between a stream arriving and a visitor being pairable with it.
+```
+hello    p50 500 µs   p99 1 141 µs
+deliver  p50 1 040 µs p99 2 320-2 387 µs
+```
+
+So the whole server-side setup is **1.04 ms at the median**, split into 0.5 ms of selector,
+handshake and hello, and 0.54 ms of prologue and delivery. Against the pairing's 5.4 ms:
+
+| term | measured |
+|---|---|
+| command across the control session | 0.02 ms |
+| the client's channel open (§4.9) | 1.7 ms |
+| the server's per-stream setup | 1.04 ms |
+| **unaccounted** | **~2.6 ms** |
+
+The residual sits between *the client finishing its open* and *the server's stream task starting*:
+the carrier's delivery of the stream's first packets, the pump's accept, and the task spawn. On an
+established group the same carrier hop costs 0.2 ms (§4.12), so either a **first** packet on a new
+stream costs an order of magnitude more than a later one, or the measurement's two ends are not
+the two events they name.
+
+That is where this cell's investigation now stands: two and a half milliseconds, on the path
+between a client's open and a server's task start, with every other term measured.
 
 The whole cell, with every number now measured rather than inferred:
 
