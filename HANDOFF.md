@@ -262,9 +262,29 @@ connection costs, that is a **three-to-four-fold penalty from sixteen-way
 concurrency** — and the TCP peers answer the same cell in 2.1–3.5 ms, about their
 uncontended cost.
 
-So the gap the objective is about is **contention**, and the next experiment must
-price it directly rather than infer it from two runs of a four-fold-variable
-median.
+**A0l priced it, and it corrected the paragraph above.** Same round, same binary,
+with the A/A arm in it:
+
+| cell | molehill | frp (a TCP peer) |
+|---|---|---|
+| `rr-1` — one connection, reused | **0.155 ms** | 0.162 ms |
+| `rr-16` — sixteen connections, reused | 23 382–23 754 1/s | 25 552–25 714 1/s |
+| `churn-16` — sixteen connections, **fresh** | **10.40–12.12 ms** | **7.20–7.35 ms** |
+
+Two corrections follow. First, **on reuse we are at parity**: 0.155 against
+0.162 ms, and 8 % behind on the sixteen-connection rate. Second, the gap on fresh
+connections is **1.44×, not the three-to-four times claimed above** — that claim
+compared our `churn-16` against the peers' *timeline* clean stage, which is a
+different cell. Against the same cell, the peer pays 7.2 ms where we pay 10.4.
+
+So both tunnels pay a large contention penalty for fresh connections — roughly
+four times their own uncontended cost — and ours is 44 % worse than a plain TCP
+tunnel's. Our own setup (1.4 ms, A0h) is a large part of that difference; the rest
+is the extra hop the carrier adds per connection.
+
+The next step is **A0m**: compare the two arms' `setup_p50_ms` (the connect to the
+tunnel, which neither tool can avoid) and their channel-open cost, so the 3.2 ms
+difference is attributed rather than guessed.
 
 ---
 
@@ -302,10 +322,13 @@ whole round trip in one leg (`wire`), with this end's own read-and-hand-off and 
 write-back both at zero. So what remains is a handful of task hops through the
 client and the backend, about a millisecond each.
 
-**A0l** — price the contention directly: the same fresh-connection workload at
-one, four and sixteen concurrent visitors, for molehill and for a TCP peer, in one
-round. §4.7 says the penalty is three to four times and says how it was inferred;
-this turns it into a measurement.
+**A0l is done** (§4.7): on reuse we are at parity with a TCP peer (0.155 against
+0.162 ms; 8 % behind on the sixteen-connection rate), and on sixteen *fresh*
+connections we are 1.44× slower (10.4–12.1 against 7.2–7.3 ms).
+
+**A0m** is next: compare the two arms' `setup_p50_ms` and their channel-open
+cost, so the 3.2 ms difference is attributed rather than guessed. Our own setup is
+1.4 ms of it.
 
 Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which is where the hop latency belongs) → **D** (delivery-rate
