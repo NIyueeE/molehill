@@ -267,69 +267,20 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** The findings are in §4.1; this is the sequence they
-produce. A0e and A0f between them say the visitor's wait is the client's
-`open_us`, and that `hs_us` — the interval inside `open_stream` — stays under five
-milliseconds. So the time sits **in front of** `open_stream`: in pool placement or
-in the stripe request.
+**Order, as of this commit.** The findings live in §4.1; this is only the
+sequence. The cell decomposes as **1.4 ms of setup plus a 5 ms round trip** through
+the data path, and every hop measured so far is microseconds — control hop,
+placement, the lane's open, the server's accept and post. So the five milliseconds
+is spread across a handful of hops rather than sitting in one.
 
-**A0g is done, and it removes the last obvious candidate.** Two instruments went
-in: pool placement (`place_us`, with `wait_us` for the capacity path) and the
-open's own round trip (`hs_us` with `reply_age_us`). Over a `churn-16` run:
+The next step is **A0j**: attribute that round trip hop by hop — server stripe
+read, carrier post, client carrier receive, stripe write to the backend, and the
+same on the way back — before any scheduler is touched. Four hops of roughly a
+millisecond each is what the total allows, and phase **C** is where a fix would
+live.
 
-- **no placement reached a millisecond** — the pool never waited for a slot;
-- **no open round trip reached a millisecond** — `hs_us` < 1 ms every time;
-- yet the client's `open_us` is still 5–8 ms (§4.1).
-
-So the time is inside `open_stripe_stream` but **outside** both the pool and the
-lane open: the group's placement map (`entry` / `used` / `record` / `finish`) and
-the bookkeeping around `open_stream_on_distinct`. That is the only interval left.
-
-**A0h is done, and it corrects the previous entry.** Four stamps inside
-`open_stripe_stream`, eleven thousand nine hundred samples from one `churn-16`
-round:
-
-```
-entry=0..2 µs   used=0 µs   open=1031..1765 µs   record=0 µs   whole=1033..1766 µs
-```
-
-The placement map is innocent — `entry`, `used` and `record` are microseconds —
-and **the whole open is 1.0–1.8 ms**, not five to eight. That earlier figure came
-from the `mhd client slow data channel` line, which prints only when
-`ready_us ≥ 5 ms`: it is a **biased sample of the slowest opens**, and the server's
-`wait_us` matched those same slow ones because they were the same connections.
-
-So the visitor's setup, at the median, is about 1.4 ms — and the `churn-16` cell is
-10.4 ms. **The setup is no longer a suspect.** What is left is the first request's
-**data path**: client → server → backend → back. A residual inside `complete()`
-(1.4 ms measured there against `hs_us` and placement both under one) is worth one
-more stamp, but it cannot account for ten.
-
-**A0i is done, and the cell now decomposes end to end.** A histogram on the
-striped group — first frame read from the visitor to first frame written back —
-reported as percentiles once a second:
-
-| part of the `churn-16` cell | measured |
-|---|---|
-| setup (A0h) | **1.4 ms** |
-| visitor's first round trip, server side | **p50 5 ms, p90 6 ms, p99 8 ms** |
-| cell | 10.4 ms |
-
-(1 400–2 250 samples a second, ten seconds of `churn-16`.)
-
-The first run of that line printed p99 *below* p50, because it fed an unsorted
-vector to `pct_us`; it is sorted now, and the percentages above are from the fixed
-build. That defect is worth its own sentence: an instrument that reports a
-distribution has to be checked for the shape of its output, not only for firing.
-
-So the clean cell is **setup plus a five-millisecond round trip through the data
-path** on a loopback that answers in a tenth of a millisecond. The remaining work
-is per-hop latency in that path — the stripe layer's two hops and the carrier's
-two — which is scheduling, not protocol. That is phase **C**'s ground, and it is
-the only place the ten milliseconds can still be.
-
-After A0g, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
-scheduling, which also carries the contended open measured at 21.8 ms) → **D**
+After A0j, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
+scheduling, now carrying both the contended open and the data-path hops) → **D**
 (delivery-rate controller) → **phase 6** (memory and CPU, only once the above
 hold) → **phase 7** (full verification, then the release record).
 
