@@ -919,8 +919,10 @@ scheduling stamp on the pump (the pump is not the constraint).
 
 This section is the **durable copy** of the order; the session's goal objective is
 the copy that is re-read every round, and a stale objective re-asserts a plan that has already
-been refuted. When a result changes the order — a step finished, a hypothesis refused, a phase
-promoted — the same commit updates this section *and* the objective.
+been refuted. **Every round ends by updating both** — the objective with what finished, what is
+next and any change of order (the operator asked for this explicitly), and this section with the
+sequence alone. Not only when the order changes: a round that changed nothing still moves the
+"next step" line, and a stale "next step" is how a plan drifts.
 
 **Reading list for B–D.** Four implementations are checked out under
 `~/tmp/mhd-references/`; each is cited where the plan uses it:
