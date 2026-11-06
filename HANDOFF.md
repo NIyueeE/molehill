@@ -941,20 +941,33 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** §4.1 carries the findings; this is the sequence.
+**Order, as of this commit.** §4 carries the findings; this is the sequence only.
 
-The clean cell is **1.4 ms of setup plus a 5 ms round trip**, and A0j puts that
-whole round trip in one leg (`wire`), with this end's own read-and-hand-off and its
-write-back both at zero. So what remains is a handful of task hops through the
-client and the backend, about a millisecond each.
+1. **A0z — the cell's remaining ~3 ms.** Pairing, echo and the carrier's hops are
+   measured; the visitor's own path outside the pairing is not. Until it is, no
+   change to the carrier can be justified by this cell.
+2. **A0aa — variance.** Our A/A spread on `churn-16`'s p99 is an order of
+   magnitude wider than a TCP peer's, and a tail that varies is a queue, not a
+   cost. This is the only open question whose answer could move the p99.
+3. **A is implemented and stays off** (`MOLEHILL_MHD_SEAL`): it removes a 1.7 ms
+   open and costs more elsewhere (§4.10, §4.13). Its default is decided by those
+   numbers, not by the design's elegance.
+4. **A per-visitor spare channel is refuted** (§4.20). A fixed small reserve,
+   refilled only when the pool is empty, is a *different* experiment and is
+   unrun; it is not in this list until 1 and 2 say the pool is the constraint.
+5. **B (RACK + PTO) is the next real work**, and it is now judged on the shaped
+   cells rather than on the clean one: `loss1` and `loss5` report 1.06 s and
+   1.46 s of p99, which is where recovery, not setup, decides the number.
+6. **C and D keep their order** behind B. C owns contention between an opening
+   and bulk, which the clean cell no longer appears to exercise; D owns the
+   window, which the clean cell never fills.
+7. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
+   `cpu_s_per_gbit` against a same-round A/A.
 
-**A0l is done** (§4.7): on reuse we are at parity with a TCP peer (0.155 against
-0.162 ms; 8 % behind on the sixteen-connection rate), and on sixteen *fresh*
-connections we are 1.44× slower (10.4–12.1 against 7.2–7.3 ms).
-
-**A0m is done** (§4.7): the median is at parity with a TCP tunnel — 6.9–7.3
-against 6.5–6.6 ms — and the whole difference is the **p99**, 10.4–12.1 against
-7.2–7.4. The tail, not the typical case, is what is left.
+What is **not** on this list, and why: making the clean cell faster by removing the
+per-visitor handshake (measured, loses), by keeping a channel per visitor
+(measured, loses), by another timer constant (three refuted), and by another
+scheduling stamp on the pump (the pump is not the constraint).
 
 **A0n is done** (§4.7): the pool never grew during `churn-16`, and every channel
 open is now histogrammed — **p50 1.23–1.26 ms, p99 4.23–4.56 ms**. The cell's gap
