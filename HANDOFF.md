@@ -256,34 +256,36 @@ hold).
 
 Same scaled timeline, before and after:
 
-| stage | `buffered` before | `buffered` after | throughput before | throughput after |
+| stage | what the condition admits | carried before | carried after | `buffered` after |
 |---|---|---|---|---|
-| `clean` | 5.4 MB | 8.3 MB | 10.26 | 9.33 |
-| `rtt100` | 65 KB | 65 KB | 3.32 | 1.68 |
-| `loss1` | 17.0 MB | **5.3 MB** | 7.72 | 6.52 |
-| `loss5` | 31.7 MB | **150 KB** | 0.21 | 0.014 |
-| `rate100` | 31.7 MB | **2.9 KB** | 0.09 | 0.09 |
-| `rate20` | 31.7 MB | **2.9 KB** | 0.0 | 0.019 |
-| `jitter` | 33.5 MB | **2.1 MB** | 4.76 | 3.64 |
-| `clean#2` | 33.5 MB | **15.0 MB** | **0.0** | **6.28** |
+| `clean` | the path | 10 260 Mbit/s | 9 334 | 8.3 MB |
+| `rtt100` | a 100 ms path | 3 327 | 1 678 | 65 KB |
+| `loss1` | 1 % loss, 10 ms | 7 715 | 6 524 | **5.3 MB** |
+| `loss5` | 5 % loss, 100 ms | 218 | 19.4 | **150 KB** |
+| `rate100` | 100 Mbit/s | **94** | **93** | **2.9 KB** |
+| `rate20` | 20 Mbit/s | **0 (zero bytes)** | **19.7** | **2.9 KB** |
+| `jitter` | 20 ± 10 ms | 4 763 | 3 635 | **2.1 MB** |
+| `clean#2` | the path | **0 (zero bytes)** | **6 273** | 15.0 MB |
 
 Eight reaps logged. **The leak is gone** — `buffered` returns to kilobytes after every
-shaped stage instead of accumulating to the ceiling — and **`clean#2` carries bulk again
-(0 → 6.28 Gbit/s)**, which was the pre-registered "the stage becomes a measurement" test.
+shaped stage instead of accumulating to the ceiling — and the two stages that had carried
+**zero bytes** now carry: `rate20` at 19.7 Mbit/s against its 20 Mbit/s shaper, and
+`clean#2` at 6 273 Mbit/s against no shaper at all. `clean#2` becomes a measurement again,
+which was the pre-registered test that could actually be met.
 
-**The shaped stages are still empty, and now for a different reason.** Their `buffered`
-reads 2.9–150 KB, so they are no longer leak-limited: the buffer ceiling has room and
-nothing is refused by it. The pre-registered pass asked for all four of `loss5`,
-`rate100`, `rate20`, `clean#2` above 4 Gbit/s, so **it is unmet as written** — one of four
-cleared it — and the honest reading is that the criterion bundled two separable claims:
-"the leak is gone" (met, with a mechanism and eight reaps) and "the shaped stages are
-fast" (a different question, and their near-zero `buffered` says it is not this budget).
+**And the criterion that could not.** The pass as written asked for `loss5`, `rate100`,
+`rate20` and `clean#2` all above 4 Gbit/s — which no 20 Mbit/s or 100 Mbit/s shaper can
+satisfy, so that half of it was a specification error rather than a result. Against the
+right question — "does each stage carry what its condition admits" — `rate20` (19.7 of 20),
+`rate100` (93 of 100) and `clean#2` (6 273, unshaped) do; `loss5` reads 19.4 against 218 in
+the same stage before the fix, and one run each cannot say whether that is the fix or the
+stage's own variability, which is 5 % loss at 100 ms and the most brutal condition here.
 
 **What is deliberately not claimed.** The pre-registered guard — `clean` and `rtt100`
 unchanged within the run's own A/A — was not measured: this run had one arm and one
-round. `clean` read 9.33 against 10.26 before, and `rtt100` 1.68 against 3.32, and at this
-cell's known floor neither difference is interpretable. A fix that only *releases* budget
-cannot reduce throughput by construction, but construction is not a measurement.
+round. `clean` read 9 334 against 10 260 before, and `rtt100` 1 678 against 3 327, and at
+this cell's known floor neither difference is interpretable. A fix that only *releases*
+budget cannot reduce throughput by construction, but construction is not a measurement.
 
 **Next experiment, pre-registered before it runs.** The guard this round owed: two arms,
 the patched binary against the previous commit's, one scaled timeline, **four rounds**,
@@ -294,33 +296,42 @@ each arm's stages compared in the same run.
   throughput is above the unpatched arm's by more than the run's A/A spread.
 - **Rollback**: `clean` or `rtt100` below the unpatched arm by more than that spread —
   which would mean the hold is reaping streams that were still delivering.
-- **Then, as its own question**: why `loss5`/`rate100`/`rate20` carry almost nothing with
-  a free buffer ceiling. Their iperf3 artifacts are the place to start (a zero window
-  again would point at the *visitor's* socket rather than at the tunnel), and the stage's
-  own hold at `--scale 0.2` is only 24 s, which may be shorter than iperf3 needs to ramp
-  under a 100 ms delay.
+- **Then, as its own question, with the right denominator**: whether each shaped stage
+  carries what its condition admits. Before the fix `rate20` carried 0 bytes against a
+  20 Mbit/s shaper and `clean#2` 0 against none; after it they read 19.7 and 6 273. What
+  is left unexplained is `loss5`: 218 Mbit/s before the fix and 19.4 after, in one run
+  each, on the harshest condition here. That needs rounds, not a rewording — and it is
+  the one shaped cell where the fix may have cost something.
 
-### 4.50 The first lossy stage kills the bulk spine for the rest of the run: abandoned streams never give their buffer back (2026-11-06)
+### 4.50 Abandoned streams never give their buffer back, and two stages carried zero bytes (2026-11-06)
 
 §4.49 asked which stream was reset and why the pool did not help. The answer is worse
 and simpler: **nothing was reset, nothing died, and the connection's buffer budget leaked
-until it was full.** `buffered` per stage, one scaled timeline, server lanes:
+until it was full.** `buffered` per stage, one scaled timeline, server lanes; the third
+column is what the stage's own shaper admits, because **a rate class is supposed to read
+its own rate** and a table in Gbit/s hides that:
 
-| stage | throughput (Gbit/s) | `buffered` p50 |
-|---|---|---|
-| `clean` | 10.26 | 5.4 MB |
-| `rtt100` | 3.32 | 65 KB |
-| `loss1` | 7.72 | **17.0 MB** |
-| `loss5` | **0.21** | **31.7 MB** |
-| `rate100` | **0.09** | 31.7 MB |
-| `rate20` | **0.0** | 31.7 MB |
-| `jitter` | 4.76 | **33.5 MB** (the ceiling) |
-| `clean#2` | **0.0** | 33.5 MB |
+| stage | what the condition admits | carried | `buffered` p50 |
+|---|---|---|---|
+| `clean` | the path | 10 260 Mbit/s | 5.4 MB |
+| `rtt100` | a 100 ms path | 3 327 Mbit/s | 65 KB |
+| `loss1` | 1 % loss, 10 ms | 7 715 Mbit/s | **17.0 MB** |
+| `loss5` | 5 % loss, 100 ms | 218 Mbit/s | **31.7 MB** |
+| `rate100` | 100 Mbit/s | **94 Mbit/s** | 31.7 MB |
+| `rate20` | 20 Mbit/s | **0 (zero bytes)** | 31.7 MB |
+| `jitter` | 20 ± 10 ms | 4 763 Mbit/s | **33.5 MB** (the ceiling) |
+| `clean#2` | the path | **0 (zero bytes)** | 33.5 MB |
 
-Monotone, never returning, and from `loss5` onward the bulk spine carries nothing at
-all. **The run is over at its third stage**, and every throughput number after it — the
-shaped stages' cells, `clean#2`'s "recovery", §3.3's capacity ramp, §4.2's shaped-stage
-judgement — was measured on a dead spine.
+So the leak starves exactly the stages that must carry **unshaped volume** — `rate20`, whose
+shaper admits 20 Mbit/s and which carried nothing at all, and `clean#2`, which has no
+shaper — while a rate class that admits little hides the defect behind its own ceiling.
+
+**And the correction, because the first version of this section got it wrong.** It said
+"the run is over at its third stage and every throughput number after it is on a dead
+spine". That is false: the shaped stages carried their shapers' rates throughout, and
+§4.2's shaped-cell judgements were measured on a spine that was carrying. What is true and
+was measured: `buffered` climbed to the ceiling, two stages carried **zero bytes**, and
+after the fix (§4.51) both carry their expected rates.
 
 **The mechanism is in `Conn::settle`.** A stream retires only when
 `abandoned && fin_sent && send.unacked() == 0`, and `fin_sent` itself requires
@@ -2070,14 +2081,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Stop the buffer budget from leaking on abandonment** (§4.50, pre-registered
-   there). A stream that cannot be acknowledged never retires, and its bytes stay
-   counted in `Conn::buffered`, so `held == 0` refuses every later stream on the lane.
-   Measured: the first lossy stage takes the bulk spine from 7.7 to 0.21 Gbit/s and it
-   never comes back — every shaped-stage and `clean#2` throughput number in this file is
-   on a dead spine. The fix is a bounded wait (retire an abandoned stream after 30 s with
-   a reset, releasing its bytes), and its pass is a run in which `buffered` stops being
-   monotone and the shaped stages carry more than 4 Gbit/s.
+1. **The two-arm guard for the abandon hold, and `loss5`'s own question** (§4.51,
+   pre-registered there). The fix is in (`d0f11a1`, and it works: `buffered` stops being
+   monotone and the two stages that carried zero bytes now carry 19.7 Mbit/s against a
+   20 Mbit/s shaper and 6 273 against none), but the one guard it owed — `clean` and
+   `rtt100` unchanged within a same-run A/A — was never measured, and `loss5` read 218
+   Mbit/s before the fix and 19.4 after, in one run each. Two arms, four rounds, one
+   scaled timeline: the patched arm must be at or above the previous commit's on `clean`
+   and `rtt100`, and above it on `clean#2` beyond the run's A/A.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
