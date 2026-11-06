@@ -368,14 +368,40 @@ sixteen concurrent opens takes that long to get to some of them. It is not the
 handshake, not the timer, not the pool, and not the acknowledgement — each of those
 was measured and excluded.
 
-**So the fix is phase C's, and it is small and testable**: let an open proceed
-without the driver round trip — a per-tunnel permit (a semaphore or an atomic
-counter) checked and taken inline, with the driver only for the cases that need it.
-The hypothesis is precise: the open's p50 should fall from 1.4 ms toward the
-carrier's own sub-millisecond open, and its p99 from 4.3 ms toward about one.
+**A0q corrects that in two ways, and finds an instrument bug on the way.**
 
-The next step is **A0q**: that experiment, judged on `churn-16`'s p50 and p99 and
-on `rr-1` for the no-regression half.
+1. **mhd does not take the driver hop.** `MhdLane` implements `PoolLane` itself
+   (`pump.rs:1040`), so `complete()` calls it inline; the request/reply through
+   `ClientTunnel` is the **yamux** path only. The paragraph above describes the
+   other carrier.
+2. **`ack_us` has always read zero, by construction.** The stamp was taken
+   immediately beside the measurement:
+
+   ```rust
+   let ack_at = Instant::now();
+   let ack_us = ack_at.elapsed();   // zero, every time
+   ```
+
+   so the hello's round trip was never measured, and every `ack_us=0` in this
+   file's history — including one read as "the acknowledgement is free" — meant
+   nothing. The stamp is now taken after the hello is flushed and before the
+   answer is read.
+
+With it fixed, both phases go into histograms, and the open turns out to be
+**two serial waits of the same size**:
+
+```
+open_channel  p50 1235–1246 µs   p99 4.3–4.9 ms
+hello_ack     p50 1235–1244 µs   p99 4.3–4.7 ms
+```
+
+Two independent ~1.2 ms waits inside one open, where the carrier's own round trip
+on an idle lane is a tenth of a millisecond. That is what a fresh connection pays
+twice, and it is why its median sits at 1.4 ms above the peer's.
+
+The next step is **A0r**: find what each wait waits for. Both are "the runtime runs
+something else first" in shape, so the instrument is a wake-up stamp on each side
+of `read_ack` and of `open_channel_with_id`, not another protocol experiment.
 
 ---
 
@@ -438,9 +464,13 @@ own open, the pool's reservation, the placement map) is microseconds. So an open
 1.4 ms median and 4.3 ms p99 are **task-hop latency**, which is phase **C**'s
 ground.
 
-**A0q** is the experiment that follows: let an open take a per-tunnel permit inline
-instead of round-tripping to the driver, and judge it on `churn-16`'s p50 and p99
-with `rr-1` as the no-regression half.
+**A0q corrected that and found an instrument bug** (§4.7): mhd implements
+`PoolLane` inline (`pump.rs:1040`), so the driver hop is the *other* carrier's path;
+and `ack_us` had always read zero because its stamp sat beside its own measurement.
+Fixed, the two phases are histograms and the open is **two serial waits of ~1.2 ms
+each** (p99 4.3–4.9 ms), where the carrier's idle round trip is 0.1 ms.
+
+**A0r** is next: a wake-up stamp either side of each wait, to say what it waits for.
 
 Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which is where the hop latency belongs) → **D** (delivery-rate

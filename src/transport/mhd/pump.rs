@@ -1093,6 +1093,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // is the acknowledgement. Stamped before the branch instead — as this was
         // first written — `hs_us` measured the preparation and read a flat `1`,
         // which cost a round of believing the handshake was free.
+        let mut ack_at = Instant::now();
         let (stream_id, stream, ack, hs_us) = if carries {
             let (id, stream, theirs) = self.open_channel_carrying(&hello).await?;
             let hs = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -1110,6 +1111,12 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 .flush()
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            // The hello is on the wire from here; the wait for its answer starts
+            // now. Stamped *before* the read, because the stamp used to sit
+            // immediately beside `elapsed()` further down — which measured zero by
+            // construction and hid this whole phase (its line always read
+            // `ack_us=0`).
+            ack_at = Instant::now();
             let ack = crate::protocol::read_ack(&mut stream)
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
@@ -1139,11 +1146,15 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 "mhd open round trip"
             );
         }
-        let ack_at = Instant::now();
         // The acknowledgement's wait: from the hello going out to its answer —
         // or, in the carrying shape, from the handshake returning to the reply's
         // payload being parsed.
         let ack_us = u64::try_from(ack_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // Both phases into histograms, every open: the line further down prints
+        // only past five milliseconds, which is a sample of the worst (see
+        // `stats::note_open_phase`).
+        crate::transport::stats::note_open_phase(0, hs_us);
+        crate::transport::stats::note_open_phase(1, ack_us);
         // The server reserved this lane's slot on this open, so the next one can
         // carry its hello in the handshake's opening message and be answered in
         // the reply: one round trip instead of two.

@@ -296,6 +296,28 @@ static OPEN_US: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// 1.2 ms median — but a threshold line at one millisecond never caught any of the
 /// four, so the tail lives in a part that is fast in the typical case and slow at
 /// the ninety-ninth. Only the p99 of each step can say which.
+/// The two phases of an mhd channel open: the channel itself (`hs_us`, which
+/// includes the Noise handshake when one is carried) and the hello's round trip
+/// (`ack_us`). The slow-open line already states both, but only past five
+/// milliseconds — a sample of the worst, not a distribution.
+static OPEN_PHASE: [std::sync::Mutex<Vec<u32>>; 2] = [
+    std::sync::Mutex::new(Vec::new()),
+    std::sync::Mutex::new(Vec::new()),
+];
+
+/// Note one phase of an mhd channel open: 0 is `hs_us`, 1 is `ack_us`.
+pub(crate) fn note_open_phase(phase: usize, us: u64) {
+    if !enabled() || phase >= OPEN_PHASE.len() {
+        return;
+    }
+    let mut samples = OPEN_PHASE[phase]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(u32::try_from(us).unwrap_or(u32::MAX));
+    }
+}
+
 static OPEN_STEP: [std::sync::Mutex<Vec<u32>>; 4] = [
     std::sync::Mutex::new(Vec::new()),
     std::sync::Mutex::new(Vec::new()),
@@ -1244,6 +1266,32 @@ fn report_open_steps() {
     }
 }
 
+/// Report the two open phases: the median and the tail of each.
+fn report_open_phases() {
+    for (phase, name) in ["open_channel", "hello_ack"].iter().enumerate() {
+        let samples = {
+            let mut guard = OPEN_PHASE[phase]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = std::mem::take(&mut *guard);
+            drop(guard);
+            let mut sorted = taken;
+            sorted.sort_unstable();
+            sorted
+        };
+        if samples.is_empty() {
+            continue;
+        }
+        info!(
+            phase = name,
+            n = samples.len(),
+            p50_us = pct_us(&samples, 50, 100),
+            p99_us = pct_us(&samples, 99, 100),
+            "mhd-stats: a phase of an mhd open"
+        );
+    }
+}
+
 fn report_growth() {
     let growth = {
         let mut samples = POOL_GROWTH
@@ -1278,6 +1326,7 @@ fn report_send_path() {
     report_growth();
     report_opens();
     report_open_steps();
+    report_open_phases();
     let roundtrip = {
         let mut samples = FIRST_ROUNDTRIP
             .lock()
