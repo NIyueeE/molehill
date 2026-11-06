@@ -1062,9 +1062,12 @@ Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged o
 
 **Order, as of this commit.** §4 carries the findings; this is the sequence only.
 
-1. **A0z — the cell's remaining ~3 ms.** Pairing, echo and the carrier's hops are
-   measured; the visitor's own path outside the pairing is not. Until it is, no
-   change to the carrier can be justified by this cell.
+1. **A0ac — where the release cell's 22.5 ms actually is.** Everything this carrier
+   owns on that cell is measured and adds up to under two milliseconds (§4.23,
+   §4.24). Three candidates remain and each is a measurement, not an inference: the
+   probe's own connect-and-ask path (a **control arm on the same `timeline` cell**
+   separates it in one run), a queue in front of the accept, or a small population
+   the medians cannot see. Nothing else should be built until this is answered.
 2. **A0aa — variance.** Our A/A spread on `churn-16`'s p99 is an order of
    magnitude wider than a TCP peer's, and a tail that varies is a queue, not a
    cost. This is the only open question whose answer could move the p99.
@@ -1088,40 +1091,9 @@ per-visitor handshake (measured, loses), by keeping a channel per visitor
 (measured, loses), by another timer constant (three refuted), and by another
 scheduling stamp on the pump (the pump is not the constraint).
 
-**A0n is done** (§4.7): the pool never grew during `churn-16`, and every channel
-open is now histogrammed — **p50 1.23–1.26 ms, p99 4.23–4.56 ms**. The cell's gap
-to the TCP peer is 3.2–4.7 ms, so the gap *is* the open's tail, and neither the
-pool's reservation nor the lane's open reaches a millisecond in the same run.
-
-**A0o is done** (§4.7): the four placement steps are histograms now, and `open`
-alone carries both the median (1.19 ms) and the tail (p99 4.27 ms). The pool's
-reservation never reaches a millisecond; `complete`'s own line reads mean 1.4 ms
-and max 6.9 ms; the lane's internal open stays under one. So the cost is inside
-`complete()`'s `tunnel.open_stream()`, the last unsplit stretch.
-
-**A0p closes the chain** (§4.7): `ClientTunnel::open_stream` is a request to a
-driver task and a reply — two wake-ups — and everything inside it (the carrier's
-own open, the pool's reservation, the placement map) is microseconds. So an open's
-1.4 ms median and 4.3 ms p99 are **task-hop latency**, which is phase **C**'s
-ground.
-
-**A0q corrected that and found an instrument bug** (§4.7): mhd implements
-`PoolLane` inline (`pump.rs:1040`), so the driver hop is the *other* carrier's path;
-and `ack_us` had always read zero because its stamp sat beside its own measurement.
-Fixed, the two phases are histograms and the open is **two serial waits of ~1.2 ms
-each** (p99 4.3–4.9 ms), where the carrier's idle round trip is 0.1 ms.
-
-**A0r** is next: a wake-up stamp either side of each wait, to say what it waits for.
-
-Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
-scheduling, which is where the hop latency belongs) → **D** (delivery-rate
-controller) → **phase 6** (memory and CPU) → **phase 7** (full verification, then
-the release record).
-
-**Keep this order in two places, and update both together.** `HANDOFF.md` is the
-durable copy; the session's goal objective is the copy that is re-read every round,
-and a stale objective re-asserts a plan that has already been refuted. When a
-result changes the order — a step finished, a hypothesis refused, a phase
+This section is the **durable copy** of the order; the session's goal objective is
+the copy that is re-read every round, and a stale objective re-asserts a plan that has already
+been refuted. When a result changes the order — a step finished, a hypothesis refused, a phase
 promoted — the same commit updates this section *and* the objective.
 
 **Reading list for B–D.** Four implementations are checked out under
