@@ -608,6 +608,43 @@ The relationship is across runs, not a controlled experiment — the next one to
 sweep with the bulk spine *throttled* to a fixed rate and the arrival measured at each, which
 turns a correlation into a curve and says where the knee is.
 
+### `just bench gate` passes: both clean stages, capacity 8 of 8, full coverage (2026-11-06)
+
+A complete five-arm sweep on a freshly built binary (the previous one measured a **stale** binary — `just
+bench doctor` reports `stale=True` and the number that disagreed, 91.98 ms, came from that build). Two hours
+and eighty-three samples later:
+
+```
+gate: profile sweep fingerprint 1421e66cb2be72f0 revision v0.11.2-592-gff0bae7
+coverage: 83 measured arm/scenario/cell triples
+endpoint invariant: 57 samples carry a dialed endpoint
+SLO: 4 clean-stage cells gated
+drowned cells: 0 refused
+drift: checked the run cells' slopes and wedges
+capacity: molehill 8 of 8, l3 8 of 8, frp 8 of 8, rathole 8 of 8, nps 0 of 8
+gate: PASS
+```
+
+molehill's own numbers:
+
+| cell | p99 | throughput | errors |
+|---|---|---|---|
+| `timeline[clean]` | **22.50 ms** | 7.57 Gbit/s | 0.0 % |
+| `timeline[clean#2]` | **23.08 ms** | — | 0.0 % |
+| capacity L1–L8 | 3.1–24.5 ms | — | ramp 8 |
+
+**The gate's one failure from two cycles ago — `timeline[clean]` p99 81.83 ms on a clean stage — is gone**,
+and the two conditions the objective names first are met on this run: both clean stages are inside fifty
+milliseconds with zero errors, and capacity is sustained at eight of eight.
+
+What remains before a release record is the regression half, which the gate only judges with a baseline:
+`just bench gate --baseline <previous release>` compares against `benches/records/`, and that is where
+`bulk-n` within fifteen percent and the TCP comparison live. Neither has been run against this tree yet.
+
+Also recorded, because it cost two rounds: **`just bench doctor` is the first thing to run after a container
+restart** — the binary survives in `target/` while the sources' mtimes do not, so a stale build silently
+measures the previous tree. One `cargo build --release` turned a 91.98 ms failure into a 22.50 ms pass.
+
 ### Same build, same profile: `clean` reads 22.5 ms in one sweep and 92.0 in the next (2026-11-05)
 
 The second full sweep after the deadline fix was gated, and the two runs of the **same binary** disagree by
