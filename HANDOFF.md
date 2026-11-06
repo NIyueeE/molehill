@@ -238,6 +238,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.20 A spare channel per visitor loses everywhere (2026-11-06)
+
+With the pairing measured at 2.0 ms — all of it a channel opened *after* the visitor arrived — the
+obvious design answer is to keep one ready. It was implemented behind `MOLEHILL_MHD_SPARE` (one
+`DataChannelRequest::Plain` per paired visitor) and measured in the same round, four samples a cell:
+
+| cell | spare on | this session's baseline |
+|---|---|---|
+| `churn-16` | 10.73–13.18 ms | 10.17–11.88 ms |
+| `rr-1` | **0.208–0.210 ms** | 0.151–0.163 ms |
+| `rr-16` | **20 095–20 290 1/s** | 23 382–23 754 1/s |
+
+**It loses on every cell**: a third slower on reuse and fourteen percent slower at sixteen
+connections, while the cell it was meant to help does not improve. One spare per visitor doubles the
+channels the client opens, and opening a channel costs a handshake — so the belt is fed faster than
+it is consumed and the cost lands on the data path.
+
+By the rule this objective was started with — a change that does not win is reverted whole, with its
+measurement kept — the code is reverted and the numbers stay here. The idea is not refuted in
+principle; *one spare per visitor* is. A reserve of a fixed small depth, refilled only when the pool
+is empty, is a different experiment and has not been run.
+
 ### 4.19 The five milliseconds were the tail of a gated log; the median pairing is 2.0 ms (2026-11-06)
 
 `report_pairing` opens with `if facts.paired_us < 5_000 { return }`. **Every pairing number this
@@ -1004,6 +1026,7 @@ spending a day.
 | 11 | Per-visitor Noise record layer, mux-over-mhd, more lanes / window / threads, static warm pool | rejected earlier; reasoning in the archive |
 | 12 | `MIN_RTO_SMALL_FLIGHT` 20 → 2 ms | `churn-16` 10.2 → 9.95 ms, inside the ±0.5 ms A/A noise — the 20 ms open is not this clamp |
 | 13 | `SMALL_FLIGHT_INITIAL_RTO` 20 → 2 ms | `churn-16` 10.2 → 9.5–10.7 ms, no change — not the unmeasured small-flight timer either |
+| 14 | One spare data channel per visitor (`MOLEHILL_MHD_SPARE`) | loses on every cell — reuse −30 %, `rr-16` −14 %, `churn-16` unchanged; reverted (§4.20) |
 
 One row is **not** in this table because it worked: the striped group's reorder
 deadline was **2 s**, shorter than an 11.9 s carrier stall, so the reader failed
