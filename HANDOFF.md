@@ -238,6 +238,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.26 The release cell costs 17 minutes per arm-round, and that is arithmetic (2026-11-06)
+
+§4.25 said a round cannot hold this cell. The schedule says why, exactly: `TIMELINES["sweep"]` is
+**eight stages of 150 and 120 seconds** — 1 020 s, seventeen minutes, for one arm and one round,
+and the runner's warm-up doubles it.
+
+So a three-arm run (`control`, `molehill`, the A/A arm) is **about a hundred minutes**, which is
+what the two attempts in this cycle looked like from the outside: at thirty-five minutes the run was
+still in the first arm's warm-up, and the earlier one had reached only the sixth stage of the first
+arm in thirteen.
+
+**The consequence is a rule, not an apology: the release cell is measured once per release, with the
+sweep that the release ritual already prescribes, and never inside an optimization round.** Every
+measurement a round can act on comes from the three-minute cells (`churn-16`, `rr-1`, `bulk-*`), and
+any claim about `timeline` must be carried by a sweep that was started deliberately and collected
+when it lands.
+
+The control-versus-molehill sweep started last round is still running and will be collected; the
+number it produces is the one A0ac needs, and it is now known to cost a hundred minutes rather than
+being "slow".
+
 ### 4.25 The release cell cannot be measured in a round; and `cost` is not a latency cell (2026-11-06)
 
 A0ac needs one number — what a control arm (no tool in the path) reports on the same `timeline`
