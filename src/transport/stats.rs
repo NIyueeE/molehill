@@ -278,6 +278,8 @@ static POSTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// *after* the stream exists (`opened` is stamped in the task), so a stream that
 /// sat in the accept queue for twenty milliseconds contributed nothing to any
 /// timer — the handshake would read fast and the arrival would still be slow.
+static FIRST_ROUNDTRIP: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 static ACCEPTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 /// How long one lane's admission took inside the dispatcher's receive callback.
@@ -814,6 +816,26 @@ fn take_post() -> Vec<u32> {
 }
 
 /// Record one stream's wait for its accept, in microseconds.
+/// The visitor's first round trip through a striped group: first frame read
+/// from the visitor to first frame written back to it.
+///
+/// A **histogram**, not a threshold log, because the cost this cycle chased was
+/// measured on the slow tail and mistaken for the median: a line that prints only
+/// past a threshold is a sample of the wrong population. Reported as p50/p90/p99
+/// once a second under the stats switch.
+pub(crate) fn note_first_roundtrip(age: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = FIRST_ROUNDTRIP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
 pub(crate) fn note_accept_age(age: Duration) {
     if !enabled() {
         return;
@@ -1081,6 +1103,27 @@ fn report_send_path() {
             post_p99_us = pct_us(&posted, 99, 100),
             post_max_us = posted.last().copied().unwrap_or(0),
             "mhd-stats: the pump's post to the socket"
+        );
+    }
+    let roundtrip = {
+        let mut samples = FIRST_ROUNDTRIP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *samples);
+        drop(samples);
+        // Sorted, because `pct_us` reads a sorted slice: the first run of this
+        // line printed p99 below p50, which is the signature of forgetting it.
+        let mut sorted = taken;
+        sorted.sort_unstable();
+        sorted
+    };
+    if !roundtrip.is_empty() {
+        info!(
+            n = roundtrip.len(),
+            rt_p50_us = pct_us(&roundtrip, 50, 100),
+            rt_p90_us = pct_us(&roundtrip, 90, 100),
+            rt_p99_us = pct_us(&roundtrip, 99, 100),
+            "mhd-stats: the visitor's first round trip"
         );
     }
     let accepted = take_accept_age();

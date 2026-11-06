@@ -305,11 +305,28 @@ So the visitor's setup, at the median, is about 1.4 ms — and the `churn-16` ce
 (1.4 ms measured there against `hs_us` and placement both under one) is worth one
 more stamp, but it cannot account for ten.
 
-The next step is **A0i**: split the first request's round trip on both ends, the
-same way the setup was split — client send, server forward, backend echo, server
-write-back, client receive — and quote the **median** as well as the tail, because
-this round's lesson is that a threshold-gated log is a sample of the wrong
-population.
+**A0i is done, and the cell now decomposes end to end.** A histogram on the
+striped group — first frame read from the visitor to first frame written back —
+reported as percentiles once a second:
+
+| part of the `churn-16` cell | measured |
+|---|---|
+| setup (A0h) | **1.4 ms** |
+| visitor's first round trip, server side | **p50 5 ms, p90 6 ms, p99 8 ms** |
+| cell | 10.4 ms |
+
+(1 400–2 250 samples a second, ten seconds of `churn-16`.)
+
+The first run of that line printed p99 *below* p50, because it fed an unsorted
+vector to `pct_us`; it is sorted now, and the percentages above are from the fixed
+build. That defect is worth its own sentence: an instrument that reports a
+distribution has to be checked for the shape of its output, not only for firing.
+
+So the clean cell is **setup plus a five-millisecond round trip through the data
+path** on a loopback that answers in a tenth of a millisecond. The remaining work
+is per-hop latency in that path — the stripe layer's two hops and the carrier's
+two — which is scheduling, not protocol. That is phase **C**'s ground, and it is
+the only place the ten milliseconds can still be.
 
 After A0g, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which also carries the contended open measured at 21.8 ms) → **D**

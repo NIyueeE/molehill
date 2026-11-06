@@ -408,6 +408,7 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut sender: StripeSender<W>,
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     sourced: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    frames: std::sync::Arc<Frames>,
     group: u64,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
@@ -461,6 +462,12 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // whether a stalled group stopped because its source stopped producing.
         sourced.fetch_add(
             u64::try_from(n).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let _ = frames.first_in_ms.compare_exchange(
+            0,
+            epoch_millis(),
+            std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
         );
         if seq == 0 {
@@ -633,6 +640,33 @@ struct Frames {
     delivered: std::sync::atomic::AtomicU64,
     /// Bytes handed to the destination, which is the number the peer can check.
     written: std::sync::atomic::AtomicU64,
+    /// Epoch milliseconds when this group first read a byte from its source, and
+    /// whether the first byte has been written back since — together they are the
+    /// visitor's first round trip, which is what the churn cell prices.
+    first_in_ms: std::sync::atomic::AtomicU64,
+    replied: std::sync::atomic::AtomicBool,
+}
+
+/// Note the visitor's first round trip, once, when the first reply is written.
+///
+/// `first_in_ms` is stamped by the send loop when it first reads the visitor;
+/// this fires on the first write back. Both are epoch milliseconds, so the delta
+/// is comparable across the two tasks without a shared clock read.
+fn note_first_reply(frames: &Frames) {
+    let started = frames
+        .first_in_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if started == 0
+        || frames
+            .replied
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let now = epoch_millis();
+    crate::transport::stats::note_first_roundtrip(std::time::Duration::from_millis(
+        now.saturating_sub(started),
+    ));
 }
 
 /// Frames are held in a `BTreeMap` keyed by sequence number while an earlier
@@ -765,6 +799,7 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
                     .fetch_max(seq + 1, std::sync::atomic::Ordering::Relaxed);
                 if seq == next {
                     write_dest(&mut dest, &bytes).await?;
+                    note_first_reply(&frames);
                     frames
                         .written
                         .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -772,6 +807,7 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
                     next += 1;
                     while let Some(bytes) = pending.remove(&next) {
                         write_dest(&mut dest, &bytes).await?;
+                        note_first_reply(&frames);
                         frames
                             .written
                             .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -944,11 +980,16 @@ where
         let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(epoch_millis()));
         let sourced = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sourced_for_monitor = std::sync::Arc::clone(&sourced);
+        // Created before either loop: the send loop stamps the visitor's first
+        // byte and the receive loop notes the first reply, so the two share one
+        // set of counters (see `note_first_reply`).
+        let frames = std::sync::Arc::new(Frames::default());
         let mut send = tokio::spawn(send_loop(
             src,
             StripeSender::new(writes, plan),
             activity.clone(),
             sourced,
+            std::sync::Arc::clone(&frames),
             group_id,
         ));
         // What the receive direction has seen and what it has delivered, shared
@@ -957,7 +998,6 @@ where
         // a grace that fires with a *gap* (`highest + 1 > delivered` and no reader
         // left to fill it) is a frame that never arrived. The visitor's byte count
         // cannot tell those apart.
-        let frames = std::sync::Arc::new(Frames::default());
         let mut recv = tokio::spawn(recv_loop(
             reads,
             dest,
