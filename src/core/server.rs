@@ -4357,6 +4357,24 @@ fn note_expired(
 /// release is a request like any other (see
 /// [`DataChannelRequest::ReleaseGroup`]), so it travels the same ordered
 /// control sink the requests did.
+/// Note, in absolute epoch milliseconds, when a pairing's requests left for the
+/// client.
+///
+/// Absolute because the other end's stamps are: `client.got_ms - ask_ms` for the
+/// same group is the control hop, and the rest of the pairing's `wait_us` is the
+/// client's own open plus the channel's arrival. Its own function, above the
+/// `#[instrument]` attribute, because `pair_striped_group` is at its line budget
+/// and an attribute has to stay attached to the function it describes.
+fn note_pairing_request(group: u32) {
+    if !crate::transport::stats::enabled() {
+        return;
+    }
+    let ask_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    tracing::info!(group, ask_ms, "mhd pairing request");
+}
+
 #[instrument(skip_all, fields(stripes = stripe_count))]
 async fn pair_striped_group<C>(
     incoming: TcpStream,
@@ -4396,6 +4414,7 @@ where
             }
         }
         let enqueue_us = u64::try_from(pairing_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        note_pairing_request(group);
         debug!(
             group,
             stripes,

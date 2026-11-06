@@ -238,6 +238,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.15 The pairing wait, measured: a two-millisecond control hop and a 1.7 ms open (2026-11-06)
+
+The stamp is on the first request at last, in absolute epoch milliseconds, and it joins with the
+client's own arrival stamp for the same group. Six thousand four hundred groups:
+
+```
+control hop (server writes the request -> the client's stream delivers it)   p50 2.0 ms  mean 2.03  max 10
+server `wait_us` for the same groups                                        p50 5.41 ms mean 5.59  max 9.2
+```
+
+So the pairing wait is **2.0 ms of control hop, about 1.7 ms of channel open (§4.9) and about
+1.7 ms of the channel reaching the server**. The arithmetic closes to the measured 5.4 ms.
+
+**The control hop is the surprise: two milliseconds, where the same carrier's data hops are
+0.2 ms (§4.12).** A request written to the control session takes ten times as long to reach the
+client as a frame written to a data lane — on the same host, over the same carrier.
+
+That is now the freshest and best-supported target this cycle has: **every fresh visitor waits
+two milliseconds for a command to cross the control session**, and that is a third of the cell's
+ten. It is also the one part of the path the transport work in the plan never touched, because
+nothing had ever measured it.
+
+The whole cell, with every number now measured rather than inferred:
+
+| term | value | shared? |
+|---|---|---|
+| visitor accepted and paired — control hop + open + arrival | **~5.4 ms** | ours |
+| the first request's back-end echo | **~4.8 ms** | every arm pays it |
+| the request and reply's carrier hops | ~0.4 ms | ours |
+
+The next step is **A0w**: split the control hop — when the server's request leaves the control
+session's sink against when the client's command loop reads it — so the two milliseconds are
+attributed to a queue, a wake-up, or the mux layer above the carrier.
+
 ### 4.14 The pairing wait is not a request-and-response at all (2026-11-06)
 
 The last unexplained piece was the five to six milliseconds a visitor waits for a data channel
