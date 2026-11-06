@@ -258,17 +258,24 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** The next step is **A0b**: three timestamps inside
-`open_channel_carrying` — the first Noise message written, the packet posted by
-the pump, the reply arrived — judged on the `dev` profile's `churn-16` with a
-same-round A/A. It decides between two small fixes: a wake-up path that does not
-signal the pump (a scheduler bug), or a peer that answers late (an ACK-timing
-one). Either is smaller than phase A and is tried first.
+**Order, as of this commit.** The next step is **A0d**: split the visitor's
+10.4 ms setup — the number the plan's TCP comparison is made of — into its dial,
+its channel open (already instrumented as `started_us` / `open_us` / `ready_us` /
+`cmd_us`) and its echo round trip, by timing those three steps separately in the
+bench's churn probe. That is a bench-side instrument fix, not a carrier change,
+and it decides what the next carrier change has to move.
 
-After that, in order: **A** (lane-root keys, which removes the handshake that is
-21.8 ms of a 22.5 ms tail) → **B** (RACK + PTO) → **C** (priority scheduling) →
-**D** (delivery-rate controller) → **phase 6** (memory and CPU, only once the
-above hold) → **phase 7** (full verification, then the release record).
+The 21.8 ms open A0 found is **contention, not the clean path** (§4.1): it
+reproduces while bulk runs and does not appear in `churn-16` at all. It belongs
+to phase **C**. Phase **A**'s expected gain is therefore smaller than this
+document claimed two entries ago — the honest statement is that neither the
+handshake nor a timer accounts for the clean 10.4 ms yet.
+
+After A0d, in order: **A** (lane-root keys — still right on its own terms, and the
+contended open is a second reason) → **B** (RACK + PTO) → **C** (priority
+scheduling, now carrying the contended-open case) → **D** (delivery-rate
+controller) → **phase 6** (memory and CPU, only once the above hold) →
+**phase 7** (full verification, then the release record).
 
 **Keep this order in two places, and update both together.** `HANDOFF.md` is the
 durable copy; the session's goal objective is the copy that is re-read every round,
