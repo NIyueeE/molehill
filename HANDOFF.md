@@ -303,19 +303,28 @@ At 846–5 458 writes a round waiting 5–8 ms, with ~5 yields per pass, **a mil
 yield is the arithmetic that fits**, and it is the only interval in the pump's own loop
 this file has never measured.
 
-**Next experiment, pre-registered before it runs.** Bound the burst instead of yielding:
-after a full run, `continue` immediately and let `send_run`'s own `socket.writable()`
-await be the yield point when the socket stops accepting. One line.
+**Next experiment, pre-registered before it runs.** Bound the give instead of removing
+it: replace `yield_now()` with `tokio::task::coop::consume_budget().await` — the
+cooperative budget yields only once a task has spent it (~128 polls), so the pump keeps
+filling while the peer has budget to spare and gives up the worker on a cadence rather
+than on every full run.
+
+That is the second attempt at this loop, and the first one is in the record because it
+was measured and reverted in the same round: **removing the yield outright is a
+regression on every axis** — `wake.json`-shaped rounds read p99 355.8 / 135.3 / 26.8 /
+278.7 with throughput 3.31 / 4.97 / 6.36 / **0.74** Gbit/s, the listener's
+`max_gap_us` rose from 0.24–0.9 s to **20.3 s**, and the idle-wait count did not fall
+(1 588–3 653). A pump that never gives up its worker starves the dispatcher that feeds
+it acknowledgements, so the yield is load-bearing and only its *cost* is the defect.
 
 - **Pass**, over four rounds of the same cell: `idle write waited for the pump` below
-  **100 per round** (baseline 830–5 458) **and** all four rounds at p99 ≤ 25 ms with
-  throughput ≥ 7.0 Gbit/s. Same-day baselines to beat: `wake.json`
-  (846/1 093/5 458/830 events; p99 22.7/35.1/99.1/19.5) and `reserve.json`.
-- **Guard**: the listener's own cadence (`mhd listener cadence`, `max_gap_us`) must not
-  grow — a pump that hogs its worker without yielding would show up there first — and
-  `bulk-1`/`bulk-pair` inside a same-round A/A, `rr-1`/`rr-16` not worse.
-- **Rollback**: throughput below 7.0 Gbit/s, a listener `max_gap_us` above one
-  millisecond, or the event count unchanged.
+  **100 per round** (baseline 830–5 458) **and** all four at p99 ≤ 25 ms with throughput
+  ≥ 7.0 Gbit/s.
+- **Guard**: the listener's `max_gap_us` at or below **1 ms** — the no-yield attempt is
+  what that guard is for — plus `bulk-1`/`bulk-pair` inside a same-round A/A and
+  `rr-1`/`rr-16` not worse.
+- **Rollback**: any of the three: throughput below 7.0, a listener gap above 1 ms, or
+  the event count unchanged.
 
 ### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
 
@@ -1758,14 +1767,13 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Stop yielding the pump between full runs** (§4.46, pre-registered there). The
-   wake instrument produced zero parked-pump samples while 846–5 458 writes a round
-   still waited 5–8 ms, which exonerates the wake path and points at the pump's own
-   loop: 12–16 k flushes a second at ~5 per pass means the `SEND_RUN → yield_now() →
-   continue` path runs four or five times between waits, and a millisecond per yield
-   is the only arithmetic that fits. Pass: the idle-wait count below 100 per round,
-   all four rounds p99 ≤ 25 ms at ≥ 7.0 Gbit/s; guard on the listener's `max_gap_us`
-   and on bulk/rr.
+1. **Spend the pump's give, do not remove it** (§4.46, pre-registered there).
+   Removing `yield_now()` outright is measured and reverted: throughput 0.74 Gbit/s in
+   one round and a listener gap of 20 s, because a pump that never gives up its worker
+   starves the dispatcher that feeds it acknowledgements. `tokio::task::coop
+   ::consume_budget()` gives on a cadence instead of on every full run. Pass: idle-wait
+   events below 100 per round, all four rounds p99 ≤ 25 ms at ≥ 7.0 Gbit/s; guard: the
+   listener's `max_gap_us` ≤ 1 ms, bulk and rr inside a same-round A/A.
 2. **One stream, one hop** (the first *structural* change after that). A visitor
    starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
    whole group machinery: coordinator task, send loop, receive loop, one reader task
