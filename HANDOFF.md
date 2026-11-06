@@ -238,6 +238,49 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.39 The release cell is an aggregate of three workloads, and the slow one is churn (2026-11-06)
+
+Every round of this cycle has optimised "the cell": `timeline[clean]`, whose p99 the gate records as
+22.5 ms. The bench writes one ndjson per series per arm — `interactive`, `churn`, `udp` — and **that
+breakdown had never been read.** Cutting the first clean stage by series, from a surviving artifact:
+
+```
+clean, first 7.5 s
+  interactive   n=150   p50 2.52 ms   p99  3.52 ms   max   4.94
+  churn         n=120   p50 2.55 ms   p99 35.62 ms   max  38.82
+  udp           n=371   p50 0.77 ms   p99 24.45 ms   max  49.73
+  AGGREGATE     n=641   p50 2.00 ms   p99 24.22 ms   max  49.73     <- the cell
+```
+
+**The aggregate reproduces the cell (24.22 against the gate's 22.5), and the interactive path — the
+one every instrument in §4.27–§4.33 measures — is already at the peer's level: p99 3.52 ms.** The
+cell's p99 is carried by the **churn** series (fresh connections, p99 35.6) and, secondarily, by UDP.
+
+So the mystery this file has spent twenty rounds on is not a mystery: **the release cell measures
+three workloads at once, the interactive one is fine, and the tail belongs to the fresh-connection
+path** — the same path `churn-16` isolates at 10 ms in the dev profile. The two cells were always the
+same subject, and the aggregate hid it.
+
+Two caveats that must travel with this:
+
+- the window is `scale 0.05`, where a stage is 7.5 s; at that scale `clean#2` reads 42–1097 ms because
+  it follows `jitter` and `rate20` too closely for the shaper to settle, so **only the first stage is
+  usable at this scale**;
+- the same run reports ~13 700 `interactive` and ~11 100 `churn` error events, against the gate's
+  0.0 % — an artifact of the shortened stages and series startup, to be re-checked at full scale
+  before anything is concluded from it.
+
+**What this changes.** The comparison to a TCP peer must be per series: our interactive p99 is 3.52 ms
+against frp's *aggregate* 2.38, which is not the same quantity. The honest question is now "what does
+frp's churn series report on this cell", and answering it needs `just bench peers fetch` (its
+binaries are missing) and one run.
+
+**And the methodological lesson, which is the real answer to "why did this take so long":** the
+instrument chain was built on the server's interactive path — accept, pairing, turnaround, pump
+passes — and every one of them correctly said "microseconds", because that path was never the slow
+one. A metric that aggregates three workloads can be optimised forever without touching the one that
+carries its tail.
+
 ### 4.38 The live-task instrument was reverted, and the cheaper shape is named (2026-11-06)
 
 The obvious next step from §4.37 was a *live* task count: an atomic taken at a task's first statement
