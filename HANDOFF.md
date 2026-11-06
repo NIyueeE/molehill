@@ -238,6 +238,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.30 The tail has a mechanism, and the logs name it: the pump does not run (2026-11-06)
+
+Reading the per-second lines at a spike (§4.29's method) found two lines repeating through the whole
+run, both from instruments that were already there:
+
+```
+mhd idle write waited for the pump  lane=3 stream=5 waited_us=6929
+mhd idle write waited for the pump  lane=3 stream=5 waited_us=6568
+mhd idle write waited for the pump  lane=0 stream=73 waited_us=8488     (5 393-8 514 µs, all run)
+mhd stream delivered group=212 ... task_us=51224
+mhd stream delivered group=258 ... task_us=30187                        (30-51 ms)
+```
+
+`idle_queued` is set when a stream's data is queued on a lane and cleared when the pump builds a
+packet carrying it (`conn.rs`'s `poll_transmit`), so that line says, in its own words: **data was
+queued, and no pump pass ran for five to eight and a half milliseconds.**
+
+That is the echo tail's mechanism. §4.29 measured an echo p99 of 21–64 ms against a median of
+0.66 ms; three to eight such pump waits is the whole of it. The `paired` tail's 80 ms is the other
+line: a stream's serving task taking 30–51 ms (`task_us`), which is the same starvation seen from
+the server's side.
+
+So the cell's tail is **pump starvation on a lane that has nothing else to do** — the exact opposite
+of the contention hypothesis this file started with, and consistent with §4.9's observation that the
+pump is woken by its signal every time on `churn-16`, where it is never idle.
+
+The next step is **A0ag**: on this cell, count where each pass comes from — `Wake::Signal` or
+`Wake::Timer` — whenever an idle write was queued. If the passes that carry queued idle data are
+timer-driven, the wake is being missed on idle lanes; if they are signal-driven, the pump is being
+starved by something ahead of it in its own task.
+
 ### 4.29 The bracket already existed, and the cell's p99 is a tail in two places (2026-11-06)
 
 A0ae was going to add a bracket from the visitor's accept to the group's write-back. The bracket was
