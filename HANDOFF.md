@@ -244,6 +244,81 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.46 The wake is exonerated, and the reserve does not cover the buffer ceiling (2026-11-06)
+
+§4.45's instrument was built and run: the interval from `wake_pump()` to the pass
+that follows, sampled only while the pump is parked (`Shared::park` / `Parked::end`,
+`mhd-stats: how long a parked pump waited after its wake`). Over four rounds it
+produced **zero samples** — and the same rounds logged **846** `idle write waited for
+the pump` events on the server, so the two facts together are the answer rather than a
+broken instrument: **the pump was not waiting when those writes arrived.** The wake
+path cannot be blamed for a park that never happened.
+
+Where it was instead is in the same logs:
+
+```
+one pump pass  stage="pass"   n=1 782-3 382   p50 0 us   p99 29-38 us   max 380-4 380 us
+one pump pass  stage="flush"  n=12 259-16 622 p50 76 us   p99 451-971 us  max 1.0-1.7 ms
+stream byte waited in the send buffer   138 samples >= 20 ms, values 39 969-45 852 us
+```
+
+Twelve to sixteen thousand flushes a second — 44 packets each, so ~530 000 packets/s —
+with about **five flushes per pass**, i.e. the `sent == SEND_RUN → continue` loop. The
+server's pump never parks while the bulk has data, and a byte that is *in* the send
+buffer waits 40–46 ms for its turn. So the shortage is the pump's attention, and the
+846 events are writes that were **refused**, not writes that waited for a wake.
+
+**And the refusal is not an opening's.** The reserve hypothesis was written down,
+built and measured in the same round — one line, an opening may overdraw the buffer
+ceiling by `OPEN_RESERVE` — and **refuted by its own logs**:
+
+```
+writes refused, by the bound that refused   credit=123..886  window=3 596..11 970  aged=0  opening=0
+```
+
+`opening=0` in every round: **no opening was ever refused.** The refusals are bulk
+writes hitting the congestion window, 3 600–12 000 times a second, which is what
+`window = cwnd − flight = 0` looks like when the flight is 9.9 MB against a 262 144
+window. The reserve was given to `credit` and to `window` and correctly withheld from
+`credit` (overrunning a peer's advertised window is a protocol violation, not a
+policy); the third bound was never the problem. The change was reverted, four rounds
+of it kept: p99 78.8 / 26.3 / 121.0 / 39.3 against a 25 ms criterion, throughput
+9.00 / 7.11 / 7.68 / **4.80**, and `idle write waited` unchanged at 582–2 989 per round
+against the baseline's 830–5 458.
+
+**So what is left is the pump's own attention, and the loop says where to look.**
+Twelve to sixteen thousand flushes a second at **about five per pass** means the
+`sent == SEND_RUN → continue` path runs four or five times between two `wait()` calls,
+and each of those iterations **yields** the task:
+
+```rust
+if sent == SEND_RUN {
+    tokio::task::yield_now().await;
+    continue;
+}
+```
+
+A `yield_now` on a saturated runtime returns the task to the back of a worker's queue.
+At 846–5 458 writes a round waiting 5–8 ms, with ~5 yields per pass, **a millisecond per
+yield is the arithmetic that fits**, and it is the only interval in the pump's own loop
+this file has never measured.
+
+**Next experiment, pre-registered before it runs.** Bound the burst instead of yielding:
+after a full run, `continue` immediately and let `send_run`'s own `socket.writable()`
+await be the yield point when the socket stops accepting. One line.
+
+- **Pass**, over four rounds of the same cell: `idle write waited for the pump` below
+  **100 per round** (baseline 830–5 458) **and** all four rounds at p99 ≤ 25 ms with
+  throughput ≥ 7.0 Gbit/s. Same-day baselines to beat: `wake.json`
+  (846/1 093/5 458/830 events; p99 22.7/35.1/99.1/19.5) and `reserve.json`.
+- **Guard**: the listener's own cadence (`mhd listener cadence`, `max_gap_us`) must not
+  grow — a pump that hogs its worker without yielding would show up there first — and
+  `bulk-1`/`bulk-pair` inside a same-round A/A, `rr-1`/`rr-16` not worse.
+- **Rollback**: throughput below 7.0 Gbit/s, a listener `max_gap_us` above one
+  millisecond, or the event count unchanged.
+
+### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
+
 ### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
 
 §4.44 left one question: why the median lands at 6 ms whenever the queue is bounded,
@@ -1683,13 +1758,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Measure the idle pump's wake latency** (§4.45, pre-registered there). Three
-   bounds all traded the median for the throughput, and the reason is `rate = W / RTT`:
-   a window kept full is a queue. What each bound exposed is the *wake* — 1 300–1 600
-   `idle write waited for the pump` events per round at a 6.4–6.6 ms median in the
-   baseline itself. Instrument the interval from `wake_pump()` to the pump's next pass
-   before changing anything; the decision rule (above 1 ms → fix the wake; below
-   100 µs → the wait is downstream in the socket hand-off) is fixed in §4.45.
+1. **Stop yielding the pump between full runs** (§4.46, pre-registered there). The
+   wake instrument produced zero parked-pump samples while 846–5 458 writes a round
+   still waited 5–8 ms, which exonerates the wake path and points at the pump's own
+   loop: 12–16 k flushes a second at ~5 per pass means the `SEND_RUN → yield_now() →
+   continue` path runs four or five times between waits, and a millisecond per yield
+   is the only arithmetic that fits. Pass: the idle-wait count below 100 per round,
+   all four rounds p99 ≤ 25 ms at ≥ 7.0 Gbit/s; guard on the listener's `max_gap_us`
+   and on bulk/rr.
 2. **One stream, one hop** (the first *structural* change after that). A visitor
    starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
    whole group machinery: coordinator task, send loop, receive loop, one reader task

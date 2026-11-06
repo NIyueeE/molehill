@@ -1495,19 +1495,53 @@ pub(crate) fn note_pump_flush(age: Duration) {
     note_us(&PUMP_FLUSH, age);
 }
 
+/// The interval from a parked pump's wake-up call to the pass that follows it.
+///
+/// Three bounds of the send queue each traded the cell's median for its throughput
+/// (HANDOFF §4.43–§4.44), and the baseline's own threshold line says what a shallow
+/// queue exposes: 1 300–1 600 `idle write waited for the pump` events per round at a
+/// 6.4–6.6 ms median. A line that prints only past five milliseconds cannot say what
+/// a *typical* wake costs, and this is the distribution that decides between "the
+/// wake path is slow" and "the wait is downstream" (§4.45's rule: a p50 above 1 ms
+/// means the former, below 100 µs the latter).
+static WAKE_LATENCY: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one parked pump's wake latency.
+pub(crate) fn note_wake_latency(age: Duration) {
+    note_us(&WAKE_LATENCY, age);
+}
+
+/// Take one window's samples, sorted, leaving the slot empty.
+fn take_sorted(slot: &std::sync::Mutex<Vec<u32>>) -> Vec<u32> {
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let taken = std::mem::take(&mut *guard);
+    drop(guard);
+    let mut sorted = taken;
+    sorted.sort_unstable();
+    sorted
+}
+
+/// Report this second's wake latencies: the whole distribution, not a tail.
+fn report_wake_latency() {
+    let samples = take_sorted(&WAKE_LATENCY);
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50_us = pct_us(&samples, 50, 100),
+        p99_us = pct_us(&samples, 99, 100),
+        max_us = samples.last().copied().unwrap_or(0),
+        "mhd-stats: how long a parked pump waited after its wake"
+    );
+}
+
 /// Report this second's pump passes and their flushes.
 fn report_pump_loop() {
     for (name, slot) in [("pass", &PUMP_PASS), ("flush", &PUMP_FLUSH)] {
-        let samples = {
-            let mut guard = slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let taken = std::mem::take(&mut *guard);
-            drop(guard);
-            let mut sorted = taken;
-            sorted.sort_unstable();
-            sorted
-        };
+        let samples = take_sorted(slot);
         if samples.is_empty() {
             continue;
         }
@@ -1820,6 +1854,7 @@ fn report_all() {
         report_accept_wait,
         report_pump_wakes,
         report_idle_passes,
+        report_wake_latency,
         report_pump_loop,
         report_tasks,
         report_open_steps,

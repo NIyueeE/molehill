@@ -564,11 +564,19 @@ async fn wait(shared: &Arc<Shared>) -> Wake {
             None => std::future::pending().await,
         }
     };
-    tokio::select! {
+    // The pump is parked from here until this future completes or is dropped, and
+    // the guard is what makes a wake-up measurable: the stamp `wake_pump` takes
+    // while it is set is the instant the pump was first asked to look (§4.45).
+    let parked = shared.park();
+    let woke = tokio::select! {
         () = shared.pump_signal() => Wake::Signal,
         () = shared.closed() => Wake::Closed,
         () = timer => Wake::Timer,
+    };
+    if let Some(waited) = parked.end() {
+        crate::transport::stats::note_wake_latency(waited);
     }
+    woke
 }
 
 /// Start the pump for one connection that owns its socket.

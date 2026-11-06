@@ -59,6 +59,14 @@ pub(crate) struct Shared {
     ended: tokio::sync::Notify,
     /// The per-connection counters the status API reads.
     pub(crate) health: std::sync::Arc<SessionHealth>,
+    /// Whether the pump is inside [`Shared::wait`], which is the only state in
+    /// which a wake-up is a *latency* rather than a no-op.
+    parked: std::sync::atomic::AtomicBool,
+    /// Epoch microseconds of the first wake since the pump last ran, or zero.
+    ///
+    /// The first, not the last: several writes can land while the pump is parked,
+    /// and the wait the visitor pays began with the first of them.
+    wake_stamp_us: std::sync::atomic::AtomicU64,
     /// How many times this connection has woken its readers.
     ///
     /// The discriminator a parked reader cannot answer for itself: one that
@@ -81,6 +89,8 @@ impl Shared {
             ended: tokio::sync::Notify::new(),
             health,
             wakes: std::sync::atomic::AtomicU64::new(0),
+            parked: std::sync::atomic::AtomicBool::new(false),
+            wake_stamp_us: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -185,8 +195,32 @@ impl Shared {
     }
 
     /// Tell the pump there is something new to send.
+    ///
+    /// While the pump is parked this also stamps *when* it was first asked to
+    /// look: the pass that follows measures the interval (see [`Parked::end`]).
+    /// A wake that arrives during a pass is not a wait and is not stamped, which
+    /// is what keeps the distribution a statement about parked pumps.
     pub(crate) fn wake_pump(&self) {
+        use std::sync::atomic::Ordering;
+        if crate::transport::stats::enabled()
+            && self.parked.load(Ordering::Relaxed)
+            && self.wake_stamp_us.load(Ordering::Relaxed) == 0
+        {
+            let _ = self.wake_stamp_us.compare_exchange(
+                0,
+                crate::transport::stats::epoch_us(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
         self.signal.notify_one();
+    }
+
+    /// Announce that the pump is about to park, answering the guard that ends it.
+    pub(crate) fn park(&self) -> Parked<'_> {
+        self.parked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Parked(self)
     }
 
     /// Tell the lane's owner that a stream may have arrived.
@@ -259,6 +293,45 @@ impl Shared {
         if !wakers.writers.iter().any(|w| w.will_wake(waker)) {
             wakers.writers.push(waker.clone());
         }
+    }
+}
+
+/// The pump is parked, and this guard is what ends that state.
+///
+/// A guard rather than two calls because a `select!` that completes on another
+/// arm **drops** the parked future: without the drop path the flag would stay set
+/// and the next wait would measure a stamp from an earlier one.
+pub(crate) struct Parked<'a>(&'a Shared);
+
+impl Parked<'_> {
+    /// How long the pump waited after being woken, if it was woken at all.
+    ///
+    /// Taken at the instant the wait completes, which is the pump being polled
+    /// past its park — the interval the wake-up actually promised.
+    pub(crate) fn end(&self) -> Option<std::time::Duration> {
+        self.0
+            .parked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let stamp = self
+            .0
+            .wake_stamp_us
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        (stamp != 0).then(|| {
+            std::time::Duration::from_micros(
+                crate::transport::stats::epoch_us().saturating_sub(stamp),
+            )
+        })
+    }
+}
+
+impl Drop for Parked<'_> {
+    fn drop(&mut self) {
+        self.0
+            .parked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .wake_stamp_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
