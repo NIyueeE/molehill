@@ -238,6 +238,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.9 Lost wake-ups are excluded, and the shape is "two waits where the peer has one" (2026-11-06)
+
+The tail's most plausible mechanism left was a **lost pump wake**: a write signals the
+pump, but if that signal does not reach it the packet waits for the timer, and the pause is
+the timer's width — exactly a wide tail over a healthy median. A counter on the pump's timer
+passes answers it: a pass that begins from the timer **with bytes queued** is a lost wake.
+
+Over a `churn-16` run: **one timer pass in the whole run, and it found nothing to send.**
+The pump is woken by its signal every time. Excluded.
+
+With that, the whole set of exclusions for the fresh-connection tail is:
+
+| candidate | how it was excluded |
+|---|---|
+| the pool growing | never grows during the scenario (§4.7) |
+| the connection lock | 2 µs at p99 (§4.7) |
+| the open's own preface | 1 µs (§4.7) |
+| the driver hop | mhd implements `PoolLane` inline; the hop is yamux's (§4.7) |
+| worker threads | 16 workers read the same as 8 (§4.7) |
+| the carrier's own round trip | 0.1 ms on an idle lane (§4.7) |
+| a lost wake | one timer pass per run, finding nothing (§4.9) |
+
+What is left is structural rather than a defect: **a fresh mhd connection pays two serial
+waits of about 1.2 ms each, and a plain TCP tunnel pays one.** Its own connect (`setup_p50`
+0.08 ms) is not one of them. Two waits of the size the peer's whole connection costs is
+exactly the median gap of 1.4 ms and, multiplied by the same contention, the p99 gap of 3 ms.
+
+The candidate fix that follows is a protocol one and it is the plan's phase A in miniature:
+**let the opening carry the hello**, so a fresh connection pays one round trip and not two —
+which the carrier already does for a *registered* lane and cannot do on the plain path.
+
 ### 4.8 Bulk has no published baseline, and is not behind where it was measured (2026-11-06)
 
 The objective asks that `bulk-n` stay within fifteen percent of "the baseline". There is no such

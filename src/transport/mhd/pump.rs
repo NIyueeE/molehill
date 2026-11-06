@@ -696,6 +696,14 @@ fn spawn_sender(
                 }
                 Wake::Timer => {
                     let now = Instant::now();
+                    // **A timer that finds unsent bytes is a wake that was lost.**
+                    // Nothing else should let a queued packet wait for the timer:
+                    // a write signals the pump, so a pass starting from the timer
+                    // with bytes queued means that signal did not reach it — and
+                    // the cost of that is a pause the width of the timer, which is
+                    // exactly the shape this cycle's tail has.
+                    let unsent = shared.with(|conn| conn.waiting(now)).0.is_some();
+                    crate::transport::stats::note_timer_pass(unsent);
                     let (expiry, _) = shared.with(|conn| conn.on_timeout(now));
                     if expiry == Expiry::Dead {
                         shared.close(ResetCode::Aborted);

@@ -217,6 +217,28 @@ pub(crate) fn enabled() -> bool {
 /// The peer of `take_datagrams`' posted count: a packet one end posted and the other
 /// never read has vanished between two sockets, which nothing inside either one can
 /// see.
+/// Timer passes that found unsent bytes, which is a lost pump wake, and those
+/// that found nothing, which is the healthy case.
+static TIMER_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TIMER_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Note one timer pass, and whether it found bytes waiting.
+pub(crate) fn note_timer_pass(unsent: bool) {
+    if !enabled() {
+        return;
+    }
+    let slot = if unsent { &TIMER_PASSES } else { &TIMER_IDLE };
+    slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// This window's timer passes: `(with unsent bytes, idle)`.
+pub(crate) fn take_timer_passes() -> (u64, u64) {
+    (
+        TIMER_PASSES.swap(0, std::sync::atomic::Ordering::Relaxed),
+        TIMER_IDLE.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub(crate) fn take_received_datagrams_per_s() -> u64 {
     PHASES.rx_datagrams.swap(0, Relaxed)
 }
@@ -1306,6 +1328,23 @@ fn report_open_phases() {
     }
 }
 
+/// Report this second's timer passes: how many found bytes waiting.
+///
+/// That number is the tail's most likely cause and has never been visible: a pass
+/// that starts from the timer with a packet queued means the write's wake did not
+/// reach the pump, and the packet waited the timer's width.
+fn report_timer_passes() {
+    let (unsent, idle) = take_timer_passes();
+    if unsent == 0 && idle == 0 {
+        return;
+    }
+    info!(
+        timer_unsent = unsent,
+        timer_idle = idle,
+        "mhd-stats: pump timer passes"
+    );
+}
+
 fn report_growth() {
     let growth = {
         let mut samples = POOL_GROWTH
@@ -1339,6 +1378,7 @@ fn report_send_path() {
     }
     report_growth();
     report_opens();
+    report_timer_passes();
     report_open_steps();
     report_open_phases();
     let roundtrip = {
