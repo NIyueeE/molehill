@@ -2333,6 +2333,34 @@ impl Conn {
         )
     }
 
+    /// What the window is compared against, and what is really waiting.
+    ///
+    /// Three numbers that must agree and, measured on the clean cell, do not:
+    ///
+    /// - `flight` is [`Recovery::flight_bytes`], the bytes the recovery table
+    ///   still counts as handed to packets. It is what `write` subtracts from
+    ///   `cwnd`, so it is what *closes* the window.
+    /// - `buffered` is what the streams actually hold and the peer has not
+    ///   acknowledged. A frontier that moved by the byte prefix while a packet
+    ///   number stayed unacknowledged leaves records counting bytes the peer
+    ///   already has.
+    /// - `packets` is the table's length.
+    ///
+    /// Measured: the staged cell logs `flight` at **3.4–12 MB** against a `cwnd`
+    /// of 262 144, which cannot be a real queue — a lane that had that much on
+    /// the wire with a window that small would carry 21 Mbit/s. Either the
+    /// counter is inflated by re-sent ranges (each re-send adds to `flight` while
+    /// the original record is held until its number is acknowledged or
+    /// [`LOST_HOLD`](super::recovery) expires) or the flight is real and the
+    /// window is not a bound. These three distinguish them without a rebuild.
+    pub(crate) fn flight_and_buffered(&self) -> (u64, u64, usize) {
+        (
+            self.recovery.flight_bytes(),
+            self.buffered,
+            self.recovery.table_stats().0,
+        )
+    }
+
     pub(crate) fn budget(&self) -> (u64, u64, u64, usize) {
         (
             self.send_credit.saturating_sub(self.written),

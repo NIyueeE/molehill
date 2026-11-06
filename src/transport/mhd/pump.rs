@@ -190,6 +190,10 @@ fn report_window(shared: &Arc<Shared>) {
         }
         conn.note_window_reported(now);
         let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
+        // What `flight` is compared against, and what is really waiting: the
+        // three only agree when no re-sent range is being counted twice (see
+        // `Conn::flight_and_buffered`).
+        let (_, buffered, flight_packets) = conn.flight_and_buffered();
         let ceiling = conn.window_ceiling();
         let (built, posted) = crate::transport::stats::take_datagrams();
         let received = crate::transport::stats::take_received_datagrams_per_s();
@@ -272,6 +276,11 @@ fn report_window(shared: &Arc<Shared>) {
             role = if conn.is_dialer() { "client" } else { "server" },
             cwnd,
             flight,
+            // The streams' own unacknowledged bytes, beside the table's: a
+            // `flight` far above `buffered` is bytes counted twice, not bytes on
+            // the wire (see `Conn::flight_and_buffered`).
+            buffered,
+            flight_packets,
             slow_start,
             acked_since_growth,
             backlog_streams = backlog.streams,

@@ -244,6 +244,59 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.42 The window bounds packetised bytes, not admitted ones, so 32 MiB queues behind a 256 KiB window (2026-11-06)
+
+§4.41 left two candidate explanations for a `flight` of 3.4–12 MB against a `cwnd`
+of 262 144: a real queue, or a counter inflated by re-sent ranges. A third reading
+turns out to be the right one, and it is a defect rather than an accounting quirk.
+
+The window line now carries the streams' own unacknowledged bytes (`buffered`) and
+the recovery table's length beside `flight`. Four rounds, all healthy this time
+(p50 2.5–4.9 ms), server lanes:
+
+```
+rnd lane  cwnd   flight_med  flight_max  buffered_med  buffered_max  pkts_max
+ 0    1  262144      196 356   8 752 760    13 335 310    33 543 640     7 159
+ 0    2  262144       59 356   6 766 584     9 801 850    16 518 560     5 016
+ 1    1  262144      121 410   2 611 664    13 678 516    33 543 640     1 936
+ 2    2  262144      182 115   8 130 690    14 491 336    33 543 640     6 848
+ 3    2  262144      151 088   2 975 894    15 718 132    33 543 640     2 736
+```
+
+**`buffered` sits at 4.4–15.7 MB and peaks at 33.5 MB — `MAX_BUFFERED` — while the
+window is 262 144.** The difference is bytes `write()` accepted and no packet has
+carried yet, and it exists because the admission test is
+
+```rust
+let window = self.cwnd.saturating_sub(self.recovery.flight_bytes());
+```
+
+`flight_bytes` counts only bytes **already handed to a packet**: it grows in
+`Recovery::on_sent`, which the pump calls. A writer in a tight loop is therefore
+tested against a number the pump has not updated yet, and it keeps admitting while
+the answer stays "60–200 KiB free" — until the memory ceiling `MAX_BUFFERED`
+(32 MiB) refuses it. **The bound on admitted data is the buffer ceiling, not the
+congestion window.**
+
+The numbers agree with that reading rather than with a real queue:
+`cwnd / RTT × lanes` = 262 144 B / 1 ms × 4 = 262 MB/s ≈ **8.4 Gbit/s**, which is
+the throughput this cell actually carries (7.57 Gbit/s). So the 30 MB of buffered
+slack buys no throughput at all; it is standing work in front of every packet the
+pump has not reached, and 32 MiB at 940 MB/s is **34 ms** — the same order as the
+bad mode's per-second medians (§4.41) and of the 100 ms p99.
+
+Why it is intermittent: how much gets buffered depends on how far the writer runs
+ahead of the pump, which depends on how the two are scheduled against each other.
+The pump and the writer are separate tasks on a shared runtime, so the same build
+alternates between "the window is the bound" (2.5 ms flat) and "the buffer ceiling
+is" (5–28 ms oscillating) — §4.41's two modes, with a mechanism.
+
+**The fix this names, and the one it rules out.** Admission must be bounded by the
+*unacknowledged bytes*, not by the packetised ones — one line in `Conn::write` —
+and it should cost no throughput, because the window is already what carries the
+cell. It also rules out "give the visitor's packets a priority class" as the first
+move: a scheduler reorders work that should not be queued in the first place.
+
 ### 4.41 The clean cell is bimodal, and the probe set is below its own noise (2026-11-06)
 
 §5's first item asked whether the staged tail is inter-probe contention. It is not:
