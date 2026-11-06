@@ -267,40 +267,20 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** The findings live in §4.1; this is only the
-sequence. The cell decomposes as **1.4 ms of setup plus a 5 ms round trip** through
-the data path, and every hop measured so far is microseconds — control hop,
-placement, the lane's open, the server's accept and post. So the five milliseconds
-is spread across a handful of hops rather than sitting in one.
+**Order, as of this commit.** §4.1 carries the findings; this is the sequence.
 
-**A0j is done, and it puts the whole five milliseconds in one leg.** Three
-histograms on the server's group, 1 400–2 200 groups a second:
+The clean cell is **1.4 ms of setup plus a 5 ms round trip**, and A0j puts that
+whole round trip in one leg (`wire`), with this end's own read-and-hand-off and its
+write-back both at zero. So what remains is a handful of task hops through the
+client and the backend, about a millisecond each.
 
-```
-up   (visitor read -> frame handed to the carrier)   p50 0 µs,  p90 0 µs
-wire (handoff -> the reply frame arrives)            p50 5 ms,  p90 6 ms
-down (reply frame -> written to the visitor)         p50 0 µs,  p90 0 µs
-```
+**A0k** — the same leg split on the client's side, which needs two stamps that
+group does not carry today.
 
-So this end is not slow in either direction: it reads, frames and hands over inside
-the same millisecond, and writes the reply back the moment it arrives. **The five
-milliseconds are the trip through the client and the backend and back** — the
-carrier's two posts, the client's stripe layer, the backend's echo, and the same
-again — where every hop measured on its own is microseconds.
-
-That is where the remaining work is, and it is scheduling rather than protocol:
-four to six task hops of roughly a millisecond each. Phase **C** is its ground.
-
-The next step is **A0k**: the same split on the client's side of the trip, which
-needs a stamp the client's group does not have today — the client's group reads
-the backend and writes to the carrier, so its "first read" is the echo and its
-"first reply" never happens. Two stamps (request written to the backend, echo read
-from it) split the five milliseconds into "the carrier and the far loop" halves.
-
-After A0j, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
-scheduling, now carrying both the contended open and the data-path hops) → **D**
-(delivery-rate controller) → **phase 6** (memory and CPU, only once the above
-hold) → **phase 7** (full verification, then the release record).
+Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
+scheduling, which is where the hop latency belongs) → **D** (delivery-rate
+controller) → **phase 6** (memory and CPU) → **phase 7** (full verification, then
+the release record).
 
 **Keep this order in two places, and update both together.** `HANDOFF.md` is the
 durable copy; the session's goal objective is the copy that is re-read every round,
