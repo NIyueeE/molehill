@@ -244,6 +244,60 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.43 The pre-registered admission fix failed its own guards, and it separates the two defects (2026-11-06)
+
+§4.42's one-line change — `Conn::write` subtracting `self.buffered` instead of
+`self.recovery.flight_bytes()` — was measured against its pre-registration and
+**reverted whole**. Both rollback conditions fired.
+
+| | before (15 rounds) | after (4 rounds) |
+|---|---|---|
+| interactive p50 | 2.5–11.8, bimodal | 2.48, 11.28, 10.79, 5.36 |
+| interactive p99 | 13–133, **median ≈ 25** | **14.9 / 23.2 / 23.4 / 24.6** |
+| slow seconds (> 5 ms p50) | 275/936 = **29 %** | 173/251 = **69 %** |
+| throughput | 6.36–9.71 Gbit/s (median 7.87) | **4.49–7.21** (median 5.86) |
+
+**The instrument check passed and is the part worth keeping.** `buffered` fell from
+4–15 MB (peak 33.5 MB) to **200–251 KB, peak 251 352** — the window became the bound
+on admitted data, exactly as claimed — and `srtt_max` fell from 44–123 ms to
+1–8.5 ms. So §4.42's mechanism is confirmed from the other direction: **the 32 MB of
+admitted-but-unpacketised data was the p99 tail**, and removing it took the worst
+round from 133 ms to 25 ms.
+
+**So the failure is not the idea, it is that the window cannot carry the path.**
+With the buffer no longer hiding it, `cwnd` is the binding constraint and it is
+calibrated on the wrong quantity: `window_ceiling` is `WINDOW_FLOOR × (min_rtt /
+1 ms)`, and `min_rtt` **cannot go below the estimator's own granularity of 1 ms**
+(`recovery::GRANULARITY`). On this cell the lane therefore gets
+256 KiB × 1 = **256 KiB**, while the smoothed RTT the same logs report is 1–4 ms and
+the flight spikes to 8 ms. A quarter of the throughput goes with it, and the median
+rises too — the sender is now paced so tightly that the pump spends time parked, and
+a small write that lands while it is parked pays the wake (the interval §4.30
+measured at 5–8 ms). That is a hypothesis about the median, not a measurement; what
+is measured is that both moved in the wrong direction together.
+
+**Both defects are now named and they have one owner.** The window is sized from a
+number pinned at the estimator's floor, and admission is bounded by a number that
+excludes what has not been packetised. Fixing either alone makes the other worse:
+raising the ceiling without bounding admission gives the buffer more room (more
+tail), and bounding admission without raising the ceiling gives a quarter of the
+throughput away.
+
+**Next experiment, pre-registered before it runs.** One commit, two lines, one
+mechanism: `window_ceiling` scales from `max(min_rtt, smoothed_rtt)` **and**
+`Conn::write` subtracts `self.buffered`.
+
+- **Pass**: the slow-second share falls to **≤ 5 %** (baseline 29 %) *and* throughput
+  stays inside the run's own A/A spread of **≥ 7.5 Gbit/s** (the pre-change median is
+  7.87; the fix's own reading was 5.86, so this is the number that failed). A/A in
+  the same run, not a remembered floor.
+- **Guard**: `rr-1`/`rr-16`, `bulk-1`/`bulk-pair` inside that A/A; `rss_peak_mib` not
+  higher; the shaped stages (`loss1`, `loss5`, `rtt100`) not worse — those have a
+  real multi-millisecond RTT already, so the ceiling there changes by the *smoothed*
+  term only, and a shaped regression means the term is wrong.
+- **Rollback**: throughput below the A/A floor, or the share unchanged, or any
+  shaped-cell regression.
+
 ### 4.42 The window bounds packetised bytes, not admitted ones, so 32 MiB queues behind a 256 KiB window (2026-11-06)
 
 §4.41 left two candidate explanations for a `flight` of 3.4–12 MB against a `cwnd`
@@ -1488,13 +1542,13 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Bound admission by what is unacknowledged, not by what is packetised**
-   (§4.42, pre-registered there). One line in `Conn::write`. Its pass is the
-   share of slow seconds — **29 % of 936 measured seconds today** — falling to
-   ≤ 5 % over four rounds, with bulk and rr inside their guards. This comes before
-   every other item because it is the mechanism the last two rounds actually found,
-   and because a scheduler (§4.1) or a controller (§4.3) built on top of a 32 MiB
-   standing queue would be measuring the queue.
+1. **Size the window from the measured path, and bound admission by what is
+   unacknowledged** (§4.42–§4.43, pre-registered there). One mechanism, two lines:
+   `window_ceiling` scales from `max(min_rtt, smoothed_rtt)` instead of `min_rtt`
+   (which cannot leave the estimator's 1 ms floor), and `Conn::write` subtracts
+   `self.buffered`. Each alone is a regression — measured, §4.43 — so they travel
+   together. Pass: slow seconds ≤ 5 % with throughput back inside the run's own A/A
+   (≥ 7.5 Gbit/s); rollback on either, or on any shaped-cell regression.
 2. **One stream, one hop** (the first *structural* change after that). A visitor
    starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
    whole group machinery: coordinator task, send loop, receive loop, one reader task
