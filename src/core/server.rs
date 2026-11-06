@@ -4614,6 +4614,23 @@ fn ask_missing(
     stripes: u8,
     gathered: usize,
 ) -> Result<bool> {
+    // **When the request left for the client.** Stamped in absolute epoch
+    // milliseconds so it can be joined with the client's own stamps for the same
+    // group: `client.got_ms - ask_ms` is the control hop, and
+    // `first_take_us - (that hop + the client's open)` is what is left of the
+    // pairing wait that no instrument has explained yet.
+    if crate::transport::stats::enabled() {
+        let ask_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        // `info!` and not `debug!`: the bench runs its subject at INFO, and a
+        // debug line here would never be seen (see `stats::enabled`).
+        tracing::info!(
+            group = u32::from_be_bytes(group),
+            ask_ms,
+            "mhd pairing request"
+        );
+    }
     let next = u8::try_from(gathered)
         .with_context(|| "stripe index exceeds u8")?
         .min(stripes);

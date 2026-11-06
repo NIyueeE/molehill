@@ -238,6 +238,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.14 The pairing wait is not a request-and-response at all (2026-11-06)
+
+The last unexplained piece was the five to six milliseconds a visitor waits for a data channel
+to exist. The obvious model — the server asks, the client opens — has an instrument: the request
+is written by `ask_missing`, and a stamp there joins, by group, with the client's arrival stamp.
+
+**It never fired.** `ask_missing` is called only from the pairing loop's **timeout** arm, and
+never being called means every pairing found a channel waiting inside its budget without asking
+for one.
+
+So the pairing is not a request and a response. The client keeps a speculative inventory of
+data channels — unclaimed, opened ahead of demand — and `take_for(group)` adopts the next one that
+arrives. **The five to six milliseconds are that inventory's arrival cadence**, not a round trip
+that could be shortened by making a message smaller.
+
+That is the same shape as everything else this cycle has measured about this cell: the visitor
+is not waiting on the carrier's work but on *another task's schedule*. It is also the first
+attribution the archive's rejected "warm pool" ever had — the objection was made without it, and
+the question it raises is now specific and cheap: **how deep is the inventory, and what sets its
+cadence?**
+
+The next step is **A0v**: count, per second, how many unclaimed channels are waiting and how often
+one arrives with none waiting. That number decides whether a deeper reserve would remove the wait
+or merely move it.
+
 ### 4.13 Sealing is a net loss, and the cell's own arithmetic closes (2026-11-06)
 
 Sealing was measured properly this time — two rounds, eight samples a cell, the A/A arm inside
