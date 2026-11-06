@@ -76,6 +76,12 @@ molehill's own row: **7.57 Gbit/s, 0.0 % errors** on `clean`; `clean#2` 23.08 ms
 with the same zero errors. Both stages are inside the 50 ms SLO **on their own**
 — neither is averaged, and no warm-up stage was added.
 
+What the number *is*: the **interactive series'** p99, where each sample is a fresh
+TCP connection to the tool's exposed port carrying one 64-byte echo (`probes/series.py`'s
+`ping()`). The same stage window also carries a churn series and a datagram series —
+they are separate metrics (`churn_per_s`, `udp_rtt_p99_ms`) and are never pooled into
+this one (see §4.39 for the correction that cost this file a wrong conclusion).
+
 The gap this document exists for: a TCP tunnel opens a visitor in **2–3.5 ms**;
 mhd takes **22.5 ms**. Roughly ten times, on the cheapest path there is.
 
@@ -238,7 +244,7 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.39 The release cell is an aggregate of three workloads, and the slow one is churn (2026-11-06)
+### 4.39 The staged cell's p99 is the interactive series alone, and it is not an aggregate (2026-11-06)
 
 Every round of this cycle has optimised "the cell": `timeline[clean]`, whose p99 the gate records as
 22.5 ms. The bench writes one ndjson per series per arm — `interactive`, `churn`, `udp` — and **that
@@ -252,14 +258,31 @@ clean, first 7.5 s
   AGGREGATE     n=641   p50 2.00 ms   p99 24.22 ms   max  49.73     <- the cell
 ```
 
-**The aggregate reproduces the cell (24.22 against the gate's 22.5), and the interactive path — the
-one every instrument in §4.27–§4.33 measures — is already at the peer's level: p99 3.52 ms.** The
-cell's p99 is carried by the **churn** series (fresh connections, p99 35.6) and, secondarily, by UDP.
+**That last row is not the cell, and the correction matters more than the finding.** The staged
+cell's `rtt_p99_ms` is built from the **interactive series alone**: `workloads.py`'s
+`_stage_metrics` takes `rtt_p99_ms` from `interaction` (`rtt_ms`), puts churn only into
+`churn_per_s`, and reports UDP as its own `udp_rtt_p99_ms` / `udp_loss_pct`. Pooling the three logs
+by hand produces the 24.22 above, and its agreeing with the gate's 22.5 to a tenth is **a
+coincidence of a hand-built pool, not a reproduction**. The gate never computes that number.
 
-So the mystery this file has spent twenty rounds on is not a mystery: **the release cell measures
-three workloads at once, the interactive one is fine, and the tail belongs to the fresh-connection
-path** — the same path `churn-16` isolates at 10 ms in the dev profile. The two cells were always the
-same subject, and the aggregate hid it.
+**So the reading is narrower, and stranger, than "the tail is churn".** The interactive and churn
+series are the *same probe function*: `probes/series.py`'s `ping()` opens a fresh TCP connection,
+sends 64 bytes, waits for the echo and closes — for both modes. They differ in offered rate
+(interactive every 50 ms ≈ 20/s, churn 16/s) and in the metric name each writes (`rtt_ms` against
+`setup_ms`). Two probes running the same code at comparable rates in the same window, reporting
+3.52 and 35.62 ms at p99, is therefore **not** a statement about two paths; it is a statement about
+the measurement. Either the two probe *processes* interfere, or churn's own cadence
+(`next_at += period` with a catch-up sleep) turns its slow samples into a different shape.
+
+**The cheap discriminator, before any architecture moves.** Run the staged timeline with **one
+series at a time** — same binary, same topology, same window, only the probe set changed. If the
+interactive p99 rises to churn's level when both run, the tail is inter-probe contention and no
+carrier change removes it. If it stays near 3.5 ms alone *and* with both, then the release cell's
+number was never the tail this file has been chasing, and the 22.5 ms needs a different account
+entirely.
+
+`churn-16` is unaffected by that question: its scenario states `fresh: True` with `connections=16,
+requests=400`, so it really is 6 400 fresh connections, and §4.7's wording is right.
 
 Two caveats that must travel with this:
 
@@ -271,15 +294,16 @@ Two caveats that must travel with this:
   before anything is concluded from it.
 
 **What this changes.** The comparison to a TCP peer must be per series: our interactive p99 is 3.52 ms
-against frp's *aggregate* 2.38, which is not the same quantity. The honest question is now "what does
-frp's churn series report on this cell", and answering it needs `just bench peers fetch` (its
+against frp's *aggregate* 2.38, which is not the same quantity. The honest question is "what does
+frp's interactive series report on this cell", and answering it needs `just bench peers fetch` (its
 binaries are missing) and one run.
 
-**And the methodological lesson, which is the real answer to "why did this take so long":** the
-instrument chain was built on the server's interactive path — accept, pairing, turnaround, pump
-passes — and every one of them correctly said "microseconds", because that path was never the slow
-one. A metric that aggregates three workloads can be optimised forever without touching the one that
-carries its tail.
+**And the methodological lesson, corrected.** The first version of this section said a metric that
+aggregates three workloads had been optimised for twenty rounds. It had not: the published metric
+aggregates nothing. The error was the opposite one — reading three series as if they were one
+because they share a stage, and then treating a hand-built pool as the gate's own arithmetic. Both
+mistakes have one root, and it is the one to carry forward: **a number whose definition was never
+read in the code that computes it.**
 
 ### 4.38 The live-task instrument was reverted, and the cheaper shape is named (2026-11-06)
 
@@ -575,7 +599,8 @@ Two more candidates fell in one run. `accept_us`, un-gated and validated on `chu
 pairing reads 1.25–1.30 ms and the turnaround 608–627 µs. So candidates ① and ② are both excluded,
 and on that cell every interval this carrier owns adds to about two milliseconds.
 
-And then the cell's own stages said something the aggregate had hidden:
+And then the cell's own stages said something one stage-wide number had hidden (this is a
+per-*stage* split of the interactive series, not a pool of several series — see §4.39):
 
 ```
 clean      p50  11.31 ms   p99  99.35 ms    n = 425     (the first stage)
@@ -1257,7 +1282,8 @@ is now recorded with a stored baseline to compare against next time.
 
 ## 5. Active architecture decisions
 
-Approved and ordered; **none of A–D is implemented yet**. Each is a separate
+Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
+see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
 commit with its own A/B and its own revert.
 
 **A. Lane-root key derivation** (removes the per-visitor handshake). One Noise
@@ -1279,42 +1305,65 @@ already decided.
 **D. Delivery-rate controller** (a window that can shrink). Simplified BBR with
 app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 
-Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
+**E. One stream, one hop** (a visitor's first channel stops paying for a
+multiplexer it does not use). A stripe group of one is driven by a single task that
+polls both directions, over the same 10-byte stripe frame and the same
+`StripeSender`, so the wire does not move. The group path stays for two or more
+stripes, where the reorder buffer and per-stripe readers are what the layer exists
+for. The decision is *structural*, and its pass criterion is the release cell's own
+percentiles, not the task count.
+
+Memory and CPU work is **phase 6**: it may not preempt A–E, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
 **Order, as of this commit.** §4 carries the findings; this is the sequence only.
+Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with a
+live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
+curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **A0aj — is the runtime saturated?** Every interval this carrier owns is now
-   microseconds (§4.33: a pump pass is 0 µs at p50 and 2–3 at p99; its `flush` is
-   18–21), the wake is a signal, and the first pass that looks carries the data. The
-   six milliseconds are therefore time in which the pump task is awake and not
-   polled — which is a statement about the runtime, and the carrier spawns two
-   tasks per stripe group on top of the pump and the stream tasks. Run the same
-   cell with `TOKIO_WORKER_THREADS=16`; a drop of thirty percent or more in
-   `echo_p99` confirms saturation and makes "fewer tasks per visitor" the next
-   structural move, while no change sends the search inside `wait()`.
-2. **A0aa — variance.** Our A/A spread on `churn-16`'s p99 is an order of
-   magnitude wider than a TCP peer's, and a tail that varies is a queue, not a
-   cost. This is the only open question whose answer could move the p99.
-3. **A is implemented and stays off** (`MOLEHILL_MHD_SEAL`): it removes a 1.7 ms
-   open and costs more elsewhere (§4.10, §4.13). Its default is decided by those
-   numbers, not by the design's elegance.
-4. **A per-visitor spare channel is refuted** (§4.20). A fixed small reserve,
-   refilled only when the pool is empty, is a *different* experiment and is
-   unrun; it is not in this list until 1 and 2 say the pool is the constraint.
-5. **B (RACK + PTO) is the next real work**, and it is now judged on the shaped
-   cells rather than on the clean one: `loss1` and `loss5` report 1.06 s and
-   1.46 s of p99, which is where recovery, not setup, decides the number.
-6. **C and D keep their order** behind B. C owns contention between an opening
-   and bulk, which the clean cell no longer appears to exercise; D owns the
-   window, which the clean cell never fills.
-7. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
+1. **One series at a time** (§4.39). The staged cell's p99 is the interactive
+   series alone, and the interactive and churn probes are the same code at nearly
+   the same rate. Run the timeline three ways — interactive only, churn only, both
+   — with everything else equal. If the interactive p99 rises when churn shares the
+   host, the tail is inter-probe contention; if it does not, the 22.5 ms is not the
+   tail this file has been chasing and needs a different account. **Nothing below
+   starts before that is answered.**
+2. **One stream, one hop** (the first structural change). A visitor starts on one
+   stripe (`initial_stripes()` is 1 in production) and still runs the whole group
+   machinery: coordinator task, send loop, receive loop, one reader task per
+   stripe, a bounded channel between them, a grace timer and a monitor. A single
+   stripe needs none of it. `spawn_single_group` drives both directions from one
+   task over the same 10-byte frame and the same `StripeSender`, so the first
+   version changes no wire byte. Pass: `timeline[clean]` and `churn-16` move beyond
+   the run's own A/A and materiality; rollback: any rr, bulk, capacity, RSS or CPU
+   regression.
+3. **A lane root that is actually usable** (phase A: implemented, default off).
+   The switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
+   root-caused with a two-end join on stream, direction and packet — not until the
+   design reads well. §4.10's and §4.13's numbers decide its default afterwards.
+4. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
+   (`wire.rs` says so), so a UDP service is framed into a reliable stream and pays
+   an ARQ, a route map, two worker queues and a Noise record for a packet that must
+   not be retransmitted at all. Only after 2 and 3, and never as a second fallback.
+5. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
+   refilled only when the pool is empty is a *different* experiment and is unrun; it
+   is not in this list until 1 says the pool is the constraint.
+6. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
+   `loss1` and `loss5` report 1.06 s and 1.46 s of p99, which is where recovery, not
+   setup, decides the number.
+7. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
+   *write* budget, not a packet-scheduling guarantee, so the question is open — but
+   it is worth building only if a `nobulk` run (`streams: 0`) against the same
+   timeline shows the bulk spine is what moves the interactive tail.
+8. **D (delivery-rate)** stays last: the clean cell never fills the window.
+9. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
-What is **not** on this list, and why: making the clean cell faster by removing the
-per-visitor handshake (measured, loses), by keeping a channel per visitor
-(measured, loses), by another timer constant (three refuted), and by another
-scheduling stamp on the pump (the pump is not the constraint).
+What is **not** on this list, and why: a live-task count (the premise is refuted by
+§4.37, and §4.38's cheaper shape answers a question nobody has shown to matter), a
+12-worker curve and a higher global worker default (the one attempt cost `bulk-n`
+48 %, §4.36), more timer constants (three refuted), yamux over mhd, and a static
+spare channel per visitor (measured, loses).
 
 **Cost of this cell, for planning.** A full `timeline` arm-round is 17 minutes and a
 three-arm run about a hundred. Optimization rounds use `--scale 0.05
