@@ -1073,13 +1073,14 @@ Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged o
 
 **Order, as of this commit.** §4 carries the findings; this is the sequence only.
 
-1. **A0ad — the accept-to-pairing interval.** A0ac is answered: the control arm
-   reports **3.052 ms** on the release cell against our 24.183, so the probe is not
-   the cause and the twenty milliseconds are ours (§4.27). Everything else we own on
-   that cell is under two milliseconds, which leaves **one interval nobody has
-   histogrammed there: `accept_us`** — the visitor accepted to the pairing starting.
-   It reads 17–41 µs on `churn-16`. Histogram it un-gated, validate it on `churn-16`
-   first, then read it with `--scale 0.05 --warmup-rounds 0 --no-aa`.
+1. **A0ai — what the pump's own awaits cost.** The chain is now measured end to
+   end (§4.27–§4.32): the cell's medians are 0.6–1.5 ms, the probe is not the
+   cause, the wake is a signal every time, and the first pass that looks at an idle
+   lane carries its data. What is left is the six milliseconds **between a write
+   queueing and that pass beginning**, with the pump runnable and unpolled. Two
+   awaits in its loop can do that: `flush(&socket, …)` around every send (a full
+   send buffer blocks until the socket is writable) and the loop's own
+   `yield_now()`. Histogram both, on `churn-16` first and then at `--scale 0.05`.
 2. **A0aa — variance.** Our A/A spread on `churn-16`'s p99 is an order of
    magnitude wider than a TCP peer's, and a tail that varies is a queue, not a
    cost. This is the only open question whose answer could move the p99.
