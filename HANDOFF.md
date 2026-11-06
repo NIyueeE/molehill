@@ -241,8 +241,8 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 ### 4.19 The five milliseconds were the tail of a gated log; the median pairing is 2.0 ms (2026-11-06)
 
 `report_pairing` opens with `if facts.paired_us < 5_000 { return }`. **Every pairing number this
-file has quoted since §4.13 is the tail of a threshold-gated sample**, not a median: 117 lines out of six
-thousand four hundred pairings in one run, the slow 1.8 %.
+file has quoted since §4.13 is the tail of a threshold-gated sample**, not a median: 907 lines out of six
+thousand four hundred pairings in one run — the slow 14 % — and 117 in an earlier one.
 
 Measured on all of them instead, by joining four absolute stamps on the group id:
 
