@@ -287,23 +287,31 @@ every `W`, so a window that is kept full **is** the queue, and the only way to h
 both is to drain the queue without emptying the pipe — which needs the small packet
 served *first* rather than the queue made smaller.
 
-**Next experiment, pre-registered before it runs.** A scheduling class, not a bound:
-in `Conn::next_stream_range`, a stream that is still opening (or has fewer than
-`OPEN_RESERVE` bytes unsent) is preferred over a stream with a wide unsent backlog,
-**within the same run**. No window, buffer or constant changes; `SEND_RUN` still caps
-the run, and a stream with nothing to say cannot take the slot.
+**Next experiment, pre-registered before it runs.** Not a scheduling class — that
+idea is withdrawn before it was built, for a reason worth writing down: a packet the
+scheduler builds earlier still enters the **same socket buffer**, behind everything
+already handed to the kernel, so `next_stream_range` cannot reorder the wire. What the
+three bounds actually exposed is the *wake*, and the baseline's own logs say what it
+costs: **1 300–1 600 `idle write waited for the pump` events per round at a p50 of
+6.4–6.6 ms**, against a cell median of 2.6 ms — a population large enough to be the
+median of any build whose queue is shallow, and it is exactly what attempts A and B
+walked into.
 
-- **Pass**: the `bufcap`-shaped cell's p50 ≤ 3.5 ms **and** p99 ≤ 25 ms over four
-  rounds, with throughput ≥ 7.5 Gbit/s — i.e. the latency of the *bounded* build with
-  the throughput of the *unbounded* one. Baseline for the comparison is the same
-  four-round shape measured today (p50 2.45–7.41, p99 12.9–27.5, throughput
-  5.40–10.04).
-- **Guard**: `bulk-1`/`bulk-n`/`bulk-pair` inside the same-round A/A; `rr-1`/`rr-16`
-  not worse; the shaped cells not worse (`loss5` is where a priority class can
-  starve bulk); no starvation symptom in the logs (`mhd stalled` with
-  `unsent_ms` growing on a bulk stream).
-- **Rollback**: throughput below the A/A floor, any bulk regression, or a stall line
-  naming a bulk stream as the worst stream for a whole second.
+So the first step is an instrument, not a change: histogram the interval from
+`Shared::wake_pump()` to the pump's next pass start, bounded-sampled, reported once a
+second. That number decides between "the wake is slow" (fix the wake path) and "the
+wake is fast and the wait is elsewhere" (the stamp pair is the same one §4.30 used to
+clear the wake of suspicion on a *busy* lane — this is the same question on an idle
+one, which was never asked).
+
+- **Decision rule, fixed now**: if the wake latency's p50 is above 1 ms, the next
+  change targets the wake path (candidates to be read from the code once the
+  distribution exists: the dispatcher's per-batch wake ordering, the pump's
+  `select!` re-arming a `sleep_until` every pass, and whether the parked pump's
+  worker is the one the dispatcher occupies). If it is below 100 µs, the wait is
+  downstream and the next target is the socket hand-off, not the runtime.
+- **Guard for whatever follows**: the four-round shape used today, bulk inside the
+  same-round A/A, no shaped-cell regression.
 
 ### 4.44 The window is the queue, and both bounds now show it (2026-11-06)
 
@@ -1675,15 +1683,13 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Serve the small stream first, without shrinking the queue** (§4.42–§4.45,
-   pre-registered in §4.45). Three bounds — admission by unacknowledged bytes, the
-   buffer sized by the window, and (measured, not built) a delay-based ceiling — all
-   trade the median for the throughput, because `rate = W / RTT` makes a full window
-   and a queue the same object. The visitor's request rides the **same direction as
-   the bulk**, so its latency is that queue; the escape is to serve it first inside
-   the run (`next_stream_range` preferring an opening or small-backlog stream), not
-   to shrink the window. Pass: p50 ≤ 3.5 ms and p99 ≤ 25 ms at ≥ 7.5 Gbit/s over four
-   rounds, bulk inside the same-round A/A.
+1. **Measure the idle pump's wake latency** (§4.45, pre-registered there). Three
+   bounds all traded the median for the throughput, and the reason is `rate = W / RTT`:
+   a window kept full is a queue. What each bound exposed is the *wake* — 1 300–1 600
+   `idle write waited for the pump` events per round at a 6.4–6.6 ms median in the
+   baseline itself. Instrument the interval from `wake_pump()` to the pump's next pass
+   before changing anything; the decision rule (above 1 ms → fix the wake; below
+   100 µs → the wait is downstream in the socket hand-off) is fixed in §4.45.
 2. **One stream, one hop** (the first *structural* change after that). A visitor
    starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
    whole group machinery: coordinator task, send loop, receive loop, one reader task
