@@ -586,6 +586,7 @@ pub(crate) fn spawn(
                     .with(|conn| conn.starved_streams(now, std::time::Duration::from_secs(1)));
                 crate::transport::stats::note_starved_streams(n);
             }
+            let flushing = std::time::Instant::now();
             let sent = match flush(&socket, peer, &shared, &mut staging).await {
                 Ok(sent) => sent,
                 Err(e) => {
@@ -594,6 +595,7 @@ pub(crate) fn spawn(
                     return;
                 }
             };
+            crate::transport::stats::note_pump_flush(flushing.elapsed());
             if sent > 0 {
                 drain_ready(&socket, &mut batch, &shared, peer);
             }
@@ -669,8 +671,15 @@ fn spawn_sender(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut staging = Staging::new();
+        // One pass is `wait()` returning to the next `wait()`: everything this task
+        // does between waking and going back to sleep.
+        let mut pass_started: Option<std::time::Instant> = None;
         loop {
+            if let Some(started) = pass_started.take() {
+                crate::transport::stats::note_pump_pass(started.elapsed());
+            }
             staging.clear();
+            let flushing = std::time::Instant::now();
             let sent = match flush(&socket, peer, &shared, &mut staging).await {
                 Ok(sent) => sent,
                 Err(e) => {
@@ -679,6 +688,7 @@ fn spawn_sender(
                     return;
                 }
             };
+            crate::transport::stats::note_pump_flush(flushing.elapsed());
             if sent == SEND_RUN {
                 // More is queued; the listener's dispatcher keeps the
                 // acknowledgements flowing while this pass sends, but give the
@@ -691,6 +701,7 @@ fn spawn_sender(
             // write that waited; whether the pump was woken by its signal or by its
             // timer then says whether the wake was missed or the task was starved.
             let woke = wait(&shared).await;
+            pass_started = Some(std::time::Instant::now());
             if crate::transport::stats::enabled() {
                 let queued = shared.with(|conn| conn.has_idle_queued());
                 if queued {

@@ -238,6 +238,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.33 The pump's own work is microseconds, so the six milliseconds are the runtime (2026-11-06)
+
+The last two candidates in the pump loop, measured on the cell that matters:
+
+```
+pass   (wait() returns -> next wait())   p50 0 µs   p99 2-3 µs   max 3-7 µs
+flush  (inside that pass)                p50 18-21 µs p99 50-59   max 57-67 µs
+```
+
+and on `churn-16`, for contrast: pass p50 0 µs (p99 2, max 234), flush p50 13 µs (p99 30).
+
+**Neither is milliseconds, so the pump is not busy and its socket is not blocking.** The write path
+is one synchronous `poll_write` — queue the bytes, then `wake_pump()` — so the notify follows the
+queue by a few instructions. That leaves one place: **the pump task is awake and not polled.**
+
+Which is a statement about the runtime, not the carrier's logic, and it fits everything measured:
+
+- the cell is slow only at its first stage, which is the busiest (§4.28);
+- a stream's serving task takes 30–51 ms in the same run (`task_us`), the same starvation seen from
+  another task;
+- `churn-16`, with sixteen visitors, never sees it — pass p99 2 µs, flush p99 30 µs, no tail.
+
+The carrier spawns **two tasks per stripe group** (a send loop and a receive loop) on top of the
+pump and the stream-serving tasks, so four thousand concurrent visitors is a several-thousand-task
+load on a runtime sized by `min(cores, 8)`. §4.9's worker experiment raised that on `churn-16`, where
+it could not matter; it has never been raised on this cell.
+
+The next step is **A0aj**, and it is cheap and decisive: run the same cell with
+`TOKIO_WORKER_THREADS=16` and compare the `echo_p99` and `clean` p99. If the tail shrinks, the
+mechanism is runtime saturation by task count and the structural answer is fewer tasks per visitor
+rather than any change to the carrier's protocol.
+
 ### 4.32 One pass: the pump is signalled and then not polled for six milliseconds (2026-11-06)
 
 Counting passes rather than milliseconds, as §4.31 planned — how many `poll_transmit` calls find the

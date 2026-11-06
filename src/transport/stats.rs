@@ -1443,6 +1443,64 @@ pub(crate) fn note_pair_wait(us: u64) {
 }
 
 /// Report this second's pairing waits.
+/// One pump pass, and how much of it was `flush` waiting on the socket.
+///
+/// The tail's last two candidates (§4.32): a pass that takes milliseconds is the
+/// task being awake and busy, and a `flush` that takes them is the socket's send
+/// buffer refusing more until the peer reads — a different bug with a different fix.
+static PUMP_PASS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static PUMP_FLUSH: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn note_us(slot: &std::sync::Mutex<Vec<u32>>, age: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Note one pump pass's duration.
+pub(crate) fn note_pump_pass(age: Duration) {
+    note_us(&PUMP_PASS, age);
+}
+
+/// Note one pump `flush`'s duration.
+pub(crate) fn note_pump_flush(age: Duration) {
+    note_us(&PUMP_FLUSH, age);
+}
+
+/// Report this second's pump passes and their flushes.
+fn report_pump_loop() {
+    for (name, slot) in [("pass", &PUMP_PASS), ("flush", &PUMP_FLUSH)] {
+        let samples = {
+            let mut guard = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = std::mem::take(&mut *guard);
+            drop(guard);
+            let mut sorted = taken;
+            sorted.sort_unstable();
+            sorted
+        };
+        if samples.is_empty() {
+            continue;
+        }
+        info!(
+            stage = name,
+            n = samples.len(),
+            p50_us = pct_us(&samples, 50, 100),
+            p99_us = pct_us(&samples, 99, 100),
+            max_us = samples.last().copied().unwrap_or(0),
+            "mhd-stats: one pump pass"
+        );
+    }
+}
+
 /// How many pump passes found an idle write still queued before one carried it.
 static IDLE_PASSES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
@@ -1741,6 +1799,7 @@ fn report_all() {
         report_accept_wait,
         report_pump_wakes,
         report_idle_passes,
+        report_pump_loop,
         report_open_steps,
         report_open_phases,
     ] {
