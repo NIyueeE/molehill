@@ -3693,6 +3693,17 @@ impl<C> ChannelQueue<C> {
                     Ok(()) => {
                         crate::transport::stats::note_claimed();
                         crate::transport::stats::note_wake();
+                        // **When the channel became available to its pairing.** The
+                        // send wakes the one task waiting on this group, so the
+                        // distance from here to that task's own take is the wake-up
+                        // itself — the interval the pairing's `wait_us` has left over
+                        // once the open and this end's setup are removed.
+                        if crate::transport::stats::enabled() {
+                            let deliver_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                            tracing::info!(group, deliver_ms, "mhd channel delivered");
+                        }
                         // Deliberately **no** `notify_waiters` here. The send
                         // itself wakes the one pairing that named this channel,
                         // and waking the others would leave the thundering herd
@@ -3772,6 +3783,14 @@ impl<C> ChannelQueue<C> {
             if let Some(rx) = claim.as_mut()
                 && let Ok(channel) = rx.try_recv()
             {
+                // The other end of the interval `deliver` starts: from here the
+                // difference is the wake-up, and nothing else can be in it.
+                if crate::transport::stats::enabled() {
+                    let take_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                    tracing::info!(group, take_ms, "mhd channel taken");
+                }
                 self.unclaim(group);
                 return Some(channel);
             }

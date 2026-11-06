@@ -238,6 +238,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.18 It was never a wake-up: the pairing takes somebody else's channel (2026-11-06)
+
+`deliver` was stamped where it hands a channel to the pairing's own queue, and `take_for` where
+the pairing takes it from there. Six thousand four hundred of the first, and **not one of the
+second**:
+
+```
+mhd channel delivered   6 400
+mhd channel taken           0
+```
+
+**The pairing never takes the channel that was delivered for its group.** Every visitor is served
+from the **shared pool**, with a channel that was delivered for an *earlier* group — and its own
+channel, arriving later, goes into that pool for the next visitor. The pool is a rotating belt.
+
+So the three and a half milliseconds are not a wake-up at all. They are **the wait for the next
+channel to arrive on the belt**, which is one whole open cycle: the previous visitor's channel has
+to be produced, and the visitor behind it takes that one.
+
+That is a structural limit, and it is the first one in this file that a *design* answer could
+remove: the cell is not slow because any hop is slow, but because **the pool holds nothing and
+every visitor queues behind production**. It also finally gives the archive's rejected "static warm
+pool" its mechanism — the objection was that a warm pool changes behaviour without a measured
+reason, and the reason was invisible until now: the pool is empty at every arrival.
+
+The next step is **A0y**: the shared queue's depth at the moment a pairing looks, to see how often
+it is empty (which the 5.4 ms wait predicts is always), and what the belt's period actually is.
+
 ### 4.17 The missing 3.4 ms is a wake-up after delivery, on the server's own queue (2026-11-06)
 
 Four stamps per group, all six thousand four hundred matched, and the order they came back in is
