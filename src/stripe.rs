@@ -669,6 +669,17 @@ async fn note_handoff<W: AsyncWrite + Unpin>(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // The other far-side leg: the source's bytes reached the carrier. Noted here
+    // because on that side of a group it also happens before any reply arrives.
+    let first_in = frames
+        .first_in_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if first_in != 0 {
+        crate::transport::stats::note_roundtrip_leg(
+            "from_src",
+            std::time::Duration::from_millis(epoch_millis().saturating_sub(first_in)),
+        );
+    }
     Ok(())
 }
 
@@ -687,6 +698,16 @@ fn note_first_reply(frames: &Frames) {
             .swap(true, std::sync::atomic::Ordering::Relaxed)
     {
         return;
+    }
+    // The leg this write ends: a frame that arrived from the carrier and is now
+    // in the destination. On the far side of a group this fires *before* any read
+    // from the source, which is why it is noted here and not in the pairing below.
+    let got_at = frames.got_ms.load(std::sync::atomic::Ordering::Relaxed);
+    if got_at != 0 {
+        crate::transport::stats::note_roundtrip_leg(
+            "to_dest",
+            std::time::Duration::from_millis(epoch_millis().saturating_sub(got_at)),
+        );
     }
     let sent = frames.sent_ms.load(std::sync::atomic::Ordering::Relaxed);
     let got = frames.got_ms.load(std::sync::atomic::Ordering::Relaxed);

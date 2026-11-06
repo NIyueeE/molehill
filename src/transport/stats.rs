@@ -298,8 +298,8 @@ pub(crate) fn note_roundtrip_leg(leg: &str, age: Duration) {
         return;
     }
     let slot = match leg {
-        "up" => &ROUNDTRIP_UP,
-        "wire" => &ROUNDTRIP_WIRE,
+        "up" | "from_src" => &ROUNDTRIP_UP,
+        "wire" | "to_dest" => &ROUNDTRIP_WIRE,
         _ => &ROUNDTRIP_DOWN,
     };
     let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
