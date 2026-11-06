@@ -499,6 +499,16 @@ pub(crate) struct Conn {
     /// scheduler next finds work. It is the send-buffer half of [`Conn::waiting`]
     /// and it costs two `Instant` reads per write call, not per packet.
     unsent_at: Option<Instant>,
+    /// When a write found the connection **idle** and queued bytes on it, and
+    /// which stream they were for.
+    ///
+    /// This is the one number that separates the two ways an open can be slow:
+    /// bytes that waited for the pump to wake (a scheduler defect, and it shows
+    /// here as milliseconds between queue and post) versus bytes that went out at
+    /// once and waited for the far end to answer (a path or acknowledgement
+    /// defect, invisible here). Measured at millisecond resolution, logged only
+    /// past a threshold, so a hot lane pays one clock read per idle write.
+    idle_queued: Option<(Instant, u32)>,
     /// When a stall line was last written, so one long stall costs one line a
     /// second rather than one per pass.
     stall_logged_at: Option<Instant>,
@@ -750,6 +760,7 @@ impl Conn {
             streams: BTreeMap::new(),
             cursor: u32::from(dialer),
             unsent_at: None,
+            idle_queued: None,
             stall_logged_at: None,
             last_refusal: None,
             table_logged_at: std::cell::Cell::new(None),
@@ -936,7 +947,14 @@ impl Conn {
         } else {
             room.saturating_sub(OPEN_RESERVE)
         };
+        // Was this connection idle before this call? A write that queues bytes on
+        // an idle connection is the moment an opening can begin waiting for the
+        // pump, and nothing else in the tree can see that wait.
+        let was_idle = self.unsent_at.is_none() && self.idle_queued.is_none();
         let take = usize::try_from(room).map_or(0, |room| room.min(bytes.len()));
+        if take > 0 && was_idle {
+            self.idle_queued = Some((Instant::now(), stream));
+        }
         if take < bytes.len() {
             // The window took less than the caller offered, so from this instant
             // there are bytes nobody has put on the wire: that is the age
@@ -1284,6 +1302,17 @@ impl Conn {
         if self.built > before {
             let number = self.recovery.last_number();
             self.note_first_posted(number);
+            if let Some((queued, stream)) = self.idle_queued.take() {
+                let waited = now.saturating_duration_since(queued);
+                if waited >= Duration::from_millis(5) && stats::enabled() {
+                    tracing::info!(
+                        lane = self.id,
+                        stream,
+                        waited_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                        "mhd idle write waited for the pump"
+                    );
+                }
+            }
         }
         packet
     }

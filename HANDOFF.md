@@ -155,12 +155,26 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 - **Unknown.** Where inside `open_channel_carrying` the time goes: the first
   Noise message's write, the pump's post of it, or the wait for the reply. The
   instrument that answers it is three timestamps inside that call.
-- **Next experiment (A0b).** Instrument `open_channel_carrying` — message written,
-  packet posted, reply arrived — then run the same `dev` A/B. It splits the 20 ms
-  into a wake-up path that does not reach the pump (a scheduler bug) or a peer
-  that answers late (an ACK-timing one), and either answer is smaller than phase
-  A. Phase A follows and is expected to remove most of the 20 ms, because the
-  handshake *is* the 20 ms.
+- **A0b, done — the pump is not the bottleneck.** The instrument measures the one
+  interval that separates the two ways an open can be slow: a write that finds the
+  connection idle records when it queued its bytes, and the pump records when it
+  posted the packet carrying them. Across seven rounds of `churn-16` and `rr-16`
+  (about two thousand opens) **not one** exceeded the 5 ms threshold:
+
+  ```
+  mhd idle write waited for the pump   ->  0 lines
+  churn-16 10.26-10.56 ms  (A/A 10.26-10.58)   rr-16 23 1/s
+  ```
+
+  So bytes queued on an idle connection reach the wire inside five milliseconds,
+  and the 20 ms is spent **after** the first handshake message is posted: this end
+  is waiting for the far end's reply. Phase A would remove the wait by removing
+  the exchange; the smaller fix needs one more split.
+- **Next experiment (A0c), and it is two timestamps.** On the server, "opening
+  datagram accepted → reply posted"; on the client, "reply datagram accepted →
+  the waiting reader woken". A slow first number is a server that builds late; a
+  slow second is a waker that does not fire — the same shape as the defect that
+  parked a stream for 11.9 s in the sealed striped test.
 - **Pass.** `churn-16` p99 moves toward the peers' ~2.6 ms; both clean stages
   improve; bulk stays within 15 %; peak RSS does not change class.
 - **Rollback.** No gain beyond the run's own noise, or bulk/capacity regression,
