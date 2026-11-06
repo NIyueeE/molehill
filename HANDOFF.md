@@ -267,66 +267,21 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** **A0d and A0e are done** (§4.1): the churn probe states
-the connect/echo split; `churn-16` turned out to be an `rr` scenario whose cell is
-the **first request on a fresh connection** (10.4 ms); and the server's pairing
-instrument already splits it — **`wait_us` 5.0–6.9 ms** is the visitor waiting for
-a data channel to *exist*, while `accept_us`, `enqueue_us` and `write_us` are
-microseconds.
+**Order, as of this commit.** The findings are in §4.1; this is the sequence they
+produce. A0e and A0f between them say the visitor's wait is the client's
+`open_us`, and that `hs_us` — the interval inside `open_stream` — stays under five
+milliseconds. So the time sits **in front of** `open_stream`: in pool placement or
+in the stripe request.
 
-**A0e is done, and it named the owner — it was already instrumented.** The
-server's `PairingFacts` has carried `accept_us / enqueue_us / wait_us / write_us /
-paired_us` since an earlier cycle; it prints at five milliseconds under the stats
-switch. Twelve samples from a `churn-16` run:
+The next step is **A0g**: one stamp in `client.rs` splitting `open_us` into
+`open_stripe_stream` and `open_stream`. That decides whether a fix touches
+placement or the stripe request; the archive's rejected warm pool is re-read after
+it, because the fix for a five-millisecond *placement* is not obviously a pool.
 
-```
-accept_us=14..24   enqueue_us=0   wait_us=5001..6885   write_us=1..4   paired_us=5003..6888
-```
-
-**The visitor waits five to seven milliseconds for a data channel to exist**, and
-every other leg of the pairing is microseconds. That wait is the whole of the
-clean tail's head: the visitor is accepted, the server asks the client for a
-channel over the control session, the client opens one (under 5 ms, §4.1 point 3),
-and only then does the pairing finish. There is **no channel waiting when the
-visitor arrives**.
-
-**A0f is done, by correlating the two ends' existing lines on `group`** (134 groups
-appear in both logs of one `churn-16` run):
-
-| sample | server `wait_us` | client `open_us` | difference |
-|---|---|---|---|
-| group 42 | 5 198 | 5 027 | 171 µs |
-| group 223 | 8 618 | 8 294 | 324 µs |
-| group 314 | 6 885 | 5 637 | 1 248 µs |
-
-**`wait_us` is the client's `open_us`**; the control-session hop is one tenth to
-one millisecond of it. So the answer to A0f is: the time is spent *opening the
-channel*, not asking for it.
-
-But that contradicts the pump-side measurement, and the contradiction is the useful
-part: `hs_us` — the interval measured **inside** `open_stream` — never reached five
-milliseconds in these runs, while `open_us` — the interval **around** it in
-`client.rs`, which includes pool placement and the stripe request — is five to
-eight. **The wait is therefore in front of `open_stream`, in the pool's placement
-or the stripe request**, and not in the handshake, not in the pump, and not in the
-control hop.
-
-The next step is **A0g**: split `open_us` into `open_stripe_stream` and
-`open_stream` (the second is already `hs_us`), which is one stamp in `client.rs`.
-The archive's rejected warm pool is re-read after that, because the fix for
-"placement takes five milliseconds" is not obviously a warm pool.
-
-The 21.8 ms open A0 found is **contention, not the clean path** (§4.1): it
-reproduces while bulk runs and does not appear in `churn-16` at all. It belongs
-to phase **C**. Phase **A**'s expected gain is therefore smaller than this
-document claimed two entries ago — the honest statement is that neither the
-handshake nor a timer accounts for the clean 10.4 ms yet.
-
-After A0d, in order: **A** (lane-root keys — still right on its own terms, and the
-contended open is a second reason) → **B** (RACK + PTO) → **C** (priority
-scheduling, now carrying the contended-open case) → **D** (delivery-rate
-controller) → **phase 6** (memory and CPU, only once the above hold) →
-**phase 7** (full verification, then the release record).
+After A0g, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
+scheduling, which also carries the contended open measured at 21.8 ms) → **D**
+(delivery-rate controller) → **phase 6** (memory and CPU, only once the above
+hold) → **phase 7** (full verification, then the release record).
 
 **Keep this order in two places, and update both together.** `HANDOFF.md` is the
 durable copy; the session's goal objective is the copy that is re-read every round,
