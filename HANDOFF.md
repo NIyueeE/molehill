@@ -2115,14 +2115,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **The two-arm guard for the abandon hold, and `loss5`'s own question** (§4.51,
-   pre-registered there). The fix is in (`d0f11a1`, and it works: `buffered` stops being
-   monotone and the two stages that carried zero bytes now carry 19.7 Mbit/s against a
-   20 Mbit/s shaper and 6 273 against none), but the one guard it owed — `clean` and
-   `rtt100` unchanged within a same-run A/A — was never measured, and `loss5` read 218
-   Mbit/s before the fix and 19.4 after, in one run each. Two arms, four rounds, one
-   scaled timeline: the patched arm must be at or above the previous commit's on `clean`
-   and `rtt100`, and above it on `clean#2` beyond the run's A/A.
+1. **Close the gate hole that lets an empty stage pass** (§4.49). A staged cell with
+   `streams > 0` whose bulk carried **zero bytes** reports `ok=True` with
+   `throughput_gbps: 0.0`, and `_breaks_slo` judges latency and errors only — so the
+   emptiest stage scores the best latency of the run, which is what §4.49 found five
+   times in six and §4.52 found three more times in one round of the pre-fix arm. It
+   must be `ok=False` with the instrument's own reason. This moves the bench's method
+   fingerprint, so it needs its own pre-registration and a re-measured baseline, and it
+   is the last bench change owed before the carrier work continues.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
