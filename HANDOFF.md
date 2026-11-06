@@ -309,22 +309,29 @@ cooperative budget yields only once a task has spent it (~128 polls), so the pum
 filling while the peer has budget to spare and gives up the worker on a cadence rather
 than on every full run.
 
-That is the second attempt at this loop, and the first one is in the record because it
-was measured and reverted in the same round: **removing the yield outright is a
-regression on every axis** — `wake.json`-shaped rounds read p99 355.8 / 135.3 / 26.8 /
-278.7 with throughput 3.31 / 4.97 / 6.36 / **0.74** Gbit/s, the listener's
-`max_gap_us` rose from 0.24–0.9 s to **20.3 s**, and the idle-wait count did not fall
-(1 588–3 653). A pump that never gives up its worker starves the dispatcher that feeds
-it acknowledgements, so the yield is load-bearing and only its *cost* is the defect.
+**Both variants have now been measured and reverted, so the give policy is a closed
+lever.** Three pumps, same cell, four rounds each:
 
-- **Pass**, over four rounds of the same cell: `idle write waited for the pump` below
-  **100 per round** (baseline 830–5 458) **and** all four at p99 ≤ 25 ms with throughput
-  ≥ 7.0 Gbit/s.
-- **Guard**: the listener's `max_gap_us` at or below **1 ms** — the no-yield attempt is
-  what that guard is for — plus `bulk-1`/`bulk-pair` inside a same-round A/A and
-  `rr-1`/`rr-16` not worse.
-- **Rollback**: any of the three: throughput below 7.0, a listener gap above 1 ms, or
-  the event count unchanged.
+| give | p99 (ms) | throughput (Gbit/s) | idle-wait events | listener `max_gap_us` |
+|---|---|---|---|---|
+| `yield_now` (baseline) | 22.7 / 35.1 / 99.1 / 19.5 | 7.11 / 7.22 / 9.18 / 7.05 | 830–5 458 | 0.27–0.90 s |
+| none | 355.8 / 135.3 / 26.8 / 278.7 | 3.31 / 4.97 / 6.36 / **0.74** | 1 588–3 653 | **20.3 s** |
+| `consume_budget` | 36.0 / **184.1** / 48.7 / 62.9 | 6.17 / 6.42 / 5.21 / 7.32 | 2 881–4 543 | 1.56 s |
+
+The baseline wins on both axes, and the two "cheaper" policies are worse in both
+directions at once: less giving starves the dispatcher that feeds the pump its
+acknowledgements, and the starvation costs more throughput than the yield ever cost
+latency. A pump whose inner loop has no await point cannot be preempted at all — tokio's
+scheduler is cooperative — which is why the no-yield run measures a 20-second gap and
+not a millisecond one.
+
+So the 5 ms figure is **not** reachable from this loop, and the honest reading of
+§4.42–§4.46 together is that the access-latency question has moved: three bounds of the
+send queue and three give policies have each been measured, and the cell's spread
+survives them all. §5's next item is therefore the **structural** one — one stream, one
+hop — which removes work rather than re-tuning it.
+
+### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
 
 ### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
 
@@ -1767,22 +1774,22 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Spend the pump's give, do not remove it** (§4.46, pre-registered there).
-   Removing `yield_now()` outright is measured and reverted: throughput 0.74 Gbit/s in
-   one round and a listener gap of 20 s, because a pump that never gives up its worker
-   starves the dispatcher that feeds it acknowledgements. `tokio::task::coop
-   ::consume_budget()` gives on a cadence instead of on every full run. Pass: idle-wait
-   events below 100 per round, all four rounds p99 ≤ 25 ms at ≥ 7.0 Gbit/s; guard: the
-   listener's `max_gap_us` ≤ 1 ms, bulk and rr inside a same-round A/A.
-2. **One stream, one hop** (the first *structural* change after that). A visitor
-   starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
-   whole group machinery: coordinator task, send loop, receive loop, one reader task
+1. **One stream, one hop** (the first *structural* change, and now the first item).
+   A visitor starts on one stripe (`initial_stripes()` is 1 in production) and still runs
+   the whole group machinery: coordinator task, send loop, receive loop, one reader task
    per stripe, a bounded channel between them, a grace timer and a monitor. A single
-   stripe needs none of it. `spawn_single_group` drives both directions from one
-   task over the same 10-byte frame and the same `StripeSender`, so the first
-   version changes no wire byte. Pass: the same slow-second share and the cell's
-   percentiles move beyond the run's own A/A; rollback: any rr, bulk, capacity, RSS
-   or CPU regression.
+   stripe needs none of it. `spawn_single_group` drives both directions from one task
+   over the same 10-byte frame and the same `StripeSender`, so the first version changes
+   no wire byte. It comes first because **every tunable in front of it has now been
+   measured and closed**: three send-queue bounds (§4.43–§4.44), three give policies
+   (§4.46), the wake (§4.46), the scheduler class (§4.45, withdrawn) and the smoothed-RTT
+   ceiling (§4.43, inert by arithmetic). Pass: the four-round cell at p50 ≤ 3.5 ms and
+   p99 ≤ 25 ms with throughput ≥ 7.0 Gbit/s, and `churn-16` beyond the run's own A/A;
+   rollback: any rr, bulk, capacity, RSS or CPU regression.
+2. **A lane root that is actually usable** (phase A: implemented, default off). The
+   switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
+   root-caused with a two-end join on stream, direction and packet — not until the
+   design reads well. §4.10's and §4.13's numbers decide its default afterwards.
 2. **One stream, one hop** (the first structural change). A visitor starts on one
    stripe (`initial_stripes()` is 1 in production) and still runs the whole group
    machinery: coordinator task, send loop, receive loop, one reader task per
