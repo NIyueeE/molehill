@@ -120,24 +120,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 - **Symptom.** Clean p99 22.5 ms against 2–3.5 ms for the TCP peers (§3.1), and
   the earlier cycle measured `open_us` p90 45.8 ms / max 101.5 ms on individual
   opens — a per-stream tail, not a throughput problem.
-- **A hypothesis that must be tested before the handshake is blamed.** A Noise KK
-  over loopback costs roughly one round trip, on the order of 0.1 ms — it cannot
-  by itself produce a **20 ms** median. The measured opening median was 20.18 ms,
-  and this crate carries `MIN_RTO_SMALL_FLIGHT = 20 ms` and
-  `SMALL_FLIGHT_INITIAL_RTO = 20 ms` on exactly this path. A number matching a
-  constant is a reason to look, not a conclusion (the archive has a section on
-  that mistake), so the first experiment is **A0**: timestamp the first opening
-  packet's post and its acknowledgement, and measure the interval. If it clusters
-  at the small-flight floor, the tail is an **RTO wait**, not a handshake, and A
-  below would buy far less than this document assumed.
-- **Unknown.** How much of that is the per-visitor KK handshake versus the
-  channel registration around it. The instrument that answers it (an end-to-end
-  timeline through `accept → request → pool open → first opening packet → Noise
-  reply → channel registered → first echoed byte`) does not exist yet.
-- **Next experiment.** **A0** (the small-flight RTO interval, one constant, one
-  A/B) and then Phase A below: derive per-stream keys from a **lane-level** root
-  instead of running a handshake per visitor. A0 is cheap and is done first
-  because it can invalidate A's premise.
+- **Where it is, measured (A0 done).** The client already splits an open into
+  `started_us` (spawn) / `open_us` (the carrier's stream open) / `ready_us`
+  (prologue) / `cmd_us` (command), and the carrier splits the open again into
+  `hs_us` (handshake) and `ack_us` (hello acknowledgement). In the failing
+  samples **all of the wait is `hs_us`**:
+
+  ```
+  started_us=2..16   open_us=8005..21924   ready_us=open_us+2..4   cmd_us=ready_us+3..17
+  mhd slow stream open: lane=0 us=21924 hs_us=21820 ack_us=0
+  ```
+
+  So the whole clean tail is the **per-visitor Noise handshake**, and a stream
+  open costs 5–22 ms where a loopback round trip costs 0.1.
+- **Two hypotheses already refuted, both one-constant A/Bs on the `dev` profile**
+  (`churn-16`, A/A in the same run, noise ±0.5 ms): the small-flight RTO clamp
+  (`MIN_RTO_SMALL_FLIGHT` 20 → 2 ms) and the unmeasured small-flight timer
+  (`SMALL_FLIGHT_INITIAL_RTO` 20 → 2 ms). `churn-16` read 10.2 ms before,
+  9.95 ms and 10.1 ms after — no change, both reverted. The 20 ms is therefore
+  **not** a retransmission timer, even though the code contains two constants of
+  exactly that value on the same path. (A number matching a constant is a reason
+  to look, not a finding.)
+- **Unknown.** Where inside `open_channel_carrying` the time goes: the first
+  Noise message's write, the pump's post of it, or the wait for the reply. The
+  instrument that answers it is three timestamps inside that call.
+- **Next experiment.** Instrument `open_channel_carrying` — message written,
+  packet posted, reply arrived — then run the same `dev` A/B. Phase A below
+  follows and is expected to remove most of the 20 ms, because the handshake
+  *is* the 20 ms.
 - **Pass.** `churn-16` p99 moves toward the peers' ~2.6 ms; both clean stages
   improve; bulk stays within 15 %; peak RSS does not change class.
 - **Rollback.** No gain beyond the run's own noise, or bulk/capacity regression,
@@ -233,9 +243,10 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order.** A0 (the small-flight RTO interval) → A → B → C → D, with the
-end-to-end timeline instrument from §4.1 built before A so that A is judged by
-attribution and not by a single number.
+**Order.** A0 → A → B → C → D. **A0 is done** (§4.1): it refuted the two
+small-flight timers and located the cost in `hs_us`, the per-visitor handshake —
+which is 21.8 ms of a 22.5 ms clean p99. Phase A therefore targets essentially
+the whole tail, not a fraction of it.
 
 **Reading list for B–D.** Four implementations are checked out under
 `~/tmp/mhd-references/`; each is cited where the plan uses it:
