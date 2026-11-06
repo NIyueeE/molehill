@@ -244,6 +244,56 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.48 The release timeline, measured with an A/A: one binary reads 47–133 ms on the first stage, and the last stage is at peer level (2026-11-06)
+
+The scaled sweep (`--scale 0.2`), two identical arms, two rounds, stats on, **0.0 %
+errors in all eight stages** — the first healthy full timeline this cycle has measured.
+36 samples, 432 s per arm-round.
+
+| stage | arm | rnd | n | p50 | p99 |
+|---|---|---|---|---|---|
+| `clean` | molehill | 0 / 1 | 607 / 638 | 6.19 / **3.04** | **132.95** / **47.32** |
+| `clean` | molehill~aa | 0 / 1 | 628 / 618 | 10.52 / 11.95 | **80.53** / **96.79** |
+| `clean#2` | molehill | 0 / 1 | 639 / 639 | 2.14 / 2.02 | **3.20** / **4.03** |
+| `clean#2` | molehill~aa | 0 / 1 | 640 / 639 | 2.48 / 1.99 | 23.43 / **2.65** |
+
+**The first stage is still there, and one binary produces both ends of it**: p99 47.3,
+80.5, 96.8 and 133.0 ms across four arm-rounds of the *same* build — a 2.8× spread with
+no configuration difference at all. `clean#2` is at the TCP peers' level in three of four
+readings (2.65–4.03 ms) and 23.4 in the fourth. So this cell's own floor is far larger
+than every effect §4.41–§4.47 tried to measure, and the ~22.5 ms §3 quotes is
+indistinguishable from "the first stage, at some point in its 47–133 ms range".
+
+**And the difference between the two clean stages is a state, not a warm-up.** Per-second
+interactive p50/p99, first six seconds and last four, in the same run:
+
+```
+clean   r0   5/24 10/28 4/61 5/65 4/83 8/101 … 7/59 7/33 7/39 2/2     (slow all through)
+clean~aa r1 20/102 20/66 7/74 16/78 10/52 17/191 … 9/84 9/38 12/38 16/16
+clean#2 r1   2/3 2/2 2/3 2/3 2/3 2/2 … 2/3 2/23 2/2 2/2                 (fast all through)
+clean#2~aa r1  2/2 2/2 2/2 2/2 2/3 2/2 … 2/3 2/22 2/3 2/3
+```
+
+The first stage is slow **for its whole 30 s** and the last is fast for its whole 30 s.
+It is not a cold start inside the stage: something about the *first* clean stage's state
+persists and something about the run's end-state does not have it. The shaped stages in
+the same run are stable to 2–25 % between arms (`rtt100` 403–511, `rate100` 102.0–103.4,
+`jitter` 103.1–107.2, `rate20` 167.7–313.9, `loss1` 267.8–1 098.5, `loss5` 1 422–2 478),
+so the variability is specific to the clean stages and not a property of the harness.
+
+**Next experiment, pre-registered before it runs.** The same shape, `RUST_LOG=info,
+molehill=debug` (the A/A run above had stats on but not debug, so it has no `mhd window`
+lines), and read the per-second `cwnd`, `ceiling`, `srtt_us`, `buffered` and `flight` for
+the first clean stage against the last, per lane.
+
+- **Decision rule, fixed now**: whichever of those five differs between the two stages by
+  more than its own **within-stage** spread is the next target; if none does, the
+  difference is not in the connection's state and the next instrument is the pool's
+  (lane age, placement, how many lanes a visitor's channel is opened on).
+- **Guard**: nothing changes in this run — it is an instrument-only measurement, and its
+  cost is one scaled timeline with one arm (≈7 minutes).
+- **No release record, no gate, no tag**: still a diagnostic on a scaled timeline.
+
 ### 4.47 One stream, one hop: a 24 % throughput win and a latency null the cell cannot resolve (2026-11-06)
 
 §5's first item was built: `spawn_single` drives a one-stripe group's two directions
@@ -384,10 +434,6 @@ So the 5 ms figure is **not** reachable from this loop, and the honest reading o
 send queue and three give policies have each been measured, and the cell's spread
 survives them all. §5's next item is therefore the **structural** one — one stream, one
 hop — which removes work rather than re-tuning it.
-
-### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
-
-### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
 
 ### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
 
@@ -1828,30 +1874,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Measure the release cell itself, with the A/A floor, before any further change.**
-   Everything in §4.41–§4.47 was measured on the `cost` cell — one `clean` stage with
-   four bulk streams — and that cell's own floor is now known to be **6.7 % of
-   throughput and 65 % of p99 between two runs of one binary** at eight rounds. The
-   release judgement is `timeline[clean]` in the full sweep, which has never been
-   measured with an in-run A/A on this tree, and four rounds of the `cost` cell cannot
-   stand in for it. One `sweep`-shaped run with the A/A twin, read per stage, is the
-   next measurement — it is also the cheapest way to find out whether the ~22–24 ms
-   this file has chased is still there after the wall of tuned-out levers.
-
-   **Pre-registered, before it runs.** `--profile dev --scenarios timeline --arms
-   molehill --aa --scale 0.2 --rounds 2 --warmup-rounds 0`, stats on, same topology; two
-   identical arms, so the *difference between them* is the floor for every number in
-   the same run. Read per stage, from the interactive series only.
-
-   - **A stage counts only if** its error rate is below 0.5 % — §4.41 found a window
-     that reported 93 % failed attempts and whose percentiles were survivors'.
-   - **"The 22.5 ms is still there"** means either arm's `clean` p99 is above the two
-     arms' difference by a margin, i.e. the gap to the TCP peers (2.06–2.38 ms) is
-     reproduced with an A/A floor under it. **"It is gone"** means both arms read at or
-     below that floor's upper arm. Anything else is "not resolved at this scale" and is
-     recorded as such rather than as a win or a loss.
-   - **No release record, no tag, no `gate`** — this run is a diagnostic on a scaled
-     timeline, and §3's numbers stay the baseline until a full sweep is asked for.
+1. **Name the state that separates the first clean stage from the last** (§4.48,
+   pre-registered there). Measured with an A/A for the first time: one binary reads
+   p99 **47.3 / 80.5 / 96.8 / 133.0 ms** on the first stage and **2.65 / 3.20 / 4.03 /
+   23.4** on the last, with the whole first stage slow second by second and the whole
+   last stage fast — so it is a persistent state, not a warm-up, and this cell's own
+   floor (2.8×) is larger than every effect §4.41–§4.47 tried to measure. The same
+   shape with `RUST_LOG=info,molehill=debug` and a per-second read of `cwnd`,
+   `ceiling`, `srtt_us`, `buffered` and `flight` per lane, first stage against last,
+   decides which of the five is the difference; if none is, the next instrument is the
+   pool's (lane age, placement, lanes per channel).
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
