@@ -3766,6 +3766,21 @@ impl<C> ChannelQueue<C> {
     /// instead of for whichever one happens to arrive next, so a visitor whose
     /// channel is slow no longer has it delivered to somebody else and then
     /// waits behind that visitor's.
+    /// Note that a pairing has taken its channel, from **any** exit of `take_for`.
+    ///
+    /// The three exits are a claim hit, a shared-queue hit and the `select!` arm that
+    /// waits on the claim; stamping only one of them is how this file twice concluded
+    /// the pairing never took its own channel.
+    fn note_taken(group: u32) {
+        if !crate::transport::stats::enabled() {
+            return;
+        }
+        let take_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        tracing::info!(group, take_ms, "mhd channel taken");
+    }
+
     async fn take_for(&self, group: u32) -> Option<C> {
         // Registered before the first look, so a delivery landing between the
         // look and the wait is not lost.
@@ -3783,19 +3798,13 @@ impl<C> ChannelQueue<C> {
             if let Some(rx) = claim.as_mut()
                 && let Ok(channel) = rx.try_recv()
             {
-                // The other end of the interval `deliver` starts: from here the
-                // difference is the wake-up, and nothing else can be in it.
-                if crate::transport::stats::enabled() {
-                    let take_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                    tracing::info!(group, take_ms, "mhd channel taken");
-                }
+                Self::note_taken(group);
                 self.unclaim(group);
                 return Some(channel);
             }
             match self.try_take() {
                 Ok(Some((_, channel))) => {
+                    Self::note_taken(group);
                     self.unclaim(group);
                     return Some(channel);
                 }
@@ -3817,6 +3826,9 @@ impl<C> ChannelQueue<C> {
                 tokio::select! {
                     item = rx.recv() => {
                         note_resume();
+                        if item.is_some() {
+                            Self::note_taken(group);
+                        }
                         self.unclaim(group);
                         // `None` here means the claim was withdrawn by a
                         // delivery that could not hand the channel over; the

@@ -238,6 +238,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.19 The five milliseconds were the tail of a gated log; the median pairing is 2.0 ms (2026-11-06)
+
+`report_pairing` opens with `if facts.paired_us < 5_000 { return }`. **Every pairing number this
+file has quoted since §4.13 is the tail of a threshold-gated sample**, not a median: 117 lines out of six
+thousand four hundred pairings in one run, the slow 1.8 %.
+
+Measured on all of them instead, by joining four absolute stamps on the group id:
+
+```
+client open                    p50 1.0 ms
+open end -> channel delivered  p50 0.0 ms   (mean 0.31, max 3)
+deliver -> pairing takes it    p50 0.0 ms   (99 % in the same millisecond)
+client start -> paired         p50 2.0 ms
+```
+
+**The pairing waits two milliseconds, not five.** The wake after delivery is instantaneous, the
+delivery follows the client's open immediately, and the whole of it is one channel open.
+
+So the cell's decomposition is corrected too:
+
+| term | value | shared? |
+|---|---|---|
+| visitor accepted and paired | **~2.0 ms** (not 5.4) | ours |
+| the first request's back-end echo | ~4.8 ms | every arm pays it |
+| the request and reply's carrier hops | ~0.4 ms | ours |
+
+and against a TCP peer's 7.2 ms the difference is **~3 ms of per-visitor setup**, of which half is
+the open (§4.9) — not the six-millisecond wait this file chased for a dozen rounds.
+
+This is the eighth time in this cycle that a threshold-gated log produced a false number, and the
+worst: it cost more rounds than any other error here. The rule already exists in §7 and was
+violated by the instrument that prints at five milliseconds. **A line that prints only the slow
+cases may never be used to characterise a wait** — the four-stamp join, printed for every group,
+is what the same question needed.
+
 ### 4.18 It was never a wake-up: the pairing takes somebody else's channel (2026-11-06)
 
 `deliver` was stamped where it hands a channel to the pairing's own queue, and `take_for` where
