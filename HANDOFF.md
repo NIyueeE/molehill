@@ -244,7 +244,75 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.48 The release timeline, measured with an A/A: one binary reads 47–133 ms on the first stage, and the last stage is at peer level (2026-11-06)
+### 4.49 The last clean stage carries no bulk in five of six runs, and the gate passes it (2026-11-06)
+
+§4.48's state diff turned into the round's most important finding, and it corrects the
+section above it: **`clean#2` is fast because it is not carrying anything.**
+
+Per-second connection state, same run, server lanes, first clean stage against last:
+
+| | `clean` (first) | `clean#2` (last) |
+|---|---|---|
+| `cwnd` / `ceiling` | 262 144 / 262 144 | 262 144 / 262 144 |
+| `srtt_us` p50 / p90 / max | **1 004 / 19 614 / 83 234** | **1 000 / 1 000 / 1 028** |
+| `buffered` p50 / max | 5.4 MB / 16.3 MB | **33.5 MB / 33.5 MB** (the ceiling) |
+| `flight` p50 / max | 118 KB / 9.6 MB | **0 / 51 B** |
+| `throughput_gbps` | **10.26** | **0.0** |
+
+And the bulk cell's own artifact says the same in iperf3's words: `end.streams[0].sender`
+reads `bytes: 0, bits_per_second: 0, max_snd_wnd: 0`, and every interval reads
+`snd_wnd: 0`. The visitor's TCP connection had a **zero receive window** for the whole
+measured window: the tool accepted it and never read from it.
+
+**Five of six `clean#2` cells across two runs read `0.0` Gbit/s**, all with `ok=True`, no
+`iperf_failure`, and no typed absence — so the cell reports a pass:
+
+| run | `clean` | `clean#2` |
+|---|---|---|
+| `state` | 10.26 | **0.0** |
+| `release-aa` (4 arm-rounds) | 7.57 / 9.07 / 9.44 / 9.47 | **0.0 / 0.0 / 0.0 / 2.69** |
+
+Two consequences, and the first is a gate defect rather than a carrier one:
+
+1. **A stage that carried no bulk passes the SLO.** `_breaks_slo` judges `rtt_p99_ms`
+   and `rtt_error_rate_pct` only, so a tool that stops forwarding after the first stage
+   scores its best latency of the run on its emptiest stage — and `rtt_samples` is 639,
+   because the interactive probe kept working. The gate has no check for "the bulk spine
+   carried approximately nothing in a stage that asked for four streams". §10 of
+   AGENTS.md already says a stage with no reading must say so with a reason; here it has
+   a reading (`0.0`) and no reason.
+2. **The wedge is real, reproducible, and after the shaped stages.** The server's send
+   buffer is pinned at `MAX_BUFFERED` with **nothing in flight**, no lane death is logged
+   (`mhd connection closed`, `mhd pump stopped`, `lane declared dead` all zero), and
+   `mhd stream ended` fires 108 times — the shape of a stream that was **reset** while
+   32 MB of its bytes were still queued, after which the visitor's channel is dead and
+   the group's send loop parks, which is exactly the zero window iperf3 measured.
+
+**So the two most-quoted numbers in this file need their caveat re-stated.** §3.1's
+`clean#2` 23.08 ms was measured in a full sweep where the bulk presumably did run (its
+throughput is not quoted per stage), and §4.28's "cold start: the last stage is at the
+peers' level" now has an alternative explanation that fits every scaled run here: the
+last stage is at the peers' level because it is empty. Until a sweep says otherwise, the
+**only load-bearing stage is the first**, which is also the one with the 47–133 ms
+spread.
+
+**Next experiment, pre-registered before it runs.** Reproduce the wedge in one scaled
+timeline with both ends' logs joined on the group id, and answer three questions in
+order: (a) which stream is reset, and by which end (`mhd peer reset a stream`, the
+client's `close_stream` on drop, or the group's abort); (b) what the client's group was
+doing immediately before it (its `stripe source ended` / `write failed` lines); (c) why
+the pool did not replace the lane — the lane never died, so the *stream* is the unit that
+failed and nothing rebuilds a channel mid-group.
+
+- **Pass**: one run names (a), (b) and (c) from the logs, with absolute stamps that agree
+  on both ends for the same group. No code change is made before that.
+- **A separate, bench-side fix, to be pre-registered and measured on its own**: a staged
+  cell whose `streams > 0` and whose throughput is zero must fail (`ok=False`) with the
+  instrument's own reason, so the gate cannot pass an empty stage. That changes the
+  bench's method and its fingerprint, and it is the first bench change this cycle that
+  closes a hole rather than adding a diagnostic.
+
+### 4.48 The release timeline, measured with an A/A: one binary reads 47–133 ms on the first stage, and the last stage is empty (2026-11-06)
 
 The scaled sweep (`--scale 0.2`), two identical arms, two rounds, stats on, **0.0 %
 errors in all eight stages** — the first healthy full timeline this cycle has measured.
@@ -259,10 +327,12 @@ errors in all eight stages** — the first healthy full timeline this cycle has 
 
 **The first stage is still there, and one binary produces both ends of it**: p99 47.3,
 80.5, 96.8 and 133.0 ms across four arm-rounds of the *same* build — a 2.8× spread with
-no configuration difference at all. `clean#2` is at the TCP peers' level in three of four
-readings (2.65–4.03 ms) and 23.4 in the fourth. So this cell's own floor is far larger
-than every effect §4.41–§4.47 tried to measure, and the ~22.5 ms §3 quotes is
-indistinguishable from "the first stage, at some point in its 47–133 ms range".
+no configuration difference at all. `clean#2` reads 2.65–4.03 ms in three arms and 23.4
+in the fourth — **and §4.49 shows why that is not a recovery: five of six of those cells
+carried no bulk at all** (0.0 Gbit/s, a zero receive window at the visitor). So this
+cell's own floor is far larger than every effect §4.41–§4.47 tried to measure, and the
+~22.5 ms §3 quotes is indistinguishable from "the first stage, at some point in its
+47–133 ms range" — which is also the only stage that carries load.
 
 **And the difference between the two clean stages is a state, not a warm-up.** Per-second
 interactive p50/p99, first six seconds and last four, in the same run:
@@ -1874,36 +1944,38 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Name the state that separates the first clean stage from the last** (§4.48,
-   pre-registered there). Measured with an A/A for the first time: one binary reads
-   p99 **47.3 / 80.5 / 96.8 / 133.0 ms** on the first stage and **2.65 / 3.20 / 4.03 /
-   23.4** on the last, with the whole first stage slow second by second and the whole
-   last stage fast — so it is a persistent state, not a warm-up, and this cell's own
-   floor (2.8×) is larger than every effect §4.41–§4.47 tried to measure. The same
-   shape with `RUST_LOG=info,molehill=debug` and a per-second read of `cwnd`,
-   `ceiling`, `srtt_us`, `buffered` and `flight` per lane, first stage against last,
-   decides which of the five is the difference; if none is, the next instrument is the
-   pool's (lane age, placement, lanes per channel).
-2. **A lane root that is actually usable** (phase A: implemented, default off). The
+1. **Name the wedge that empties the last stage** (§4.49, pre-registered there). Five of
+   six `clean#2` cells carry **0.0 Gbit/s** with `ok=True`: the server's send buffer is
+   pinned at `MAX_BUFFERED` with nothing in flight, `mhd stream ended` fires ~108 times,
+   no lane dies, and iperf3 reads `max_snd_wnd: 0` — a stream was reset with 32 MB
+   queued, the visitor's channel died, and nothing rebuilds a channel mid-group. One
+   scaled timeline with both ends' logs joined on the group id answers *which* stream,
+   *by which end*, and *why the pool did not help* — and no code changes before that.
+2. **Close the gate hole that lets an empty stage pass** (§4.49). A staged cell with
+   `streams > 0` and zero throughput must be `ok=False` with the instrument's reason;
+   today `_breaks_slo` judges latency and errors only, so the emptiest stage scores the
+   best latency of the run. This is a bench change: it moves the method fingerprint and
+   needs its own pre-registration and a re-measured baseline.
+3. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
    design reads well. §4.10's and §4.13's numbers decide its default afterwards.
-3. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
+4. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
    (`wire.rs` says so), so a UDP service is framed into a reliable stream and pays
    an ARQ, a route map, two worker queues and a Noise record for a packet that must
-   not be retransmitted at all. Only after 1 and 2, and never as a second fallback.
-4. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
+   not be retransmitted at all. Only after 1 and 3, and never as a second fallback.
+5. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
-5. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
+6. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
    `loss1` and `loss5` report 1.06 s and 1.46 s of p99, which is where recovery, not
    setup, decides the number.
-6. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
+7. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-7. **D (delivery-rate)** stays last: the clean cell never fills the window.
-8. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
+8. **D (delivery-rate)** stays last: the clean cell never fills the window.
+9. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
 Settled and off the list: **one stream, one hop** (§4.47). Built, measured at eight
