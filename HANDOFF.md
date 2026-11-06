@@ -267,12 +267,16 @@ app-limited sampling; loss is repaired, not treated as proof of capacity loss.
 Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** The next step is **A0d**: split the visitor's
-10.4 ms setup — the number the plan's TCP comparison is made of — into its dial,
-its channel open (already instrumented as `started_us` / `open_us` / `ready_us` /
-`cmd_us`) and its echo round trip, by timing those three steps separately in the
-bench's churn probe. That is a bench-side instrument fix, not a carrier change,
-and it decides what the next carrier change has to move.
+**Order, as of this commit.** **A0d is done** (§4.1): the churn probe now states
+the connect/echo split, and `churn-16` turned out to be an `rr` scenario whose
+cell is the **first request on a fresh connection** (10.4 ms). The carrier's share
+of that is bounded on both ends — no open reached 5 ms, the server accepts in
+6 µs and posts in 12 µs — so the residual sits in the **forward and echo path**.
+
+The next step is **A0e**: timestamp the first request's forward and echo legs on
+the server (`visitor accepted → first byte to the backend`, `first byte from the
+backend → written back to the visitor`), so the ~10 ms has an owner before any
+carrier change is attempted. Only then does a fix get designed.
 
 The 21.8 ms open A0 found is **contention, not the clean path** (§4.1): it
 reproduces while bulk runs and does not appear in `churn-16` at all. It belongs
