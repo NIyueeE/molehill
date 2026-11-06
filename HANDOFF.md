@@ -238,6 +238,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.25 The release cell cannot be measured in a round; and `cost` is not a latency cell (2026-11-06)
+
+A0ac needs one number — what a control arm (no tool in the path) reports on the same `timeline`
+cell — and getting it turned out to be its own finding.
+
+**The `timeline` scenario is a sweep-class run, not a round instrument.** One arm, seven stages,
+warm-up plus one measured round: a run started with two arms had not finished its **warm-up** after
+twenty minutes, and a control-only run had not either. Every other cell this file uses (`churn-16`,
+`rr-1`, `bulk-n`) finishes in three minutes because it is one scenario; `timeline` is seven. So
+A0ac is not something a round can contain, and pretending otherwise costs a round to learn nothing.
+It is now a long background run, collected when it lands.
+
+**The cheap profile with a control arm measures something else.** `stage` runs the `cost` scenario
+with arms `control, molehill, l3` in about a minute a round, and its metric is **CPU seconds per
+Gbit**, not latency:
+
+```
+molehill   0.966 / 1.027 s/Gbit     (its own A/A arm: 1.088)
+l3         0.713 s/Gbit
+```
+
+so this carrier spends about **forty percent more processor per gigabit** than the L3 tunnel in the
+same round, and its own A/A spread is six percent. That belongs to phase 6 and is recorded here so
+phase 6 does not start from a guess; it does not answer the latency question, and reading it as if
+it did would be the same category error as reading `cost` as a latency cell.
+
 ### 4.24 On the release cell every interval we own is milliseconds, and the cell is not (2026-11-06)
 
 Two more distributions on the timeline cell, both un-gated so the median can be read (the pairing
