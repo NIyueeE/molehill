@@ -3827,6 +3827,27 @@ fn open_data_channel(
     stripe: Option<StripeOpen>,
     queued_at: std::time::Instant,
 ) {
+    // **When this end started the open, and how long the command sat queued.**
+    // Absolute epoch milliseconds so it joins with the server's `ask_ms` for the
+    // same group: `now_ms - ask_ms - queued_us` is what the command spent on the
+    // control session itself, with this end's own queueing taken out.
+    if crate::transport::stats::enabled() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        // `StripeOpen` only exists with the multiplex feature, so the group is
+        // read through the same gate that gives it a field.
+        #[cfg(feature = "multiplex")]
+        let group = stripe.as_ref().map_or(0, |s| s.group);
+        #[cfg(not(feature = "multiplex"))]
+        let group = 0;
+        info!(
+            group,
+            now_ms,
+            queued_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "mhd channel open started"
+        );
+    }
     // Every data channel this end dials, with the service it serves and whether
     // it is a claim's lane. A dial that never happens and a dial that is refused
     // before it reaches the wire look identical without this line, and the L3

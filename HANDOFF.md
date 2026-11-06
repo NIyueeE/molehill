@@ -248,17 +248,24 @@ control hop (server writes the request -> the client's stream delivers it)   p50
 server `wait_us` for the same groups                                        p50 5.41 ms mean 5.59  max 9.2
 ```
 
-So the pairing wait is **2.0 ms of control hop, about 1.7 ms of channel open (§4.9) and about
-1.7 ms of the channel reaching the server**. The arithmetic closes to the measured 5.4 ms.
+**A0w corrected the label on that first term, and the correction matters.** `ask_ms` to the
+client's `got_ms` is not a control hop: `got_ms` is a *data* frame on the group's lane, so the
+interval already contains the open. Stamped where the client actually begins the open — absolute
+epoch milliseconds, with how long the command sat in its queue:
 
-**The control hop is the surprise: two milliseconds, where the same carrier's data hops are
-0.2 ms (§4.12).** A request written to the control session takes ten times as long to reach the
-client as a frame written to a data lane — on the same host, over the same carrier.
+```
+command trip (server writes the request -> the client starts the open)   p50 0.0 ms  mean 0.02  max 2
+client queueing before it starts                                        p50 0.00 ms
+```
 
-That is now the freshest and best-supported target this cycle has: **every fresh visitor waits
-two milliseconds for a command to cross the control session**, and that is a third of the cell's
-ten. It is also the one part of the path the transport work in the plan never touched, because
-nothing had ever measured it.
+**The control session is not slow.** A command crosses it in twenty microseconds.
+
+So the pairing wait of 5.4 ms is: **~0 ms of command, ~1.7 ms of open (§4.9), and ~3.7 ms of the
+new channel getting from the client's open to the server's pairing queue** — the server's own
+per-stream setup: accepting the stream, reading its hello and prologue, and delivering it.
+
+That is the last term of this cell and the only one never measured: three and a half
+milliseconds on the server between a stream arriving and a visitor being pairable with it.
 
 The whole cell, with every number now measured rather than inferred:
 
