@@ -403,6 +403,25 @@ impl<W: AsyncWrite + Unpin> StripeSender<W> {
 /// buffer — behind the 10-byte header, which is written in front once
 /// the read length is known — so the frame crosses to the stripe by
 /// ownership and the payload is copied zero times (link S1).
+/// Note the first read from a group's source: the echo, on the far side.
+///
+/// Its distance from the request's arrival is the one part of a visitor's round
+/// trip that includes the destination's own processing, and the only part the
+/// near side cannot see.
+fn note_first_source(frames: &Frames, first: bool) {
+    if !first {
+        return;
+    }
+    let arrived = frames.got_ms.load(std::sync::atomic::Ordering::Relaxed);
+    if arrived == 0 {
+        return;
+    }
+    crate::transport::stats::note_roundtrip_leg(
+        "echo",
+        std::time::Duration::from_millis(epoch_millis().saturating_sub(arrived)),
+    );
+}
+
 async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut src: R,
     mut sender: StripeSender<W>,
@@ -464,18 +483,18 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             u64::try_from(n).unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let _ = frames.first_in_ms.compare_exchange(
-            0,
-            epoch_millis(),
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
+        note_first_source(
+            &frames,
+            frames
+                .first_in_ms
+                .compare_exchange(
+                    0,
+                    epoch_millis(),
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok(),
         );
-        if seq == 0 {
-            // A direction that never logs this was **never polled**: the whole
-            // difference between a response that is slow and one that never starts,
-            // and the two want different fixes.
-            debug!(group, bytes = n, "stripe send: first frame read");
-        }
         if sampled {
             let waited = reading.elapsed();
             if waited >= std::time::Duration::from_millis(20) {

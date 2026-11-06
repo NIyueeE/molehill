@@ -238,7 +238,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.10 Sealing works now, removes the 1.7 ms handshake, and barely moves the cell (2026-11-06)
+### 4.11 The data path's two ends disagree by five times, and that is the finding (2026-11-06)
+
+The cell is the data path under concurrency (§4.10), so the next step was to split the server's
+`wire` leg — the one part it cannot see is the far side's. A fourth histogram was added on the
+client, `echo`, spanning the request's arrival from the carrier to the echo being read from the
+backend. Both ends, same run:
+
+```
+server  wire   p50 1000 µs   p90 6000 µs   (n = 4300)
+client  echo   p50 5000 µs   p90 6000 µs   (n = 2147)
+```
+
+**These span the same wall-clock interval from opposite ends and differ by five times.** One of
+them is not measuring what it says, and until they agree nothing about the data path's
+attribution is trustworthy — which is the same lesson as `ack_us` in §4.9 and the round before
+it: an instrument that has not been cross-checked against another view of the same interval is
+a guess with a number attached.
+
+The obvious candidates on inspection: the server's `sent_ms` is stamped at the **first handoff**
+while `got_ms` is stamped at the **first received frame**, and a group's first received frame is
+not necessarily the reply to its first handoff — a group can receive the request's own frames
+from a client that opened it, and the first round trip of a stripe group is not the first
+exchange the group carries. The client's `echo`, meanwhile, starts at the first frame *from* the
+carrier and ends at the first read *from the backend*, which is a different pair of events.
+
+The next step is **A0t**: one line per group stating both ends' stamps for the *same* round trip
+(group id, `sent`, `got`, `echo`), so the two numbers are defined in terms of the same two
+events before either is used again.### 4.10 Sealing works now, removes the 1.7 ms handshake, and barely moves the cell (2026-11-06)
 
 The mechanism phase A needs **already exists**: with `MOLEHILL_MHD_SEAL=1` the first stream's
 handshake leaves a lane root behind, every later stream writes one derived selector byte, and

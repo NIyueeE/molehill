@@ -407,6 +407,14 @@ static ROUNDTRIP_UP: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new
 static ROUNDTRIP_WIRE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 static ROUNDTRIP_DOWN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// On the far side of a group: the interval between the request arriving from the
+/// carrier and the echo being read from the destination.
+///
+/// It is the one piece of the server's `wire` leg that the server cannot see, and
+/// the only part of a visitor's round trip that includes the backend's own
+/// processing.
+static ROUNDTRIP_ECHO: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 /// Note one leg of a visitor's first round trip.
 pub(crate) fn note_roundtrip_leg(leg: &str, age: Duration) {
     if !enabled() {
@@ -415,6 +423,7 @@ pub(crate) fn note_roundtrip_leg(leg: &str, age: Duration) {
     let slot = match leg {
         "up" | "from_src" => &ROUNDTRIP_UP,
         "wire" | "to_dest" => &ROUNDTRIP_WIRE,
+        "echo" => &ROUNDTRIP_ECHO,
         _ => &ROUNDTRIP_DOWN,
     };
     let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
@@ -1397,6 +1406,7 @@ fn report_send_path() {
         ("up", &ROUNDTRIP_UP),
         ("wire", &ROUNDTRIP_WIRE),
         ("down", &ROUNDTRIP_DOWN),
+        ("echo", &ROUNDTRIP_ECHO),
     ] {
         let samples = {
             let mut guard = slot
