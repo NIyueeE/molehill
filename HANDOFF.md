@@ -282,9 +282,32 @@ four times their own uncontended cost — and ours is 44 % worse than a plain TC
 tunnel's. Our own setup (1.4 ms, A0h) is a large part of that difference; the rest
 is the extra hop the carrier adds per connection.
 
-The next step is **A0m**: compare the two arms' `setup_p50_ms` (the connect to the
-tunnel, which neither tool can avoid) and their channel-open cost, so the 3.2 ms
-difference is attributed rather than guessed.
+**A0m is done, and it moves the target to the tail.** The same run, per-metric:
+
+| `churn-16` | molehill | frp |
+|---|---|---|
+| `rtt_p50_ms` | **6.89 / 7.32** | **6.54 / 6.55** |
+| `rtt_p99_ms` | **10.40 / 12.12** | **7.20 / 7.35** |
+| `setup_p50_ms` | 0.085 / 0.093 | 0.075 / 0.076 |
+
+So the **median is at parity** — within five percent of a plain TCP tunnel — and the
+`1.44×` above is entirely a **p99** difference. The connect to the tunnel, which
+neither tool can avoid, is eighty microseconds for both.
+
+The distribution is also ten times as variable: our A/A pair reads 10.40 and 12.12
+for p99 against the peer's 7.20 and 7.35.
+
+**So what remains is the tail of a fresh connection, not its typical cost** — and
+that is exactly what the objective asks for ("new-connection p99 close to TCP's").
+A tail that is wide only when sixteen visitors arrive at once points at
+something that happens *once per burst* rather than per connection: the pool
+growing (dialling a tunnel when the burst exceeds what it holds), a lane being
+created, or the first group's stripe plan.
+
+The next step is **A0n**: count how often the pool grows during `churn-16` and
+correlate those moments with the slow opens. Our own `open_us` has a p50 of 1.4 ms
+and never reached 5 ms in the churn runs; the pool's growth path is the one piece
+of a fresh connection that has never been timed.
 
 ---
 
@@ -326,9 +349,13 @@ client and the backend, about a millisecond each.
 0.162 ms; 8 % behind on the sixteen-connection rate), and on sixteen *fresh*
 connections we are 1.44× slower (10.4–12.1 against 7.2–7.3 ms).
 
-**A0m** is next: compare the two arms' `setup_p50_ms` and their channel-open
-cost, so the 3.2 ms difference is attributed rather than guessed. Our own setup is
-1.4 ms of it.
+**A0m is done** (§4.7): the median is at parity with a TCP tunnel — 6.9–7.3
+against 6.5–6.6 ms — and the whole difference is the **p99**, 10.4–12.1 against
+7.2–7.4. The tail, not the typical case, is what is left.
+
+**A0n** is next: count pool growths during `churn-16` and correlate them with the
+slow opens. Growth is the one piece of a fresh connection that has never been
+timed.
 
 Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which is where the hop latency belongs) → **D** (delivery-rate
