@@ -136,11 +136,17 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 - **Two hypotheses already refuted, both one-constant A/Bs on the `dev` profile**
   (`churn-16`, A/A in the same run, noise ±0.5 ms): the small-flight RTO clamp
   (`MIN_RTO_SMALL_FLIGHT` 20 → 2 ms) and the unmeasured small-flight timer
-  (`SMALL_FLIGHT_INITIAL_RTO` 20 → 2 ms). `churn-16` read 10.2 ms before,
-  9.95 ms and 10.1 ms after — no change, both reverted. The 20 ms is therefore
-  **not** a retransmission timer, even though the code contains two constants of
-  exactly that value on the same path. (A number matching a constant is a reason
-  to look, not a finding.)
+  (`SMALL_FLIGHT_INITIAL_RTO` 20 → 2 ms). `churn-16` read **10.2 ms** at the
+  baseline, **9.95 ms** and **9.5–10.7 ms** after — no change, both reverted. The
+  20 ms is therefore **not** a retransmission timer, even though the code contains
+  two constants of exactly that value on the same path. (A number matching a
+  constant is a reason to look, not a finding.)
+- **A proviso on that second A/B.** I rebuilt the binary *while its run was still
+  going*, so only that run's first four rounds belong to the 2 ms build (9.720,
+  10.472, 7.373, 10.733 ms); the rest measured a mixed binary and are not used.
+  The conclusion does not change — the first four are the whole of the evidence —
+  but the rule is worth restating: **build, then run, then read; never rebuild
+  under a measurement.**
 - **Unknown.** Where inside `open_channel_carrying` the time goes: the first
   Noise message's write, the pump's post of it, or the wait for the reply. The
   instrument that answers it is three timestamps inside that call.
