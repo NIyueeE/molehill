@@ -399,9 +399,31 @@ Two independent ~1.2 ms waits inside one open, where the carrier's own round tri
 on an idle lane is a tenth of a millisecond. That is what a fresh connection pays
 twice, and it is why its median sits at 1.4 ms above the peer's.
 
-The next step is **A0r**: find what each wait waits for. Both are "the runtime runs
-something else first" in shape, so the instrument is a wake-up stamp on each side
-of `read_ack` and of `open_channel_with_id`, not another protocol experiment.
+**A0r narrows it once more and then stops at a wall of equal numbers.** Five
+phases now, and two of them are exonerated:
+
+```
+preface       p50 1 µs      p99 5 µs     (hello serialisation, closed check)
+lock_wait     p50 2 µs      p99 3 µs     (the connection lock, for `open()`)
+open_channel  p50 1227 µs   p99 4363 µs
+hello_ack     p50 1226 µs   p99 4362 µs
+channel_call  p50 22.8 ms   (one sample: the first open on a fresh lane)
+```
+
+`open_channel_with_id` is synchronous, its preface is a microsecond, its lock is
+two — and `open_channel` still reads 1.2 ms. `hello_ack` is a second, independent
+1.2 ms, which is also what an idle lane's round trip would not cost.
+
+**Two unrelated waits landing on the same number is the clue**: that is the shape
+of two "let the runtime run something else" hops, not of two pieces of work. The
+measurement cannot separate them further with stamps on the caller's side, because
+both waits are inside the callee and both are dominated by time this task is simply
+not running.
+
+The next step is **A0s**, and it is a different kind of instrument: count what the
+runtime is doing while an open waits — the number of tasks polled and the number of
+`shared` passes during the 1.2 ms, so "waiting for a wake-up" and "waiting behind
+work" can be told apart.
 
 ---
 

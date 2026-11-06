@@ -300,12 +300,17 @@ static OPEN_US: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// includes the Noise handshake when one is carried) and the hello's round trip
 /// (`ack_us`). The slow-open line already states both, but only past five
 /// milliseconds — a sample of the worst, not a distribution.
-static OPEN_PHASE: [std::sync::Mutex<Vec<u32>>; 2] = [
+static OPEN_PHASE: [std::sync::Mutex<Vec<u32>>; 5] = [
+    std::sync::Mutex::new(Vec::new()),
+    std::sync::Mutex::new(Vec::new()),
+    std::sync::Mutex::new(Vec::new()),
     std::sync::Mutex::new(Vec::new()),
     std::sync::Mutex::new(Vec::new()),
 ];
 
 /// Note one phase of an mhd channel open: 0 is `hs_us`, 1 is `ack_us`.
+/// Note one phase of an mhd channel open: 0 is `hs_us`, 1 is `ack_us`, 2 is the
+/// wait for the connection's own lock.
 pub(crate) fn note_open_phase(phase: usize, us: u64) {
     if !enabled() || phase >= OPEN_PHASE.len() {
         return;
@@ -1268,7 +1273,16 @@ fn report_open_steps() {
 
 /// Report the two open phases: the median and the tail of each.
 fn report_open_phases() {
-    for (phase, name) in ["open_channel", "hello_ack"].iter().enumerate() {
+    for (phase, name) in [
+        "open_channel",
+        "hello_ack",
+        "lock_wait",
+        "preface",
+        "channel_call",
+    ]
+    .iter()
+    .enumerate()
+    {
         let samples = {
             let mut guard = OPEN_PHASE[phase]
                 .lock()

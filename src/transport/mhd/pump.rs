@@ -862,7 +862,15 @@ impl MhdLane {
         if self.shared.is_closed() {
             return Err(crate::transport::multiplex::LaneError::Closed);
         }
+        // **The one number that says whether an open waits for the pump.** This
+        // section is synchronous — `open()` allocates an id and nothing else — so
+        // any time it takes is time spent waiting for the connection's lock, which
+        // the pump holds while it builds packets. Sixteen concurrent opens against
+        // one lock is exactly the shape the churn cell measures.
+        let locking = Instant::now();
         let id = self.shared.with(|conn| conn.open().id);
+        let lock_us = u64::try_from(locking.elapsed().as_micros()).unwrap_or(u64::MAX);
+        crate::transport::stats::note_open_phase(2, lock_us);
         self.shared.wake_pump();
         let plain: crate::transport::multiplex::CarrierStream =
             Box::new(StreamIo::new(Arc::clone(&self.shared), id));
@@ -1094,6 +1102,12 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // first written — `hs_us` measured the preparation and read a flat `1`,
         // which cost a round of believing the handshake was free.
         let mut ack_at = Instant::now();
+        // Where the open's first millisecond goes: everything before the branch
+        // (the hello's serialisation and the closed check) against the channel
+        // call itself. `lock_wait` already showed the lock is two microseconds, so
+        // one of these two owns the rest.
+        let preface_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+        crate::transport::stats::note_open_phase(3, preface_us);
         let (stream_id, stream, ack, hs_us) = if carries {
             let (id, stream, theirs) = self.open_channel_carrying(&hello).await?;
             let hs = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -1103,6 +1117,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         } else {
             let (id, mut stream) = self.open_channel_with_id().await?;
             let hs = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+            crate::transport::stats::note_open_phase(4, hs.saturating_sub(preface_us));
             stream
                 .write_all(&hello)
                 .await
