@@ -1052,6 +1052,32 @@ impl MhdLane {
     }
 }
 
+impl MhdLane {
+    /// One line when an open's round trip was slow, naming where its wait went.
+    ///
+    /// `reply_age_us` is how long the bytes that ended it had already been in this
+    /// end's buffer when the caller was handed them — the wake-up latency no hop
+    /// measurement can see.
+    fn log_slow_open(&self, stream_id: u32, carries: bool, hs_us: u64) {
+        if hs_us < 1_000 || !crate::transport::stats::enabled() {
+            return;
+        }
+        let Some(ready) = self.shared.with(|conn| conn.reader_ready_at(stream_id)) else {
+            return;
+        };
+        tracing::info!(
+            lane = self.id,
+            stream = stream_id,
+            carries,
+            hs_us,
+            reply_age_us =
+                u64::try_from(Instant::now().saturating_duration_since(ready).as_micros())
+                    .unwrap_or(u64::MAX),
+            "mhd open round trip"
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::transport::multiplex::PoolLane for MhdLane {
     fn id(&self) -> usize {
@@ -1109,7 +1135,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // is the acknowledgement. Stamped before the branch instead — as this was
         // first written — `hs_us` measured the preparation and read a flat `1`,
         // which cost a round of believing the handshake was free.
-        let mut ack_at = Instant::now();
+        let ack_at: Option<Instant>;
         // Where the open's first millisecond goes: everything before the branch
         // (the hello's serialisation and the closed check) against the channel
         // call itself. `lock_wait` already showed the lock is two microseconds, so
@@ -1119,6 +1145,11 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         let (stream_id, stream, ack, hs_us) = if carries {
             let (id, stream, theirs) = self.open_channel_carrying(&hello).await?;
             let hs = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+            // The reply's payload arrived with the handshake, so this phase is
+            // parsing and nothing else. Stamped here for the same reason the plain
+            // branch is: without it, `ack_us` measured the whole handshake and the
+            // two phases read identical (which is how this was found).
+            ack_at = Some(Instant::now());
             let ack = postcard::from_bytes::<crate::protocol::Ack>(&theirs)
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
             (id, stream, ack, hs)
@@ -1134,45 +1165,21 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 .flush()
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-            // The hello is on the wire from here; the wait for its answer starts
-            // now. Stamped *before* the read, because the stamp used to sit
-            // immediately beside `elapsed()` further down — which measured zero by
-            // construction and hid this whole phase (its line always read
-            // `ack_us=0`).
-            ack_at = Instant::now();
+            // Stamped before the read: it used to sit beside its own `elapsed()`
+            // and always read zero, hiding this phase entirely.
+            ack_at = Some(Instant::now());
             let ack = crate::protocol::read_ack(&mut stream)
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
             (id, stream, ack, hs)
         };
-        // **Where a slow open's round trip went.** `hs_us` is the whole wait for
-        // the channel to be usable; `reply_age_us` is how long the bytes that ended
-        // it had already been sitting in this end's buffer when the caller was
-        // handed them — the **wake-up latency**, the one interval no hop
-        // measurement can see. Equal numbers mean the far end answered at once and
-        // the waiter was woken late; a small age means the answer itself was late.
-        // Every hop on either side is measured in microseconds (`accept_p50` 6,
-        // `post_p50` 12, placement under a millisecond), so a millisecond-scale
-        // round trip on loopback is one of these two and nothing else.
-        if hs_us >= 1_000
-            && crate::transport::stats::enabled()
-            && let Some(ready) = self.shared.with(|conn| conn.reader_ready_at(stream_id))
-        {
-            tracing::info!(
-                lane = self.id,
-                stream = stream_id,
-                carries,
-                hs_us,
-                reply_age_us =
-                    u64::try_from(Instant::now().saturating_duration_since(ready).as_micros())
-                        .unwrap_or(u64::MAX),
-                "mhd open round trip"
-            );
-        }
+        self.log_slow_open(stream_id, carries, hs_us);
         // The acknowledgement's wait: from the hello going out to its answer —
         // or, in the carrying shape, from the handshake returning to the reply's
         // payload being parsed.
-        let ack_us = u64::try_from(ack_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let ack_us = ack_at.map_or(0, |at| {
+            u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
         // Both phases into histograms, every open: the line further down prints
         // only past five milliseconds, which is a sample of the worst (see
         // `stats::note_open_phase`).

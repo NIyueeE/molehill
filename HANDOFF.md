@@ -260,14 +260,32 @@ With that, the whole set of exclusions for the fresh-connection tail is:
 | the carrier's own round trip | 0.1 ms on an idle lane (§4.7) |
 | a lost wake | one timer pass per run, finding nothing (§4.9) |
 
-What is left is structural rather than a defect: **a fresh mhd connection pays two serial
-waits of about 1.2 ms each, and a plain TCP tunnel pays one.** Its own connect (`setup_p50`
-0.08 ms) is not one of them. Two waits of the size the peer's whole connection costs is
-exactly the median gap of 1.4 ms and, multiplied by the same contention, the p99 gap of 3 ms.
+**Then the corrected instrument changed the picture once more, and for the better.**
+`ack_at` was only ever assigned in the plain branch, so for a *carrying* open it still
+held the function's entry stamp — and `ack_us` therefore measured the whole handshake.
+That is why the two phases read identical. Stamped in both branches:
 
-The candidate fix that follows is a protocol one and it is the plan's phase A in miniature:
-**let the opening carry the hello**, so a fresh connection pays one round trip and not two —
-which the carrier already does for a *registered* lane and cannot do on the plain path.
+```
+preface       p50 1 µs
+open_channel  p50 1693–1743 µs
+hello_ack     p50 0 µs
+```
+
+So an open is **one wait, not two**: `open_channel` — the Noise handshake, with the
+hello and its acknowledgement carried inside it, which is the shape that was
+already optimised. `hello_ack` is zero because the reply arrives with the
+handshake, exactly as designed.
+
+The interesting number is the ratio: **the carrier's own round trip on an idle lane
+is 0.1 ms, and the handshake's is 1.7 ms.** Sixteen times, on loopback, with every
+hop measured in microseconds and both wake-ups accounted for. The difference is the
+per-visitor handshake itself — two X25519 exchanges and the two task wake-ups that
+carry them — and that is precisely what phase **A** (lane-root keys, one handshake
+per lane instead of per visitor) removes.
+
+So the A0 series ends where the plan began, but now with a number instead of an
+assumption: **1.7 ms of every fresh connection is a handshake that a lane root
+would not need to run at all.**
 
 ### 4.8 Bulk has no published baseline, and is not behind where it was measured (2026-11-06)
 
