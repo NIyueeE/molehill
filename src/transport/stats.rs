@@ -1443,6 +1443,47 @@ pub(crate) fn note_pair_wait(us: u64) {
 }
 
 /// Report this second's pairing waits.
+/// How many pump passes found an idle write still queued before one carried it.
+static IDLE_PASSES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note how many passes an idle write waited for.
+pub(crate) fn note_idle_passes(passes: u64) {
+    if !enabled() {
+        return;
+    }
+    let passes = u32::try_from(passes).unwrap_or(u32::MAX);
+    let mut samples = IDLE_PASSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(passes);
+    }
+}
+
+/// Report this second's idle-write pass counts.
+fn report_idle_passes() {
+    let samples = {
+        let mut guard = IDLE_PASSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *guard);
+        drop(guard);
+        let mut sorted = taken;
+        sorted.sort_unstable();
+        sorted
+    };
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50 = pct_us(&samples, 50, 100),
+        p99 = pct_us(&samples, 99, 100),
+        max = samples.last().copied().unwrap_or(0),
+        "mhd-stats: pump passes an idle write waited for"
+    );
+}
+
 /// Pump passes that began with a write queued on an idle connection, split by
 /// whether the pass was woken by the pump's signal or by its timer.
 ///
@@ -1699,6 +1740,7 @@ fn report_all() {
         report_pair_wait,
         report_accept_wait,
         report_pump_wakes,
+        report_idle_passes,
         report_open_steps,
         report_open_phases,
     ] {

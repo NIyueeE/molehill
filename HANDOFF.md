@@ -238,6 +238,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.32 One pass: the pump is signalled and then not polled for six milliseconds (2026-11-06)
+
+Counting passes rather than milliseconds, as §4.31 planned — how many `poll_transmit` calls find the
+idle write still queued before one carries it:
+
+```
+churn-16        p50 = 1   p99 = 1   max = 1
+timeline[clean] p50 = 1   p99 = 1   max = 1      (~100 a second, every second)
+```
+
+**One, everywhere.** So the first pass that looks at that lane carries its data, and the five to eight
+and a half milliseconds are **not spent inside the pump's pass**: they are spent between the data
+queueing and that pass *beginning*.
+
+Both halves of the earlier reasoning are now excluded, and what is left is precise:
+
+- the wake arrives (signal, 100 %, §4.31);
+- the first pass that sees the queue carries it (one pass, here);
+- and yet the queue sits for five to eight and a half milliseconds first.
+
+That leaves exactly one shape: **the pump task is runnable and not polled for that long** — either the
+runtime is not scheduling it, or it is inside one of the two awaits in its loop that are not `wait()`
+and takes milliseconds to come back. The loop has three: `flush(&socket, …)` around every send,
+`yield_now()`, and `wait()`. A `flush` on a socket whose send buffer is full blocks until the socket is
+writable, which under four thousand visitors is exactly the kind of thing that takes milliseconds.
+
+The next step is **A0ai**: put a histogram on the pump loop's own awaits — how long each `flush` takes,
+and how long the task spends between leaving `wait()` and arriving at the next one. If `flush` owns
+five to eight milliseconds, the tail is a socket-writable stall and the answer is in the send path,
+not in the carrier's scheduling at all.
+
 ### 4.31 The wake is not missed; the pump is woken and still does not serve the lane (2026-11-06)
 
 Counting where every pump pass came from, but only when a write was already queued on an idle

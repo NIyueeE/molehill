@@ -509,6 +509,12 @@ pub(crate) struct Conn {
     /// defect, invisible here). Measured at millisecond resolution, logged only
     /// past a threshold, so a hot lane pays one clock read per idle write.
     idle_queued: Option<(Instant, u32)>,
+    /// How many pump passes have found that idle write still queued.
+    ///
+    /// One means the first pass that looked at this connection carried it; two or
+    /// more mean passes ran and chose not to serve this lane, which is a
+    /// scheduling question in this end's own loop rather than a wake-up one.
+    idle_passes: u32,
     /// When a stall line was last written, so one long stall costs one line a
     /// second rather than one per pass.
     stall_logged_at: Option<Instant>,
@@ -761,6 +767,7 @@ impl Conn {
             cursor: u32::from(dialer),
             unsent_at: None,
             idle_queued: None,
+            idle_passes: 0,
             stall_logged_at: None,
             last_refusal: None,
             table_logged_at: std::cell::Cell::new(None),
@@ -1303,11 +1310,19 @@ impl Conn {
     /// appended from the stream's own buffer and never staged twice.
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
         let before = self.built;
+        // **One pass that found the idle write still queued.** Incremented before
+        // the build, so a pass that carries it counts as one rather than zero.
+        if self.idle_queued.is_some() {
+            self.idle_passes = self.idle_passes.saturating_add(1);
+        }
         let packet = self.build_packet(now, out);
         if self.built > before {
             let number = self.recovery.last_number();
             self.note_first_posted(number);
             if let Some((queued, stream)) = self.idle_queued.take() {
+                let passes = self.idle_passes;
+                self.idle_passes = 0;
+                stats::note_idle_passes(u64::from(passes));
                 let waited = now.saturating_duration_since(queued);
                 if waited >= Duration::from_millis(5) && stats::enabled() {
                     tracing::info!(
