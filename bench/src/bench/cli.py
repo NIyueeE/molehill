@@ -1385,6 +1385,47 @@ def _check_probes(c: Checker) -> None:
         "a threshold at or below the budget makes one unanswered attempt a wedge",
     )
 
+    # The staged probe set is declared once, in `model.STAGED_SERIES`, and every
+    # name in it must be a mode the probe actually implements: a name the probe
+    # does not know would start a process that exits immediately, and the stage
+    # would then report a series that produced nothing rather than a typo.
+    c.check(
+        "every staged series is a mode the probe implements",
+        set(model.STAGED_SERIES) <= set(series.MODES),
+        f"declared {sorted(model.STAGED_SERIES)}, probe has {sorted(series.MODES)}",
+    )
+    c.check(
+        "the staged scenarios start every series by default",
+        all(
+            tuple(model.SCENARIOS[name].params.get("series", ()))
+            == tuple(model.STAGED_SERIES)
+            for name in ("timeline", "soak", "cost")
+        ),
+        "a staged scenario that defaults to fewer series cannot be gated",
+    )
+    # A subset is a diagnostic, and both ways of naming a bad one are refused
+    # before a namespace is created. The empty list is the one that looks
+    # harmless: it starts no probe at all and every metric reads absent.
+    for refused in (
+        {"series": ("interactive", "churnn")},
+        {"series": ()},
+    ):
+        try:
+            workloads.staged_series(refused)
+            ok = False
+        except SystemExit:
+            ok = True
+        c.check(
+            f"a staged run refuses series {refused['series']!r}",
+            ok,
+            "a bad probe set must fail before the run, not measure nothing",
+        )
+    c.check(
+        "a staged run with no series named starts all of them",
+        workloads.staged_series({}) == tuple(model.STAGED_SERIES),
+        str(workloads.staged_series({})),
+    )
+
 
 #: What [`_check_wedges`]'s silent sample must report: two unanswered attempts,
 #: the first starting at 105.0 and the last ending at 115.6 — so a silence is
@@ -1662,6 +1703,16 @@ def _add_model_parsers(sub: argparse._SubParsersAction) -> None:
         type=float,
         default=0.0,
         help="scale every staged timeline's holds (a full sweep in minutes)",
+    )
+    run.add_argument(
+        "--series",
+        default="",
+        help=(
+            "comma list of staged probe series to start "
+            "(interactive,udp,churn; default: all three). A subset is a "
+            "diagnostic: a run without `interactive` has no staged rtt_p99_ms "
+            "and the gate will refuse it"
+        ),
     )
     run.add_argument("--warmup-rounds", type=int, default=None)
     run.add_argument("--binary", default=str(paths.DEFAULT_BINARY))

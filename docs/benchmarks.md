@@ -430,6 +430,21 @@ applied to its holds.
 same shape answers a question in two minutes or in forty; the scale travels in
 the fingerprint, because a run that used it measured a different method.
 
+**The staged p99 is one series, not a sum.** A stage runs three probes at once —
+an interactive one (a fresh TCP connection carrying one 64-byte echo every
+50 ms), a churn one (sixteen fresh connections a second) and a datagram one — and
+each feeds a different metric: `rtt_p99_ms` comes from the interactive series
+alone, `churn_per_s` from the churn series, `udp_rtt_p99_ms` and `udp_loss_pct`
+from the datagram one. They are three measurements of one network at one instant
+and are never pooled into one percentile; a stage's results record carries both
+how many samples each series produced and which series ran.
+
+The probe set is a method parameter. `--series interactive` starts that probe
+alone, `--series interactive,churn` starts two. A subset is a **diagnostic** —
+"does a second probe on this host move the first one's tail?" — and never a
+release configuration, because a run without the interactive series has no staged
+`rtt_p99_ms` at all and the gate refuses a clean stage it cannot judge.
+
 A **single-condition** run (`--condition NAME`, on every other scenario) is the
 same vocabulary without the schedule: one cell, one condition, one number.
 

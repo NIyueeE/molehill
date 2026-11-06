@@ -969,6 +969,38 @@ class SeriesSpec:
     log: Path | None = None
 
 
+#: Which port each series dials: the interactive and churn probes dial the
+#: forwarded TCP service, the datagram probe the UDP one.
+STAGED_TARGETS: dict = {
+    "interactive": topology.ECHO_PORT,
+    "udp": topology.UDP_PORT,
+    "churn": topology.ECHO_PORT,
+}
+
+
+def staged_series(params: dict) -> tuple:
+    """The probe series this staged run starts, validated before anything does.
+
+    Refused rather than defaulted: a typo would otherwise start a run that
+    measured two of three series while the run's own record said three. **An
+    empty list is refused too**, and not because it is harmless — a run with no
+    series measures nothing, while the method record would say so and the stages
+    would report every metric absent. The default (the key absent) is every
+    series, which is what a gateable run needs (see `model.STAGED_SERIES`).
+    """
+    if "series" not in params:
+        return tuple(model.STAGED_SERIES)
+    names = tuple(params["series"] or ())
+    unknown = [name for name in names if name not in STAGED_TARGETS]
+    if unknown:
+        raise SystemExit(
+            f"unknown staged series {unknown}; known: {', '.join(model.STAGED_SERIES)}"
+        )
+    if not names:
+        raise SystemExit("a staged run needs at least one probe series to measure")
+    return names
+
+
 def _series_probe(ctx: Ctx, spec: SeriesSpec, params: dict):
     """Start one series probe; return `(process, log path)`.
 
@@ -1018,14 +1050,50 @@ def read_series(log: Path, since: float, until: float) -> list:
     return points
 
 
-def _stage_absences(metrics: dict, interaction: list, datagrams: list) -> dict:
+def _series_points(logs: dict, mode: str, since: float, until: float) -> list:
+    """One series' samples in the window, or nothing when it was not started.
+
+    A run may name a subset of the series (`--series`), so "no log" and "an empty
+    log" are both normal. Reading a missing log as an empty one keeps the stage's
+    arithmetic total without inventing a zero: the metric stays absent and
+    `_stage_absences` says the series was not started.
+    """
+    log = logs.get(mode)
+    return read_series(log, since, until) if log else []
+
+
+def _stage_absences(
+    metrics: dict, interaction: list, datagrams: list, series: tuple
+) -> dict:
     """Why a stage's interactive or datagram numbers are missing, typed.
 
-    A stage where every attempt failed has no percentile to report — and the
-    difference between "the tool answered slowly" and "the tool never answered"
-    is the finding, so it is written down rather than left as an absent key.
+    Three reasons produce an absent metric and they are not interchangeable: the
+    series was never started (a diagnostic run), every attempt in it failed (the
+    tool), or the probe produced no sample in this window (the instrument). Only
+    the second is a reading about the tool, so each reason is written down rather
+    than left as an absent key.
     """
     unavailable: dict = {}
+    if "interactive" not in series:
+        for metric in (
+            "rtt_p50_ms",
+            "rtt_p99_ms",
+            "rtt_max_ms",
+            "rtt_worst_1s_ms",
+            "rtt_error_rate_pct",
+        ):
+            unavailable[metric] = {
+                "reason": "the interactive series was not started in this run"
+            }
+    if "udp" not in series:
+        for metric in ("udp_rtt_p99_ms", "udp_loss_pct", "udp_gap_p99_ms"):
+            unavailable[metric] = {
+                "reason": "the datagram series was not started in this run"
+            }
+    if "churn" not in series:
+        unavailable["churn_per_s"] = {
+            "reason": "the churn series was not started in this run"
+        }
     failed = [p for p in interaction if p["metric"] == "error"]
     if failed and metrics.get("rtt_p99_ms") is None:
         reason = f"all {len(failed)} interactive attempts failed in this stage"
@@ -1045,6 +1113,7 @@ def _stage_metrics(
     datagrams: list,
     churn: list,
     span: Span,
+    series: tuple,
 ) -> tuple:
     """One stage's interactive/datagram/churn numbers, from its own samples."""
     window_s = span.seconds
@@ -1066,8 +1135,12 @@ def _stage_metrics(
             if (rtts or errors)
             else None
         ),
+        # Only when the churn series ran: a stage that never started it has no
+        # rate, and `0.0` would be a fabricated reading of the tool.
         "churn_per_s": (
-            round(len(churn_setup) / window_s, 2) if window_s > 0 else None
+            round(len(churn_setup) / window_s, 2)
+            if "churn" in series and window_s > 0
+            else None
         ),
         "udp_rtt_p99_ms": inst.pct(datagram_rtts, 0.99),
         "udp_loss_pct": (
@@ -1081,6 +1154,10 @@ def _stage_metrics(
             "datagram": len(datagrams),
             "churn": len(churn),
         },
+        # Which series this stage actually ran, beside how many samples each
+        # produced: a zero is then "started and produced nothing" and a missing
+        # key in `enabled` is "never started", which are different findings.
+        "series_enabled": list(series),
         # The probe's own log paths are the caller's to add: this function is
         # handed the *points*, not the files, and a list of the points rendered
         # as text (which is what stood here) is not a log — it doubled every
@@ -1095,10 +1172,13 @@ def _stage_metrics(
         ),
         # The offered rate beside the achieved one (`churn_per_s` is measured):
         # a churn probe that fell behind offers less than the timeline asked
-        # for, and its cells are then a statement about the probe.
-        "churn_offered_per_s": span.params.get("churn_per_s", 16.0),
+        # for, and its cells are then a statement about the probe. Absent, not
+        # defaulted, when no churn probe ran at all.
+        "churn_offered_per_s": (
+            span.params.get("churn_per_s", 16.0) if "churn" in series else None
+        ),
     }
-    return metrics, evidence, _stage_absences(metrics, interaction, datagrams)
+    return metrics, evidence, _stage_absences(metrics, interaction, datagrams, series)
 
 
 def _per_second(points: list, since: float) -> list:
@@ -1206,21 +1286,19 @@ def run_staged(ctx: Ctx, params: dict) -> list:
     """
     stages = _stages_of(params)
     cells: list = []
+    series = staged_series(params)
+    # 0 = run until this workload kills them: a stage's drain cost is not
+    # known before the run, so a precomputed duration can end before the
+    # last stage begins. Only the series this run named start at all.
     probes = [
-        # 0 = run until this workload kills them: a stage's drain cost is not
-        # known before the run, so a precomputed duration can end before the
-        # last stage begins.
-        _series_probe(ctx, SeriesSpec(mode, target, 0.0), params)
-        for mode, target in (
-            ("interactive", f"{ctx.arm.dial_host}:{topology.ECHO_PORT}"),
-            ("udp", f"{ctx.arm.dial_host}:{topology.UDP_PORT}"),
-            ("churn", f"{ctx.arm.dial_host}:{topology.ECHO_PORT}"),
+        _series_probe(
+            ctx,
+            SeriesSpec(mode, f"{ctx.arm.dial_host}:{STAGED_TARGETS[mode]}", 0.0),
+            params,
         )
+        for mode in series
     ]
-    logs = {
-        mode: probe[1]
-        for mode, probe in zip(("interactive", "udp", "churn"), probes, strict=True)
-    }
+    logs = {mode: probe[1] for mode, probe in zip(series, probes, strict=True)}
     drift_points: list = []
     try:
         with inst.DriftSampler(ctx.pids_of, interval=inst.DRIFT_POLL_S) as drift:
@@ -1234,7 +1312,7 @@ def run_staged(ctx: Ctx, params: dict) -> list:
                 proc.wait(timeout=5)
         if ctx.condition is not None:
             ctx.topo.set_condition(ctx.leg, ctx.condition)
-    cells.append(_run_cell(drift_points, logs))
+    cells.append(_run_cell(drift_points, logs, series))
     return cells
 
 
@@ -1399,12 +1477,17 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
             time.sleep(max(0.0, secs))
             t1 = time.time()
         window = again
-    interaction = read_series(logs["interactive"], t0, t1)
-    datagrams = read_series(logs["udp"], t0, t1)
-    churn = read_series(logs["churn"], t0, t1)
+    interaction = _series_points(logs, "interactive", t0, t1)
+    datagrams = _series_points(logs, "udp", t0, t1)
+    churn = _series_points(logs, "churn", t0, t1)
+    series = staged_series(params)
     window_s = max(t1 - t0, 1e-9)
     stage_metrics, evidence, unavailable = _stage_metrics(
-        interaction, datagrams, churn, Span(since=t0, seconds=window_s, params=params)
+        interaction,
+        datagrams,
+        churn,
+        Span(since=t0, seconds=window_s, params=params),
+        series,
     )
     stage_metrics |= {"slo_broken": _breaks_slo(stage_metrics)}
     # Only the interactive metrics carry the stage's verdict; throughput is the
@@ -1427,9 +1510,7 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     # The three logs this stage was read out of, by path: the numbers above are
     # slices of them, and a reader who wants the shape at another resolution
     # needs the file rather than a second summary.
-    built.evidence["series_logs"] = [
-        str(logs[mode]) for mode in ("interactive", "udp", "churn") if mode in logs
-    ]
+    built.evidence["series_logs"] = [str(logs[mode]) for mode in series if mode in logs]
     # The boundary's own answer, on every stage: a visitor's whole life through the
     # tool, asked before this stage's traffic started.
     built.evidence["echo_probe"] = boundary
@@ -1459,9 +1540,9 @@ def _breaks_slo(metrics: dict) -> int | None:
     return int(broken)
 
 
-def _run_cell(drift_points: list, logs: dict) -> Cell:
+def _run_cell(drift_points: list, logs: dict, series: tuple) -> Cell:
     """The whole run: the drift axis and the wedge axis, from its own series."""
-    interaction = read_series(logs["interactive"], 0.0, time.time() + 1)
+    interaction = _series_points(logs, "interactive", 0.0, time.time() + 1)
     wedged = inst.wedges(interaction)
     metrics = {
         "drift_rss_mib_per_min": _per_min(inst.slope_per_min(drift_points, "rss_kib")),
@@ -1480,6 +1561,7 @@ def _run_cell(drift_points: list, logs: dict) -> Cell:
             "drift_points": len(drift_points),
             "drift_series": _thinned(drift_points),
             "series": {"interactive": len(interaction)},
+            "series_enabled": list(series),
             "series_logs": [str(p) for p in logs.values()],
             "wedge_silence_s": inst.WEDGE_SILENCE_S,
         },

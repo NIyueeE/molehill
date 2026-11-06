@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A staged run can start a named subset of its probe series**
+  (`just bench run --series interactive`). The three series are three separate
+  measurements of one network — the staged `rtt_p99_ms` comes from the
+  interactive one, `churn_per_s` from the churn one, and the datagram probe's two
+  from its own — so running one at a time is how a diagnostic asks whether a
+  second probe on the same host moves the first one's tail. The probe set travels
+  in the run's fingerprint, and a subset is never a release configuration: a run
+  without the interactive series has no staged `rtt_p99_ms`, and the gate refuses
+  a clean stage it cannot judge.
+
 ### Fixed
 
 - A striped data channel no longer gives up on a frame the carrier is still

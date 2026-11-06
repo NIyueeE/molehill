@@ -773,6 +773,23 @@ CONDITIONS: dict[str, Condition] = {
 }
 
 
+#: The probe series a staged run starts, in the order it starts them.
+#:
+#: A method parameter rather than a detail. The three are **three separate
+#: measurements of one network at one time**, and each feeds a different metric:
+#: the interactive series is the only source of a staged cell's `rtt_p99_ms`
+#: (`workloads._stage_metrics`), the churn series contributes `churn_per_s`, and
+#: the datagram series contributes `udp_rtt_p99_ms` / `udp_loss_pct`. Pooling
+#: them produces a number no metric declares — the mistake HANDOFF §4.39 records.
+#:
+#: Naming a subset is how a *diagnostic* answers a question the full set cannot:
+#: with `--series interactive` only, one probe runs and the answer says whether a
+#: second probe on the same host moves the first one's tail. That is not a gate
+#: configuration (a run without the interactive series has no `rtt_p99_ms`, and
+#: the gate refuses a clean stage it cannot judge), and the results file records
+#: what ran.
+STAGED_SERIES: tuple = ("interactive", "udp", "churn")
+
 #: The stage schedules. A timeline is a *list* rather than a dict because the
 #: recovery axis is a repeat: the clean stage at both ends is the run's own
 #: replicate, and its position is part of what it means.
@@ -1398,6 +1415,7 @@ def scenario_catalog() -> list:
                 "udp_interval_ms": 20,
                 "churn_per_s": 16,
                 "min_hold_s": 20.0,
+                "series": STAGED_SERIES,
             },
             headline="rtt_p99_ms",
         ),
@@ -1416,6 +1434,7 @@ def scenario_catalog() -> list:
                 "udp_interval_ms": 20,
                 "churn_per_s": 16,
                 "min_hold_s": 20.0,
+                "series": STAGED_SERIES,
             },
             headline="rtt_p99_ms",
         ),
@@ -1434,6 +1453,7 @@ def scenario_catalog() -> list:
                 "udp_interval_ms": 20,
                 "churn_per_s": 16,
                 "min_hold_s": 20.0,
+                "series": STAGED_SERIES,
             },
             headline="cpu_s_per_gbit",
         ),
@@ -1666,6 +1686,18 @@ def profile_of(name: str, args) -> dict:
             if scenario.kind == Kind.STAGED:
                 profile["params"].setdefault(scenario.id, {})
                 profile["params"][scenario.id]["scale"] = scale
+    # The probe set is a method parameter for the same reason `scale` is: three
+    # probes running at once and one running alone are different measurements of
+    # the same tool, and a run that measured the second must say so in its
+    # fingerprint rather than in a footnote (see `STAGED_SERIES`).
+    series = getattr(args, "series", "")
+    if series:
+        for scenario in SCENARIOS.values():
+            if scenario.kind == Kind.STAGED:
+                profile["params"].setdefault(scenario.id, {})
+                profile["params"][scenario.id]["series"] = tuple(
+                    name.strip() for name in str(series).split(",") if name.strip()
+                )
     budget = getattr(args, "budget_s", None)
     del budget  # consumed by the caller, kept out of the fingerprint
     return profile
