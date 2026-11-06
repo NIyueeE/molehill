@@ -290,13 +290,31 @@ channel over the control session, the client opens one (under 5 ms, §4.1 point 
 and only then does the pairing finish. There is **no channel waiting when the
 visitor arrives**.
 
-So the next step is **A0f: measure what `wait_us` is made of** — the control-session
-hop against the client's open — before deciding. If the hop dominates, it is a
-control-path latency problem; if the open dominates, a warm channel would remove
-it. The archive records a warm pool as *rejected earlier*; that rejection must be
-re-read with this number in hand rather than assumed to still hold, because five
-milliseconds per visitor is a large prize and the earlier decision was made without
-this attribution.
+**A0f is done, by correlating the two ends' existing lines on `group`** (134 groups
+appear in both logs of one `churn-16` run):
+
+| sample | server `wait_us` | client `open_us` | difference |
+|---|---|---|---|
+| group 42 | 5 198 | 5 027 | 171 µs |
+| group 223 | 8 618 | 8 294 | 324 µs |
+| group 314 | 6 885 | 5 637 | 1 248 µs |
+
+**`wait_us` is the client's `open_us`**; the control-session hop is one tenth to
+one millisecond of it. So the answer to A0f is: the time is spent *opening the
+channel*, not asking for it.
+
+But that contradicts the pump-side measurement, and the contradiction is the useful
+part: `hs_us` — the interval measured **inside** `open_stream` — never reached five
+milliseconds in these runs, while `open_us` — the interval **around** it in
+`client.rs`, which includes pool placement and the stripe request — is five to
+eight. **The wait is therefore in front of `open_stream`, in the pool's placement
+or the stripe request**, and not in the handshake, not in the pump, and not in the
+control hop.
+
+The next step is **A0g**: split `open_us` into `open_stripe_stream` and
+`open_stream` (the second is already `hs_us`), which is one stamp in `client.rs`.
+The archive's rejected warm pool is re-read after that, because the fix for
+"placement takes five milliseconds" is not obviously a warm pool.
 
 The 21.8 ms open A0 found is **contention, not the clean path** (§4.1): it
 reproduces while bulk runs and does not appear in `churn-16` at all. It belongs
