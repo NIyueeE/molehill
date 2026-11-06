@@ -440,205 +440,38 @@ violated by the instrument that prints at five milliseconds. **A line that print
 cases may never be used to characterise a wait** — the four-stamp join, printed for every group,
 is what the same question needed.
 
-### 4.18 It was never a wake-up: the pairing takes somebody else's channel (2026-11-06)
+### 4.18 Superseded: "the pool is a rotating belt" was a missing join key
 
-`deliver` was stamped where it hands a channel to the pairing's own queue, and `take_for` where
-the pairing takes it from there. Six thousand four hundred of the first, and **not one of the
-second**:
+Deliveries were stamped and takes were not, and this section read the asymmetry as every visitor
+taking somebody else's channel. The take stamp was on `try_recv` while the pairing leaves through
+the `select!` arm; stamped at all three exits, deliver→take is 0.0 ms (§4.19). The "empty pool"
+idea that survived is §4.20's, and it lost. Original text archived.
 
-```
-mhd channel delivered   6 400
-mhd channel taken           0
-```
+### 4.17 Superseded: the 3.4 ms was attributed to a wake-up that does not exist
 
-**The pairing never takes the channel that was delivered for its group.** Every visitor is served
-from the **shared pool**, with a channel that was delivered for an *earlier* group — and its own
-channel, arriving later, goes into that pool for the next visitor. The pool is a rotating belt.
+With four absolute stamps the gap appeared to sit between delivery and the pairing's take; measured
+properly (§4.19) the wake is instantaneous — 99 % of takes land in the same millisecond as the
+delivery. Original text archived.
 
-So the three and a half milliseconds are not a wake-up at all. They are **the wait for the next
-channel to arrive on the belt**, which is one whole open cycle: the previous visitor's channel has
-to be produced, and the visitor behind it takes that one.
+### 4.16 Superseded: the legs did not add up, because one of them was gated
 
-That is a structural limit, and it is the first one in this file that a *design* answer could
-remove: the cell is not slow because any hop is slow, but because **the pool holds nothing and
-every visitor queues behind production**. It also finally gives the archive's rejected "static warm
-pool" its mechanism — the objection was that a warm pool changes behaviour without a measured
-reason, and the reason was invisible until now: the pool is empty at every arrival.
+The five legs summed to 2.4–2.9 ms against a reported 5.4, and this section concluded the
+discrepancy was in a definition. It was: the 5.4 was a gated sample. See §4.19. Original text
+archived.
 
-The next step is **A0y**: the shared queue's depth at the moment a pairing looks, to see how often
-it is empty (which the 5.4 ms wait predicts is always), and what the belt's period actually is.
+### 4.15 Superseded: the pairing wait, before it was measured without a gate
 
-### 4.17 The missing 3.4 ms is a wake-up after delivery, on the server's own queue (2026-11-06)
+This section built a decomposition of a 5.4 ms pairing wait that turned out to be the tail of a
+log line that prints only past five milliseconds. §4.19 has the median over every pairing, and
+§4.23–§4.24 have the release cell. Original text archived; kept for the record of how the gated
+line misled a dozen rounds.
 
-Four stamps per group, all six thousand four hundred matched, and the order they came back in is
-the answer:
+### 4.14 Superseded: the pairing request stamp was on the retry path
 
-```
-client open               p50  1.0 ms
-open-end -> server task   p50 -1.0 ms     (negative: the task starts before the open ends)
-server setup              p50  1.0 ms
-sum of the three          p50  2.0 ms
-```
-
-**The negative gap is correct and it corrects the model**: the server's stream task must run to
-answer the handshake, so it starts *before* the client's open returns. From the client starting its
-open to the server delivering the channel is therefore **2.0 ms**.
-
-The pairing's own line says the rest:
-
-```
-accept_us 17-41 µs   enqueue_us 0   wait_us 5.1-5.5 ms   write_us 2-6 µs
-```
-
-and the command crosses to the client in 0.02 ms. So of the 5.4 ms the visitor waits, **2.0 ms is
-the channel being opened and delivered and 3.4 ms is the pairing not noticing that it has been**.
-
-That last stretch is a wake-up on this end's own in-process queue: `deliver` puts the channel where
-`take_for` will find it, and the pairing task does not resume for three and a half milliseconds.
-It is the same shape as the pump's parked writer (§4.11) and the stripe reader's deadline (§4.6),
-and it is the only unexplained interval left in this cell.
-
-The next step is **A0x**: stamp `deliver` and the `take_for` that follows it (absolute time, per
-group), which turns "a wake-up" from an inference into a measurement — and, if it holds, makes the
-pairing's wake the third member of a family this file can then fix once.
-
-### 4.16 Every leg is measured and they do not add up to `wait_us` (2026-11-06)
-
-The last named candidate — the server's spawn of the stream-serving task — is two microseconds:
-
-```
-spawn             p50 2 µs      p99 14-20 µs
-server setup      p50 971-974 µs (selector, handshake, hello, prologue, delivery)
-client open       p50 1 235 µs
-carrier hops      ~200 µs        (established groups, §4.12)
-control command   p50 20 µs
-```
-
-**Their sum is 2.4–2.9 ms. The pairing reports 5.4.** Nothing else is left to instrument on this
-path, and a ninth stamp would be measuring one of these again.
-
-So the discrepancy is in a **definition**, not in an interval: either `wait_us` begins somewhere
-other than the moment the request is written (`pairing_started` is 22 µs after the visitor was
-accepted, which is consistent), or one of the five numbers above is not the interval its name
-claims — the likeliest being the client's `open`, which is measured at `open_data_channel`, the
-service-level entry, while the lane's own open is measured deeper and the pool's placement between
-them has only ever been sampled at a one-millisecond threshold.
-
-The honest state of this cell: **every leg is measured, they are each microseconds to 1.2 ms, and
-they do not account for the 5.4 ms a visitor waits.** The next step is to make one interval carry
-both ends — a single line per group with the client's open start, the client's open end, the
-server's task start and the server's delivery — and check that they are monotone and sum to the
-pairing's own number. Until they do, the cell's ten milliseconds are attributable in order of
-magnitude but not to the millisecond.
-
-### 4.15 The pairing wait, measured: a two-millisecond control hop and a 1.7 ms open (2026-11-06)
-
-The stamp is on the first request at last, in absolute epoch milliseconds, and it joins with the
-client's own arrival stamp for the same group. Six thousand four hundred groups:
-
-```
-control hop (server writes the request -> the client's stream delivers it)   p50 2.0 ms  mean 2.03  max 10
-server `wait_us` for the same groups                                        p50 5.41 ms mean 5.59  max 9.2
-```
-
-**A0w corrected the label on that first term, and the correction matters.** `ask_ms` to the
-client's `got_ms` is not a control hop: `got_ms` is a *data* frame on the group's lane, so the
-interval already contains the open. Stamped where the client actually begins the open — absolute
-epoch milliseconds, with how long the command sat in its queue:
-
-```
-command trip (server writes the request -> the client starts the open)   p50 0.0 ms  mean 0.02  max 2
-client queueing before it starts                                        p50 0.00 ms
-```
-
-**The control session is not slow.** A command crosses it in twenty microseconds.
-
-**The server's own share is smaller than that arithmetic predicted, and the rest has no owner.**
-Two histograms inside `serve_mhd_stream` — task start to the hello decoded, and task start to the
-channel delivered:
-
-```
-hello    p50 500 µs   p99 1 141 µs
-deliver  p50 1 040 µs p99 2 320-2 387 µs
-```
-
-So the whole server-side setup is **1.04 ms at the median**, split into 0.5 ms of selector,
-handshake and hello, and 0.54 ms of prologue and delivery. Against the pairing's 5.4 ms:
-
-| term | measured |
-|---|---|
-| command across the control session | 0.02 ms |
-| the client's channel open (§4.9) | 1.7 ms |
-| the server's per-stream setup | 1.04 ms |
-| **unaccounted** | **~2.6 ms** |
-
-**The residual is one effect, and this cycle has now measured it from three directions.** The
-line that would have said which branch the open took is silent, and its silence is the answer it
-was built for: `log_slow_open` requires `reader_ready_at`, which is `None` when the acknowledgement
-arrives **inside** the handshake rather than as stream data — so the carrying branch is the one in
-use, its `hello_ack` is zero by construction, and the 2.6 ms cannot be a hello round trip.
-
-That leaves one term in the whole cell: **a new stream's first exchange costs two to three
-milliseconds, while the same carrier's later data costs 0.2.** The measurement has now hit that
-same shape three times without ever naming a mechanism:
-
-- the open's own round trip: 1.7 ms (§4.9) where an idle lane's is 0.1;
-- the pairing's residual: 2.6 ms (§4.15) between a client's open and a server's task start;
-- and, earlier, the 5–8 ms opens that sent twenty rounds after the handshake (§4.7).
-
-Three independent intervals, all "the first thing on a new stream", all an order of magnitude
-above the established path. That is a property of how this carrier starts a stream, not of any one
-hop, and it is where the next experiment belongs: **first packet against second packet on the same
-stream**, on the data path, with no handshake involved.
-
-The whole cell, with every number now measured rather than inferred:
-
-| term | value | shared? |
-|---|---|---|
-| visitor accepted and paired — control hop + open + arrival | **~5.4 ms** | ours |
-| the first request's back-end echo | **~4.8 ms** | every arm pays it |
-| the request and reply's carrier hops | ~0.4 ms | ours |
-
-The next step is **A0w**: split the control hop — when the server's request leaves the control
-session's sink against when the client's command loop reads it — so the two milliseconds are
-attributed to a queue, a wake-up, or the mux layer above the carrier.
-
-### 4.14 The pairing wait is not a request-and-response at all (2026-11-06)
-
-The last unexplained piece was the five to six milliseconds a visitor waits for a data channel
-to exist. The obvious model — the server asks, the client opens — has an instrument: the request
-is written by `ask_missing`, and a stamp there joins, by group, with the client's arrival stamp.
-
-**It never fired — and that was the instrument, not the system.** `ask_missing` is only the
-pairing's **retry** path; the first request is sent directly, a few lines before the gather loop
-(`data_ch_req_tx.send(stripe_request(...))` in a `for index in 0..stripes`). The stamp sat on the
-retry and nothing ever retried, so it proved only that the first attempt succeeded.
-
-**So the pairing *is* a request and a response**, as it always looked: request written, the client
-opens a channel, the channel arrives, the visitor pairs. The five to six milliseconds contain
-that open (1.7 ms, §4.9) plus whatever the request and the arrival cost, and the question the
-section asked — how deep the client's inventory is — does not arise, because there is no
-inventory: the channel is opened on demand.
-
-The stamp belongs on the first request, in absolute epoch milliseconds so it joins with the
-client's stamps for the same group. It was moved there and then reverted: the change kept landing
-between `pair_striped_group`'s attribute and its body, and the function is at its line budget. The
-next round makes it in one piece, as a helper above the attribute.
-
-So the pairing is not a request and a response. The client keeps a speculative inventory of
-data channels — unclaimed, opened ahead of demand — and `take_for(group)` adopts the next one that
-arrives. **The five to six milliseconds are that inventory's arrival cadence**, not a round trip
-that could be shortened by making a message smaller.
-
-That is the same shape as everything else this cycle has measured about this cell: the visitor
-is not waiting on the carrier's work but on *another task's schedule*. It is also the first
-attribution the archive's rejected "warm pool" ever had — the objection was made without it, and
-the question it raises is now specific and cheap: **how deep is the inventory, and what sets its
-cadence?**
-
-The next step is **A0v**: count, per second, how many unclaimed channels are waiting and how often
-one arrives with none waiting. That number decides whether a deeper reserve would remove the wait
-or merely move it.
+A stamp on `ask_missing` never fired, and this section read that as "the pairing is not a request
+and a response". `ask_missing` is only the **retry**; the first request is sent directly a few lines
+earlier, so the conclusion was an instrument placement error. §4.19 re-measured the interval on all
+6 400 pairings. Original text archived.
 
 ### 4.13 Sealing is a net loss, and the cell's own arithmetic closes (2026-11-06)
 
@@ -706,66 +539,12 @@ hops, and the rest in the visitor's own connect and pairing.** Against a TCP pee
 That is the most complete accounting of this cell so far, and it is also the least flattering to
 the plan: the transport was never the bottleneck at this cell.
 
-### 4.11 The data path's two ends disagree by five times, and that is the finding (2026-11-06)
+### 4.11 Superseded: the data path's two ends disagreed by five times
 
-The cell is the data path under concurrency (§4.10), so the next step was to split the server's
-`wire` leg — the one part it cannot see is the far side's. A fourth histogram was added on the
-client, `echo`, spanning the request's arrival from the carrier to the echo being read from the
-backend. Both ends, same run:
-
-```
-server  wire   p50 1000 µs   p90 6000 µs   (n = 4300)
-client  echo   p50 5000 µs   p90 6000 µs   (n = 2147)
-```
-
-**These span the same wall-clock interval from opposite ends and differ by five times.** One of
-them is not measuring what it says, and until they agree nothing about the data path's
-attribution is trustworthy — which is the same lesson as `ack_us` in §4.9 and the round before
-it: an instrument that has not been cross-checked against another view of the same interval is
-a guess with a number attached.
-
-The obvious candidates on inspection: the server's `sent_ms` is stamped at the **first handoff**
-while `got_ms` is stamped at the **first received frame**, and a group's first received frame is
-not necessarily the reply to its first handoff — a group can receive the request's own frames
-from a client that opened it, and the first round trip of a stripe group is not the first
-exchange the group carries. The client's `echo`, meanwhile, starts at the first frame *from* the
-carrier and ends at the first read *from the backend*, which is a different pair of events.
-
-The next step is **A0t**: one line per group stating both ends' stamps for the *same* round trip
-(group id, `sent`, `got`, `echo`), so the two numbers are defined in terms of the same two
-events before either is used again.### 4.10 Sealing works now, removes the 1.7 ms handshake, and barely moves the cell (2026-11-06)
-
-The mechanism phase A needs **already exists**: with `MOLEHILL_MHD_SEAL=1` the first stream's
-handshake leaves a lane root behind, every later stream writes one derived selector byte, and
-`open_channel_with_id` skips Noise entirely. It was off by default because sealing deadlocked
-the striped transfer four runs in eight — and that deadlock's cause (the group's two-second
-reorder deadline against an eleven-second carrier stall) was fixed in §4.6.
-
-So it was measured again, and the open's own number collapses:
-
-| phase | unsealed | sealed |
-|---|---|---|
-| `open_channel` | **1 693–1 743 µs** | **10 µs** |
-| `hello_ack` | 0 µs | 129 µs |
-
-**A hundred and seventy times faster on the phase that carries the handshake**, exactly as
-§4.9 predicted. And the striped integration test now passes **6 of 6** with sealing on, against
-11 of 12 unsealed — the stall that kept this switch off is gone.
-
-**But the cell does not follow.** `churn-16` reads 9.29–10.26 ms sealed against 10.3–12.1
-unsealed — about a millisecond, inside its own spread — and `rr-1` gets *worse*: 0.167–0.178 ms
-against 0.151–0.163. The reuse cost is the per-packet AEAD that sealing adds to a 64-byte
-request.
-
-Two conclusions, and they are worth more than the speedup:
-
-1. **the `churn-16` cell is not the open.** Removing 1.7 ms of handshake from every fresh
-   connection leaves the cell where it was, so the seven to ten milliseconds it reports are the
-   **data path under sixteen-way concurrency**, which §4.7's leg measurements put on the server
-   side of the round trip (`wire` 1–5 ms, `up` and `down` zero, the client's legs zero).
-2. **sealing stays off by default for now**, not because it is unsafe — it is not, any more —
-   but because it buys nothing on the cell and costs thirteen percent on reuse. It becomes the
-   right default the moment the data path is fixed, or if the target is open latency itself.
+The server's `wire` leg and the client's `echo` leg spanned the same wall-clock interval and
+differed five-fold. The cause was the **join key**, not the path: both ends numbered their groups
+with their own counter, so nothing could be matched event for event. Fixed in §4.12, which is the
+first place in this file where two ends' intervals are comparable. Original text archived.
 
 ### 4.9 Lost wake-ups are excluded, and the shape is "two waits where the peer has one" (2026-11-06)
 
