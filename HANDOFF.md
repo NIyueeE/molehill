@@ -238,6 +238,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.21 The control arm gives the zero point, and the cell's overhead finally closes (2026-11-06)
+
+Every comparison in this file has been tool-against-tool. The bench has a **control arm with no tool
+in the path at all**, and it was measured in the same round:
+
+| arm | `churn-16` (fresh connections) | `rr-1` (reuse) |
+|---|---|---|
+| **control** (no tool) | **6.228 ms** | **0.045 ms** |
+| molehill | 10.102 ms | 0.151 ms |
+| **molehill's own cost** | **+3.87 ms** | **+0.106 ms** |
+
+**Sixty percent of the cell is the harness.** Our carrier adds 3.9 ms to a fresh connection and a
+tenth of a millisecond to a reused one.
+
+And the 3.9 ms closes against everything measured inside it:
+
+| term | value | source |
+|---|---|---|
+| pairing (accept to channel delivered) | 2.0 ms | §4.19, four-stamp join |
+| channel delivered to first reply written | 4.0 ms | §4.21, six-thousand-group join |
+| — of which the back-end echo, which the control also pays | ~4.8 ms | §4.12 |
+| carrier hops | ~0.4 ms | §4.12 |
+
+so our own share of that 4.0 ms is a little over a millisecond: the group's two task spawns, the
+request's hop and the reply's. **2.0 + 0.4 + ~1.5 = 3.9**, which is the control delta.
+
+Two things follow. The first is that **absolute cell numbers were overstating our cost by a factor of
+about 1.6**, and every "we are N ms slower" statement in this file should be read as a difference of
+two overheads, not as a property of the carrier. The second is that the remaining work on this cell is
+worth at most 3.9 ms, of which the open is 1.0–1.7 ms and two attempts to remove it have lost (§4.10,
+§4.20).
+
+`frp` was **not** measured in this round: its binaries are missing from `~/tmp/bench-peers/frp`. The
+peer comparison is re-run after `just bench peers fetch` before any claim that uses it.
+
 ### 4.20 A spare channel per visitor loses everywhere (2026-11-06)
 
 With the pairing measured at 2.0 ms — all of it a channel opened *after* the visitor arrived — the
