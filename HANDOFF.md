@@ -1837,6 +1837,21 @@ curve and a RACK rewrite that no measurement had asked for yet.
    stand in for it. One `sweep`-shaped run with the A/A twin, read per stage, is the
    next measurement — it is also the cheapest way to find out whether the ~22–24 ms
    this file has chased is still there after the wall of tuned-out levers.
+
+   **Pre-registered, before it runs.** `--profile dev --scenarios timeline --arms
+   molehill --aa --scale 0.2 --rounds 2 --warmup-rounds 0`, stats on, same topology; two
+   identical arms, so the *difference between them* is the floor for every number in
+   the same run. Read per stage, from the interactive series only.
+
+   - **A stage counts only if** its error rate is below 0.5 % — §4.41 found a window
+     that reported 93 % failed attempts and whose percentiles were survivors'.
+   - **"The 22.5 ms is still there"** means either arm's `clean` p99 is above the two
+     arms' difference by a margin, i.e. the gap to the TCP peers (2.06–2.38 ms) is
+     reproduced with an A/A floor under it. **"It is gone"** means both arms read at or
+     below that floor's upper arm. Anything else is "not resolved at this scale" and is
+     recorded as such rather than as a win or a loss.
+   - **No release record, no tag, no `gate`** — this run is a diagnostic on a scaled
+     timeline, and §3's numbers stay the baseline until a full sweep is asked for.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
