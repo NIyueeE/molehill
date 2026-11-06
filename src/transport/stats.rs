@@ -280,6 +280,37 @@ static POSTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// timer — the handshake would read fast and the arrival would still be slow.
 static FIRST_ROUNDTRIP: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// The three legs of that round trip, each its own histogram: `up` is this
+/// end reading the visitor and handing the frame to the carrier, `wire` is
+/// everything between that handoff and the reply frame's arrival (the carrier,
+/// the far end's stripe layer, the backend and back), and `down` is writing the
+/// reply to the visitor.
+///
+/// Split rather than measured whole because "five milliseconds" is not a
+/// diagnosis: it can be this process's own two legs, or it can be the far side.
+static ROUNDTRIP_UP: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static ROUNDTRIP_WIRE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static ROUNDTRIP_DOWN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one leg of a visitor's first round trip.
+pub(crate) fn note_roundtrip_leg(leg: &str, age: Duration) {
+    if !enabled() {
+        return;
+    }
+    let slot = match leg {
+        "up" => &ROUNDTRIP_UP,
+        "wire" => &ROUNDTRIP_WIRE,
+        _ => &ROUNDTRIP_DOWN,
+    };
+    let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
 static ACCEPTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 /// How long one lane's admission took inside the dispatcher's receive callback.
@@ -1117,6 +1148,31 @@ fn report_send_path() {
         sorted.sort_unstable();
         sorted
     };
+    for (name, slot) in [
+        ("up", &ROUNDTRIP_UP),
+        ("wire", &ROUNDTRIP_WIRE),
+        ("down", &ROUNDTRIP_DOWN),
+    ] {
+        let samples = {
+            let mut guard = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = std::mem::take(&mut *guard);
+            drop(guard);
+            let mut sorted = taken;
+            sorted.sort_unstable();
+            sorted
+        };
+        if !samples.is_empty() {
+            info!(
+                n = samples.len(),
+                leg = name,
+                p50_us = pct_us(&samples, 50, 100),
+                p90_us = pct_us(&samples, 90, 100),
+                "mhd-stats: a leg of the visitor's first round trip"
+            );
+        }
+    }
     if !roundtrip.is_empty() {
         info!(
             n = roundtrip.len(),

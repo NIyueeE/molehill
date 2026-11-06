@@ -496,10 +496,7 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         )
         .map_err(|e| anyhow::anyhow!("stripe frame header: {e}"))?;
         let writing = std::time::Instant::now();
-        sender
-            .send_owned(frame.freeze())
-            .await
-            .map_err(|e| anyhow::anyhow!("stripe write failed: {e}"))?;
+        note_handoff(&frames, &mut sender, frame.freeze()).await?;
         if sampled {
             let waited = writing.elapsed();
             if waited >= std::time::Duration::from_millis(20) {
@@ -644,7 +641,35 @@ struct Frames {
     /// whether the first byte has been written back since — together they are the
     /// visitor's first round trip, which is what the churn cell prices.
     first_in_ms: std::sync::atomic::AtomicU64,
+    /// Epoch milliseconds when the first frame was handed to the carrier and when
+    /// the first reply frame came back. With `first_in_ms` and the reply's own
+    /// write they split the visitor's first round trip into its three legs.
+    sent_ms: std::sync::atomic::AtomicU64,
+    got_ms: std::sync::atomic::AtomicU64,
     replied: std::sync::atomic::AtomicBool,
+}
+
+/// Hand one frame to the carrier, stamping the first handoff.
+///
+/// A separate function because `send_loop` is at its line budget and because the
+/// stamp belongs beside the call it measures: from the moment this returns, any
+/// delay in the round trip is the far side's.
+async fn note_handoff<W: AsyncWrite + Unpin>(
+    frames: &Frames,
+    sender: &mut StripeSender<W>,
+    frame: Bytes,
+) -> anyhow::Result<()> {
+    sender
+        .send_owned(frame)
+        .await
+        .map_err(|e| anyhow::anyhow!("stripe write failed: {e}"))?;
+    let _ = frames.sent_ms.compare_exchange(
+        0,
+        epoch_millis(),
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(())
 }
 
 /// Note the visitor's first round trip, once, when the first reply is written.
@@ -663,10 +688,21 @@ fn note_first_reply(frames: &Frames) {
     {
         return;
     }
+    let sent = frames.sent_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let got = frames.got_ms.load(std::sync::atomic::Ordering::Relaxed);
     let now = epoch_millis();
-    crate::transport::stats::note_first_roundtrip(std::time::Duration::from_millis(
-        now.saturating_sub(started),
-    ));
+    let millis = |from: u64, to: u64| std::time::Duration::from_millis(to.saturating_sub(from));
+    crate::transport::stats::note_first_roundtrip(millis(started, now));
+    // The three legs, each only when both of its ends exist: a missing stamp is a
+    // frame that never crossed that boundary, and reporting it as zero would be a
+    // fabricated measurement.
+    if sent >= started {
+        crate::transport::stats::note_roundtrip_leg("up", millis(started, sent));
+        if got >= sent {
+            crate::transport::stats::note_roundtrip_leg("wire", millis(sent, got));
+            crate::transport::stats::note_roundtrip_leg("down", millis(got, now));
+        }
+    }
 }
 
 /// Frames are held in a `BTreeMap` keyed by sequence number while an earlier
@@ -794,6 +830,12 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
         let Some(event) = event else { break };
         match event {
             StripeEvent::Frame { seq, bytes } => {
+                let _ = frames.got_ms.compare_exchange(
+                    0,
+                    epoch_millis(),
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 frames
                     .highest
                     .fetch_max(seq + 1, std::sync::atomic::Ordering::Relaxed);
