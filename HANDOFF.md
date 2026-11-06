@@ -238,6 +238,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.17 The missing 3.4 ms is a wake-up after delivery, on the server's own queue (2026-11-06)
+
+Four stamps per group, all six thousand four hundred matched, and the order they came back in is
+the answer:
+
+```
+client open               p50  1.0 ms
+open-end -> server task   p50 -1.0 ms     (negative: the task starts before the open ends)
+server setup              p50  1.0 ms
+sum of the three          p50  2.0 ms
+```
+
+**The negative gap is correct and it corrects the model**: the server's stream task must run to
+answer the handshake, so it starts *before* the client's open returns. From the client starting its
+open to the server delivering the channel is therefore **2.0 ms**.
+
+The pairing's own line says the rest:
+
+```
+accept_us 17-41 µs   enqueue_us 0   wait_us 5.1-5.5 ms   write_us 2-6 µs
+```
+
+and the command crosses to the client in 0.02 ms. So of the 5.4 ms the visitor waits, **2.0 ms is
+the channel being opened and delivered and 3.4 ms is the pairing not noticing that it has been**.
+
+That last stretch is a wake-up on this end's own in-process queue: `deliver` puts the channel where
+`take_for` will find it, and the pairing task does not resume for three and a half milliseconds.
+It is the same shape as the pump's parked writer (§4.11) and the stripe reader's deadline (§4.6),
+and it is the only unexplained interval left in this cell.
+
+The next step is **A0x**: stamp `deliver` and the `take_for` that follows it (absolute time, per
+group), which turns "a wake-up" from an inference into a measurement — and, if it holds, makes the
+pairing's wake the third member of a family this file can then fix once.
+
 ### 4.16 Every leg is measured and they do not add up to `wait_us` (2026-11-06)
 
 The last named candidate — the server's spawn of the stream-serving task — is two microseconds:

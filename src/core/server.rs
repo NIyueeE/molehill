@@ -2495,6 +2495,11 @@ async fn serve_mhd_stream(
     // Read only when the whole opening was late (see the line below), because a
     // clock read per phase is what makes a healthy open cost nothing.
     let opened = std::time::Instant::now();
+    // The same instant in wall-clock terms, so this end's stamps can be joined with
+    // the client's for the same group (see the pairing's four-stamp check).
+    let opened_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
     // Bound the crypto + hello phase: an unresponsive or bogus peer must not
     // park this stream's task forever (the same role HANDSHAKE_TIMEOUT plays on
@@ -2569,6 +2574,18 @@ async fn serve_mhd_stream(
             let total_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
             note_slow_opening(total_us, sel_us, hs_us);
             let (service_id, _tunnel, group) = read_tunnel_prologue(&mut io).await?;
+            if crate::transport::stats::enabled() {
+                let deliver_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                tracing::info!(
+                    group,
+                    opened_ms,
+                    deliver_ms,
+                    task_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    "mhd stream delivered"
+                );
+            }
             debug!(%service_id, "mhd tunnel stream routed");
             {
                 let served = route_mhd_stream(io, &registry, &nonce, service_id, group).await;

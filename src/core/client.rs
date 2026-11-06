@@ -1611,6 +1611,16 @@ async fn run_mux_data_channel(
     // From the command leaving the control loop to the prologue being written:
     // the only interval in an arrival that no other instrument covers.
     let cmd_us = u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+    // **The end of this end's work, in absolute epoch milliseconds.** Joined by
+    // group with the server's task start and delivery, this is the one number that
+    // can say whether the two ends' intervals are the same events: the four stamps
+    // must be monotone and their sum must equal the pairing's own `wait_us`.
+    if crate::transport::stats::enabled() {
+        let end_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        info!(group, end_ms, open_us, cmd_us, "mhd channel open finished");
+    }
     // Five milliseconds, behind the stats switch, exactly like the server's
     // pairing line — and with the group id, because that is the only way the two
     // ends' numbers can be matched event for event instead of by magnitude. A
