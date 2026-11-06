@@ -686,7 +686,18 @@ fn spawn_sender(
                 tokio::task::yield_now().await;
                 continue;
             }
-            match wait(&shared).await {
+            // **Where this pass came from, counted only when it matters.** A pass
+            // that starts with a write already queued on an idle connection is a
+            // write that waited; whether the pump was woken by its signal or by its
+            // timer then says whether the wake was missed or the task was starved.
+            let woke = wait(&shared).await;
+            if crate::transport::stats::enabled() {
+                let queued = shared.with(|conn| conn.has_idle_queued());
+                if queued {
+                    crate::transport::stats::note_pump_wake(matches!(woke, Wake::Signal));
+                }
+            }
+            match woke {
                 Wake::Signal => {}
                 Wake::Closed => {
                     staging.clear();

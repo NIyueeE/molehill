@@ -238,6 +238,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.31 The wake is not missed; the pump is woken and still does not serve the lane (2026-11-06)
+
+Counting where every pump pass came from, but only when a write was already queued on an idle
+connection:
+
+```
+signal=104 timer=0      signal=105 timer=0      signal=101 timer=0   (every second of the run)
+```
+
+**A hundred per second, and not one from the timer.** So the hypothesis §4.30 left open is settled on
+the other side: on this cell the pump is woken by its signal every time, exactly as `churn-16` showed
+(§4.9). The wake is not being missed.
+
+Which means the pump is **woken and still does not carry the lane's data for five to eight and a half
+milliseconds.** That leaves two places for the delay, and they are distinguishable:
+
+1. **the pump's own pass** — it is awake and running passes, but `poll_transmit` does not build a
+   packet for that lane for several passes (other lanes, other streams, or the run's batching order
+   come first). This is the scheduling question §5's phase C was written about, arriving now from a
+   measurement rather than from a design;
+2. **the runtime** — the task is awake but not scheduled. `churn-16` refuted this for eight workers,
+   but this cell runs four lanes' pumps plus four thousand visitors' streams, which is a different
+   load.
+
+The next step is **A0ah**: count *passes* rather than milliseconds — how many `poll_transmit` calls
+elapse between a write queueing on an idle lane and the pass that carries it. One means the pump
+itself was slow to run (runtime); two or more means the pass ran and chose not to serve that lane
+(pass ordering).
+
 ### 4.30 The tail has a mechanism, and the logs name it: the pump does not run (2026-11-06)
 
 Reading the per-second lines at a spike (§4.29's method) found two lines repeating through the whole

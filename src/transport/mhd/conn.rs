@@ -1994,6 +1994,12 @@ impl Conn {
     /// closed, or the pump starved), and the flight, when the wire took it and
     /// no acknowledgement came back. A stall that the drop counters cannot see
     /// is one of these two ages growing, so it is worth one line when it does.
+    /// Whether a write is queued on an idle connection and still waiting for a
+    /// pump pass — the condition the pump's wake kind is counted against.
+    pub(crate) fn has_idle_queued(&self) -> bool {
+        self.idle_queued.is_some()
+    }
+
     pub(crate) fn waiting(&self, now: Instant) -> (Option<Duration>, Option<Duration>) {
         let unsent = self.unsent_at.map(|at| now.saturating_duration_since(at));
         (unsent, self.recovery.oldest_flight_age(now))

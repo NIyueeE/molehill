@@ -1443,6 +1443,38 @@ pub(crate) fn note_pair_wait(us: u64) {
 }
 
 /// Report this second's pairing waits.
+/// Pump passes that began with a write queued on an idle connection, split by
+/// whether the pass was woken by the pump's signal or by its timer.
+///
+/// A write that queues on an idle lane waits for the next pass. If the passes that
+/// carry such a write are timer-driven, the wake is being missed; if they are
+/// signal-driven, the pump task is being starved. The two want different fixes.
+static WAKE_SIGNAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WAKE_TIMER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Note one pass that began with an idle write queued, and where it came from.
+pub(crate) fn note_pump_wake(by_signal: bool) {
+    if !enabled() {
+        return;
+    }
+    let slot = if by_signal { &WAKE_SIGNAL } else { &WAKE_TIMER };
+    slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Report this window's idle-write pump wakes by source.
+fn report_pump_wakes() {
+    let signal = WAKE_SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let timer = WAKE_TIMER.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if signal == 0 && timer == 0 {
+        return;
+    }
+    info!(
+        by_signal = signal,
+        by_timer = timer,
+        "mhd-stats: passes that carried a queued idle write"
+    );
+}
+
 /// How long a visitor's connection waited between being accepted and its pairing
 /// beginning.
 ///
@@ -1649,6 +1681,31 @@ fn report_growth() {
     );
 }
 
+/// Every periodic reporter, one list.
+///
+/// Its own function so that the per-second line stays inside the lint budget no
+/// matter how many reporters there are, and so adding one is a word here.
+fn report_all() {
+    // One list, so adding a reporter is a word here and not a line, and so this
+    // function stays inside the lint budget however many there become.
+    for report in [
+        report_growth,
+        report_opens,
+        report_timer_passes,
+        report_serve,
+        report_spawn,
+        report_turnaround,
+        report_preflow,
+        report_pair_wait,
+        report_accept_wait,
+        report_pump_wakes,
+        report_open_steps,
+        report_open_phases,
+    ] {
+        report();
+    }
+}
+
 fn report_send_path() {
     let posted = take_post();
     if !posted.is_empty() {
@@ -1661,17 +1718,7 @@ fn report_send_path() {
             "mhd-stats: the pump's post to the socket"
         );
     }
-    report_growth();
-    report_opens();
-    report_timer_passes();
-    report_serve();
-    report_spawn();
-    report_turnaround();
-    report_preflow();
-    report_pair_wait();
-    report_accept_wait();
-    report_open_steps();
-    report_open_phases();
+    report_all();
     let roundtrip = {
         let mut samples = FIRST_ROUNDTRIP
             .lock()
