@@ -297,6 +297,23 @@ and it should cost no throughput, because the window is already what carries the
 cell. It also rules out "give the visitor's packets a priority class" as the first
 move: a scheduler reorders work that should not be queued in the first place.
 
+**Next experiment, pre-registered before it runs.** `Conn::write` subtracts
+`self.buffered` (unacknowledged bytes) instead of `self.recovery.flight_bytes()`
+(packetised ones), leaving `MAX_BUFFERED` as the memory ceiling. The measurement is
+the per-second *mode*, not the cell's median, because §4.41 showed the median swings
+2–15× between rounds:
+
+- **Baseline, measured over 15 rounds of this cell**: **275 of 936 seconds (29 %) sit
+  above a 5 ms per-second p50**, and 4 of the 15 rounds are entirely in the slow
+  mode. (`interactive.json` 97 %, `modes` r0–r2 100/76/84 %, `all` r1 84 %.)
+- **Pass**: over four rounds of the same cell, that share falls to **≤ 5 %**, and
+  `buffered`'s per-second peak reads at most `cwnd` plus one `SEND_RUN` — the
+  instrument's own check that the bound is the window again rather than the buffer.
+- **Guard**: `bulk-1` and `bulk-pair` throughput inside the same round's A/A
+  spread, `rr-1`/`rr-16` not worse, RSS not higher (the buffer ceiling is
+  untouched, so it must not move).
+- **Rollback**: any guard breached, or the share unchanged.
+
 ### 4.41 The clean cell is bimodal, and the probe set is below its own noise (2026-11-06)
 
 §5's first item asked whether the staged tail is inter-probe contention. It is not:
@@ -1471,15 +1488,22 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **What sets the mode** (§4.41, instrumented in §4.40). Running the cell with one,
-   two and three probes showed the probe set is below the cell's own noise; what
-   separates a 2.6 ms round from a 9.6 ms one is not yet measured, and the bad mode
-   has no `mhd window` line in any existing log. Capture one with
-   `RUST_LOG=info,molehill=debug` and compare `ceiling`, `cwnd`, `flight`, `srtt_us`
-   and the request queue between the modes. **Every comparison from here on is
-   several rounds per configuration with each round's mode recorded** — one round per
-   arm cannot separate two configurations on this cell, which is how the previous
-   twenty rounds compared them.
+1. **Bound admission by what is unacknowledged, not by what is packetised**
+   (§4.42, pre-registered there). One line in `Conn::write`. Its pass is the
+   share of slow seconds — **29 % of 936 measured seconds today** — falling to
+   ≤ 5 % over four rounds, with bulk and rr inside their guards. This comes before
+   every other item because it is the mechanism the last two rounds actually found,
+   and because a scheduler (§4.1) or a controller (§4.3) built on top of a 32 MiB
+   standing queue would be measuring the queue.
+2. **One stream, one hop** (the first *structural* change after that). A visitor
+   starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
+   whole group machinery: coordinator task, send loop, receive loop, one reader task
+   per stripe, a bounded channel between them, a grace timer and a monitor. A single
+   stripe needs none of it. `spawn_single_group` drives both directions from one
+   task over the same 10-byte frame and the same `StripeSender`, so the first
+   version changes no wire byte. Pass: the same slow-second share and the cell's
+   percentiles move beyond the run's own A/A; rollback: any rr, bulk, capacity, RSS
+   or CPU regression.
 2. **One stream, one hop** (the first structural change). A visitor starts on one
    stripe (`initial_stripes()` is 1 in production) and still runs the whole group
    machinery: coordinator task, send loop, receive loop, one reader task per
