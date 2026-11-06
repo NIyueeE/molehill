@@ -270,22 +270,33 @@ criterion cannot certify a win or a loss here — it can only refuse.
 measurement is above, and the question is left open with its own pre-registration
 rather than answered with four samples of a bimodal cell.
 
-**Next experiment, pre-registered before it runs.** The powered comparison this cell
-needs: **eight rounds per configuration**, baseline and one-hop in the *same* run as
-two arms (`--ab-arm` needs two binaries, so the patch is built into a second binary
-and the run carries both), stats on, same conditions.
+**The powered run answered it, and the answer is no.** Three arms, eight rounds each,
+in one run: the baseline twice (the A/A twin is the floor) and the patched binary.
 
-- **Pass**: the one-hop arm's throughput median at least 10 % above the baseline arm's
-  **in the same run**, and its p99 median not above the baseline arm's by more than the
-  run's own A/A spread on the same cell. Both arms' slow-second shares reported.
-- **Guard**: `bulk-1`/`bulk-pair` and `rr-1`/`rr-16` between the two arms inside the
-  run's A/A; `rss_peak_mib` lower for one-hop (four fewer tasks per visitor must not
-  cost memory, and cannot).
-- **Rollback**: the throughput median not clearing 10 %, or a p99 median beyond the
-  A/A spread. If it clears both, the patch lands as its own commit with this
-  measurement as its evidence.
-- **Cost**: 2 arms × 8 rounds × ~64 s ≈ 17 minutes. That is the price of a claim on
-  this cell, and it is the first time this investigation pays it.
+| arm | throughput median | range | p99 median | range |
+|---|---|---|---|---|
+| `molehill` (baseline) | 8.42 | 6.95–9.44 | 39.5 | 14.7–127.2 |
+| `molehill~aa` (same binary) | **7.86** | 6.74–9.56 | **23.9** | 11.1–84.4 |
+| `molehill~b` (one hop) | 7.46 | 6.29–8.68 | 33.1 | 22.6–73.9 |
+
+**Two runs of one binary differ by 6.7 % of throughput and 65 % of p99.** The one-hop
+arm sits inside that band and below both baseline arms on throughput, so the +24 % of
+the four-round reading was an artefact of sampling this cell four times, and the p99
+question is not resolvable at eight rounds either. The run's own resolution report says
+so in its own words: `cost|run rtt_samples: the cell is too noisy for rounds to fix
+(longer workloads, not more of them)`.
+
+Two conclusions, both worth more than the patch:
+
+1. **The four tasks per visitor are not on the critical path.** Deleting the
+   coordinator, the reader task, the bounded channel and the grace timer changes
+   nothing measurable — which is the same answer §4.37 gave from the spawn side, now
+   from the other end.
+2. **This cell cannot certify a change smaller than ~7 % of throughput or ~30 ms of
+   p99 at eight rounds**, whatever the change. Every four-round reading in §4.41–§4.46
+   has to be read against that, including the ones that looked like wins and the ones
+   that looked like failures: §4.43's −25 % throughput and §4.46's 0.74 Gbit/s are
+   large enough to survive it, but the medians in between are not.
 
 ### 4.46 The wake is exonerated, and the reserve does not cover the buffer ceiling (2026-11-06)
 
@@ -1817,47 +1828,41 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **One stream, one hop, decided with enough rounds** (§4.47, pre-registered there).
-   Built and measured: four tasks per visitor became one, throughput 7.2 → 8.9 Gbit/s
-   median (+24 %, and four rounds in four above 8.0 against one in four), latency not
-   separable because the baseline's own p99 spans 19.5–99.1 ms at four rounds. The patch
-   is at `~/tmp/patches/single-hop.patch`; the next step is a two-arm, eight-round
-   comparison (baseline against the patched binary, A/A inside the run) before it lands.
-   Pass: +10 % throughput median *in the same run*, p99 median inside the A/A spread.
+1. **Measure the release cell itself, with the A/A floor, before any further change.**
+   Everything in §4.41–§4.47 was measured on the `cost` cell — one `clean` stage with
+   four bulk streams — and that cell's own floor is now known to be **6.7 % of
+   throughput and 65 % of p99 between two runs of one binary** at eight rounds. The
+   release judgement is `timeline[clean]` in the full sweep, which has never been
+   measured with an in-run A/A on this tree, and four rounds of the `cost` cell cannot
+   stand in for it. One `sweep`-shaped run with the A/A twin, read per stage, is the
+   next measurement — it is also the cheapest way to find out whether the ~22–24 ms
+   this file has chased is still there after the wall of tuned-out levers.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
    design reads well. §4.10's and §4.13's numbers decide its default afterwards.
-2. **One stream, one hop** (the first structural change). A visitor starts on one
-   stripe (`initial_stripes()` is 1 in production) and still runs the whole group
-   machinery: coordinator task, send loop, receive loop, one reader task per
-   stripe, a bounded channel between them, a grace timer and a monitor. A single
-   stripe needs none of it. `spawn_single_group` drives both directions from one
-   task over the same 10-byte frame and the same `StripeSender`, so the first
-   version changes no wire byte. Pass: `timeline[clean]` and `churn-16` move beyond
-   the run's own A/A and materiality; rollback: any rr, bulk, capacity, RSS or CPU
-   regression.
-3. **A lane root that is actually usable** (phase A: implemented, default off).
-   The switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
-   root-caused with a two-end join on stream, direction and packet — not until the
-   design reads well. §4.10's and §4.13's numbers decide its default afterwards.
-4. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
+3. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
    (`wire.rs` says so), so a UDP service is framed into a reliable stream and pays
    an ARQ, a route map, two worker queues and a Noise record for a packet that must
-   not be retransmitted at all. Only after 2 and 3, and never as a second fallback.
-5. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
+   not be retransmitted at all. Only after 1 and 2, and never as a second fallback.
+4. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
-6. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
+5. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
    `loss1` and `loss5` report 1.06 s and 1.46 s of p99, which is where recovery, not
    setup, decides the number.
-7. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
+6. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-8. **D (delivery-rate)** stays last: the clean cell never fills the window.
-9. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
+7. **D (delivery-rate)** stays last: the clean cell never fills the window.
+8. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
+
+Settled and off the list: **one stream, one hop** (§4.47). Built, measured at eight
+rounds with the A/A inside the run, and it does not move either axis — so the group
+machinery is not on the critical path, and the patch stays in `~/tmp/patches/` rather
+than in the tree.
 
 What is **not** on this list, and why: a live-task count (the premise is refuted by
 §4.37, and §4.38's cheaper shape answers a question nobody has shown to matter), a
