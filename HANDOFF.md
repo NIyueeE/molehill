@@ -238,6 +238,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.7 The clean cell, measured end to end (A0i–A0k)
+
+One connection's path, from three histogram instruments on both ends of a group
+(1 400–2 200 groups a second, `churn-16`, stats switch on):
+
+| leg | what it spans | p50 | p90 |
+|---|---|---|---|
+| server `up` | visitor read → frame handed to the carrier | 0 µs | 0 µs |
+| server `wire` | handoff → the reply frame arrives | **1 ms** (5 ms in another run) | 6 ms |
+| server `down` | reply frame → written to the visitor | 0 µs | 0 µs |
+| client `from_src` / `to_dest` | the far side's two hops | 0 µs | 0 µs |
+| setup (A0h) | pool placement + the lane's open | 1.4 ms | — |
+
+So neither end is slow in its own two hops, and the whole cost is the trip in
+between — the carrier's posts, the client's stripe layer, the backend's echo, and
+back — at four to six task hops of roughly a millisecond each.
+
+**The cell is not that round trip.** `churn-16` is sixteen connections each making
+four hundred *fresh* requests; its run took 2.87 s, so 7.2 ms per request per
+connection, and the cell prints 10.4 ms. Against the 2.4 ms an uncontended
+connection costs, that is a **three-to-four-fold penalty from sixteen-way
+concurrency** — and the TCP peers answer the same cell in 2.1–3.5 ms, about their
+uncontended cost.
+
+So the gap the objective is about is **contention**, and the next experiment must
+price it directly rather than infer it from two runs of a four-fold-variable
+median.
+
 ---
 
 ## 5. Active architecture decisions
@@ -274,8 +302,10 @@ whole round trip in one leg (`wire`), with this end's own read-and-hand-off and 
 write-back both at zero. So what remains is a handful of task hops through the
 client and the backend, about a millisecond each.
 
-**A0k** — the same leg split on the client's side, which needs two stamps that
-group does not carry today.
+**A0l** — price the contention directly: the same fresh-connection workload at
+one, four and sixteen concurrent visitors, for molehill and for a TCP peer, in one
+round. §4.7 says the penalty is three to four times and says how it was inferred;
+this turns it into a measurement.
 
 Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which is where the hop latency belongs) → **D** (delivery-rate
