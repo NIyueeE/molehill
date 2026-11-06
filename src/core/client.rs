@@ -1666,13 +1666,36 @@ async fn open_stripe_stream(
     tunnel: &Tunnels,
     stripe: StripeOpen,
 ) -> Result<TunnelStream> {
+    // **The four steps a stripe's placement is made of**, timed together so that
+    // whichever one holds the visitor's milliseconds names itself. Every other
+    // interval on this path has been measured and excluded: the control hop is a
+    // tenth to one millisecond, the lane's own open round trip is under one, and
+    // the pool's reservation is under one. What is left is here.
+    let started = std::time::Instant::now();
     let placement = args.stripe_placements.entry(stripe.group, stripe.count);
+    let entry = started.elapsed();
     let used = placement.used();
+    let used_at = started.elapsed();
     let stream = tunnel
         .open_stream_on_distinct(&used, usize::from(stripe.count))
         .await?;
+    let opened = started.elapsed();
     if placement.record(stream.tunnel_id()) {
         args.stripe_placements.finish(stripe.group, &placement);
+    }
+    let whole = started.elapsed();
+    if whole >= std::time::Duration::from_millis(1) && crate::transport::stats::enabled() {
+        let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        info!(
+            group = stripe.group,
+            stripes = stripe.count,
+            entry_us = micros(entry),
+            used_us = micros(used_at.saturating_sub(entry)),
+            open_us = micros(opened.saturating_sub(used_at)),
+            record_us = micros(whole.saturating_sub(opened)),
+            whole_us = micros(whole),
+            "mhd stripe placement"
+        );
     }
     Ok(stream)
 }

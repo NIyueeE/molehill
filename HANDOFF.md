@@ -285,10 +285,31 @@ So the time is inside `open_stripe_stream` but **outside** both the pool and the
 lane open: the group's placement map (`entry` / `used` / `record` / `finish`) and
 the bookkeeping around `open_stream_on_distinct`. That is the only interval left.
 
-The next step is **A0h**: four stamps inside `open_stripe_stream`, around those
-four calls and around `open_stream_on_distinct`, at a millisecond threshold. One
-of them is holding five milliseconds, and a placement map under a `std::sync::Mutex`
-is not obviously innocent when sixteen fresh connections arrive at once.
+**A0h is done, and it corrects the previous entry.** Four stamps inside
+`open_stripe_stream`, eleven thousand nine hundred samples from one `churn-16`
+round:
+
+```
+entry=0..2 µs   used=0 µs   open=1031..1765 µs   record=0 µs   whole=1033..1766 µs
+```
+
+The placement map is innocent — `entry`, `used` and `record` are microseconds —
+and **the whole open is 1.0–1.8 ms**, not five to eight. That earlier figure came
+from the `mhd client slow data channel` line, which prints only when
+`ready_us ≥ 5 ms`: it is a **biased sample of the slowest opens**, and the server's
+`wait_us` matched those same slow ones because they were the same connections.
+
+So the visitor's setup, at the median, is about 1.4 ms — and the `churn-16` cell is
+10.4 ms. **The setup is no longer a suspect.** What is left is the first request's
+**data path**: client → server → backend → back. A residual inside `complete()`
+(1.4 ms measured there against `hs_us` and placement both under one) is worth one
+more stamp, but it cannot account for ten.
+
+The next step is **A0i**: split the first request's round trip on both ends, the
+same way the setup was split — client send, server forward, backend echo, server
+write-back, client receive — and quote the **median** as well as the tail, because
+this round's lesson is that a threshold-gated log is a sample of the wrong
+population.
 
 After A0g, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which also carries the contended open measured at 21.8 ms) → **D**
