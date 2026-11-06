@@ -347,9 +347,35 @@ So the cost is **inside `complete()`'s `tunnel.open_stream()`**, between the poo
 reservation and the pump's own open, and that is the last stretch of a visitor's
 setup that has never been split.
 
-The next step is **A0p**: two stamps inside the lane's `open_stream` — before the
-pump's call and after it — so the 1.4 ms mean and 6.9 ms maximum are attributed
-either to the lane's own admission (a cap, a queue, a lock) or to the pump.
+**A0p closes the chain without needing another instrument: the open is a task
+hop.** `ClientTunnel::open_stream` does not open anything itself:
+
+```rust
+let (tx, rx) = oneshot::channel();
+self.open_tx.send(tx).await?;   // hand the request to the driver task
+rx.await?                        // wait for it to hand a stream back
+```
+
+So a fresh connection's channel open is **a request to a driver task and its
+reply** — two wake-ups — while the carrier's own open inside that driver
+(`hs_us`) stays under a millisecond, and the pool's reservation, the placement map
+and the stripe bookkeeping are all microseconds.
+
+That is the answer to the whole A0 series, and it explains the shape of every
+number this cycle: the median of a fresh connection costs 1.4 ms because two task
+hops cost about that under load, and the p99 costs 4–7 ms because a driver serving
+sixteen concurrent opens takes that long to get to some of them. It is not the
+handshake, not the timer, not the pool, and not the acknowledgement — each of those
+was measured and excluded.
+
+**So the fix is phase C's, and it is small and testable**: let an open proceed
+without the driver round trip — a per-tunnel permit (a semaphore or an atomic
+counter) checked and taken inline, with the driver only for the cases that need it.
+The hypothesis is precise: the open's p50 should fall from 1.4 ms toward the
+carrier's own sub-millisecond open, and its p99 from 4.3 ms toward about one.
+
+The next step is **A0q**: that experiment, judged on `churn-16`'s p50 and p99 and
+on `rr-1` for the no-regression half.
 
 ---
 
@@ -406,8 +432,15 @@ reservation never reaches a millisecond; `complete`'s own line reads mean 1.4 ms
 and max 6.9 ms; the lane's internal open stays under one. So the cost is inside
 `complete()`'s `tunnel.open_stream()`, the last unsplit stretch.
 
-**A0p** is next: two stamps inside the lane's `open_stream`, either side of the
-pump's call.
+**A0p closes the chain** (§4.7): `ClientTunnel::open_stream` is a request to a
+driver task and a reply — two wake-ups — and everything inside it (the carrier's
+own open, the pool's reservation, the placement map) is microseconds. So an open's
+1.4 ms median and 4.3 ms p99 are **task-hop latency**, which is phase **C**'s
+ground.
+
+**A0q** is the experiment that follows: let an open take a per-tunnel permit inline
+instead of round-tripping to the driver, and judge it on `churn-16`'s p50 and p99
+with `rr-1` as the no-regression half.
 
 Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which is where the hop latency belongs) → **D** (delivery-rate
