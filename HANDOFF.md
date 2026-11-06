@@ -276,10 +276,15 @@ which on `churn-16` reads 17–41 µs and has never been histogrammed on this ce
 **eight stages of 150 and 120 seconds** — 1 020 s, seventeen minutes, for one arm and one round,
 and the runner's warm-up doubles it.
 
-So a three-arm run (`control`, `molehill`, the A/A arm) is **about a hundred minutes**, which is
-what the two attempts in this cycle looked like from the outside: at thirty-five minutes the run was
-still in the first arm's warm-up, and the earlier one had reached only the sixth stage of the first
-arm in thirteen.
+So a three-arm run (`control`, `molehill`, the A/A arm) is **about a hundred minutes**. But be
+precise about the two attempts that looked slower than that: the cause was found afterwards and it
+was **not** the schedule. A `stage`-profile run from an earlier round was still alive, competing for
+the same host, so the sweep ran at half speed — host load was 2.5 with two bench runs at once. Killed
+by PID and re-run alone, the same scenario finished its first arm in six minutes at `--scale 0.05`.
+
+**The rule that costs nothing to follow: before any long measurement, list what is running and kill
+by PID.** A stray run does not fail loudly, it just makes every number slower than the one before
+it — and this file has already recorded that lesson in §7 without applying it here.
 
 **The consequence is a rule, not an apology: the release cell is measured once per release, with the
 sweep that the release ritual already prescribes, and never inside an optimization round.** Every
