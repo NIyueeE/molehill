@@ -897,9 +897,13 @@ that moved a number, and it moved the *bulk* stall, not the clean tail.
 | gate | result |
 |---|---|
 | `just bench gate ~/tmp/m24-sweep.json` | **PASS** — coverage 83 triples, endpoint 57 samples, SLO 4 clean cells, drowned 0, drift checked, capacity 8/8 (molehill, l3, frp, rathole) and 0/8 (nps). Revision `v0.11.2-592-gff0bae7`, fingerprint `1421e66cb2be72f0`. **That aggregate file was deleted by the §4.6 clean-up**; the run's raw per-sample artefacts survive under `~/tmp/bench-20261105-230248/` (48 series files, 146 raw iperf3 artefacts), and the gate output above is the one this document quotes. |
-| `just check` | green after the consolidation commit that carries this file |
-| `just interop` | last green earlier in this cycle, at an ancestor commit — **re-run before any release** |
-| `just l3-accept` | last green earlier in this cycle, at an ancestor commit — **re-run before any release** |
+| `just check` | **green** at `83eb22e` (0 errors; the serial suite, both clippy passes, audit, deny, outdated, ruff, pyright and the bench selfcheck's 708 checks all pass) |
+| `just interop` | **3 of 3** at `83eb22e` — new server refuses an old client and keeps serving, old server refuses a new client and says so, old server rejects an unknown dialect and survives |
+| `just l3-accept` | **16 PASS, 0 FAIL** at `83eb22e` (run as root: the recipe skips with exit 77 without namespaces; `sudo -n bash bench/src/bench/utils/l3/run.sh`) |
+
+All three were re-run on this tree rather than carried over from an ancestor: this cycle changed
+the stripe layer, the stats instruments and the server's stream setup, and a gate result from
+before those changes would have described a different binary.
 
 **Host and harness traps** (each cost real time this cycle)
 
