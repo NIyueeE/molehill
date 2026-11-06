@@ -304,10 +304,29 @@ something that happens *once per burst* rather than per connection: the pool
 growing (dialling a tunnel when the burst exceeds what it holds), a lane being
 created, or the first group's stripe plan.
 
-The next step is **A0n**: count how often the pool grows during `churn-16` and
-correlate those moments with the slow opens. Our own `open_us` has a p50 of 1.4 ms
-and never reached 5 ms in the churn runs; the pool's growth path is the one piece
-of a fresh connection that has never been timed.
+**A0n is done, and the tail is the channel open's own.** Two instruments:
+
+1. **the pool never grew** during a `churn-16` run — not once, so growth is not
+   the tail (the config sizes it up front and sixteen visitors stay inside it);
+2. **every** channel open now goes into a histogram, not only the slow ones:
+
+```
+open_p50 = 1.23–1.26 ms      open_p99 = 4.23–4.56 ms
+```
+
+The median matches A0h's 1.4 ms, and the **p99 is 4.2–4.6 ms** — a 3.4 ms tail
+against a 1.2 ms body. The cell's gap to the TCP peer is 3.2–4.7 ms. **The gap
+is the open's tail.**
+
+And the tail is not where the obvious suspects are: the pool's reservation never
+reached a millisecond and the lane's own open never reached one either, in the same
+run. So the 4.2 ms at p99 is inside the stretch between them — the stripe
+placement's bookkeeping — which has only ever been measured by a threshold line
+that read microseconds in a different run.
+
+The next step is **A0o**: turn those four placement stamps into histograms, so the
+p99 of each is readable instead of the p99 of their sum. One of them owns three
+milliseconds in the tail and none of them shows it at a one-millisecond threshold.
 
 ---
 
@@ -353,9 +372,13 @@ connections we are 1.44× slower (10.4–12.1 against 7.2–7.3 ms).
 against 6.5–6.6 ms — and the whole difference is the **p99**, 10.4–12.1 against
 7.2–7.4. The tail, not the typical case, is what is left.
 
-**A0n** is next: count pool growths during `churn-16` and correlate them with the
-slow opens. Growth is the one piece of a fresh connection that has never been
-timed.
+**A0n is done** (§4.7): the pool never grew during `churn-16`, and every channel
+open is now histogrammed — **p50 1.23–1.26 ms, p99 4.23–4.56 ms**. The cell's gap
+to the TCP peer is 3.2–4.7 ms, so the gap *is* the open's tail, and neither the
+pool's reservation nor the lane's open reaches a millisecond in the same run.
+
+**A0o** is next: the same four stamps as histograms, so the p99 of each is visible
+instead of the p99 of their sum.
 
 Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which is where the hop latency belongs) → **D** (delivery-rate

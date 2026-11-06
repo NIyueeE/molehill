@@ -278,6 +278,46 @@ static POSTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 /// *after* the stream exists (`opened` is stamped in the task), so a stream that
 /// sat in the accept queue for twenty milliseconds contributed nothing to any
 /// timer — the handshake would read fast and the arrival would still be slow.
+/// Pool growths and how long each took: the one piece of a fresh connection that
+/// happens per burst rather than per connection.
+static POOL_GROWTH: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Every data-channel open, not only the slow ones.
+///
+/// The `mhd client slow data channel` line prints past five milliseconds, which is
+/// a sample of the slowest opens: it told this cycle "eight milliseconds" when the
+/// median was 1.4. A histogram of **all** opens is the only way to read the p99 the
+/// benches judge.
+static OPEN_US: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one data-channel open.
+pub(crate) fn note_open_us(us: u64) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(us).unwrap_or(u32::MAX);
+    let mut samples = OPEN_US
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Note one pool growth, with the time it took.
+pub(crate) fn note_pool_grow(age: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = POOL_GROWTH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
 static FIRST_ROUNDTRIP: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 /// The three legs of that round trip, each its own histogram: `up` is this
@@ -1124,6 +1164,53 @@ fn report_rejections() {
 /// the stream's wait for its accept (the server's handshake clock starts *after*
 /// the stream exists, so a stream sitting in the accept queue cost nothing on
 /// anybody's timer).
+/// Report this second's pool growths, when there were any.
+///
+/// Its own function because `report_send_path` is at its line budget, and because
+/// a growth is a different event from a send-path sample: it happens once per
+/// burst, not once per connection.
+/// Report this second's channel opens: the median and the tail.
+fn report_opens() {
+    let opens = {
+        let mut samples = OPEN_US
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *samples);
+        drop(samples);
+        let mut sorted = taken;
+        sorted.sort_unstable();
+        sorted
+    };
+    if opens.is_empty() {
+        return;
+    }
+    info!(
+        n = opens.len(),
+        open_p50_us = pct_us(&opens, 50, 100),
+        open_p99_us = pct_us(&opens, 99, 100),
+        "mhd-stats: data-channel opens"
+    );
+}
+
+fn report_growth() {
+    let growth = {
+        let mut samples = POOL_GROWTH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *samples)
+    };
+    if growth.is_empty() {
+        return;
+    }
+    let count = u32::try_from(growth.len()).unwrap_or(1).max(1);
+    info!(
+        n = growth.len(),
+        grow_p50_us = growth.iter().sum::<u32>() / count,
+        grow_max_us = growth.iter().copied().max().unwrap_or(0),
+        "mhd-stats: pool growths this second"
+    );
+}
+
 fn report_send_path() {
     let posted = take_post();
     if !posted.is_empty() {
@@ -1136,6 +1223,8 @@ fn report_send_path() {
             "mhd-stats: the pump's post to the socket"
         );
     }
+    report_growth();
+    report_opens();
     let roundtrip = {
         let mut samples = FIRST_ROUNDTRIP
             .lock()

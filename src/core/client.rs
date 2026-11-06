@@ -1590,6 +1590,9 @@ async fn run_mux_data_channel(
         None => tunnel.open_stream().await?,
     };
     let open_us = u64::try_from(stream_opening.elapsed().as_micros()).unwrap_or(u64::MAX);
+    // Every open, into a histogram: the log line below is a slow-open sample and
+    // was mistaken for the median once already (see `stats::note_open_us`).
+    crate::transport::stats::note_open_us(open_us);
     trace!("Multiplexed data channel opened");
     // A v4 tunnel belongs to the session, so each of its streams names the
     // service it carries: the server reads these bytes before its forwarding

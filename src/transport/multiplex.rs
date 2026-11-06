@@ -2496,7 +2496,25 @@ impl TunnelPool {
         if self.inner.shared.resizing.swap(true, Ordering::AcqRel) {
             return;
         }
+        // **A growth is the one part of a fresh connection that happens once per
+        // burst, not once per connection.** If a visitor's p99 is wide only when
+        // sixteen arrive at once, this is where it comes from: the pool dialling a
+        // tunnel while opens wait on the empty-pool path. Timed so the claim can be
+        // checked instead of assumed.
+        let growing = std::time::Instant::now();
+        let size_before = self.size();
         let result = self.grow_locked(reason).await;
+        let took = growing.elapsed();
+        crate::transport::stats::note_pool_grow(took);
+        if crate::transport::stats::enabled() {
+            info!(
+                pool = %self.inner.shared.key,
+                size_before,
+                size_after = self.size(),
+                grow_us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+                "mhd pool growth"
+            );
+        }
         self.inner.shared.resizing.store(false, Ordering::Release);
         // Whoever waited on an empty pool re-reads the size here and either
         // places its open or fails on its own.
