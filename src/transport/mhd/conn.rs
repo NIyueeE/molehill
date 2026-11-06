@@ -866,6 +866,11 @@ impl Conn {
     /// The age is measured from the datagram that named the stream, so it is the
     /// wait the *accept path* added — the carrier's delivery time is inside it
     /// only as far as the datagram itself was late.
+    /// When this stream first had bytes for its reader, if it has yet.
+    pub(crate) fn reader_ready_at(&self, stream: u32) -> Option<Instant> {
+        self.streams.get(&stream)?.recv.ready_at()
+    }
+
     pub(crate) fn accept_aged(&mut self, now: Instant) -> Option<(StreamHandle, Duration)> {
         let id = self.inbound.pop_front()?;
         let age = self

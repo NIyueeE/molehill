@@ -155,37 +155,25 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 - **Unknown.** Where inside `open_channel_carrying` the time goes: the first
   Noise message's write, the pump's post of it, or the wait for the reply. The
   instrument that answers it is three timestamps inside that call.
-- **A0b, done — the pump is not the bottleneck.** The instrument measures the one
-  interval that separates the two ways an open can be slow: a write that finds the
-  connection idle records when it queued its bytes, and the pump records when it
-  posted the packet carrying them. Across seven rounds of `churn-16` and `rr-16`
-  (about two thousand opens) **not one** exceeded the 5 ms threshold:
+- **A0b/A0c, done — and they reframe the question.** Two instruments and three
+  runs (`churn-16` and `rr-16`, ~2 000 opens, same-run A/A) say:
 
-  ```
-  mhd idle write waited for the pump   ->  0 lines
-  churn-16 10.26-10.56 ms  (A/A 10.26-10.58)   rr-16 23 1/s
-  ```
+  1. an idle write reaches the wire inside five milliseconds — `mhd idle write
+     waited for the pump` fired **zero** times;
+  2. the server's own path is microseconds — `accept_p50 6 µs`, `post_p50 12 µs`;
+  3. in the churn scenario **no open exceeded 5 ms at all** — the
+     `mhd open round trip` line never fired.
 
-  So bytes queued on an idle connection reach the wire inside five milliseconds,
-  and the 20 ms is spent **after** the first handshake message is posted: this end
-  is waiting for the far end's reply. Phase A would remove the wait by removing
-  the exchange; the smaller fix needs one more split.
-- **Next experiment (A0c), and it is two timestamps.** On the server, "opening
-  datagram accepted → reply posted"; on the client, "reply datagram accepted →
-  the waiting reader woken". A slow first number is a server that builds late; a
-  slow second is a waker that does not fire — the same shape as the defect that
-  parked a stream for 11.9 s in the sealed striped test.
-- **Pass.** `churn-16` p99 moves toward the peers' ~2.6 ms; both clean stages
-  improve; bulk stays within 15 %; peak RSS does not change class.
-- **Rollback.** No gain beyond the run's own noise, or bulk/capacity regression,
-  or the design cannot avoid re-introducing record boundaries and partial reads.
+  So the 21.8 ms `hs_us` that A0 found is **not** the clean path's cost: it is an
+  open measured **under contention** (during bulk), which is phase C's problem,
+  not the handshake's.
 
-### 4.2 Recovery cannot tell a lost packet from a deep queue
+  What the plan's completion condition compares against TCP is the bench's
+  `churn-16` cell, and that cell is the **visitor's end-to-end setup** — dial,
+  request, echo — median **10.4 ms** here against 2.1–3.5 ms for the TCP peers.
+  Nothing yet splits that 10.4 ms, and the carrier's own open is a small part of
+  it (point 3).
 
-- **Symptom.** One timer decides the fate of the whole flight: the oldest data
-  packet's age gates every non-opening write, so an 11.9 s parked writer was
-  measured with a healthy path, and the same timer has to serve a handshake
-  packet and a megabyte of bulk.
 - **Unknown.** Whether RACK-style loss detection plus a separate PTO — the split
   MsQuic makes in `core/loss_detection.c` — removes both the age gate and the
   full-flight retransmission storm without reintroducing spurious repairs.

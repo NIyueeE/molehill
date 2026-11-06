@@ -673,6 +673,15 @@ impl RecvBuf {
     /// tree operations and an allocation for every 1400 bytes carried. Appending
     /// costs one copy into a block the pool already holds.
     /// Whether the reader is owed bytes right now, stamped the first time it is.
+    /// When this stream first had bytes the reader could take.
+    ///
+    /// For a fresh stream that is the moment its reply arrived, so comparing it
+    /// with the moment the waiting caller returns separates a reply that was late
+    /// from a future that was woken late.
+    pub(crate) fn ready_at(&self) -> Option<std::time::Instant> {
+        self.ready_at
+    }
+
     pub(crate) fn note_ready(&mut self, now: Option<std::time::Instant>) {
         if let Some(now) = now
             && self.ready_at.is_none()

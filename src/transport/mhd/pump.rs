@@ -1115,6 +1115,28 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
             (id, stream, ack, hs)
         };
+        // **Where a slow open's round trip went.** `hs_us` is the whole wait for
+        // the channel to be usable; `reply_age_us` is how long the bytes that
+        // ended it had already been sitting in this end's buffer. Equal numbers
+        // mean the far end answered at once and the **waiter was woken late**; a
+        // small age means the answer itself was late. Every hop on either side is
+        // measured in microseconds (`accept_p50` 6, `post_p50` 12), so a twenty
+        // millisecond open is one of these two and nothing else.
+        if hs_us >= 5_000
+            && crate::transport::stats::enabled()
+            && let Some(ready) = self.shared.with(|conn| conn.reader_ready_at(stream_id))
+        {
+            tracing::info!(
+                lane = self.id,
+                stream = stream_id,
+                carries,
+                hs_us,
+                reply_age_us =
+                    u64::try_from(Instant::now().saturating_duration_since(ready).as_micros())
+                        .unwrap_or(u64::MAX),
+                "mhd open round trip"
+            );
+        }
         let ack_at = Instant::now();
         // The acknowledgement's wait: from the hello going out to its answer —
         // or, in the carrying shape, from the handshake returning to the reply's
