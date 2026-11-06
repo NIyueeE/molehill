@@ -86,7 +86,7 @@ def remaining(started_at: float) -> float:
     return max(attempt_deadline(started_at) - time.time(), 0.001)
 
 
-def ping(target: tuple, size: int) -> None:
+def ping(target: tuple, size: int) -> tuple[float, float] | None:
     """One fresh TCP connection, one echo, timed end to end.
 
     The round trip is also split at the send: `connect_ms` is everything up to and
@@ -96,6 +96,11 @@ def ping(target: tuple, size: int) -> None:
     question "which side of the request byte is the tail on" cannot be answered from
     the total. Both travel as extra fields on the same line, so nothing about the
     metrics changes; they are evidence, and the engine hash still covers this file.
+
+    Answers the split, and `None` when the ping failed (a failure is already on its
+    own line): the churn loop states the same two numbers on its `setup_ms` line,
+    because "a visitor's setup" is what the TCP comparison is made of and it is not
+    one number.
     """
     started = time.perf_counter()
     started_at = time.time()
@@ -115,18 +120,21 @@ def ping(target: tuple, size: int) -> None:
                 got += len(chunk)
     except OSError as exc:
         emit_error(f"{type(exc).__name__}: {exc}", started_at)
-        return
+        return None
     if got != size:
         emit_error(f"short echo: {got} of {size} bytes", started_at)
-        return
+        return None
     finished = time.perf_counter()
+    connect_ms = round((sent_at - started) * 1000, 4)
+    echo_ms = round((finished - sent_at) * 1000, 4)
     emit(
         "rtt_ms",
         round((finished - started) * 1000, 4),
         started_at=started_at,
-        connect_ms=round((sent_at - started) * 1000, 4),
-        echo_ms=round((finished - sent_at) * 1000, 4),
+        connect_ms=connect_ms,
+        echo_ms=echo_ms,
     )
+    return connect_ms, echo_ms
 
 
 def _deadline(args) -> float:
@@ -187,8 +195,15 @@ def run_churn(target: tuple, args) -> None:
     next_at = time.perf_counter()
     while time.time() < end:
         started = time.perf_counter()
-        ping(target, args.size)
-        emit("setup_ms", round((time.perf_counter() - started) * 1000, 4))
+        split = ping(target, args.size)
+        total = round((time.perf_counter() - started) * 1000, 4)
+        # The same split the interactive mode states, because a visitor's setup is
+        # what the TCP comparison is made of and it is not one number: `connect_ms`
+        # is everything up to the request leaving, `echo_ms` the wait for the reply.
+        if split is None:
+            emit("setup_ms", total)
+        else:
+            emit("setup_ms", total, connect_ms=split[0], echo_ms=split[1])
         next_at += period
         left = next_at - time.perf_counter()
         if left > 0:

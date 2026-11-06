@@ -169,10 +169,19 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   not the handshake's.
 
   What the plan's completion condition compares against TCP is the bench's
-  `churn-16` cell, and that cell is the **visitor's end-to-end setup** — dial,
-  request, echo — median **10.4 ms** here against 2.1–3.5 ms for the TCP peers.
-  Nothing yet splits that 10.4 ms, and the carrier's own open is a small part of
-  it (point 3).
+  `churn-16` cell: `kind="rr"`, sixteen connections each carrying four hundred
+  requests, every connection fresh, and the cell is **the round trip of the first
+  request on each new connection** — its own claim says so, and that the connect
+  itself is `setup_p50_ms` because the server accepts before it pairs. That cell
+  reads **10.4 ms** here against 2.1–3.5 ms for the TCP peers.
+
+  The carrier's share of it is now bounded from both ends: the channel open never
+  reached 5 ms in these runs (point 3), and the server's accept and post are
+  microseconds (point 2). So the residual ~10 ms is in the **forward and echo
+  path** — the pair, the backend round trip, the response leg — and that is where
+  the next instrument goes. (The probe now states the same connect/echo split on
+  its churn line that it already stated for the interactive one; `churn-16` itself
+  is an `rr` scenario and does not use that probe.)
 
 - **Unknown.** Whether RACK-style loss detection plus a separate PTO — the split
   MsQuic makes in `core/loss_detection.c` — removes both the age gate and the
