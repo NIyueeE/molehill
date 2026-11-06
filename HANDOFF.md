@@ -238,6 +238,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.22 The release cell cannot be read with the group instruments (2026-11-06)
+
+The release criterion is `timeline[clean]`, whose p99 is 22.5 ms against a TCP tunnel's 2–3.5, and
+that cell had never been decomposed. It was attempted this round and did not get there, for a reason
+worth writing down.
+
+**The timeline workload is not the workload the instruments were built for.** The legs this file
+uses are per **group**: `up` is "the group started → its first frame was handed to the carrier".
+Under `churn`/`rr` a group lives for one connection's whole request and the leg is microseconds.
+Under `timeline` a group can live for the entire stage, so the same code reports:
+
+```
+leg="up"  n=12 994  p50 = 32 031 000 µs   (32 seconds)
+```
+
+That is not a bug: it is the interval the definition names, and 32 s is how long those groups had
+been open before their first byte was handed over. It is also why `note_first_roundtrip` cannot be
+read on that cell either — the same number goes into it.
+
+So the decomposition needs a **per-request anchor** rather than a per-group one: a stamp at the
+visitor's read of this request, carried to the carrier hand-off, the far side's echo and the reply.
+That is a different instrument from every one this file has, and it is the next round's whole job.
+
+Also measured, and worth keeping: one `timeline` arm takes **six minutes** (seven stages), so a
+two-arm A/A run is about thirty-five minutes. The full-profile route to this cell is a
+`--scenarios timeline` run with **one** arm plus the A/A the runner adds, not with a control arm
+alongside.
+
 ### 4.21 The control arm gives the zero point, and the cell's overhead finally closes (2026-11-06)
 
 Every comparison in this file has been tool-against-tool. The bench has a **control arm with no tool
