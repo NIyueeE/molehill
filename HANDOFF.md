@@ -238,6 +238,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.28 The gap is cold start, and it is not in any interval we instrument (2026-11-06)
+
+Two more candidates fell in one run. `accept_us`, un-gated and validated on `churn-16` first (p50
+18 µs, p99 34, against the known 17–41), reads **25–29 µs, p99 38–49** on the release cell. The
+pairing reads 1.25–1.30 ms and the turnaround 608–627 µs. So candidates ① and ② are both excluded,
+and on that cell every interval this carrier owns adds to about two milliseconds.
+
+And then the cell's own stages said something the aggregate had hidden:
+
+```
+clean      p50  11.31 ms   p99  99.35 ms    n = 425     (the first stage)
+clean#2    p50   2.10 ms   p99   4.51 ms    n = 440     (the last, after recovery)
+```
+
+**The last stage is at the TCP peers' level** (frp 2.377, rathole 2.063) and the first is
+twenty-two times worse. This is a **cold start**, and the objective's rules forbid deleting the
+first stage or adding a warm-up — correctly, because the first stage is what a real deployment
+looks like when traffic arrives.
+
+The coldness is not in the three intervals either: in the first four seconds of that stage the same
+histograms read turnaround 629–1 888 µs, pairing 1 257–3 570 µs, accept 18–42 µs.
+
+So the next instrument is not another segment but a **bracket**: from the visitor's `accepted_at` to
+the last byte the group writes back to it, per visitor. If that reads ~99 ms on the first stage, the
+time is inside this process and the segments between are the ones nobody named; if it reads 3 ms,
+the time is on the visitor's socket or in the probe, both of which are outside every stamp here.
+
+The next step is **A0ae**: that bracket, on the first `clean` stage.
+
 ### 4.27 A0ac answered: the control arm reports 3.05 ms, so the 22.5 is ours (2026-11-06)
 
 `--scale 0.05 --warmup-rounds 0 --no-aa` makes the release cell affordable: 6 minutes an arm instead

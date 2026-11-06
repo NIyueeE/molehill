@@ -4437,6 +4437,20 @@ fn note_pairing_request(group: u32) {
     tracing::info!(group, ask_ms, "mhd pairing request");
 }
 
+/// Note the two waits a pairing's line used to print only as a five-millisecond
+/// tail (§4.19): the pairing's own wait for a channel, and the interval between
+/// the visitor's connection being accepted and the pairing beginning — the one
+/// interval on the release cell with no distribution behind it (§4.27).
+fn note_waits(
+    first_take_us: Option<u64>,
+    paired: std::time::Duration,
+    pairing_started: std::time::Instant,
+    accepted_at: std::time::Instant,
+) {
+    crate::transport::stats::note_pair_wait(first_take_us.unwrap_or_else(|| micros(paired)));
+    crate::transport::stats::note_accept_wait(micros(pairing_started.duration_since(accepted_at)));
+}
+
 #[instrument(skip_all, fields(stripes = stripe_count))]
 async fn pair_striped_group<C>(
     incoming: TcpStream,
@@ -4562,10 +4576,7 @@ where
             }
         }
         let paired = pairing_started.elapsed();
-        // The pairing wait as a distribution, not only as the five-millisecond tail
-        // its log line prints (§4.19): the gated line cost a dozen rounds of
-        // chasing a number that was never the median.
-        crate::transport::stats::note_pair_wait(first_take_us.unwrap_or_else(|| micros(paired)));
+        note_waits(first_take_us, paired, pairing_started, arrival.accepted_at);
         report_pairing(&PairingFacts {
             group,
             stripes: usize::from(stripes),

@@ -1443,6 +1443,54 @@ pub(crate) fn note_pair_wait(us: u64) {
 }
 
 /// Report this second's pairing waits.
+/// How long a visitor's connection waited between being accepted and its pairing
+/// beginning.
+///
+/// The last interval on the release cell with no distribution behind it: on
+/// `churn-16` it is 17–41 µs, and the release cell is 22.5 ms while every other
+/// interval we own there is under two (§4.27). Un-gated for the reason §4.19
+/// records at length.
+static ACCEPT_WAIT: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one accept-to-pairing interval in microseconds.
+pub(crate) fn note_accept_wait(us: u64) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(us).unwrap_or(u32::MAX);
+    let mut samples = ACCEPT_WAIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Report this second's accept-to-pairing waits.
+fn report_accept_wait() {
+    let samples = {
+        let mut guard = ACCEPT_WAIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *guard);
+        drop(guard);
+        let mut sorted = taken;
+        sorted.sort_unstable();
+        sorted
+    };
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50_us = pct_us(&samples, 50, 100),
+        p90_us = pct_us(&samples, 90, 100),
+        p99_us = pct_us(&samples, 99, 100),
+        max_us = samples.last().copied().unwrap_or(0),
+        "mhd-stats: accepted visitor to pairing start"
+    );
+}
+
 fn report_pair_wait() {
     let samples = {
         let mut guard = PAIR_WAIT
@@ -1621,6 +1669,7 @@ fn report_send_path() {
     report_turnaround();
     report_preflow();
     report_pair_wait();
+    report_accept_wait();
     report_open_steps();
     report_open_phases();
     let roundtrip = {
