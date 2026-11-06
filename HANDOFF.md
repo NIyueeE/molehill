@@ -238,6 +238,25 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.38 The live-task instrument was reverted, and the cheaper shape is named (2026-11-06)
+
+The obvious next step from §4.37 was a *live* task count: an atomic taken at a task's first statement
+and released when its future drops. It was written and then reverted whole, for two reasons worth
+recording rather than hiding.
+
+**Ownership.** Putting a guard inside each spawned future means moving `activity` and `frames` into
+the async blocks, which changes three call sites' clones and — in the code that followed — pushed two
+functions past the hundred-line lint (the rule this file already carries, and which this round then
+broke three times).
+
+**The lever was larger than the measurement.** The count I want is `groups × 4`, and groups are
+already known: `spawn_inner` is entered once per group and returns when it ends. Two atomic
+operations at those two points — no guard, no ownership change, no line added to any loop — give the
+same number. That is the shape to write next, in a round with budget for it.
+
+The revert is recorded per this objective's own rule: an experiment that does not land cleanly is
+reverted whole and its measurement kept, not left half-applied because it was expensive to write.
+
 ### 4.37 The task count is a number now, and it weakens the premise (2026-11-06)
 
 A0ak's verdict (§4.36) rested on a premise this file had only ever asserted: that this carrier puts
