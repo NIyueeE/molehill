@@ -92,6 +92,25 @@ const MAX_BUFFERED: u64 = 2 * WINDOW;
 /// described did not exist.
 pub(crate) const OPEN_RESERVE: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
 
+/// How long an abandoned stream may hold unacknowledged bytes before it is retired.
+///
+/// A stream whose handle was dropped still delivers what it has queued — a
+/// response must not be truncated — and it retires when the peer acknowledges all
+/// of it. When the peer *never* acknowledges (it is gone, or the path has stopped
+/// carrying), that wait has no end, and the bytes it is waiting on stay counted in
+/// `buffered` for the lane's life. `write` subtracts exactly that number from
+/// [`MAX_BUFFERED`], so one such stream refuses **every later stream on the
+/// connection**: measured, the first lossy stage of a sweep took the bulk spine
+/// from 7.7 to 0.21 Gbit/s and it never came back, with `buffered` climbing stage
+/// by stage to the ceiling (HANDOFF §4.50).
+///
+/// Thirty seconds is chosen against the layer above and the layer below: the
+/// stripe group's own reorder deadline is thirty (`STRIPE_REORDER_DEADLINE`), the
+/// carrier's dead-path floor is five and `DEAD_AFTER` is twenty, and the longest
+/// stall this carrier has been measured to recover from is twelve. A stream that
+/// has been abandoned for longer than all of those is one nobody is waiting for.
+pub(crate) const ABANDON_HOLD: Duration = Duration::from_secs(30);
+
 /// Whether a stream is still opening: it has not written a reserve's worth yet.
 fn opening(state: &StreamState) -> bool {
     state.send.written() < OPEN_RESERVE
@@ -204,6 +223,14 @@ struct StreamState {
     /// The local handle was dropped: nothing will read this stream again, and
     /// it is retired once everything written has been acknowledged.
     abandoned: bool,
+    /// When this stream's handle was dropped, for the bounded wait below.
+    ///
+    /// A graceful close may wait for an acknowledgement for as long as the peer
+    /// takes, and that is right: a response must not be truncated. It may not
+    /// wait for ever, because the bytes it is waiting on stay counted in
+    /// `buffered`, and `write`'s buffer ceiling is that number — see
+    /// [`ABANDON_HOLD`] and `reap_abandoned`.
+    abandoned_at: Option<Instant>,
     /// The finish has been told to the peer. A finish rides the last data frame
     /// when there is one; otherwise it is the reset frame this flag records, so
     /// it is queued once and never lost.
@@ -1063,6 +1090,10 @@ impl Conn {
             return;
         };
         state.abandoned = true;
+        // The bounded wait starts here: nothing will read this stream again, so
+        // an acknowledgement it never gets must cost it [`ABANDON_HOLD`] and not
+        // the connection's whole buffer budget (see `reap_abandoned`).
+        state.abandoned_at.get_or_insert_with(Instant::now);
         // Nothing will read this half again: release what arrived, and with it
         // the blocks a later stream on this connection can use.
         state.recv.discard(blocks);
@@ -2653,11 +2684,55 @@ impl Conn {
         ack_timing.stop(&stats::PHASES.ack);
     }
 
+    /// Retire streams whose owner is gone and whose bytes can no longer arrive.
+    ///
+    /// `settle` waits for the peer to acknowledge everything, which is right for a
+    /// graceful close and wrong for a stream nobody will read again: an
+    /// unacknowledged tail then keeps its bytes in `buffered` for the lane's life,
+    /// and `write`'s buffer ceiling is that number (see [`ABANDON_HOLD`]). This is
+    /// the only place a stream leaves the table without being acknowledged.
+    ///
+    /// Called from [`Conn::on_timeout`], which the pump already drives, so there is
+    /// no new clock read on any hot path and no new task.
+    fn reap_abandoned(&mut self, now: Instant) -> usize {
+        let stale: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, state)| {
+                state.abandoned
+                    && state.send.held() > 0
+                    && state
+                        .abandoned_at
+                        .is_some_and(|at| now.saturating_duration_since(at) >= ABANDON_HOLD)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in &stale {
+            // The peer is told the stream is over, so its own table does not hold a
+            // half-open stream that nothing will ever finish.
+            self.resets.push_back((*id, ResetCode::Aborted));
+            let held = self.streams.remove(id).map_or(0, |mut state| {
+                state.recv.discard(&mut self.blocks);
+                u64::try_from(state.send.held()).unwrap_or(u64::MAX)
+            });
+            self.buffered = self.buffered.saturating_sub(held);
+            self.stream_opened.remove(id);
+            self.finishing.remove(id);
+            tracing::debug!(
+                stream = id,
+                released_bytes = held,
+                "mhd abandoned stream retired without an acknowledgement"
+            );
+        }
+        stale.len()
+    }
+
     /// The timer expired: why, and how many packets it put back in the queue.
     pub(crate) fn on_timeout(&mut self, now: Instant) -> (Expiry, usize) {
         if self.closed.is_some() {
             return (Expiry::Loss, 0);
         }
+        self.reap_abandoned(now);
         // The keepalive deadline is the other caller of this: when it fires
         // with nothing in flight there is nothing to recover, and the pump's
         // next pass emits the probe (see `poll_transmit`).
@@ -3597,6 +3672,37 @@ mod tests {
     /// The refusal here is the sealing one — a stream marked sealed with no key
     /// is the state `payload_plan` exists to refuse — and the assertion is that
     /// the connection's own numbering did not move.
+    /// An abandoned stream gives its bytes back after the hold, and not before.
+    ///
+    /// Its bytes stay in the connection's `buffered` total while it waits for an
+    /// acknowledgement, and `write`'s buffer ceiling is exactly that number — so a
+    /// stream whose peer never acknowledges refuses every later stream on the lane.
+    /// Measured: the bulk spine went from 7.7 to 0.21 Gbit/s after the first lossy
+    /// stage and never recovered (HANDOFF §4.50).
+    #[test]
+    fn an_abandoned_stream_releases_its_buffer_after_the_hold() {
+        let mut conn = Conn::new(3, true);
+        let stream = conn.open().id;
+        assert_eq!(conn.write(stream, &[7u8; 4096]), 4096, "the write lands");
+        let room = conn.budget().2;
+        conn.close_stream(stream);
+        let now = Instant::now();
+        // One second in: the graceful close is still waiting for its ack.
+        conn.on_timeout(now + Duration::from_secs(1));
+        assert_eq!(
+            conn.budget().2,
+            room,
+            "an abandoned stream must keep waiting inside the hold"
+        );
+        // Past the hold: the bytes come back and the ceiling is the lane's again.
+        conn.on_timeout(now + ABANDON_HOLD + Duration::from_secs(1));
+        assert_eq!(
+            conn.budget().2,
+            room + 4096,
+            "the hold must release exactly what the stream held"
+        );
+    }
+
     #[test]
     fn a_refused_packet_does_not_consume_a_packet_number() {
         let now = Instant::now();

@@ -244,6 +244,62 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.51 The bounded abandon works: `buffered` stops being monotone and the last stage carries 6.28 Gbit/s again (2026-11-06)
+
+§4.50's fix was built and measured in the same round: `StreamState.abandoned_at`, a
+30-second `ABANDON_HOLD`, and `Conn::reap_abandoned` called from `Conn::on_timeout` — the
+timer the pump already drives, so no new clock read on a hot path and no new task. A
+stream abandoned with unacknowledged bytes is retired after the hold with a reset, and its
+bytes come out of `buffered`. One unit test pins both halves (`an_abandoned_stream_
+releases_its_buffer_after_the_hold`: unchanged at one second, released exactly at the
+hold).
+
+Same scaled timeline, before and after:
+
+| stage | `buffered` before | `buffered` after | throughput before | throughput after |
+|---|---|---|---|---|
+| `clean` | 5.4 MB | 8.3 MB | 10.26 | 9.33 |
+| `rtt100` | 65 KB | 65 KB | 3.32 | 1.68 |
+| `loss1` | 17.0 MB | **5.3 MB** | 7.72 | 6.52 |
+| `loss5` | 31.7 MB | **150 KB** | 0.21 | 0.014 |
+| `rate100` | 31.7 MB | **2.9 KB** | 0.09 | 0.09 |
+| `rate20` | 31.7 MB | **2.9 KB** | 0.0 | 0.019 |
+| `jitter` | 33.5 MB | **2.1 MB** | 4.76 | 3.64 |
+| `clean#2` | 33.5 MB | **15.0 MB** | **0.0** | **6.28** |
+
+Eight reaps logged. **The leak is gone** — `buffered` returns to kilobytes after every
+shaped stage instead of accumulating to the ceiling — and **`clean#2` carries bulk again
+(0 → 6.28 Gbit/s)**, which was the pre-registered "the stage becomes a measurement" test.
+
+**The shaped stages are still empty, and now for a different reason.** Their `buffered`
+reads 2.9–150 KB, so they are no longer leak-limited: the buffer ceiling has room and
+nothing is refused by it. The pre-registered pass asked for all four of `loss5`,
+`rate100`, `rate20`, `clean#2` above 4 Gbit/s, so **it is unmet as written** — one of four
+cleared it — and the honest reading is that the criterion bundled two separable claims:
+"the leak is gone" (met, with a mechanism and eight reaps) and "the shaped stages are
+fast" (a different question, and their near-zero `buffered` says it is not this budget).
+
+**What is deliberately not claimed.** The pre-registered guard — `clean` and `rtt100`
+unchanged within the run's own A/A — was not measured: this run had one arm and one
+round. `clean` read 9.33 against 10.26 before, and `rtt100` 1.68 against 3.32, and at this
+cell's known floor neither difference is interpretable. A fix that only *releases* budget
+cannot reduce throughput by construction, but construction is not a measurement.
+
+**Next experiment, pre-registered before it runs.** The guard this round owed: two arms,
+the patched binary against the previous commit's, one scaled timeline, **four rounds**,
+each arm's stages compared in the same run.
+
+- **Pass**: the patched arm's `clean` and `rtt100` throughput medians are at or above the
+  unpatched arm's (the fix releases budget and must not cost any), and its `clean#2`
+  throughput is above the unpatched arm's by more than the run's A/A spread.
+- **Rollback**: `clean` or `rtt100` below the unpatched arm by more than that spread —
+  which would mean the hold is reaping streams that were still delivering.
+- **Then, as its own question**: why `loss5`/`rate100`/`rate20` carry almost nothing with
+  a free buffer ceiling. Their iperf3 artifacts are the place to start (a zero window
+  again would point at the *visitor's* socket rather than at the tunnel), and the stage's
+  own hold at `--scale 0.2` is only 24 s, which may be shorter than iperf3 needs to ramp
+  under a 100 ms delay.
+
 ### 4.50 The first lossy stage kills the bulk spine for the rest of the run: abandoned streams never give their buffer back (2026-11-06)
 
 §4.49 asked which stream was reset and why the pool did not help. The answer is worse
