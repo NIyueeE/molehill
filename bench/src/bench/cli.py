@@ -1435,6 +1435,131 @@ def _check_probes(c: Checker) -> None:
 WEDGE_SAMPLE_SPAN_S = 10.6
 
 
+#: The staged-series selfcheck's own sample values. Named because they are
+#: *compared*: a bare literal inside a check is a number whose meaning a reader
+#: has to reconstruct from the sample it was planted in.
+SERIES_INTERACTIVE_MS = 4.0
+SERIES_DATAGRAM_MS = 900.0
+SERIES_CHURN_SETUP_MS = 700.0
+SERIES_CHURN_CONNECT_MS = 1.0
+SERIES_CHURN_ECHO_MS = 699.0
+SERIES_CHURN_OFFERED_PER_S = 16
+#: A window in which every attempt failed: the error rate is total.
+SERIES_TOTAL_ERROR_PCT = 100.0
+
+
+def _check_staged_series(c: Checker) -> None:
+    """A staged cell's numbers come from the series that owns them, and only it.
+
+    Two mistakes this pins, both of which happened:
+
+    1. **pooling the series.** `rtt_p99_ms` is the interactive series' own
+       percentile. Handing churn's or the datagram probe's `rtt_ms` samples to
+       the same computation produces a number no metric declares, and the
+       agreement of such a number with a cell's reading is then a coincidence
+       (HANDOFF §4.39).
+    2. **an unmeasured window read as a measurement.** A window with no sample
+       has no error rate, no percentile and no SLO verdict; a window in which
+       every attempt failed has a total error rate and no percentile. Writing
+       `0.0` for either turns "nothing arrived" into "everything was fine".
+    """
+    span = workloads.Span(
+        since=0.0,
+        seconds=10.0,
+        params={"churn_per_s": SERIES_CHURN_OFFERED_PER_S},
+    )
+    all_series = tuple(model.STAGED_SERIES)
+
+    def sample(metric: str, value: float, **extra) -> dict:
+        return {"t": 1.0, "metric": metric, "v": value} | extra
+
+    # One sample from each series: only the interactive one may reach the p99.
+    interaction = [sample("rtt_ms", SERIES_INTERACTIVE_MS)]
+    datagrams = [sample("rtt_ms", SERIES_DATAGRAM_MS)]
+    churn = [
+        sample(
+            "setup_ms",
+            SERIES_CHURN_SETUP_MS,
+            connect_ms=SERIES_CHURN_CONNECT_MS,
+            echo_ms=SERIES_CHURN_ECHO_MS,
+        )
+    ]
+    metrics, evidence, _ = workloads._stage_metrics(
+        interaction, datagrams, churn, span, all_series
+    )
+    c.equal(
+        "a staged p99 is the interactive series' own",
+        metrics["rtt_p99_ms"],
+        SERIES_INTERACTIVE_MS,
+    )
+    c.check(
+        "neither a datagram nor a churn sample can reach the staged p99",
+        metrics["rtt_p99_ms"] not in (SERIES_DATAGRAM_MS, SERIES_CHURN_SETUP_MS),
+        f"p99 {metrics['rtt_p99_ms']}",
+    )
+    c.check(
+        "the churn series states its own shape as evidence",
+        (evidence["churn_setup"] or {}).get("p99") == SERIES_CHURN_SETUP_MS
+        and (evidence["churn_echo"] or {}).get("max") == SERIES_CHURN_ECHO_MS,
+        str(evidence["churn_setup"]),
+    )
+
+    # An empty window: nothing measured, nothing invented.
+    empty, _, absent = workloads._stage_metrics([], [], [], span, all_series)
+    c.equal("an empty window has no error rate", empty["rtt_error_rate_pct"], None)
+    c.equal("an empty window has no p99", empty["rtt_p99_ms"], None)
+    c.equal(
+        "an empty window has no SLO verdict",
+        workloads._breaks_slo(empty),
+        None,
+    )
+    c.check(
+        "an empty window is absent with a reason, not absent silently",
+        bool(absent),
+        str(absent),
+    )
+
+    # Every attempt failed: the error rate is total, the percentile is not
+    # invented, and the absence names the attempts.
+    failed = [sample("error", 1, why="TimeoutError: timed out") for _ in range(3)]
+    broken, _, broken_absent = workloads._stage_metrics(
+        failed, [], [], span, all_series
+    )
+    c.equal(
+        "a fully failed window is all errors",
+        broken["rtt_error_rate_pct"],
+        SERIES_TOTAL_ERROR_PCT,
+    )
+    c.equal("a fully failed window has no p99", broken["rtt_p99_ms"], None)
+    c.check(
+        "a fully failed window's absence names the attempts",
+        "failed" in str(broken_absent.get("rtt_p99_ms", "")),
+        str(broken_absent),
+    )
+
+    # A run that started only some series reports the others as absent, and a
+    # churn rate it never offered never appears.
+    churn_only = ("churn",)
+    _, only_evidence, only_absent = workloads._stage_metrics(
+        [], [], churn, span, churn_only
+    )
+    c.check(
+        "a run without the interactive series says so",
+        "not started" in str(only_absent.get("rtt_p99_ms", "")),
+        str(only_absent),
+    )
+    interactive_only, _, _ = workloads._stage_metrics(
+        interaction, [], [], span, ("interactive",)
+    )
+    c.check(
+        "a run without the churn series reports no churn rate",
+        interactive_only["churn_per_s"] is None
+        and only_evidence["churn_offered_per_s"] == SERIES_CHURN_OFFERED_PER_S
+        and only_evidence["churn_setup"]["n"] == 1,
+        str(only_evidence.get("churn_offered_per_s")),
+    )
+
+
 def _check_wedges(c: Checker) -> None:
     """A slow answer is not a silence, and a run of them is.
 
@@ -1665,6 +1790,7 @@ def cmd_selfcheck(args) -> int:
     _check_comparability(c)
     _check_fingerprint(c)
     _check_probes(c)
+    _check_staged_series(c)
     _check_wedges(c)
     _check_provenance(c)
     _check_socket_query(c)

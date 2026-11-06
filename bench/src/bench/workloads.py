@@ -937,6 +937,26 @@ def _ms(microseconds):
     return round(microseconds / 1000.0, 3) if microseconds is not None else None
 
 
+def _distribution(values: list) -> dict | None:
+    """A series' own shape — count, p50, p90, p99 and max — or `None`.
+
+    **Evidence, not a metric.** The registry (`model.METRICS`) owns what a number
+    means and what the gate judges; this is the distribution *behind* a declared
+    metric, so a reader can see whether `churn_per_s` came with a tail instead of
+    inferring one. It is `None` when the series produced nothing, never a zero
+    dict: a stage that started no churn probe has no churn distribution at all.
+    """
+    if not values:
+        return None
+    return {
+        "n": len(values),
+        "p50": inst.pct(values, 0.50),
+        "p90": inst.pct(values, 0.90),
+        "p99": inst.pct(values, 0.99),
+        "max": max(values),
+    }
+
+
 def _spawn_probe(argv: list, log: Path, timeout: float) -> tuple:
     """Run one probe process; return its JSON line, exit status and wall time."""
     t0 = time.perf_counter()
@@ -1062,38 +1082,56 @@ def _series_points(logs: dict, mode: str, since: float, until: float) -> list:
     return read_series(log, since, until) if log else []
 
 
-def _stage_absences(
-    metrics: dict, interaction: list, datagrams: list, series: tuple
+#: The two reasons that come from the *series* rather than from the tool: a run
+#: that never started it (a diagnostic), and one that ran and produced nothing
+#: (a probe that died, a namespace that lost its route, or a bug here).
+_NOT_STARTED = "the series was not started in this run"
+_NO_SAMPLE = "the series produced no sample in this window"
+
+
+def _missing_series(
+    series: tuple, interaction: list, datagrams: list, churn: list
 ) -> dict:
-    """Why a stage's interactive or datagram numbers are missing, typed.
+    """Every metric a series cannot answer for, with the series' own reason."""
+    unavailable: dict = {}
+    groups = {
+        "interactive": (
+            (
+                "rtt_p50_ms",
+                "rtt_p99_ms",
+                "rtt_max_ms",
+                "rtt_worst_1s_ms",
+                "rtt_error_rate_pct",
+            ),
+            interaction,
+        ),
+        "udp": (("udp_rtt_p99_ms", "udp_loss_pct", "udp_gap_p99_ms"), datagrams),
+        "churn": (("churn_per_s",), churn),
+    }
+    for mode, (metrics, samples) in groups.items():
+        if mode not in series:
+            reason = _NOT_STARTED
+        elif not samples:
+            reason = _NO_SAMPLE
+        else:
+            continue
+        for metric in metrics:
+            unavailable[metric] = {"reason": f"{mode}: {reason}"}
+    return unavailable
+
+
+def _stage_absences(
+    metrics: dict, interaction: list, datagrams: list, churn: list, series: tuple
+) -> dict:
+    """Why a stage's numbers are missing, typed.
 
     Three reasons produce an absent metric and they are not interchangeable: the
-    series was never started (a diagnostic run), every attempt in it failed (the
-    tool), or the probe produced no sample in this window (the instrument). Only
-    the second is a reading about the tool, so each reason is written down rather
-    than left as an absent key.
+    series was never started (a diagnostic run), it started and produced nothing
+    (the instrument), or every attempt in it failed (the tool). Only the last is
+    a reading about the tool, so each is written down rather than left as an
+    absent key.
     """
-    unavailable: dict = {}
-    if "interactive" not in series:
-        for metric in (
-            "rtt_p50_ms",
-            "rtt_p99_ms",
-            "rtt_max_ms",
-            "rtt_worst_1s_ms",
-            "rtt_error_rate_pct",
-        ):
-            unavailable[metric] = {
-                "reason": "the interactive series was not started in this run"
-            }
-    if "udp" not in series:
-        for metric in ("udp_rtt_p99_ms", "udp_loss_pct", "udp_gap_p99_ms"):
-            unavailable[metric] = {
-                "reason": "the datagram series was not started in this run"
-            }
-    if "churn" not in series:
-        unavailable["churn_per_s"] = {
-            "reason": "the churn series was not started in this run"
-        }
+    unavailable = _missing_series(series, interaction, datagrams, churn)
     failed = [p for p in interaction if p["metric"] == "error"]
     if failed and metrics.get("rtt_p99_ms") is None:
         reason = f"all {len(failed)} interactive attempts failed in this stage"
@@ -1158,6 +1196,34 @@ def _stage_metrics(
         # produced: a zero is then "started and produced nothing" and a missing
         # key in `enabled` is "never started", which are different findings.
         "series_enabled": list(series),
+        # The churn series' own shape. `churn_per_s` is a throughput and says
+        # nothing about the tail of what a visitor pays to arrive, while the
+        # probe already states all three numbers per attempt: the whole attempt
+        # (`setup_ms`) and its two halves (`connect_ms` to the request leaving,
+        # `echo_ms` for the reply). Evidence, never a declared metric — a staged
+        # cell's declared numbers are the ones the gate judges.
+        "churn_setup": _distribution(
+            [p["v"] for p in churn if p["metric"] == "setup_ms"]
+        ),
+        "churn_connect": _distribution(
+            [
+                p["connect_ms"]
+                for p in churn
+                if p["metric"] == "setup_ms" and "connect_ms" in p
+            ]
+        ),
+        "churn_echo": _distribution(
+            [
+                p["echo_ms"]
+                for p in churn
+                if p["metric"] == "setup_ms" and "echo_ms" in p
+            ]
+        ),
+        "churn_errors": (
+            len([p for p in churn if p["metric"] == "error"])
+            if "churn" in series
+            else None
+        ),
         # The probe's own log paths are the caller's to add: this function is
         # handed the *points*, not the files, and a list of the points rendered
         # as text (which is what stood here) is not a log — it doubled every
@@ -1178,7 +1244,11 @@ def _stage_metrics(
             span.params.get("churn_per_s", 16.0) if "churn" in series else None
         ),
     }
-    return metrics, evidence, _stage_absences(metrics, interaction, datagrams, series)
+    return (
+        metrics,
+        evidence,
+        _stage_absences(metrics, interaction, datagrams, churn, series),
+    )
 
 
 def _per_second(points: list, since: float) -> list:

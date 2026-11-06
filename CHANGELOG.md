@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the run's fingerprint, and a subset is never a release configuration: a run
   without the interactive series has no staged `rtt_p99_ms`, and the gate refuses
   a clean stage it cannot judge.
+- **A staged cell carries the churn series' own shape** — `churn_setup`,
+  `churn_connect`, `churn_echo` and `churn_errors` — as evidence rather than as a
+  metric, so a reader can see whether the arrival rate came with a tail. And a
+  metric whose series could not answer is now absent *with its reason*: never
+  started, started and produced no sample, or every attempt failed. An absent
+  number with no explanation is the shape a dead probe, a lost route and a bug in
+  the analysis all produce.
 
 ### Fixed
 

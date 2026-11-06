@@ -244,6 +244,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.40 The staged cell can be measured one probe at a time, and its absences are typed (2026-11-06)
+
+§4.39's next step needed a switch that did not exist: the staged runner always
+started all three probes. It is now a method parameter.
+
+- **`--series interactive`** starts one probe; `--series interactive,churn` starts
+  two; the default is all three (`model.STAGED_SERIES`, declared once). The set
+  travels in the fingerprint like `--scale` does, because three probes running at
+  once and one running alone are different measurements of the same tool.
+- **An unknown name and an empty list are refused before a namespace exists.**
+  The empty list is the dangerous one: it would measure nothing while the record
+  said so, and every metric would read absent.
+- **Every absence carries its reason** — the series was not started, it started and
+  produced no sample, or every attempt failed. The middle one did not exist until
+  the selfcheck asked for it: with all three series enabled and an empty window,
+  every metric was absent with no explanation at all, which is the shape a dead
+  probe, a lost route and an analysis bug produce equally.
+- **The churn series reports its own shape** (`churn_setup`, `churn_connect`,
+  `churn_echo`, `churn_errors`) as evidence, not as a metric: `churn_per_s` is a
+  throughput and says nothing about the tail of what a visitor pays to arrive,
+  while the probe already states all three numbers per attempt.
+
+Two regressions in `just bench selfcheck` now pin the arithmetic: a churn or
+datagram sample **cannot** reach a staged `rtt_p99_ms`, and an empty window has no
+error rate, no percentile and no SLO verdict (a `0.0` in any of them turns
+"nothing arrived" into "everything was fine"). 725 checks.
+
+This is the instrument §5's first item needs; it does not yet say what the
+measurement will show.
+
 ### 4.39 The staged cell's p99 is the interactive series alone, and it is not an aggregate (2026-11-06)
 
 Every round of this cycle has optimised "the cell": `timeline[clean]`, whose p99 the gate records as
@@ -1321,13 +1351,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **One series at a time** (§4.39). The staged cell's p99 is the interactive
-   series alone, and the interactive and churn probes are the same code at nearly
-   the same rate. Run the timeline three ways — interactive only, churn only, both
-   — with everything else equal. If the interactive p99 rises when churn shares the
-   host, the tail is inter-probe contention; if it does not, the 22.5 ms is not the
-   tail this file has been chasing and needs a different account. **Nothing below
-   starts before that is answered.**
+1. **One series at a time** (§4.39, instrumented in §4.40). The staged cell's p99
+   is the interactive series alone, and the interactive and churn probes are the
+   same code at nearly the same rate. Run the timeline three ways — interactive
+   only, churn only, both — with everything else equal (`--series`). If the
+   interactive p99 rises when churn shares the host, the tail is inter-probe
+   contention; if it does not, the 22.5 ms is not the tail this file has been
+   chasing and needs a different account. **Nothing below starts before that is
+   answered.**
 2. **One stream, one hop** (the first structural change). A visitor starts on one
    stripe (`initial_stripes()` is 1 in production) and still runs the whole group
    machinery: coordinator task, send loop, receive loop, one reader task per
