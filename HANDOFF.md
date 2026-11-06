@@ -238,6 +238,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.34 A0aj confirmed: the tail is runtime saturation, and the cell moves 71 % (2026-11-06)
+
+The pre-registered test: the same cell, twice, with the only difference the runtime's worker count
+(`TOKIO_WORKER_THREADS`, which both subject processes inherit). Every second's histogram averaged
+over the run, so the comparison is a distribution and not one cold-start sample:
+
+| metric | default (`min(cores, 8)` = 8) | 16 workers | change |
+|---|---|---|---|
+| `clean` p99, the cell | **142.97 ms** | **41.40 ms** | **−71 %** |
+| echo p50 | 1 268 µs | 613 µs | −52 % |
+| echo p99 | 8 128 µs | 4 989 µs | **−39 %** (the criterion was 30 %) |
+| paired p50 | 2 789 µs | 1 430 µs | −49 % |
+| paired p99 | 9 612 µs | 4 542 µs | −53 % |
+
+**Confirmed on every metric and by a wider margin than the criterion asked for.** The six
+milliseconds §4.33 could not place are the runtime not polling the pump while several thousand tasks
+compete for eight workers; doubling the workers halves the medians and removes 71 % of the cell's
+p99.
+
+One number to keep honest: the same cell measured 24.183 ms in §4.27's paired run and 142.97 ms
+here, on the same tree. **The first stage's p99 swings by six times between runs at eight workers**
+— which is itself a symptom of saturation, and the reason every claim in this file now quotes a
+distribution rather than a single cell when the tail is the subject.
+
+The next step is **A0ak**: make the worker count a deliberate decision. `DEFAULT_WORKERS` is 8 in
+`src/main.rs` and is not a configuration key, so raising its cap is a code change with a measured
+effect — but it is a **global** default (every carrier, every role), it costs threads and memory
+(phase 6's budget), and the objective puts latency above both. Measured as a change: the cell at
+16 and at `min(cores, 16)`, `churn-16`, `rr-1`, `rr-16` and `bulk-n` in the same round, with the
+revert rule stated before the numbers are read.
+
 ### 4.33 The pump's own work is microseconds, so the six milliseconds are the runtime (2026-11-06)
 
 The last two candidates in the pump loop, measured on the cell that matters:
