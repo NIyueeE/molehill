@@ -244,6 +244,76 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.50 The first lossy stage kills the bulk spine for the rest of the run: abandoned streams never give their buffer back (2026-11-06)
+
+§4.49 asked which stream was reset and why the pool did not help. The answer is worse
+and simpler: **nothing was reset, nothing died, and the connection's buffer budget leaked
+until it was full.** `buffered` per stage, one scaled timeline, server lanes:
+
+| stage | throughput (Gbit/s) | `buffered` p50 |
+|---|---|---|
+| `clean` | 10.26 | 5.4 MB |
+| `rtt100` | 3.32 | 65 KB |
+| `loss1` | 7.72 | **17.0 MB** |
+| `loss5` | **0.21** | **31.7 MB** |
+| `rate100` | **0.09** | 31.7 MB |
+| `rate20` | **0.0** | 31.7 MB |
+| `jitter` | 4.76 | **33.5 MB** (the ceiling) |
+| `clean#2` | **0.0** | 33.5 MB |
+
+Monotone, never returning, and from `loss5` onward the bulk spine carries nothing at
+all. **The run is over at its third stage**, and every throughput number after it — the
+shaped stages' cells, `clean#2`'s "recovery", §3.3's capacity ramp, §4.2's shaped-stage
+judgement — was measured on a dead spine.
+
+**The mechanism is in `Conn::settle`.** A stream retires only when
+`abandoned && fin_sent && send.unacked() == 0`, and `fin_sent` itself requires
+`unacked == 0`, so a stream whose peer never acknowledges cannot retire — and its
+`send.held()` bytes stay in `Conn::buffered` for the lane's life. `Conn::write` computes
+its third bound from exactly that number:
+
+```rust
+let held = MAX_BUFFERED.saturating_sub(self.buffered);
+```
+
+so one stream that cannot be retired refuses **every later stream on the lane**:
+`held == 0`, no room, and a new bulk stream's first write is refused. The logs agree
+from the other end: the four groups of the bulk spine are the only ones that never
+finish (1 156 started, 1 152 finished), each read 16–40 KB from its visitor and then
+stopped — and iperf3 sees `max_snd_wnd: 0`, because a group that cannot write to the
+tunnel stops reading its visitor.
+
+**And every stage transition creates one.** A stage ends by killing `iperf3`'s client;
+the tool's group sees EOF, its `StreamIo` drops, `close_stream` runs, and the stream is
+marked `abandoned` while some of its bytes are still unacknowledged. On a clean path
+those acks arrive and the stream retires; **after a lossy stage they do not**, and the
+lane's budget is gone for good. Four lanes, eight stages, one ceiling.
+
+**Next experiment, pre-registered before it runs.** Bound the wait instead of trusting
+it: a stream that has been `abandoned` with unacknowledged bytes for longer than
+`ABANDON_HOLD` (30 s, the same order as `STRIPE_REORDER_DEADLINE`, and longer than
+`recovery`'s `LOST_HOLD` of 3 s and `DEAD_AFTER` of 20 s) is retired with a reset, and its
+`send.held()` is subtracted from `buffered`. Swept from the pump's existing once-a-second
+pass, so no new task and no clock in `settle`.
+
+- **Pass**: one scaled timeline in which `buffered` does not grow monotonically — the
+  per-stage series returns toward its starting level — **and** `loss5`, `rate100`,
+  `rate20` and `clean#2` each carry more than 4 Gbit/s (today: 0.21, 0.09, 0.0, 0.0).
+  The shaped stages' *latency* is expected to get worse and that is the point: it is
+  measured with load again.
+- **Guard**: `clean` and `rtt100` unchanged within the run's own A/A (the clean cell is
+  not near this ceiling), `rss_peak_mib` not higher (the hold releases memory earlier,
+  never later), and no truncation symptom: a stream that retires with `written > acked`
+  must say so on its `mhd stream closed` line, and that count must stay zero for streams
+  that were **not** abandoned.
+- **Rollback**: any clean-cell regression, a non-zero truncated-stream count, or
+  `buffered` still monotone.
+
+**What this changes in the plan.** §5's RACK+PTO item is judged on the shaped cells, and
+the shaped cells have been empty: until this leak is fixed, no shaped-cell number in this
+file describes the carrier. That item moves behind this one, and so does any capacity
+claim past the first stage.
+
 ### 4.49 The last clean stage carries no bulk in five of six runs, and the gate passes it (2026-11-06)
 
 §4.48's state diff turned into the round's most important finding, and it corrects the
@@ -1944,38 +2014,34 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Name the wedge that empties the last stage** (§4.49, pre-registered there). Five of
-   six `clean#2` cells carry **0.0 Gbit/s** with `ok=True`: the server's send buffer is
-   pinned at `MAX_BUFFERED` with nothing in flight, `mhd stream ended` fires ~108 times,
-   no lane dies, and iperf3 reads `max_snd_wnd: 0` — a stream was reset with 32 MB
-   queued, the visitor's channel died, and nothing rebuilds a channel mid-group. One
-   scaled timeline with both ends' logs joined on the group id answers *which* stream,
-   *by which end*, and *why the pool did not help* — and no code changes before that.
-2. **Close the gate hole that lets an empty stage pass** (§4.49). A staged cell with
-   `streams > 0` and zero throughput must be `ok=False` with the instrument's reason;
-   today `_breaks_slo` judges latency and errors only, so the emptiest stage scores the
-   best latency of the run. This is a bench change: it moves the method fingerprint and
-   needs its own pre-registration and a re-measured baseline.
-3. **A lane root that is actually usable** (phase A: implemented, default off). The
+1. **Stop the buffer budget from leaking on abandonment** (§4.50, pre-registered
+   there). A stream that cannot be acknowledged never retires, and its bytes stay
+   counted in `Conn::buffered`, so `held == 0` refuses every later stream on the lane.
+   Measured: the first lossy stage takes the bulk spine from 7.7 to 0.21 Gbit/s and it
+   never comes back — every shaped-stage and `clean#2` throughput number in this file is
+   on a dead spine. The fix is a bounded wait (retire an abandoned stream after 30 s with
+   a reset, releasing its bytes), and its pass is a run in which `buffered` stops being
+   monotone and the shaped stages carry more than 4 Gbit/s.
+2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
    design reads well. §4.10's and §4.13's numbers decide its default afterwards.
-4. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
+3. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
    (`wire.rs` says so), so a UDP service is framed into a reliable stream and pays
    an ARQ, a route map, two worker queues and a Noise record for a packet that must
    not be retransmitted at all. Only after 1 and 3, and never as a second fallback.
-5. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
+4. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
-6. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
+5. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
    `loss1` and `loss5` report 1.06 s and 1.46 s of p99, which is where recovery, not
    setup, decides the number.
-7. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
+6. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-8. **D (delivery-rate)** stays last: the clean cell never fills the window.
-9. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
+7. **D (delivery-rate)** stays last: the clean cell never fills the window.
+8. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
 Settled and off the list: **one stream, one hop** (§4.47). Built, measured at eight
