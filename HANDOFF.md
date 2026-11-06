@@ -238,6 +238,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.13 Sealing is a net loss, and the cell's own arithmetic closes (2026-11-06)
+
+Sealing was measured properly this time — two rounds, eight samples a cell, the A/A arm inside
+the same invocation:
+
+| cell | sealed | unsealed (this session) |
+|---|---|---|
+| `churn-16` | 10.17–10.43 ms | 10.27–11.88 ms |
+| `rr-1` | **0.168–0.175 ms** | **0.151–0.163 ms** |
+| `rr-16` | **22 591–22 718 1/s** | **23 382–23 754 1/s** |
+
+So it is neutral on fresh connections (inside their spread) and **costs eight percent on reuse
+and four on the sixteen-connection rate** — the per-packet AEAD. With §4.10's finding that it
+does not move the cell either, the switch stays **off**: it is faster where nothing needs it and
+slower where requests are small.
+
+And the cell's arithmetic now closes, on this build:
+
+```
+pairing wait   5.0-6.4 ms   (server: visitor accepted -> a channel exists)
+backend echo   4.8 ms       (shared with every arm, TCP tunnels included)
+carrier hops   0.5 ms       (0.2 + 0.3, §4.12)
+                ---------
+               ~10.3 ms     = the cell's 10.2 ms
+```
+
+**The two terms that matter are the pairing wait and a backend every tool pays.** The visitor's
+own connect is 0.08 ms and the transport is half a millisecond.
+
+So the next question is entirely inside that 5–6 ms: the visitor is accepted, the server asks the
+client for a channel, the client opens one (1.7 ms, §4.9), and the channel arrives. One and a
+half of those five milliseconds are therefore *not* the open, and no instrument yet says where
+they go — the control hop measured 0.1–1.2 ms and the placement under one.
+
+The next step is **A0u**: split the pairing wait on the server into "request written to the
+control session" and "channel delivered", against the client's own stamps for the same group —
+now joinable, because both ends finally number a group the same way (§4.12).
+
 ### 4.12 The five-times disagreement was the join key; joined properly, the carrier's hops are 0.2 ms (2026-11-06)
 
 The previous entry's two ends could not be compared because their group ids were **different
