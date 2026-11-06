@@ -267,6 +267,23 @@ pub(crate) fn note_serve(delivered: bool, age: Duration) {
     }
 }
 
+/// From the server handing a stream to `tokio::spawn` to the task running.
+static SPAWN_US: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note how long a stream's serving task took to start.
+pub(crate) fn note_spawn(age: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(age.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = SPAWN_US
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
 pub(crate) fn take_received_datagrams_per_s() -> u64 {
     PHASES.rx_datagrams.swap(0, Relaxed)
 }
@@ -1383,6 +1400,29 @@ fn report_timer_passes() {
 }
 
 /// Report the server's per-stream setup: hello, and the whole path to delivery.
+/// Report the spawn delay of the stream-serving tasks.
+fn report_spawn() {
+    let samples = {
+        let mut guard = SPAWN_US
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *guard);
+        drop(guard);
+        let mut sorted = taken;
+        sorted.sort_unstable();
+        sorted
+    };
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50_us = pct_us(&samples, 50, 100),
+        p99_us = pct_us(&samples, 99, 100),
+        "mhd-stats: stream task spawn"
+    );
+}
+
 fn report_serve() {
     for (name, slot) in [("hello", &SERVE_HELLO), ("deliver", &SERVE_DELIVER)] {
         let samples = {
@@ -1443,6 +1483,7 @@ fn report_send_path() {
     report_opens();
     report_timer_passes();
     report_serve();
+    report_spawn();
     report_open_steps();
     report_open_phases();
     let roundtrip = {

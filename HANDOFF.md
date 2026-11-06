@@ -238,6 +238,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.16 Every leg is measured and they do not add up to `wait_us` (2026-11-06)
+
+The last named candidate — the server's spawn of the stream-serving task — is two microseconds:
+
+```
+spawn             p50 2 µs      p99 14-20 µs
+server setup      p50 971-974 µs (selector, handshake, hello, prologue, delivery)
+client open       p50 1 235 µs
+carrier hops      ~200 µs        (established groups, §4.12)
+control command   p50 20 µs
+```
+
+**Their sum is 2.4–2.9 ms. The pairing reports 5.4.** Nothing else is left to instrument on this
+path, and a ninth stamp would be measuring one of these again.
+
+So the discrepancy is in a **definition**, not in an interval: either `wait_us` begins somewhere
+other than the moment the request is written (`pairing_started` is 22 µs after the visitor was
+accepted, which is consistent), or one of the five numbers above is not the interval its name
+claims — the likeliest being the client's `open`, which is measured at `open_data_channel`, the
+service-level entry, while the lane's own open is measured deeper and the pool's placement between
+them has only ever been sampled at a one-millisecond threshold.
+
+The honest state of this cell: **every leg is measured, they are each microseconds to 1.2 ms, and
+they do not account for the 5.4 ms a visitor waits.** The next step is to make one interval carry
+both ends — a single line per group with the client's open start, the client's open end, the
+server's task start and the server's delivery — and check that they are monotone and sum to the
+pairing's own number. Until they do, the cell's ten milliseconds are attributable in order of
+magnitude but not to the millisecond.
+
 ### 4.15 The pairing wait, measured: a two-millisecond control hop and a 1.7 ms open (2026-11-06)
 
 The stamp is on the first request at last, in absolute epoch milliseconds, and it joins with the

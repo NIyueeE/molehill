@@ -2318,7 +2318,12 @@ async fn serve_mhd_lane(
         let shared = Arc::clone(&shared);
         let state = Arc::clone(&state);
         let lane = Arc::clone(&lane);
+        let handed_at = std::time::Instant::now();
         tokio::spawn(async move {
+            // **From the accept to this task running.** `accept_p50` says the queue
+            // is six microseconds, so if a fresh visitor's unexplained milliseconds
+            // are here, this is where they are: the spawn itself.
+            crate::transport::stats::note_spawn(handed_at.elapsed());
             if let Err(e) =
                 serve_mhd_stream(stream, lane, state, registry, shared, max_tunnels).await
             {
