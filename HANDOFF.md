@@ -925,12 +925,13 @@ Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged o
 
 **Order, as of this commit.** §4 carries the findings; this is the sequence only.
 
-1. **A0ac — where the release cell's 22.5 ms actually is.** Everything this carrier
-   owns on that cell is measured and adds up to under two milliseconds (§4.23,
-   §4.24). Three candidates remain and each is a measurement, not an inference: the
-   probe's own connect-and-ask path (a **control arm on the same `timeline` cell**
-   separates it in one run), a queue in front of the accept, or a small population
-   the medians cannot see. Nothing else should be built until this is answered.
+1. **A0ad — the accept-to-pairing interval.** A0ac is answered: the control arm
+   reports **3.052 ms** on the release cell against our 24.183, so the probe is not
+   the cause and the twenty milliseconds are ours (§4.27). Everything else we own on
+   that cell is under two milliseconds, which leaves **one interval nobody has
+   histogrammed there: `accept_us`** — the visitor accepted to the pairing starting.
+   It reads 17–41 µs on `churn-16`. Histogram it un-gated, validate it on `churn-16`
+   first, then read it with `--scale 0.05 --warmup-rounds 0 --no-aa`.
 2. **A0aa — variance.** Our A/A spread on `churn-16`'s p99 is an order of
    magnitude wider than a TCP peer's, and a tail that varies is a queue, not a
    cost. This is the only open question whose answer could move the p99.
@@ -953,6 +954,12 @@ What is **not** on this list, and why: making the clean cell faster by removing 
 per-visitor handshake (measured, loses), by keeping a channel per visitor
 (measured, loses), by another timer constant (three refuted), and by another
 scheduling stamp on the pump (the pump is not the constraint).
+
+**Cost of this cell, for planning.** A full `timeline` arm-round is 17 minutes and a
+three-arm run about a hundred. Optimization rounds use `--scale 0.05
+--warmup-rounds 0 --no-aa` (six minutes an arm); the release cell is measured once per
+release with the full sweep. Before any long measurement, list what is running and
+kill by PID — a stray run doubles every number without failing (§4.26).
 
 This section is the **durable copy** of the order; the session's goal objective is
 the copy that is re-read every round, and a stale objective re-asserts a plan that has already
