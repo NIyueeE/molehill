@@ -238,6 +238,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.36 A0ak verdict: the pre-registration did its job — revert the global default (2026-11-06)
+
+The four cells at `TOKIO_WORKER_THREADS=16`, two rounds with the A/A arm:
+
+| cell | 16 workers (median, range) | 8 workers, this session |
+|---|---|---|
+| `churn-16` | 10.6 ms (10.3–15.6) | 10.4 ms (10.17–11.88) |
+| `rr-1` | 0.164 ms (0.154–0.174) | 0.157 ms (0.151–0.163) |
+| `rr-16` | ~23 100 1/s (21 489–23 459) | 23 500 1/s (23 382–23 754) |
+| **`bulk-n`** | **4.5 Gbit/s (3.3–6.5)** | **8.6 Gbit/s (6.55–10.73)** |
+
+Three of the four are inside noise. **`bulk-n` is not**: its sixteen-worker samples sit below every
+eight-worker sample taken this session, and the drop is about half. The pre-registered rule said
+revert on a material throughput regression, so **`DEFAULT_WORKERS` stays 8** — the latency win at
+§4.34 is real and is **not** shipped as a global default, because it costs throughput and the rule
+was written before the numbers.
+
+Two things make this a good outcome rather than a failed experiment:
+
+1. **The rule bound the decision.** Without it, −71 % on the release cell is exactly the number that
+   would have justified a one-line global change; the throughput cost would have surfaced later, on
+   someone else's benchmark.
+2. **It localises the fix.** Ten workers per visitor's tasks is a *task-count* problem, not a
+   *worker-count* one. Eight workers were enough until this carrier put two tasks per stripe group on
+   top of the pump and the stream tasks. The answer is fewer tasks (or a scheduling budget reserved
+   for the pump), not more threads for everything.
+
+`bulk-n`'s own A/A spread is two-fold (3.3–6.5 within one run), which is worth recording on its own:
+that cell cannot currently resolve a 20 % difference, so any future claim about bulk needs more
+rounds than a latency cell does.
+
 ### 4.35 A0ak, pre-registered before the numbers (2026-11-06)
 
 `DEFAULT_WORKERS` is 8 in `src/main.rs`, and `min(cores, 8)` is what any machine gets. §4.34 shows
