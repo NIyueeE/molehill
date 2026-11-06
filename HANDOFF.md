@@ -1105,14 +1105,15 @@ Memory and CPU work is **phase 6**: it may not preempt A–D, and it is judged o
 
 **Order, as of this commit.** §4 carries the findings; this is the sequence only.
 
-1. **A0ai — what the pump's own awaits cost.** The chain is now measured end to
-   end (§4.27–§4.32): the cell's medians are 0.6–1.5 ms, the probe is not the
-   cause, the wake is a signal every time, and the first pass that looks at an idle
-   lane carries its data. What is left is the six milliseconds **between a write
-   queueing and that pass beginning**, with the pump runnable and unpolled. Two
-   awaits in its loop can do that: `flush(&socket, …)` around every send (a full
-   send buffer blocks until the socket is writable) and the loop's own
-   `yield_now()`. Histogram both, on `churn-16` first and then at `--scale 0.05`.
+1. **A0aj — is the runtime saturated?** Every interval this carrier owns is now
+   microseconds (§4.33: a pump pass is 0 µs at p50 and 2–3 at p99; its `flush` is
+   18–21), the wake is a signal, and the first pass that looks carries the data. The
+   six milliseconds are therefore time in which the pump task is awake and not
+   polled — which is a statement about the runtime, and the carrier spawns two
+   tasks per stripe group on top of the pump and the stream tasks. Run the same
+   cell with `TOKIO_WORKER_THREADS=16`; a drop of thirty percent or more in
+   `echo_p99` confirms saturation and makes "fewer tasks per visitor" the next
+   structural move, while no change sends the search inside `wait()`.
 2. **A0aa — variance.** Our A/A spread on `churn-16`'s p99 is an order of
    magnitude wider than a TCP peer's, and a tail that varies is a queue, not a
    cost. This is the only open question whose answer could move the p99.
