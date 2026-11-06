@@ -324,9 +324,32 @@ run. So the 4.2 ms at p99 is inside the stretch between them — the stripe
 placement's bookkeeping — which has only ever been measured by a threshold line
 that read microseconds in a different run.
 
-The next step is **A0o**: turn those four placement stamps into histograms, so the
-p99 of each is readable instead of the p99 of their sum. One of them owns three
-milliseconds in the tail and none of them shows it at a one-millisecond threshold.
+**A0o is done, and it puts the whole open in one call.** The four steps as
+histograms, 2 200 opens a second:
+
+```
+entry  p50 0 µs      p99 0
+used   p50 0 µs      p99 0
+open   p50 1192 µs   p99 4270 µs
+record p50 0 µs      p99 0
+```
+
+`open` is `tunnel.open_stream_on_distinct(...)` and it holds both the median and
+the tail; the placement map and the bookkeeping are zero at every percentile.
+
+Two more numbers pin it down. The pool's reservation (`place_us`) never reached a
+millisecond even at its p99 — because it is taken **before** `complete().await` —
+and `complete`'s own measurement, which this repository already had, reads
+**mean 1.4 ms, max 6.9 ms** with `MOLEHILL_PLACEMENT_STATS=1`. The lane's internal
+open (`hs_us`) stays under a millisecond throughout.
+
+So the cost is **inside `complete()`'s `tunnel.open_stream()`**, between the pool's
+reservation and the pump's own open, and that is the last stretch of a visitor's
+setup that has never been split.
+
+The next step is **A0p**: two stamps inside the lane's `open_stream` — before the
+pump's call and after it — so the 1.4 ms mean and 6.9 ms maximum are attributed
+either to the lane's own admission (a cap, a queue, a lock) or to the pump.
 
 ---
 
@@ -377,8 +400,14 @@ open is now histogrammed — **p50 1.23–1.26 ms, p99 4.23–4.56 ms**. The cel
 to the TCP peer is 3.2–4.7 ms, so the gap *is* the open's tail, and neither the
 pool's reservation nor the lane's open reaches a millisecond in the same run.
 
-**A0o** is next: the same four stamps as histograms, so the p99 of each is visible
-instead of the p99 of their sum.
+**A0o is done** (§4.7): the four placement steps are histograms now, and `open`
+alone carries both the median (1.19 ms) and the tail (p99 4.27 ms). The pool's
+reservation never reaches a millisecond; `complete`'s own line reads mean 1.4 ms
+and max 6.9 ms; the lane's internal open stays under one. So the cost is inside
+`complete()`'s `tunnel.open_stream()`, the last unsplit stretch.
+
+**A0p** is next: two stamps inside the lane's `open_stream`, either side of the
+pump's call.
 
 Then, in order: **A** (lane-root keys) → **B** (RACK + PTO) → **C** (priority
 scheduling, which is where the hop latency belongs) → **D** (delivery-rate

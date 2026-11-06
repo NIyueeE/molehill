@@ -290,6 +290,32 @@ static POOL_GROWTH: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new(
 /// benches judge.
 static OPEN_US: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// The four steps a stripe placement is made of, each its own histogram.
+///
+/// Their **sum** has been histogrammed since A0n, and its p99 is 4.2 ms against a
+/// 1.2 ms median — but a threshold line at one millisecond never caught any of the
+/// four, so the tail lives in a part that is fast in the typical case and slow at
+/// the ninety-ninth. Only the p99 of each step can say which.
+static OPEN_STEP: [std::sync::Mutex<Vec<u32>>; 4] = [
+    std::sync::Mutex::new(Vec::new()),
+    std::sync::Mutex::new(Vec::new()),
+    std::sync::Mutex::new(Vec::new()),
+    std::sync::Mutex::new(Vec::new()),
+];
+
+/// Note one step of a stripe placement: 0 entry, 1 used, 2 open, 3 record.
+pub(crate) fn note_open_step(step: usize, us: u64) {
+    if !enabled() || step >= OPEN_STEP.len() {
+        return;
+    }
+    let mut samples = OPEN_STEP[step]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(u32::try_from(us).unwrap_or(u32::MAX));
+    }
+}
+
 /// Note one data-channel open.
 pub(crate) fn note_open_us(us: u64) {
     if !enabled() {
@@ -1192,6 +1218,32 @@ fn report_opens() {
     );
 }
 
+/// Report the four placement steps: the median and the tail of each.
+fn report_open_steps() {
+    for (step, name) in ["entry", "used", "open", "record"].iter().enumerate() {
+        let samples = {
+            let mut guard = OPEN_STEP[step]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = std::mem::take(&mut *guard);
+            drop(guard);
+            let mut sorted = taken;
+            sorted.sort_unstable();
+            sorted
+        };
+        if samples.is_empty() {
+            continue;
+        }
+        info!(
+            step = name,
+            n = samples.len(),
+            p50_us = pct_us(&samples, 50, 100),
+            p99_us = pct_us(&samples, 99, 100),
+            "mhd-stats: a step of a stripe placement"
+        );
+    }
+}
+
 fn report_growth() {
     let growth = {
         let mut samples = POOL_GROWTH
@@ -1225,6 +1277,7 @@ fn report_send_path() {
     }
     report_growth();
     report_opens();
+    report_open_steps();
     let roundtrip = {
         let mut samples = FIRST_ROUNDTRIP
             .lock()

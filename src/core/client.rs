@@ -1687,6 +1687,15 @@ async fn open_stripe_stream(
         args.stripe_placements.finish(stripe.group, &placement);
     }
     let whole = started.elapsed();
+    {
+        // Every open, every step, into histograms: a threshold line at a
+        // millisecond cannot see where the p99 lives (see `stats::note_open_step`).
+        let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        crate::transport::stats::note_open_step(0, micros(entry));
+        crate::transport::stats::note_open_step(1, micros(used_at.saturating_sub(entry)));
+        crate::transport::stats::note_open_step(2, micros(opened.saturating_sub(used_at)));
+        crate::transport::stats::note_open_step(3, micros(whole.saturating_sub(opened)));
+    }
     if whole >= std::time::Duration::from_millis(1) && crate::transport::stats::enabled() {
         let micros = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
         info!(
