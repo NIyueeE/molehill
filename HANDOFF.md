@@ -244,6 +244,67 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.45 The visitor's request rides the busy direction, and three window bounds each trade latency for throughput (2026-11-06)
+
+§4.44 left one question: why the median lands at 6 ms whenever the queue is bounded,
+when the queue is what the bound was meant to remove. Three measurements answer it.
+
+**Where the 6 ms is spent.** Joining the two ends' absolute stamps on the group id
+(2 236 matched pairings per round, `bufcap` run, good round against slow):
+
+| | control (ask → client start) | client open (→ finished) | transit (→ delivered at the pairing) |
+|---|---|---|---|
+| r2, cell p50 2.45 ms | 0 ms | **1 ms** | **0 ms** |
+| r1, cell p50 7.41 ms | 0 ms | **2 ms** | **2 ms** |
+
+The control hop is free in both, and the two legs that **are** a carrier round trip
+double. `paired` = open + transit = 1 ms against 4 ms, and the echo adds the same
+again. So the cell's latency is `2 × lane RTT + the visitor's own connect`, and the
+lane's RTT is the queue — the visitor's request travels in the **same direction as
+the bulk**, so it waits behind whatever that direction holds.
+
+**What the queue is not.** Two candidates are excluded with the same logs:
+
+- **Socket blocking.** `mhd pump waited on the socket` fired **zero** times in every
+  round of all three binaries, so the tail never came from a full socket buffer.
+- **Delayed acknowledgement.** The server attaches an ack to essentially every
+  packet (`acks_attached_per_s ≈ numbers_built_per_s`, 102 000–285 000/s) and the
+  receiver acks on the order of once per batch — 3 458–8 476 acks/s × ~32 datagrams
+  ≈ the send rate, i.e. exactly self-consistent. There is no ack gap to close.
+
+**What the queue really is, and why three bounds all failed the same way.** At the
+baseline the 32 MiB send buffer shows up as *bulk backpressure*, not as an interactive
+stall: `mhd stream writer was parked` fired **1 100–1 460 times per round with a p50
+of 33–43 ms**. The pump is then always busy, so a small packet is served within a
+pass — median 2.6 ms — while the deep flight occasionally costs the p99 its 100 ms.
+Bound the buffer, and the same cell flips: no deep flight (p99 15–25 ms), but the pump
+now has nothing to send between acknowledgements, so a small packet waits for a wake,
+and the median becomes 5–7 ms. Both readings are the *same* queue seen from either
+side of the bound.
+
+So the trade is structural, and no window size escapes it: `rate = W / RTT` holds at
+every `W`, so a window that is kept full **is** the queue, and the only way to have
+both is to drain the queue without emptying the pipe — which needs the small packet
+served *first* rather than the queue made smaller.
+
+**Next experiment, pre-registered before it runs.** A scheduling class, not a bound:
+in `Conn::next_stream_range`, a stream that is still opening (or has fewer than
+`OPEN_RESERVE` bytes unsent) is preferred over a stream with a wide unsent backlog,
+**within the same run**. No window, buffer or constant changes; `SEND_RUN` still caps
+the run, and a stream with nothing to say cannot take the slot.
+
+- **Pass**: the `bufcap`-shaped cell's p50 ≤ 3.5 ms **and** p99 ≤ 25 ms over four
+  rounds, with throughput ≥ 7.5 Gbit/s — i.e. the latency of the *bounded* build with
+  the throughput of the *unbounded* one. Baseline for the comparison is the same
+  four-round shape measured today (p50 2.45–7.41, p99 12.9–27.5, throughput
+  5.40–10.04).
+- **Guard**: `bulk-1`/`bulk-n`/`bulk-pair` inside the same-round A/A; `rr-1`/`rr-16`
+  not worse; the shaped cells not worse (`loss5` is where a priority class can
+  starve bulk); no starvation symptom in the logs (`mhd stalled` with
+  `unsent_ms` growing on a bulk stream).
+- **Rollback**: throughput below the A/A floor, any bulk regression, or a stall line
+  naming a bulk stream as the worst stream for a whole second.
+
 ### 4.44 The window is the queue, and both bounds now show it (2026-11-06)
 
 The second attempt — `held = 2 × max(cwnd, WINDOW_FLOOR) − buffered`, i.e. size the
@@ -1614,15 +1675,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Bound the queue, not the window: a delay-bounded ceiling** (§4.42–§4.44,
-   pre-registered there). Three measurements now agree that the cell's latency *is*
-   its standing queue: `buffered` reached 33.5 MB against a 256 KiB window and the
-   p99 paid 100 ms; bounding admission removed the tail but cost a quarter of the
-   throughput; bounding the buffer by the window restored the throughput and left a
-   6 ms median. The way out is pacing — a window that covers `rate × srtt` while the
-   admitted and in-flight data is bounded to `rate × (min_rtt + 1 ms)`. Pass: p50
-   ≤ 3.5 ms, p99 ≤ 15 ms, throughput ≥ 7.5 Gbit/s with an A/A twin; rollback on any
-   shaped-cell regression or a collapsed ceiling.
+1. **Serve the small stream first, without shrinking the queue** (§4.42–§4.45,
+   pre-registered in §4.45). Three bounds — admission by unacknowledged bytes, the
+   buffer sized by the window, and (measured, not built) a delay-based ceiling — all
+   trade the median for the throughput, because `rate = W / RTT` makes a full window
+   and a queue the same object. The visitor's request rides the **same direction as
+   the bulk**, so its latency is that queue; the escape is to serve it first inside
+   the run (`next_stream_range` preferring an opening or small-backlog stream), not
+   to shrink the window. Pass: p50 ≤ 3.5 ms and p99 ≤ 25 ms at ≥ 7.5 Gbit/s over four
+   rounds, bulk inside the same-round A/A.
 2. **One stream, one hop** (the first *structural* change after that). A visitor
    starts on one stripe (`initial_stripes()` is 1 in production) and still runs the
    whole group machinery: coordinator task, send loop, receive loop, one reader task
