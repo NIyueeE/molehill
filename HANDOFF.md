@@ -238,6 +238,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.27 A0ac answered: the control arm reports 3.05 ms, so the 22.5 is ours (2026-11-06)
+
+`--scale 0.05 --warmup-rounds 0 --no-aa` makes the release cell affordable: 6 minutes an arm instead
+of 17. Both arms in one run:
+
+```
+control    timeline[clean]   3.052 ms
+molehill   timeline[clean]  24.183 ms
+```
+
+**The probe's floor is three milliseconds**, and the peers sit at 2.06–2.38 on the same cell, which
+is the same floor. So **candidate ① of A0ac is excluded**: the twenty-two milliseconds are ours to
+explain, not an artefact of the harness. That is worth stating plainly because the last four rounds
+of this file have all pointed at the harness.
+
+The instruments on that same cell, from a molehill-only run:
+
+```
+turnaround (request read -> reply written)   p50   534-697 µs   p90 831   p99 915
+pairing    (accept -> first channel taken)   p50 1 442-1 460 µs p90 1695  p99 1862
+pre-flow   (group created -> first byte)     p50 679 µs       p90 7 769 p99 12 849
+```
+
+`pre-flow`'s tail is **the probe's own think-time**, not ours: it is the interval between the
+probe's connect and the request it sends afterwards, and the group exists throughout it. That is
+why it was 9 µs on the dev-profile run and 7.8 ms here — different probe behaviour, same code.
+
+So on the release cell our request path is under a millisecond and the pairing is one and a half,
+against a twenty-four millisecond cell. **The remaining twenty milliseconds are between the
+visitor's connection being accepted and the pairing beginning** — candidate ② of A0ac, `accept_us`,
+which on `churn-16` reads 17–41 µs and has never been histogrammed on this cell.
+
 ### 4.26 The release cell costs 17 minutes per arm-round, and that is arithmetic (2026-11-06)
 
 §4.25 said a round cannot hold this cell. The schedule says why, exactly: `TIMELINES["sweep"]` is
