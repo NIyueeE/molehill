@@ -420,10 +420,33 @@ measurement cannot separate them further with stamps on the caller's side, becau
 both waits are inside the callee and both are dominated by time this task is simply
 not running.
 
-The next step is **A0s**, and it is a different kind of instrument: count what the
-runtime is doing while an open waits — the number of tasks polled and the number of
-`shared` passes during the 1.2 ms, so "waiting for a wake-up" and "waiting behind
-work" can be told apart.
+**A0s rules out the runtime as well.** The binary runs a multi-threaded runtime
+with `min(cores, 8)` workers, and sixteen visitors against four to eight workers is
+exactly where queueing would live. Raising it to sixteen:
+
+```
+churn-16  10.28–10.39 ms   (8 workers: 10.32–10.50)
+rr-1       0.151–0.161 ms  (8 workers: 0.153–0.158)
+```
+
+**Identical.** So it is not thread starvation, not the connection lock (2 µs), not
+the open's preface (1 µs), not pool growth (never happens), not the driver hop (mhd
+does not take it), and not the carrier's own round trip (0.1 ms idle).
+
+What is left is the honest state of this investigation: **a fresh connection pays
+two waits of about 1.2 ms each, both inside calls this task makes, and every
+internal stamp says those calls are microseconds.** Either the wait is time this
+task is not scheduled — which the worker experiment argues against — or the
+instrument's own clock reads are not where the cost is.
+
+Before spending more rounds on it, the cheap experiment is a **clock sanity check**:
+time a `sleep(0)`-free no-op loop and a second `Instant::now()` pair inside the same
+function during the churn, to confirm the timestamps themselves behave.
+
+The alternative, and it is a real choice: the tail is 3 ms on a cell where the
+median is at parity, while **bulk-n within 15 % and the TCP comparison have never
+been measured on this tree at all**. The objective names both. This document should
+not keep choosing the tail by default merely because it was already being chased.
 
 ---
 
