@@ -238,6 +238,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.10 Sealing works now, removes the 1.7 ms handshake, and barely moves the cell (2026-11-06)
+
+The mechanism phase A needs **already exists**: with `MOLEHILL_MHD_SEAL=1` the first stream's
+handshake leaves a lane root behind, every later stream writes one derived selector byte, and
+`open_channel_with_id` skips Noise entirely. It was off by default because sealing deadlocked
+the striped transfer four runs in eight — and that deadlock's cause (the group's two-second
+reorder deadline against an eleven-second carrier stall) was fixed in §4.6.
+
+So it was measured again, and the open's own number collapses:
+
+| phase | unsealed | sealed |
+|---|---|---|
+| `open_channel` | **1 693–1 743 µs** | **10 µs** |
+| `hello_ack` | 0 µs | 129 µs |
+
+**A hundred and seventy times faster on the phase that carries the handshake**, exactly as
+§4.9 predicted. And the striped integration test now passes **6 of 6** with sealing on, against
+11 of 12 unsealed — the stall that kept this switch off is gone.
+
+**But the cell does not follow.** `churn-16` reads 9.29–10.26 ms sealed against 10.3–12.1
+unsealed — about a millisecond, inside its own spread — and `rr-1` gets *worse*: 0.167–0.178 ms
+against 0.151–0.163. The reuse cost is the per-packet AEAD that sealing adds to a 64-byte
+request.
+
+Two conclusions, and they are worth more than the speedup:
+
+1. **the `churn-16` cell is not the open.** Removing 1.7 ms of handshake from every fresh
+   connection leaves the cell where it was, so the seven to ten milliseconds it reports are the
+   **data path under sixteen-way concurrency**, which §4.7's leg measurements put on the server
+   side of the round trip (`wire` 1–5 ms, `up` and `down` zero, the client's legs zero).
+2. **sealing stays off by default for now**, not because it is unsafe — it is not, any more —
+   but because it buys nothing on the cell and costs thirteen percent on reuse. It becomes the
+   right default the moment the data path is fixed, or if the target is open latency itself.
+
 ### 4.9 Lost wake-ups are excluded, and the shape is "two waits where the peer has one" (2026-11-06)
 
 The tail's most plausible mechanism left was a **lost pump wake**: a write signals the
