@@ -4562,6 +4562,10 @@ where
             }
         }
         let paired = pairing_started.elapsed();
+        // The pairing wait as a distribution, not only as the five-millisecond tail
+        // its log line prints (§4.19): the gated line cost a dozen rounds of
+        // chasing a number that was never the median.
+        crate::transport::stats::note_pair_wait(first_take_us.unwrap_or_else(|| micros(paired)));
         report_pairing(&PairingFacts {
             group,
             stripes: usize::from(stripes),

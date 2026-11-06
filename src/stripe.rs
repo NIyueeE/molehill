@@ -412,6 +412,15 @@ fn note_first_source(frames: &Frames, first: bool) {
     if !first {
         return;
     }
+    // How long this group waited for its first byte after it existed. A group is
+    // created when a visitor's pairing finishes, and the visitor's request is
+    // already in its socket by then, so this should be microseconds — anything
+    // larger is the request waiting on something other than this carrier.
+    if frames.spawned_us != 0 {
+        crate::transport::stats::note_preflow(
+            crate::transport::stats::epoch_us().saturating_sub(frames.spawned_us),
+        );
+    }
     let arrived = frames.got_ms.load(std::sync::atomic::Ordering::Relaxed);
     if arrived == 0 {
         return;
@@ -704,6 +713,9 @@ struct Frames {
     /// visitor's first round trip, which is what the churn cell prices.
     /// This group's layer id, so both ends' stamp lines can be joined on it.
     group: u64,
+    /// When this group was created, in epoch microseconds: the anchor for the
+    /// pre-flow interval — how long after a group exists its first byte arrives.
+    spawned_us: u64,
     /// When this group read the bytes a reply will answer, in epoch microseconds.
     ///
     /// Zero when nothing is outstanding. See `note_turnaround_release`: the read
@@ -1144,6 +1156,7 @@ where
         // set of counters (see `note_first_reply`).
         let frames = std::sync::Arc::new(Frames {
             group: group_id,
+            spawned_us: crate::transport::stats::epoch_us(),
             ..Frames::default()
         });
         let mut send = tokio::spawn(send_loop(

@@ -1425,6 +1425,90 @@ fn report_timer_passes() {
 }
 
 /// Report the server's per-stream setup: hello, and the whole path to delivery.
+/// Every pairing's wait for its first channel, un-gated.
+static PAIR_WAIT: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one pairing's wait in microseconds.
+pub(crate) fn note_pair_wait(us: u64) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(us).unwrap_or(u32::MAX);
+    let mut samples = PAIR_WAIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Report this second's pairing waits.
+fn report_pair_wait() {
+    let samples = {
+        let mut guard = PAIR_WAIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *guard);
+        drop(guard);
+        let mut sorted = taken;
+        sorted.sort_unstable();
+        sorted
+    };
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50_us = pct_us(&samples, 50, 100),
+        p90_us = pct_us(&samples, 90, 100),
+        p99_us = pct_us(&samples, 99, 100),
+        max_us = samples.last().copied().unwrap_or(0),
+        "mhd-stats: a pairing's wait for its channel"
+    );
+}
+
+/// How long a group waited for its first byte after it was created.
+static PREFLOW: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one pre-flow interval: group created to first byte read.
+pub(crate) fn note_preflow(us: u64) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(us).unwrap_or(u32::MAX);
+    let mut samples = PREFLOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Report this second's pre-flow intervals.
+fn report_preflow() {
+    let samples = {
+        let mut guard = PREFLOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *guard);
+        drop(guard);
+        let mut sorted = taken;
+        sorted.sort_unstable();
+        sorted
+    };
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50_us = pct_us(&samples, 50, 100),
+        p90_us = pct_us(&samples, 90, 100),
+        p99_us = pct_us(&samples, 99, 100),
+        max_us = samples.last().copied().unwrap_or(0),
+        "mhd-stats: group created to its first byte"
+    );
+}
+
 /// Report this second's group turnarounds: request read to reply written.
 fn report_turnaround() {
     let samples = {
@@ -1535,6 +1619,8 @@ fn report_send_path() {
     report_serve();
     report_spawn();
     report_turnaround();
+    report_preflow();
+    report_pair_wait();
     report_open_steps();
     report_open_phases();
     let roundtrip = {

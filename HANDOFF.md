@@ -238,6 +238,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.24 On the release cell every interval we own is milliseconds, and the cell is not (2026-11-06)
+
+Two more distributions on the timeline cell, both un-gated so the median can be read (the pairing
+line's five-millisecond gate is what cost §4.19's dozen rounds):
+
+```
+turnaround (request read -> reply written)     p50   542 µs   p90 618   p99  730
+pre-flow   (group created -> first byte)       p50     9 µs   p90  13   p99   20
+pairing    (accept -> first channel taken)     p50 1 183 µs  p90 1298  p99 1503
+```
+
+**Together under two milliseconds**, against a cell whose p99 the release gate reads as 22.5. The
+pre-flow number also settles a design question: a group reads its first byte nine microseconds after
+it exists, so the visitor's request is never waiting on this carrier once the group is up.
+
+So on this cell **every interval we can measure is 1–2 ms and the cell is not**, which means the
+22.5 ms is spent somewhere none of these stamps covers. Three candidates remain, and they are
+distinguishable next round rather than by inference: the probe's own connect-and-ask path (which a
+TCP peer pays too, and which reports 2–3.5 ms), a queue in front of the accept, or a small
+population of connections that the medians here cannot see.
+
+What this rules out, and it is the useful half: the carrier's own request path is **not** where the
+release cell's p99 comes from. Every structural phase in §5 that would optimise that path — A's key
+schedule, C's scheduling, D's controller — is optimising under two milliseconds of a twenty-two
+millisecond number.
+
+Both instruments stay: un-gated histograms behind the stats switch, nothing on the hot path when
+it is off.
+
 ### 4.23 The release cell is not the request's transit, it is the wait before it (2026-11-06)
 
 A new instrument, the first in this file that is **per request** and not per group: a stripe group
