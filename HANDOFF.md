@@ -351,6 +351,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.96 The final-tree acceptance run: every gate green at `1b79085` (2026-11-07)
+
+Condition ⑥, run on the final tree rather than assembled from earlier scattered runs. Revision
+`v0.11.2-746-g1b79085`, worktree clean, no release tag.
+
+| gate | result |
+|---|---|
+| `just check` (the whole fast+heavy chain: audit, deny, outdated, machete, fmt, clippy ×2, the serial test suite, ruff, pyright, bench self-check) | **exit 0** |
+| `just interop` | **3 / 3** — `new_server_refuses_old_client_and_keeps_serving`, `old_server_refuses_new_client_and_says_so`, `old_server_rejects_unknown_dialect_and_survives` |
+| `just l3-accept` | **all PASS** — 17 named checks including the address the backend sees, no per-visitor state on the server, the client namespace owning the accepted connection, 200 KB in 65 KB chunks (no MTU black hole), 2 000 small round trips byte-exact, 16 concurrent flows byte-exact, L3 refused by policy without `[server.transparent]`, the refusal ordered before the device, lane lending and its `lend = false` inverse, the operator's valve naming its cap |
+| `integration_test` under **`MOLEHILL_DATA_CARRIER=mhd`** | **22 / 22**, 93 s |
+| `integration_test` under **`MOLEHILL_DATA_CARRIER=tcp`** | **22 / 22**, 82 s |
+
+So ⑥ is green, and it is green on **both carriers**, which is the part that would have hidden a
+carrier-specific regression: the same 22 integration tests pass with the mhd carrier and with TCP.
+
+**What the ledger now says, and it is the last thing this session can settle.**
+
+| condition | verdict |
+|---|---|
+| ③ `bulk-n` within 15 % of a valid baseline | **pass** — 8.63 against TCP's 8.22 Gbit/s |
+| ⑤ coverage / endpoint / drift / wedge | **pass** — `gate: PASS`, 36 triples, 32 endpoint samples, 0 drowned |
+| ⑥ final-tree acceptance | **pass** — the table above |
+| ① `clean` and `clean#2` at p99 ≤ 50 ms | **fail** — tail is one yamux SYN/ACK through a bulk-saturated lane |
+| ② no worse than TCP and the peers at p50/p90/p99 | **fail on the unshaped cell** (p50 2.0–2.8× worse, p99 10–22×), **pass on the shaped cells** (`loss1` best of four) |
+| ④ capacity 8/8 | **not independent** — it is ① on another instrument (§4.93) |
+| ⑦ release record | **not triggerable**: it is gated on "全绿", and ①② are not |
+
+**And the reason ⑦ cannot be written is the same sentence as everything above**: the per-visitor
+channel open is **1 709 µs at p50** (§4.84), it is **65 % of the pairing wait** (§4.89), its
+placement half costs **nothing** (§4.90), it is **one round trip** so there is no trip to remove
+(§4.90), and the only measured way to stop paying it — the lane root — costs **3.13× per packet**
+(§4.70) and would lose ③. That is a design boundary rather than an unfinished measurement, and it is
+written here as one.
+
 ### 4.95 The gate passes, and the throughput spread across arms is real (2026-11-07)
 
 Two things this round, both from data already on disk plus one command.
