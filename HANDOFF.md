@@ -244,6 +244,55 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.55 The clean stage's p99 tracks a lane-level mode: both carrier round trips scale together (2026-11-07)
+
+§4.54 left one question — why one binary reads 20.1 and 141.7 ms at p99 on the same stage
+in different arm-rounds. The `info!` histograms already in every run answer the *shape* of
+it, and this is the first time they can be read on stages that both carry load:
+
+| arm | rnd | stage p99 | `paired` p50 (accept → channel taken) | `echo` p50 (request read → reply written) |
+|---|---|---|---|---|
+| molehill | 0 | **141.7** | **4 519 µs** | **1 606 µs** |
+| molehill~aa | 0 | 28.2 | 1 573 | 673 |
+| molehill~aa | 1 | 20.1 | 2 021 | 932 |
+| molehill | 1 | 37.7 | 1 840 | 735 |
+
+**Both of the carrier's round trips are 2.4–2.9× longer in the worst round, by almost the
+same factor**, and the visitor's own first-byte delay is unchanged. That is the same
+signature §4.44 measured between a good and a slow `cost` cell, now on the release cell
+and with the leak fixed: the stage's p99 is not one bad visitor, it is a **lane-level
+mode** in which every one of the carrier's round trips is ~2.5× slower.
+
+**And the arithmetic of that mode is the window.** With `ceiling = 262 144` (256 KiB) and
+`srtt ≈ 1 004 µs`, `W / RTT` is 2.1 Gbit/s per lane — which is exactly the 8.4 Gbit/s four
+lanes carry. So at the good mode the lane is **window-limited and its queue is one
+millisecond**, by construction. A mode that doubles `paired` doubles the queue too, and
+since `W/RTT = rate` is an identity, a lane that drains slower holds the same bytes
+longer. The window is not misconfigured in either mode; it is *full* in both, and the mode
+difference is what the path delivers while full.
+
+**So the two levers left are named, and neither is a constant.** Either the window stops
+being the binding constraint (which §4.43–§4.44 measured as a latency/throughput trade
+that failed three times), or the path stops queueing — which is pacing, and pacing needs a
+rate estimate this carrier does not keep. That is §5.D, and it is now the item the
+evidence points at rather than a design someone liked.
+
+**Pre-registered, before it runs.** A **rate estimator from the acknowledgements already
+arriving**, reported only (no control loop yet): per lane, `delivered_bytes / interval`
+over one-second windows, and the same in the window line beside `cwnd`, `srtt` and
+`flight`. Pass is not a performance number — it is that the estimator reproduces the
+independent measurement: its median over a `clean` stage must land within 15 % of that
+stage's own `throughput_gbps`, on all four arm-rounds of §4.54's baseline. If it does not,
+the estimator is wrong and no controller may be built on it.
+
+- **Guard**: instrument-only, `MOLEHILL_MHD_STATS` gated, one line a second; `clean` and
+  `clean#2` p50/p99 must not move beyond the run's own A/A between this run and §4.54's.
+- **Rollback**: the estimator's 15 % agreement fails, or an instrumented run's numbers
+  move — in which case the instrument is charging for itself and is reverted.
+- **Then**: the controller (§5.D) is built on the estimator and judged on the clean
+  stage's *p99 distribution across arm-rounds*, which is the quantity §4.54 showed varies
+  7× and the only one the release cell is gated on.
+
 ### 4.54 The stricter method's first baseline: `clean#2` carries in three arm-rounds of four, and one is refused (2026-11-07)
 
 The re-baseline §5's first item asked for: current tree (`c8ac062`, fingerprint
@@ -2215,12 +2264,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Re-baseline the bench method, then return to the carrier** (§4.53). The gate now
-   refuses a staged cell that dialed bulk and carried zero bytes, which moves the method
-   fingerprint: §3's numbers came from a method that would refuse three of §4.52's own
-   guard cells. A scaled `sweep`-shaped run on the current tree — one arm, the A/A as the
-   only repeat, `--scale 0.2` — records what the stricter method reports for each stage,
-   so the next real comparison has a baseline produced by the gate that will judge it.
+1. **A rate estimator on the acknowledgements already arriving** (§4.55, pre-registered
+   there). The clean stage's p99 tracks a lane-level mode in which both of the carrier's
+   round trips are 2.4–2.9× slower, and `W / RTT = rate` makes that the window being full
+   at whatever the path delivers — so the levers left are pacing, not another constant.
+   Instrument first: per lane, delivered bytes over one-second windows, printed beside
+   `cwnd`, `srtt` and `flight`. Its pass is that the estimate lands within 15 % of the
+   stage's own measured `throughput_gbps` on all four of §4.54's arm-rounds; a controller
+   built on an unvalidated estimator is the next mistake this file would make.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
@@ -2239,7 +2290,15 @@ curve and a RACK rewrite that no measurement had asked for yet.
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-7. **D (delivery-rate)** stays last: the clean cell never fills the window.
+7. **D (delivery-rate) moves up to item 1's follow-on, and its old reason is refuted.**
+   This item used to say "the clean cell never fills the window". §4.55 measures the
+   opposite: `ceiling` 262 144 with `srtt ≈ 1 004 µs` gives 2.1 Gbit/s per lane against the
+   8.4 Gbit/s four lanes carry, so the window **is** the binding constraint on the release
+   cell and its queue is one millisecond by construction. What the earlier claim got right
+   is narrower: the cell never *suffered* from an under-sized window, which is why three
+   attempts to change the size failed. A controller is wanted for the opposite job — to
+   stop the queue forming while keeping the window full — and it waits on item 1's
+   estimator passing its own validation.
 8. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
