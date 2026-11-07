@@ -351,6 +351,56 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.88 The open is 1.2 ms and flat, so the 12 ms is a 10.8 ms gap nobody has measured (2026-11-07)
+
+§4.87 pre-registered measuring the client's open span, on the hypothesis that the ~12 ms pairing wait
+was the client's runtime giving the new task small slices. **The instrument existed already** —
+`run_mux_data_channel` logs `mhd channel open finished … open_us=… cmd_us=…` — so this round added a
+reporter for the *non-multiplex* path only and then read the numbers that were already there.
+
+**Both halves in the same run, because the first comparison I made was across two runs and that is
+not a comparison:**
+
+| | p50 | p99 |
+|---|---|---|
+| pairing `wait_us` (server) | **11 948 µs** | 84 291 |
+| channel `open_us` (client) | **1 178 µs** | 23 738 |
+| **the gap** | **10 770 µs** | — |
+
+`cmd_us` is `open_us` + 21 µs, so the client's command handling is not it either.
+
+**And the open is flat in load**, which refutes §4.87's own hypothesis: 1 139 µs at a median 92 B of
+flight against 1 424 µs at 237 516 B — **1.25× for 2 582× the bytes**. So the client's runtime is not
+starving the open: a channel opens in 1.2 ms whether the lanes are idle or carrying a quarter of a
+megabyte.
+
+**So the 12 ms is neither the client's scheduling nor the open. It is a 10.8 ms gap between "the
+channel finished opening" and "the pairing took it"**, and that is the one hop in the chain nobody
+has stamped. The chain is: server enqueues → control command → client opens (1.2 ms) → **the new
+connection reaches the server's listener, is accepted, and is routed to the pool** → `push` (which
+calls `note_wake`) → the pairing's `take_for` resumes (which calls `note_resume`). Every stamp on the
+ends of that chain is microseconds — the wake-to-resume pair reports p99 **25 µs** — so the
+unmeasured middle is the server's own **accept-and-route** of a connection that arrives while its
+runtime is saturated with bulk pumps.
+
+**Two things this rules out, worth stating.** It is not the shared queue handing one visitor's
+channel to another: `ChannelQueue`'s own comment records that tail (a pairing p99 of 20.1 ms beside a
+worst open of 7.6 ms) and the per-group one-slot delivery is the fix that is in the tree. And it is
+not the retry budget: every recorded slow pairing has `attempts=0`.
+
+**Next increment, pre-registered.** Stamp the server's inbound data-connection path: from the
+listener accepting the connection to the moment its channel is pushed into the pool queue, reported
+as its own histogram. That is the only unstamped segment left, and its width should be ~10.8 ms at
+p50 if this is right.
+
+- **Pass**: the accept-to-push span is the missing 10.8 ms, and it is **flat in flight** again (the
+  same test, three times now). Then the fix is in how the server's accept path gets scheduled against
+  its pump tasks, which is a runtime-shape change and not a carrier change.
+- **If the span is small**: the gap is in the control command itself (server → client), and the
+  §4.86 join's 1 ms resolution was too coarse to see it; the next step is that hop at microsecond
+  resolution.
+- **Guard**: instrument only, behind `MOLEHILL_MHD_STATS`.
+
 ### 4.87 Two designs refuted before they were written, and the wait is flat in flight (2026-11-07)
 
 §4.86 pre-registered a reserve of depth 1 per service. Three measurements taken before writing it —
@@ -3920,16 +3970,17 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Measure the client's open span** (§4.87, pre-registered there). Two candidate designs were
-   refuted before being written. A **depth-1 reserve** cannot hold the p99: inter-arrival is
-   **27.8 ms** (34.1 visitors/s) while the refill is 11.7 ms at p50 but **114.7 ms at p99**, so
-   covering the tail needs depth ≈ 4 — exactly §4.20's "belt fed faster than consumed". **Picker
-   priority for opening streams** cannot help either: the sender's queue is **25 µs** (§4.84), so the
-   handshake already leaves at once and waits in the socket's buffer, which no pick-order can reorder.
-   And the wait is **not a queue**: joining each slow pairing to the flight in its second gives
-   **12 078 µs at 0.30 MB against 11 553 µs at 2.31 MB** — 7.7× the bytes for 0.96× the wait. A
-   constant ~12 ms is a timer or a scheduling quantum, and it sits on the **client**, whose dial start
-   is already known to be prompt. Measure `spawn_data_channel` → established.
+1. **Stamp the server's accept-to-push path** (§4.88, pre-registered there). The client's open span
+   was measured and it **refuted §4.87's own hypothesis**: p50 **1 178 µs**, and **flat in load**
+   (1 139 µs at 92 B of flight against 1 424 µs at 237 516 B — 1.25× for 2 582× the bytes). In the
+   same run the pairing `wait_us` is **11 948 µs**, so there is a **10 770 µs gap** between "the
+   channel finished opening" and "the pairing took it" — the one hop nobody has stamped. Every other
+   stamp on the chain is microseconds (wake-to-resume p99 25 µs), and it is not the shared queue
+   (§ its own comment already fixes that with per-group delivery) nor the retry budget
+   (`attempts=0` on all 786). The remaining segment is the server **accepting and routing** a new
+   data connection while its runtime is saturated with bulk pumps. **Pass**: that span is the missing
+   10.8 ms and is flat in flight again. **If small**: the gap is in the control command hop, which
+   §4.86's 1 ms resolution could not see.
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
