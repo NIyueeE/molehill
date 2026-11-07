@@ -351,6 +351,57 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.93 The capacity ramp is condition ① with another instrument, and my headroom reading was wrong (2026-11-07)
+
+§4.92 pre-registered four rounds at `--scale 1` to settle ④. They came back:
+
+| arm | `capacity_streams` per round | median | spread | `capacity_headroom_pct` |
+|---|---|---|---|---|
+| **molehill** | **[1, 1, 1, 4]** | **1** | **300 %** | 87.5 / 87.5 / 87.5 / 50.0 |
+| TCP (`l4`) | [2, 1, 2, 3] | 2 | 100 % | 75.0 / 87.5 / 75.0 / 62.5 |
+
+Neither arm is anywhere near 8 (max 4), and mhd's spread is 300 %.
+
+**Then the stop rule was read, and it changes what the number is.** `run_capacity` ramps the bulk
+stream count from 1 to `streams_max` (= 8) and **stops at the first level where the interactive SLO
+breaks**:
+
+```python
+for level in range(1, params["streams_max"] + 1):
+    cell = _capacity_level(ctx, level, settle, params)
+    if not cell.ok or cell.metrics.get("slo_broken"):
+        break
+    sustainable = level
+```
+
+So **`capacity_streams = k` means "at k bulk streams the interactive p99 was still ≤ 50 ms, and at k+1
+it was not"**, and `capacity_headroom_pct` is simply `1 − k/8`. It is not spare machine capacity.
+
+**Which withdraws the reading §4.92 put on those headroom numbers.** That section said "a ramp that
+stops with 75 % headroom left is a different defect from one that stops saturated, and the two draws
+already show both (75 % and 37.5 %)". **That is wrong**: 87.5 % is `k = 1` and 50 % is `k = 4`. There
+is no second kind of stop to distinguish; the field is arithmetic on the same number.
+
+**And the important part: ④ is not an independent condition. It is ① measured on another axis.** The
+ramp stops when the *interactive p99* breaks 50 ms, which is exactly the number condition ① is written
+on, and §4.83–§4.90 established where that p99 comes from: the pairing's stream open through a
+bulk-saturated lane. The ramp therefore re-measures the same defect at every level — which is why mhd's
+median is 1: at one bulk stream the interactive tail is already 9.01–133 ms (§4.83), above the 50 ms
+SLO.
+
+**What that means for the plan, said plainly.**
+
+- **④ cannot be worked on separately.** Closing ① closes ④, and the same priced trade blocks both: the
+  lane root takes the open from 1 610 µs to 557 µs and costs **3.13× per packet** (§4.68/§4.70).
+- **The two "worse than TCP" axes have one cause and one is arithmetic.** Memory (+31 %, §4.91) is a
+  real cost. Capacity is not a separate cost at all; it is ① in a different unit.
+- **The honest statement of ④ for the record** is: "the ramp reaches k = 1–4 of 8 (four draws), because
+  it stops where the interactive SLO breaks, and that break is ①'s defect."
+
+**Next increment, pre-registered.** Nothing about capacity. The remaining conditions that are *not* ①
+are ② (the peer half), ⑤ (gate axes) and ⑥ (final-tree acceptance), and they are what the next rounds
+go to — in that order, because ② is the one still capable of changing a decision.
+
 ### 4.92 The capacity ramp reverses between scales, so ④ cannot be judged from one draw (2026-11-07)
 
 §4.91 pre-registered the full-scale ramp to settle ④, having read 5 streams on mhd against 3 on TCP at
