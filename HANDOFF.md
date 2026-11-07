@@ -351,6 +351,61 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.90 The placement is free; the whole tail is the carrier's stream open (2026-11-07)
+
+§4.89 pre-registered splitting `open_stripe_stream` into placement and the lane's open, and said the
+code claims "only these two numbers tell them apart". **The numbers already existed** — the client logs
+`mhd stripe placement … entry_us / used_us / open_us / record_us / whole_us` and
+`a phase of an mhd open phase=…` — so this round read them.
+
+**Placement is free.** 7 154 slow placements (the line prints at `whole ≥ 1 ms`):
+
+| step | p50 | p99 | share of `whole` |
+|---|---|---|---|
+| `entry` | 0 | 1 | **0.0 %** |
+| `used` (the `open_stream_on_distinct` call's own bookkeeping) | 0 | 0 | **0.0 %** |
+| **`open`** (the tunnel stream open) | **1 177** | 23 954 | **99.9 %** |
+| `record` | 0 | 1 | **0.0 %** |
+
+So the comment's suspect — *"a lock over the group's record, then the tunnel order"* — costs **nothing**.
+The lock is exonerated twice over: the per-second `lock_wait` phase reads **p50 3 µs**, and `used`/`record`
+are zero. **The entire pairing tail is the mhd stream's own open.**
+
+**And the phases inside it say the same thing:**
+
+| phase | p50 | worst p99 |
+|---|---|---|
+| `lock_wait` | **3 µs** | 5 |
+| `preface` | **1 µs** | 42 |
+| `hello_ack` | **~0 µs** | 1 212 |
+| **`open_channel`** | **1 129 µs** | **168 534** |
+
+`preface` and `hello_ack` are the prologue writes and the acknowledgement after them, and both are
+microseconds. `open_channel` — which contains the carrier's own stream open — is 1 129 µs typical and
+**168 ms at the worst second**.
+
+**What that means for the plan.** §4.68 already measured the two versions of this open: **557 µs with
+the lane root (sealing), 1 610 µs without**. So the per-stream handshake is between 1.6 ms and 0.56 ms
+of the 1.13 ms seen here, and **removing it is phase 2's lane root**, which §4.70 rejected on
+throughput (3.13× per packet). What has never been measured is **how many round trips the handshake
+takes**: a handshake that costs 1.1 ms on a loopback whose RTT is ~0.1 ms is either many trips or a lot
+of work, and those two have different fixes — fewer trips is a 6.0 wire change that costs no
+throughput, while crypto work is what §4.70 already priced.
+
+**Next increment, pre-registered.** Count and time the round trips inside `open_channel`: stamp each
+message the client sends and each response it waits for, and report the count per open beside the phase
+line.
+
+- **Pass**: an open takes **three or more** round trips. Then the fix is a shorter handshake — the
+  messages that are not load-bearing are collapsed — and it is judged on the same cell as everything
+  else, with **no throughput cost**, which is exactly what the priority order wants.
+- **If it is one or two trips**: the 1.1 ms is compute inside a trip (key agreement, record setup), and
+  the answer is §4.70's — the crypto is the cost and the trade stands.
+- **Guard**: instrument only, behind `MOLEHILL_MHD_STATS`; the count is asserted to be ≥ 1 and the
+  per-trip times to sum to `open_channel` within a small tolerance, so a mis-placed stamp shows up as a
+  broken sum rather than as a plausible number.
+- **Rollback**: none needed.
+
 ### 4.89 §4.88's 10.8 ms gap was a sampling error, and the code warned about it (2026-11-07)
 
 §4.88 compared the pairing's `wait_us` p50 (**11 948 µs**) with the channel's `open_us` p50
@@ -4017,15 +4072,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Split `open_stripe_stream` into placement and lane open** (§4.89, pre-registered there).
-   §4.88's 10.8 ms gap was a **sampling error** — it subtracted an unconditional `open_us` median
-   (1 178 µs) from a tail-conditional `wait_us` median (11 948 µs), which measures the selection, and
-   the code beside `note_open_us` warns about that very mistake. **Same groups (n=786): wait 11 948 µs,
-   open 6 849 µs — the open is 65.0 % of the wait, residual 5 099 µs.** Per second the two p99s have a
-   **Spearman correlation of 0.88**, and in the 47 seconds with `paired_p99 ≥ 20 ms` the open p99
-   median is **32 123 µs**. Client scheduling is not the problem (`started_us` 5–8 µs), so the target
-   is `open_stripe_stream` = *the pool's placement and the lane's open*, which the code says only two
-   numbers can tell apart. **Pass**: one half is ≥80 % of the 6.8 ms.
+1. **Count the round trips inside `open_channel`** (§4.90, pre-registered there). The split is done
+   and it exonerates placement completely: over 7 154 slow placements `entry`/`used`/`record` are
+   **0.0 %** each and **`open` is 99.9 %** (p50 1 177 µs, p99 23 954, max 168 553); `lock_wait` reads
+   **p50 3 µs**. So the whole pairing tail is the mhd stream's own open, whose phases are `preface`
+   **1 µs**, `hello_ack` **~0 µs**, and **`open_channel` 1 129 µs** (worst p99 168 534). §4.68 already
+   measured that open at **557 µs with the lane root against 1 610 without**, and §4.70 priced the
+   lane root at 3.13× per packet — so what decides the next step is **how many round trips** the
+   handshake takes: three or more means a shorter handshake is a 6.0 change that costs no throughput;
+   one or two means the cost is crypto and §4.70's verdict stands.
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
