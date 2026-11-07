@@ -351,6 +351,51 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.95 The gate passes, and the throughput spread across arms is real (2026-11-07)
+
+Two things this round, both from data already on disk plus one command.
+
+**1. §4.94's unverified number is verified — and the spread is real.** That section flagged
+rathole's 28.58 Gbit/s against mhd's 7.48 as "more likely a load or accounting difference". Checked
+against `offered_gbps`, which tracks `carried` **in every arm**:
+
+| arm | carried | offered | `mean_carried_packet_b` |
+|---|---|---|---|
+| molehill | 7.48 | 7.51 | 25 221 |
+| frp | 6.22 | 6.15 | 6 772 |
+| **rathole** | **28.58** | **28.08** | 5 907 |
+| nps | 0.13 | 0.14 | 768 |
+
+So each arm carried essentially what it was offered, and **rathole genuinely carries 3.8× mhd's
+throughput on the same unshaped cell**. The flag is withdrawn: this is a carrier result, not a method
+artefact.
+
+**Which completes the characterisation, and it is coherent.** mhd is behind on the **unshaped** cell on
+**both** axes — throughput 7.48 against 28.58, p50 2.82 against 1.02–1.09 — and it is level or ahead on
+the **shaped** cells (p99 1 046 against 1 055–1 085 on `loss1`, the best of four; `rtt100` and the rate
+cells level). That is one sentence and it explains every column: **where the shaper is the constraint,
+mhd competes; where the host is the constraint, mhd loses.** The host-bound limit is the one §4.66
+measured — **1.73–1.76 µs per packet** — and the peers are not paying it.
+
+**2. The gate passes.** `just bench gate` on the four-arm run:
+
+```
+coverage: 36 measured arm/scenario/cell triples
+endpoint invariant: 32 samples carry a dialed endpoint
+SLO: 2 clean-stage cells gated
+drowned cells: 0 refused
+drift: timeline ran 380s, under the 900s a slope needs: slopes reported, wedges still gated
+drift: checked the run cells' slopes and wedges
+gate: PASS
+```
+
+Every axis condition ⑤ names is green on this run: coverage, the endpoint invariant, the SLO cells, no
+drowned cell, drift and wedges. The regression half was not run (no `--baseline` supplied), and the run's
+own revision string is `v0.11.2-744-g7539b05`, so the provenance is recorded with the result.
+
+**So the ledger now reads**: ③ **pass**, ⑤ **pass**, ④ **= ①**, ①② **fail on the unshaped cell for one
+located reason**, ⑥ and ⑦ outstanding.
+
 ### 4.94 Against the peers, mhd loses the release cell at p50 — and the cause is the same open (2026-11-07)
 
 Condition ②'s peer half, measured for the first time. `just bench peers fetch` brought frp 0.72.0,
