@@ -244,6 +244,54 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.68 Sealing passes the latency test and fails the throughput one, and the cost is in the build: 273 µs a pass against 73 (2026-11-07)
+
+§4.67's pre-registration: **ON · OFF · ON · OFF**, same shape, pass if the open falls ≥ 30 %, `clean`
+p99 falls ≥ 30 %, and throughput is no worse than the spread *between* the two ON runs and the two
+OFF runs. Four runs, and one of them died at the readiness probe:
+
+| arm | open µs | `clean` p99 | `clean` thr | `loss1` thr | max reader park | cells |
+|---|---|---|---|---|---|---|
+| `on1` | 566 | — | — | — | **2 001 691 µs** | 1 (failed) |
+| `off1` | 1 826 | 24.08 | 6.26 | 4.33 | 2 003 270 | 8 |
+| `on2` | **549** | **23.22** | 4.13 | 1.86 | 2 002 012 | 8 |
+| `off2` | 1 394 | 59.62 | 7.93 | 5.10 | **2 385 739** | 8 |
+
+**The latency criterion passes with room**: the open is **557 µs against 1 610** (−65 %), and `on2`'s
+`clean` p99 is lower than *both* OFF runs (23.22 against 24.08 and 59.62).
+
+**The throughput criterion fails.** `clean` 4.13 against 6.26 and 7.93, `loss1` 1.86 against 4.33 and
+5.10 — below both OFF runs by more than the OFF pair's own spread (6.26–7.93, i.e. 1.67 Gbit/s wide).
+So under its own rule **the switch stays off**.
+
+**And the cost is now located, which is worth more than the verdict.** Per-pass `flush` on busy
+lane-seconds: **ON 273 µs (p50), OFF 73–81 µs** — sealing **triples** the build. At ~44 packets a
+pass that is **+4.5 µs per packet**, on top of the 1.73–1.76 µs §4.66 measured. ChaCha20-Poly1305 on
+1 387 bytes is a fraction of a microsecond in software, so 4.5 µs is **not the cipher**: the suspect
+is the per-packet work around it — deriving a key and nonce per packet rather than advancing a
+counter, or an allocation per seal. That is a specific, testable defect in a path that is otherwise
+finished.
+
+**One thing the pairs settle, and it is not sealing's fault.** The **2-second reader park appears in
+all four arms** — 1 999–2 386 ms — including both OFF runs, so it is the ambient stall this file has
+recorded before and not a property of sealing. `on1` died because the readiness probe's 3-second
+connect landed inside it; the same stall in an OFF arm would have done the same. **Saying "sealing
+wedged" would have been wrong**, and the 6/6 integration result of §4.67 stands.
+
+**Next experiment, pre-registered before it runs.** Split the sealed path's per-packet cost, with the
+same instrument shape §4.64–§4.66 used: time `seal_stream_payload` as a whole, and inside it the
+**key/nonce derivation** and the **AEAD call** separately.
+
+- **Pass**: the derivation is ≥ half of the 4.5 µs. Then it is the defect named above, the fix is a
+  counter instead of a fresh derivation, and sealing becomes a **latency win at no throughput cost** —
+  which would be the first change in this cycle to win on the first-priority axis for free.
+- **If the AEAD call itself is most of it**: the cipher is the cost on this host and the trade stands
+  as measured; sealing stays off and the numbers above go into the release record as the reason.
+- **Guard**: the benchmarked arms are unchanged (this is an instrument); `flush_per_pass` must move
+  by the amount the derivation accounts for, and the four-arm spread is the yardstick.
+- **Rollback**: the instrumentation's own cost exceeds 5 % of `flush_per_pass` against an
+  uninstrumented arm.
+
 ### 4.67 The sealed wedge is gone, and sealing is now the cycle's first real latency win (2026-11-07)
 
 Phase 2's precondition was "reproduce the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1`, then fix
@@ -2889,16 +2937,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Decide sealing with interleaved pairs** (§4.67, pre-registered there). Phase 2's
-   precondition is met: the multi-stripe wedge **does not reproduce** — six passes of six under
-   `MOLEHILL_MHD_SEAL=1`, against the 3-of-6 recorded in §4.13 — and both ends agree on one
-   distinct transcript per lane, which is what `(lane hash, direction, stream id)` needs. And the
-   first pair of runs shows the trade the priority order is about: the open falls from **1 494 to
-   513 µs** (`paired_p50`) and the clean cell's p99 from **125.01 to 16.00 ms**, while throughput
-   falls on `loss1` (7.68 → 1.38 Gbit/s) and `jitter` (4.75 → 0.90) beyond what the swing
-   explains. Two single runs cannot decide it (§4.66), so: **ON · OFF · ON · OFF**, same shape,
-   pass if the open falls ≥ 30 %, `clean` p99 falls ≥ 30 %, and throughput is no worse than the
-   spread *between* the two ON runs and the two OFF runs.
+1. **Split the sealed packet's 4.5 µs** (§4.68, pre-registered there). The interleaved pairs decided
+   the verdict and named the cost: sealing **passes latency** (open 557 µs against 1 610, −65 %;
+   `clean` p99 lower than both OFF runs) and **fails throughput** (`clean` 4.13 against 6.26/7.93,
+   `loss1` 1.86 against 4.33/5.10, beyond the OFF pair's own spread), so under its own pre-registration
+   **the switch stays off**. But the cost is located: `flush` per pass is **273 µs ON against 73–81
+   OFF** — **+4.5 µs per packet**, and ChaCha20 on 1 387 B is a fraction of that, so the suspect is the
+   per-packet key/nonce derivation or an allocation, not the cipher. Split `seal_stream_payload` into
+   derivation and AEAD; if derivation is ≥ half, sealing becomes a latency win at no throughput cost.
+   **Also recorded**: the 2-second reader park is present in **all four arms** (1 999–2 386 ms), so it
+   is ambient and not seal-specific; `on1`'s death was the probe landing inside it.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says
