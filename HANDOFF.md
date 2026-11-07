@@ -367,6 +367,58 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.102 Phase 1 closes: the accounting was right, and it is now pinned (2026-11-07)
+
+The plan's phase 1 asked for the recovery `flight`/`buffer` accounting to be corrected before any
+new recovery rule is built on it. The answer is that **there was nothing to correct**, and the
+evidence for that was already in this file — the work was to pin it so a later change cannot quietly
+break it.
+
+**Two invariants are now tests rather than prose.**
+
+- `a_declared_lost_range_and_its_repair_are_never_both_in_flight` (recovery): the original leaves the
+  flight when it is declared lost, the repair enters it when it is posted, and the two never overlap —
+  flight reads 100, then 0, then 100, then 0. That is the rule `Conn::write` leans on; a repair
+  charged on top of the copy it repairs would close the window on a path that lost nothing.
+- `a_finished_exchange_leaves_nothing_counted` (connection): after a loss, its repair and the
+  acknowledgements that retire both, `flight` = 0 and `buffered` = 0, `Recovery::in_flight` = 0, and
+  **at most one record** remains — the dropped packet's *lost* record, which costs no window and
+  expires past `LOST_HOLD`. The first draft of this test asserted the table was empty and failed on
+  that one record, which is the test being wrong: a lost record is held on purpose, to catch the
+  original if it arrives late (§4.50's 6.7 GiB came from dropping it too early).
+
+`LOST_HOLD` became `pub(crate)` so the test advances a simulated clock past it instead of
+hard-coding a second number that would go stale the day the hold moves.
+
+**The old anomaly was never a counter bug.** §4.42 explains `flight` at 3.4–12 MB against a `cwnd` of
+262 144: `flight_bytes` counts only bytes already handed to a packet, so a writer in a tight loop is
+tested against a number the pump has not updated, and the real bound on admitted data was
+`MAX_BUFFERED`. §4.43 confirmed it from the other side — changing the admission test dropped
+`buffered` from 4–15 MB to 200–251 KB. So the counters were right about what they counted, and the
+policy used the wrong one.
+
+**What that leaves, and it is a policy question with two measured answers already.** Both attempts to
+change the policy were reverted on pre-registered grounds: admission on `buffered` cost 25 % of the
+throughput (§4.43); a buffer sized by the window kept the throughput (8.99 Gbit/s) and the p99 but
+landed the median at 6 ms in 3 of 4 rounds because a shallow queue leaves the pump idle and a small
+packet then waits for a wake (§4.44/§4.45).
+
+**And that failure mode is exactly what §4.101's bound touches — but not in a way this round can
+show.** §4.45 measured `idle write waited for the pump` at 1 300–1 600 events per round, p50
+6.4–6.6 ms, and that log line fires at ≥ 5 ms; a pump that must pass every 1 ms cannot leave a write
+waiting 6. So the bound may have removed attempt B's blocker. **I could not test it here**: the
+harness's request/response shape never leaves an idle write queued, so the line fired **0 times with
+the bound on and 0 times with it off** (400 requests each, 1 349 B). That A/B is inconclusive by
+construction and is recorded as such — it says nothing about the product path, where the population
+was measured.
+
+**Next, with its criterion taken from §4.44 rather than invented.** Re-apply attempt B (buffer sized
+by the window: `held = 2 × max(cwnd, WINDOW_FLOOR) − buffered`) on top of §4.101's bound, and judge it
+on §4.44's own numbers, which are the ones it failed: slow-second share ≤ 5 % (baseline 29 %, attempt
+B alone 70 %), throughput ≥ 7.5 Gbit/s, `rr-1`/`rr-16` and `bulk-1`/`bulk-pair` inside the same-round
+A/A, no shaped-cell regression. This is a `timeline` campaign, not a harness run, and it is the only
+outstanding item that could move both latency and throughput at once.
+
 ### 4.101 The 21 ms is a missed socket wake-up, and the RTO is what recovers it (2026-11-07)
 
 §4.100 left three candidates after excluding the stream open, the reader's wake-up and the send
@@ -4638,22 +4690,29 @@ is now recorded with a stored baseline to compare against next time.
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: phase 1, recovery accounting.** The detour is over. Phase 0's tail is found, named and
-bounded (§4.101): a lone datagram's readiness edge is sometimes lost, the pump then slept to a
-retransmission deadline, and capping that sleep at 1 ms while a stream is live removed the tail
-without moving the median. So the sequence returns to the plan's order, and phase 1 is what it says:
-`flight` and the stream buffers must agree before any new recovery rule is built on them — §4.65
-records `flight` at 3.4–12 MB against a `cwnd` of 262 144, and that number is an input to the write
-path's backpressure.
+**Next step: re-apply attempt B on top of the 1 ms bound, judged on §4.44's own numbers.** Phase 1 is
+closed (§4.102): the accounting was right, so there is nothing to correct before building on it. What
+is left from that chain is a *policy* question with two measured answers — and one of them may now be
+viable. Attempt B sized the send buffer by the window, kept the throughput (8.99 Gbit/s) and the p99,
+and failed only on the median (6 ms in 3 of 4 rounds) because a shallow queue leaves the pump idle and
+a small packet then waits for a wake. That wait is what §4.101's bound now caps at 1 ms.
 
-Two things from the detour stay open, deliberately and with their evidence:
+The harness cannot test it — its request/response shape never leaves an idle write queued, and the
+`idle write waited for the pump` line fired zero times with the bound on *and* off (§4.102). So this is
+a `timeline` campaign, judged on: slow-second share ≤ 5 % (baseline 29 %, attempt B alone 70 %),
+throughput ≥ 7.5 Gbit/s, `rr-1`/`rr-16` and `bulk-1`/`bulk-pair` inside the same-round A/A, and no
+shaped-cell regression.
+
+Three things stay open, deliberately and with their evidence:
 
 - the lost readiness edge is **bounded, not fixed** — it is still between `drain_ready`'s bare
   `try_io` and the `select!` that follows it, and no visitor's latency depends on that round
   happening first;
 - a lane that is *idle with a stream open* now pays up to 1 000 wake-ups a second, which is the
   poll's pure cost and is unmeasured. It belongs to the next milestone's `cpu_cores` and
-  `rss_peak_mib` guardrail, and §4.101 says so.
+  `rss_peak_mib` guardrail, and §4.101 says so;
+- admission is still bounded by `MAX_BUFFERED`, not by the window (§4.42). That is the defect attempt
+  B was meant to fix, and it stands until B is either accepted or refuted again.
 
 **The session objective is one round behind this section** — it still says the next step is the
 five-stamp instrument, which is done. A goal edit is refused outside a direct human turn, so it is

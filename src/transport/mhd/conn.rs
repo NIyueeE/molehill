@@ -3848,6 +3848,68 @@ mod tests {
         assert_eq!(out, bytes, "the stream is whole after the retransmission");
     }
 
+    /// When the exchange is over, nothing is left counted.
+    ///
+    /// The accounting invariant that keeps `write`'s admission honest across a
+    /// stream's whole life: after a loss, its repair and the acknowledgements that
+    /// retire both, the flight, the buffered bytes and the recovery table all read
+    /// zero. A leak here is not a slow number — it is the ceiling behind §4.50,
+    /// where one abandoned stream's unacknowledged tail refused every later stream
+    /// on the lane for the lane's whole life.
+    #[test]
+    fn a_finished_exchange_leaves_nothing_counted() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let stream = link.a.open();
+        let bytes = payload(8000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        link.pump_dropping_one(now);
+        let Some(accepted) = link.b.accept() else {
+            unreachable!("the stream is named on arrival")
+        };
+        let mut out = take(&mut link.b, accepted.id);
+
+        let mut clock = now;
+        for _ in 0..12 {
+            clock += Duration::from_millis(10);
+            link.pump(clock);
+            out.extend_from_slice(&take(&mut link.b, accepted.id));
+        }
+        assert_eq!(out, bytes, "every byte arrived, once");
+
+        // A few quiet passes let the last acknowledgements retire what is left.
+        for _ in 0..4 {
+            clock += Duration::from_millis(10);
+            link.pump(clock);
+        }
+        let (flight, buffered, packets) = link.a.flight_and_buffered();
+        assert_eq!(flight, 0, "the flight is empty once the peer has it all");
+        assert_eq!(buffered, 0, "and nothing is held for a re-send");
+        assert_eq!(
+            link.a.recovery.in_flight(),
+            0,
+            "nothing is still on the wire: whatever record is left is a *lost* \
+             one, kept to catch the original if it arrives late"
+        );
+        assert!(
+            packets <= 1,
+            "only the one dropped packet's record can remain, got {packets}"
+        );
+
+        // And that record is bounded by its hold, not by the connection's life: a
+        // path that keeps dropping must not grow the table for ever.
+        clock += crate::transport::mhd::recovery::LOST_HOLD + Duration::from_millis(1);
+        link.pump(clock);
+        let _ = link.a.on_timeout(clock);
+        assert_eq!(
+            link.a.flight_and_buffered().2,
+            0,
+            "past its hold the last record goes too"
+        );
+    }
+
     /// A byte prefix frees the buffer with no packet record at all.
     ///
     /// This is the property the whole block exists for: the peer's cumulative

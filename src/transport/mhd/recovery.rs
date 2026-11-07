@@ -140,8 +140,11 @@ const DEAD_FLOOR: Duration = Duration::from_secs(5);
 /// existed. Three seconds is far past any reordering window this carrier
 /// tolerates (nine eighths of a round trip) and far below the point where
 /// holding the record costs anything worth measuring.
-const LOST_HOLD: Duration = Duration::from_secs(3);
-
+///
+/// `pub(crate)` so the connection's own tests can advance a simulated clock past
+/// it, rather than hard-coding a duration that goes stale the day this number
+/// moves.
+pub(crate) const LOST_HOLD: Duration = Duration::from_secs(3);
 /// The most lost records kept at once, so a path that drops everything cannot
 /// grow the table without bound before the dead-link rule ends it.
 ///
@@ -935,6 +938,60 @@ mod tests {
             0,
             "no byte is left counted against the window"
         );
+    }
+
+    /// A re-sent range is on the wire once, and the flight says so.
+    ///
+    /// The invariant the write path leans on: `flight_bytes` bounds admission
+    /// (`Conn::write`), so a repair that added its range on top of the copy it is
+    /// repairing would make the congestion window close on a path that lost
+    /// nothing. The bookkeeping is *retire on declare, charge on send*: the
+    /// original leaves the flight when it is declared lost, the repair enters it
+    /// when it is posted, and the two never overlap.
+    #[test]
+    fn a_declared_lost_range_and_its_repair_are_never_both_in_flight() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let original = send_one(&mut recovery, start, 0);
+        assert_eq!(recovery.flight_bytes(), 100, "the send is in flight");
+
+        let Some(lost) = recovery.declare_lost(start, original) else {
+            unreachable!("a packet in the table can be declared lost")
+        };
+        assert_eq!(lost.number, original);
+        assert_eq!(
+            recovery.flight_bytes(),
+            0,
+            "a declared loss leaves the flight, so the queue can move again"
+        );
+
+        // The repair: the same byte range, a new number.
+        let repair = recovery.next_number();
+        recovery.on_sent(start, repair, Some(range(0)), false);
+        assert_eq!(
+            recovery.flight_bytes(),
+            100,
+            "the repair is charged once, not twice, for the bytes it re-sends"
+        );
+
+        // Both numbers are now acknowledged. The original is a lost record, so
+        // its retirement must not subtract the bytes a second time.
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(10),
+            Ack {
+                largest: repair,
+                below: repair + 1,
+                bits: 0,
+                ..Ack::default()
+            },
+        );
+        assert_eq!(acked.newly.len(), 2, "both records are retired");
+        assert_eq!(
+            recovery.flight_bytes(),
+            0,
+            "a late acknowledgement of the original must not drive the flight negative"
+        );
+        assert_eq!(recovery.lost_records(), 0, "and no lost record is left");
     }
 
     /// A record nobody can still acknowledge is forgotten, so the table cannot
