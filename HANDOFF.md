@@ -244,6 +244,60 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.54 The stricter method's first baseline: `clean#2` carries in three arm-rounds of four, and one is refused (2026-11-07)
+
+The re-baseline §5's first item asked for: current tree (`c8ac062`, fingerprint
+`1e7f4ed13553b4e8`), one arm plus its A/A twin, two rounds, `--scale 0.2`, stats on.
+36 samples; **one cell refused** by §4.53's rule, and that refusal is the point.
+
+| stage | arm | rnd | throughput | p50 | p99 |
+|---|---|---|---|---|---|
+| `clean` | molehill | 0 | 7.94 | 8.81 | **141.71** |
+| `clean` | molehill | 1 | 4.01 | 2.80 | 37.69 |
+| `clean` | molehill~aa | 0 | 8.27 | 2.53 | 28.20 |
+| `clean` | molehill~aa | 1 | 7.78 | 3.41 | 20.06 |
+| `rtt100` | all four | — | 0.38–3.32 | 402.4–402.8 | 410.6–2 090 |
+| `loss1` | all four | — | 5.33–6.38 | 42.8–45.3 | 1 057.9–1 093.8 |
+| `loss5` | all four | — | 0.24–1.10 | 401.7–402.7 | 1 417.2–3 108.2 |
+| `rate100` | all four | — | 0.062–0.094 | 177.4–183.0 | 229.0–262.1 |
+| `rate20` | all four | — | 0.0182–0.0187 | 360.8–393.6 | 495.1–744.2 |
+| `jitter` | all four | — | 4.85–7.92 | 86.2–89.3 | 138.9–216.9 |
+| `clean#2` | molehill | 0 | **0.0 — refused** | 2.55 | 22.27 |
+| `clean#2` | the other three | — | **5.05 / 5.25 / 7.00** | 2.27–14.15 | 5.69–91.77 |
+
+**Three things this establishes, each measured rather than argued.**
+
+1. **The abandon fix shows up in the baseline itself.** `clean#2` now carries bulk in
+   three of four arm-rounds at 5.05–7.00 Gbit/s. Before the fix (§4.52's pre-fix arm) it
+   carried zero in three stages of one round and in five of six cells across two earlier
+   runs. The last stage is a measurement again, which is what makes the "first stage
+   against last" comparison meaningful at all.
+2. **The rule bites exactly once, on the cell that deserves it.** `molehill` r0's
+   `clean#2` moved zero bytes and was refused with its reason; the other three carried
+   and were judged. A single rule with no threshold, and the run separates the two
+   populations on its own.
+3. **The first stage's p99 still spans 20–142 ms across four arm-rounds of one binary.**
+   Same 7× spread §4.48 measured (47–133), on a different day, with a different
+   fingerprint. §3's 22.505 ms sits inside that spread, so it is neither reproducible nor
+   contradicted by any single run — it is one draw from a distribution this file has now
+   sampled three times (47–133, 20–142, and the 133 in §4.48's table).
+
+**The shaped stages are stable, and that is worth saying because it bounds the harness.**
+`loss1` reads 1 057.9–1 093.8 ms at p99 across four arm-rounds (**3 % spread**),
+`rate100` 229.0–262.1 (**14 %**), `rate20` 495.1–744.2, `jitter` 138.9–216.9. A harness
+whose shaped stages repeat to 3 % and whose clean stage varies 7× is telling us the clean
+stage's variance is in the clean stage — not in the instrument.
+
+**Two cells moved the wrong way and are recorded, not explained.** `rtt100` carried
+0.38 Gbit/s in one arm-round against 1.94–3.32 in the others, and `loss5`'s p99 reaches
+3 108 ms in one. Both are single samples of the harshest conditions; neither has a
+mechanism yet, and attaching one now would be the same mistake §4.50 made with units.
+
+**This is the baseline the next comparison uses.** Fingerprint `1e7f4ed13553b4e8`,
+`--scale 0.2`, two rounds with the A/A inside. Any claim about a carrier change is read
+against *these* numbers, and against the run's own A/A — never against §3's full-scale
+sweep, which was produced by a method that would now refuse three of its own cells.
+
 ### 4.53 The gate can no longer pass a stage that carried nothing (2026-11-06)
 
 §4.49's hole is closed: a staged cell that dialed bulk and moved **zero** bytes is now
