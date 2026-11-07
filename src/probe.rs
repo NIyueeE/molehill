@@ -141,18 +141,22 @@ pub struct Lane(Arc<MhdLane>);
 impl Lane {
     /// Dial a lane at `peer`.
     ///
-    /// `id` is the connection id on the wire, and the caller supplies it so a
-    /// harness can keep two lanes apart in the engine's own per-lane lines. The
-    /// nonce is zero: a bare lane carries no tunnel hello, so it names no
+    /// It takes no id on purpose. The number that matters — the one the peer
+    /// keys its connection table by — is the engine's own and unique per process
+    /// (`pump::next_wire_id`). The pool label a caller used to pass here only
+    /// ever named a lane in a log, and exposing it invited exactly the collision
+    /// it could not prevent (`HANDOFF.md` §4.100).
+    ///
+    /// The nonce is zero: a bare lane carries no tunnel hello, so it names no
     /// session — see the module docs for why that is the honest boundary rather
     /// than an omission.
     ///
     /// # Errors
     ///
     /// Fails when the local UDP socket cannot be bound.
-    pub async fn dial(peer: SocketAddr, id: usize) -> std::io::Result<Arc<Self>> {
+    pub async fn dial(peer: SocketAddr) -> std::io::Result<Arc<Self>> {
         let lane =
-            MhdLane::dial(peer, id, None, [0u8; crate::protocol::HASH_WIDTH_IN_BYTES]).await?;
+            MhdLane::dial(peer, 0, None, [0u8; crate::protocol::HASH_WIDTH_IN_BYTES]).await?;
         Ok(Arc::new(Self(lane)))
     }
 
@@ -255,7 +259,7 @@ mod tests {
     async fn a_pool_less_lane_carries_bytes_both_ways() {
         let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listener.local_addr();
-        let dialer = Lane::dial(addr, 77).await.unwrap();
+        let dialer = Lane::dial(addr).await.unwrap();
 
         let server = tokio::spawn(async move {
             let lane = listener.accept().await.unwrap();

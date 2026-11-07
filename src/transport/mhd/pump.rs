@@ -953,8 +953,11 @@ impl MhdLane {
         nonce: crate::protocol::Digest,
     ) -> std::io::Result<Arc<Self>> {
         let socket = bind().await?;
+        // The **wire** id is the process's own, not the pool's label: `id` names
+        // this lane in logs and pin accounting, while the number the peer keys
+        // its table by must be unique across clients (see `next_wire_id`).
         let shared = Shared::new(
-            Conn::new(u32::try_from(id).unwrap_or(1), true),
+            Conn::new(next_wire_id(), true),
             crate::transport::health::SessionHealth::new(),
         );
         let task = spawn(Arc::clone(&socket), peer, Arc::clone(&shared));
@@ -1737,6 +1740,44 @@ impl Drop for MhdListener {
     }
 }
 
+/// The wire id of the next connection this process dials.
+///
+/// **Randomly seeded, then sequential**, which is exactly the property the
+/// listener needs. Its registry is keyed by this number alone (`MhdLane` ids are
+/// not namespaced by peer address), so two dialers that picked the same value are
+/// routed into each other: a process-local counter starting at zero did that to
+/// the first lane of *every* client, and the second client's packets were
+/// delivered to the first one's connection, which accepted them because
+/// `apply_datagram` only rejects a packet whose id differs from its own
+/// (`HANDOFF.md` §4.100).
+///
+/// A random *seed* rather than a random value per lane: the sequence keeps one
+/// process's own lanes distinct by construction, so the only way to collide is
+/// for two processes to draw the same 32-bit start — one chance in 2^32 per
+/// pair, instead of certainty.
+///
+/// The fallback is a constant, not a panic: a host whose system RNG fails loses
+/// the collision property and nothing else, and refusing to open a data channel
+/// over it would be a worse trade.
+fn next_wire_id() -> u32 {
+    use rand::TryRng;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    /// Zero until the first call seeds it; `fetch_add` then hands out 0, 1, 2…
+    /// from that base.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    static SEED: std::sync::Once = std::sync::Once::new();
+    SEED.call_once(|| {
+        let mut base = [0u8; 4];
+        let seed = if rand::rngs::SysRng.try_fill_bytes(&mut base).is_ok() {
+            u32::from_le_bytes(base)
+        } else {
+            1
+        };
+        NEXT.store(seed, Ordering::Relaxed);
+    });
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod lane_tests {
     #![expect(
@@ -1833,6 +1874,54 @@ mod lane_tests {
         };
         assert_eq!(got, b"lane to lane");
         assert!(PoolLane::is_alive(&*accepted));
+    }
+
+    /// Two clients dialling one listener are two lanes, not one.
+    ///
+    /// The listener keys its connection table by the wire id **alone**, so a
+    /// process-local counter starting at zero made the first lane of every client
+    /// the same number: the second client's datagrams were delivered to the first
+    /// one's connection — which accepted them, because `apply_datagram` only
+    /// rejects a packet whose id differs from its own — so the second lane was
+    /// never admitted and its open answered "the lane is gone" (`HANDOFF.md`
+    /// §4.100).
+    ///
+    /// The two dials deliberately pass the **same** label: that is what two
+    /// client processes look like to this end, each counting from its own zero.
+    #[tokio::test]
+    async fn two_clients_that_count_from_zero_are_two_lanes() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut listener = MhdListener::bind(addr).unwrap();
+        let bound = listener.local_addr();
+
+        let first = MhdLane::dial(bound, 1, None, [3u8; crate::protocol::HASH_WIDTH_IN_BYTES])
+            .await
+            .unwrap();
+        let second = MhdLane::dial(bound, 1, None, [4u8; crate::protocol::HASH_WIDTH_IN_BYTES])
+            .await
+            .unwrap();
+
+        // A lane has no handshake: its first stream is what admits it.
+        let mut a_stream = first.open_channel().await.unwrap();
+        let mut b_stream = second.open_channel().await.unwrap();
+        a_stream.write_all(b"first").await.unwrap();
+        b_stream.write_all(b"second").await.unwrap();
+
+        let a = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let b = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let id_a = a.shared.with(|conn| conn.wire_id());
+        let id_b = b.shared.with(|conn| conn.wire_id());
+        assert_ne!(
+            id_a, id_b,
+            "two clients must not share one wire id: the listener routes by it alone"
+        );
     }
 
     /// A yamux session over one mhd stream carries four independent streams and

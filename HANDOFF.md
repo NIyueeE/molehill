@@ -385,12 +385,27 @@ against one server:
 
 The server never admitted lanes 2 and 3: its table already held id 1, so their datagrams were
 delivered to the first client's connection — which accepted them, because `apply_datagram` only
-rejects a packet whose id differs from its own. Passing distinct `--lane-id` values fixed the
-probe (3 runs, 20/20 each). **The product has the same allocator**: `establish_one_mhd_tunnel`
-takes `next_tunnel_id()` and hands it to `MhdLane::dial` as the wire id, so the first lane of
-*every* client process is id 0. Two clients behind one server therefore collide, and the
-consequence is not a refused lane but one lane receiving another's packets. Not yet demonstrated
-with two real daemons; the code path is the same one the probe exercised.
+rejects a packet whose id differs from its own. **The product had the same allocator**:
+`establish_one_mhd_tunnel` took `next_tunnel_id()` and handed it to `MhdLane::dial` as the wire
+id, so the first lane of *every* client process was id 0. Two clients behind one server therefore
+collided, and the consequence was not a refused lane but one lane receiving another's packets.
+
+**Fixed in the allocator, not in the probe.** `MhdLane::dial` now takes its wire id from
+`pump::next_wire_id()` — a process-local counter **seeded from the system RNG** — instead of from
+the pool label the caller passed. The sequence keeps one process's own lanes distinct by
+construction; the random start makes two processes collide with probability 2⁻³² per pair instead
+of with certainty. The label stays a label: `MhdLane.id` still names the lane in logs and pin
+accounting, and is no longer conflated with the number the peer routes by.
+
+Evidence, in both directions. `two_clients_that_count_from_zero_are_two_lanes` dials twice with
+the **same** label — what two client processes look like to one listener — and asserts the
+listener admits two lanes with distinct wire ids. Against the old allocation it fails by
+*timeout* (the second lane is never admitted, which is the defect); with the fix it passes. End to
+end, three sequential probe clients against one server now read 20/20 each, 60 `served` lines and
+zero "lane is gone", where previously only the first client could connect at all. The harness's
+`--lane-id` workaround went with it: the probe's `dial` takes no id any more.
+
+Still not demonstrated with two real daemons; the code path is the same one the probe exercised.
 
 **2. The first stream on a fresh lane costs 21–22 ms on loopback, and the server is not slow.**
 Three fresh lanes, three runs, same numbers:

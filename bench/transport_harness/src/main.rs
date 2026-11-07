@@ -87,15 +87,6 @@ struct Args {
     size: usize,
     requests: usize,
     stream_mode: StreamMode,
-    /// The carrier's connection id on the wire.
-    ///
-    /// Exposed because it is **not** free: the server keys its lane table by
-    /// this number alone, so two clients that pick the same one are routed into
-    /// each other. The default (this process's pid) is unique enough for a
-    /// runner that starts one client per measurement, and a caller comparing two
-    /// clients against one server must pass distinct values — see `HANDOFF.md`
-    /// §4.100 for the product-sized version of that hazard.
-    lane_id: u32,
 }
 
 /// Emit one NDJSON line.
@@ -133,7 +124,6 @@ fn parse_args() -> Result<Args> {
     let mut size = 64usize;
     let mut requests = 1000usize;
     let mut stream_mode = StreamMode::Fresh;
-    let mut lane_id = std::process::id();
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -162,7 +152,6 @@ fn parse_args() -> Result<Args> {
             }
             "--size" => size = value.parse().context("--size wants bytes")?,
             "--requests" => requests = value.parse().context("--requests wants a count")?,
-            "--lane-id" => lane_id = value.parse().context("--lane-id wants a u32")?,
             "--stream-mode" => {
                 stream_mode = match value.as_str() {
                     "fresh" => StreamMode::Fresh,
@@ -172,7 +161,7 @@ fn parse_args() -> Result<Args> {
             }
             other => bail!(
                 "unknown argument {other:?}; the flags are --mode, --role, --addr, \
-                 --size, --requests, --stream-mode, --lane-id"
+                 --size, --requests, --stream-mode"
             ),
         }
     }
@@ -184,7 +173,6 @@ fn parse_args() -> Result<Args> {
         size: size.max(1),
         requests: requests.max(1),
         stream_mode,
-        lane_id,
     })
 }
 
@@ -425,12 +413,9 @@ async fn client_tcp(args: &Args) -> Result<()> {
 /// L2's client: the same workload over the carrier's own streams.
 async fn client_mhd(args: &Args) -> Result<()> {
     let setup = Instant::now();
-    let lane = molehill_rathole::probe::Lane::dial(
-        args.addr,
-        usize::try_from(args.lane_id).unwrap_or(usize::MAX),
-    )
-    .await
-    .with_context(|| format!("cannot dial {} over mhd", args.addr))?;
+    let lane = molehill_rathole::probe::Lane::dial(args.addr)
+        .await
+        .with_context(|| format!("cannot dial {} over mhd", args.addr))?;
     emit("lane_setup", &[("us", us(setup.elapsed()).to_string())]);
 
     let payload = vec![0xA5u8; args.size];
