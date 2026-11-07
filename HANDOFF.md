@@ -351,6 +351,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.78 A stop to the datagram plumbing, and the reason is the completion conditions (2026-11-07)
+
+Phase 3 has now run eight sections — §4.71 through §4.77 — and the honest accounting is that it has
+produced **no user-visible improvement yet**. What exists is a wire class, a carrier that can carry
+one and hand it over once, a test that pins its three properties, and a documented order in which the
+service endpoints may be wired. What does not exist is a datagram that a visitor ever receives on the
+new class.
+
+**And the completion conditions do not ask for one.** They are: `timeline[clean]` and `clean#2` at
+p99 ≤ 50 ms and ≤ 0.5 % errors; p50/p90/p99 not worse than in-tree TCP on like workloads; `bulk-n`
+within 15 % of a valid baseline; capacity 8/8; coverage / endpoint / drift / wedge green; the final
+tree green through `just check`, `just interop` and L3 acceptance with UDP/L3 **not regressing**;
+then the release record. **"UDP does not regress" is already satisfied** by the framed-into-a-reliable
+-stream path this phase was going to replace, and nothing in the list prices the datagram class.
+
+**So the order changes, and the change is written down rather than made quietly.** The remaining
+rounds go to the conditions that are still open and are all *measured*: ①, the release cell's
+distribution; ②, the comparison against in-tree TCP and the peers; ③, `bulk-n` resolution; ⑤, the
+gate axes. Phase 3 is **parked**, not abandoned: the code is committed, tested and inert, its
+receive door is used by a test and carries **one** narrow waiver, and the pre-registration that
+resumes it is §4.77's — the wake mechanism and the client hook.
+
+**Two things this costs, stated so they are not discovered later.**
+
+- The parked code is *inert*, which means it does not pay rent: nothing measures it, and a future
+  reader will find a class the product does not use. That is acceptable only because §4.71–§4.77 each
+  say so out loud and because the alternative — reverting a tested, committed piece of wire protocol —
+  costs more than carrying it into the release under its own section.
+- If a later phase needs the lane's datagram path (a hostile path where ARQ on a UDP service is
+  visibly wrong), it starts from §4.77's pre-registration, not from a blank slate.
+
+**What the next measurement is.** No new instrument: **two more rounds of the release cell**, one arm,
+the same shape, recorded into the same distribution, because ① currently has six draws
+(47.3 / 80.5 / 96.8 / 133.0 / and four from §4.68's arms at 23.2 / 24.1 / 59.6) that do not yet say
+anything a single number could. The question this round answers is only "where does this tree sit",
+so the next decision — reducing the spread, or arguing the cell's SLO against its own floor — is made
+on more than one sample.
+
 ### 4.77 The receive door exists, and one waiver went away as another arrived (2026-11-07)
 
 §4.76 pre-registered the client read path. What landed is the half that can be verified by not
@@ -3440,16 +3478,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **The wake mechanism, then the client read hook** (§4.77, pre-registered there). The carrier
-   now **stores** arriving datagrams and hands them over once (`take_datagrams`, asserted by the lane
-   test: count 1, one entry collected, the sender's id and bytes). What is missing is a wake-up:
-   `udp_read_loop` waits on `read_u8` and nothing wakes it when a datagram arrives. Options are a
-   per-lane `Notify` (correct, touches `Shared`), a periodic poll (**rejected**: a timer on the
-   client's read path for a queue that is empty today), or reusing the pump's existing reader wake
-   with its own reason bit. Decide the mechanism first, then hook the loop. **Pass**: behaviour
-   identical while the server does not switch — `udp_recv_mbit`, `udp_loss_pct`, `udp_gap_p99_ms`
-   inside the A/A, `datagrams_in` still **0**, and `cpu_s_per_gbit` not worse (which is what rules out
-   the poll). **Rollback**: any UDP-cell movement or CPU above the A/A.
+1. **The release cell's distribution, then the TCP comparison** (§4.78 parks phase 3). The
+   completion conditions do not price the datagram class; "UDP does not regress" is already satisfied
+   by the framed path. What is open is ① (`clean`/`clean#2` p99 ≤ 50 ms, ≤ 0.5 % errors), ② (not worse
+   than in-tree TCP and the same-method peers at p50/p90/p99), ③ (`bulk-n` resolution) and ⑤ (the gate
+   axes). This round adds **two draws** to the release cell's distribution — no new instrument — because
+   six draws that read 23.2 / 24.1 / 47.3 / 59.6 / 80.5 / 96.8 / 133.0 ms cannot yet support a verdict
+   and the next decision (reduce the spread, or argue the SLO against the cell's own floor) needs more
+   than one sample. Phase 3 resumes from §4.77's pre-registration, unchanged.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
