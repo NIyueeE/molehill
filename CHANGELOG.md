@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A staged cell that asked for bulk and carried nothing is a failure, not a fast
+  stage.** Its latency is a measurement of an idle path, so a cell with
+  `streams > 0` and exactly zero carried bytes now reports `ok=False` with that
+  reason, and `just bench gate` refuses it as an unmeasured round. Measured: five
+  of six last-stage cells in one campaign carried nothing while reporting a pass,
+  because a tool that stops forwarding scores its best number on its emptiest
+  stage. The test is exactly zero — a rate-shaped stage legitimately reads small.
+- **A comparison the run cannot pair is reported, not crashed.** `just bench report`
+  raised `StatisticsError` when two arms carried a metric in disjoint rounds; it now
+  returns an `unavailable` verdict whose reason names both arms' rounds.
 - A striped data channel no longer gives up on a frame the carrier is still
   recovering. The reorder deadline was two seconds, shorter than a carrier stall
   measured at nearly twelve; a group now waits thirty, so the side that can still

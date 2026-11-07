@@ -377,6 +377,16 @@ carried" are different findings.
   path carried nothing" from "nobody could measure what it carried". A bare
   `0` cannot: it is the number a defeated sender reports for a path that was
   full.
+- **A stage that asked for bulk and carried nothing is a failure, not a fast
+  stage.** Its latency is a measurement of an idle path, so a cell with
+  `streams > 0` and exactly zero carried bytes is `ok=False` with that reason, and
+  the gate refuses it as an unmeasured round rather than gating its (excellent)
+  latency. Measured: five of six last-stage cells in one campaign carried nothing
+  while reporting a pass, because a tool that stops forwarding scores its best
+  number on its emptiest stage. The test is exactly zero and never a threshold — a
+  **rate-shaped** stage legitimately reads small (`rate20` carrying 19 Mbit/s
+  against its 20 Mbit/s shaper), so the smallest honest value in a staged run is a
+  shaper's own rate, orders of magnitude above zero.
 - **The per-stage numbers carry their sample count.** A stage's `rtt_p99` is a
   nearest-rank percentile of that stage's interactive samples, so with fewer
   than a hundred samples the "p99" *is* the worst observation — a stage that

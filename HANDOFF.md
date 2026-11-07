@@ -244,6 +244,52 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.53 The gate can no longer pass a stage that carried nothing (2026-11-06)
+
+§4.49's hole is closed: a staged cell that dialed bulk and moved **zero** bytes is now
+`ok=False` with its own reason, so the gate refuses it as an unmeasured round instead of
+judging its (excellent) latency.
+
+The rule is exact, not a threshold — `_carried_nothing` is `carried <= 0.0` and nothing
+else, because a **rate-shaped** stage legitimately reads small: `rate20` carrying
+18.4 Mbit/s against its 20 Mbit/s shaper must not be mistaken for a dead stage, and the
+smallest honest value in a staged run is a shaper's own rate, orders of magnitude above
+zero. A missing metric is not this case either; it is a typed absence and already carries
+its own reason. Five selfcheck cases pin the boundary (0.0 fails; 0.001, 0.0197, `streams
+= 0` and absent do not), and the rejection lives in `_iperf_cell` — the cell that knows
+how many streams were dialed is the cell that fails — rather than at the call site,
+which also kept `_measure_stage` inside its statement budget.
+
+**Verified end to end** with the pre-fix binary, which is the build that produced these
+cells: `rate100` in **both** rounds and `clean#2` in round 0 came out `ok=False` with
+
+> the bulk spine carried no bytes in this stage: 4 stream(s) were dialed and the sender
+> reported zero, so this stage's latency is an idle path's
+
+while `rate20` at 18.4 Mbit/s was left alone. And the gate now fails that run:
+
+```
+gate: 2 FAILURE(S)
+  - coverage: molehill / timeline / rate100 produced no measured round (staged)
+  - SLO: molehill / timeline[clean] p99 130.30245 ms > 50.0 ms on a clean stage
+```
+
+The first line is this section's claim, measured: a dead stage is now an *unmeasured*
+round, not a fast one.
+
+**A limit worth stating.** Coverage is satisfied by **any one** round, so a stage that
+dies in some rounds but not others still passes — `clean#2` died in one of its two rounds
+here and the gate did not complain about it. That is deliberate (a retried stage is
+normal) but it means a 50 %-dead stage is still a 50 %-dead measurement. If that starts
+to matter, the rule to consider is a floor on the *share* of rounds a cell must measure,
+not one on a single round.
+
+**And the method moved, which is the last bench debt.** `workloads.py` is a method module,
+so this change moves the fingerprint: §3's numbers were produced by a method that would
+now refuse those cells. The next sweep must record its baseline from this stricter
+method — and the difference is not cosmetic, since three of the cells in §4.52's own
+guard run are now failures rather than readings.
+
 ### 4.52 The abandon hold passes its guard: no cost on `clean`/`rtt100`, and the leak's signature is gone (2026-11-06)
 
 The two-arm guard §4.51 owed: the patched binary against the pre-fix build (`git show
@@ -2115,14 +2161,12 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Close the gate hole that lets an empty stage pass** (§4.49). A staged cell with
-   `streams > 0` whose bulk carried **zero bytes** reports `ok=True` with
-   `throughput_gbps: 0.0`, and `_breaks_slo` judges latency and errors only — so the
-   emptiest stage scores the best latency of the run, which is what §4.49 found five
-   times in six and §4.52 found three more times in one round of the pre-fix arm. It
-   must be `ok=False` with the instrument's own reason. This moves the bench's method
-   fingerprint, so it needs its own pre-registration and a re-measured baseline, and it
-   is the last bench change owed before the carrier work continues.
+1. **Re-baseline the bench method, then return to the carrier** (§4.53). The gate now
+   refuses a staged cell that dialed bulk and carried zero bytes, which moves the method
+   fingerprint: §3's numbers came from a method that would refuse three of §4.52's own
+   guard cells. A scaled `sweep`-shaped run on the current tree — one arm, the A/A as the
+   only repeat, `--scale 0.2` — records what the stricter method reports for each stage,
+   so the next real comparison has a baseline produced by the gate that will judge it.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the

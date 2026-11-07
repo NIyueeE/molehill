@@ -1426,6 +1426,24 @@ def _check_probes(c: Checker) -> None:
         str(workloads.staged_series({})),
     )
 
+    # A stage that dialed bulk and moved no byte is a failure, not a fast stage.
+    # This is the hole §4.49 found five times in six: the emptiest stage reports
+    # `ok=True` with `throughput_gbps: 0.0` and its latency is the best of the run.
+    for streams, carried, want in (
+        (4, 0.0, True),
+        (4, 0.001, False),
+        (4, 0.0197, False),  # `rate20` carrying its shaper: not a failure
+        (0, 0.0, False),  # a run that asked for no bulk cannot fail for having none
+        (4, None, False),  # a typed absence carries its own reason
+    ):
+        got = workloads._carried_nothing(streams, {"throughput_gbps": carried})
+        c.check(
+            f"a stage with {streams} stream(s) at {carried} Gbit/s is "
+            f"{'a failure' if want else 'not a failure'}",
+            got == want,
+            f"got {got}",
+        )
+
 
 #: What [`_check_wedges`]'s silent sample must report: two unanswered attempts,
 #: the first starting at 105.0 and the last ending at 115.6 — so a silence is

@@ -605,7 +605,9 @@ def _dial(ctx: Ctx, params: dict) -> iperf.IperfDial:
     )
 
 
-def _iperf_cell(spot: Spot, result: dict, metrics: dict, lenient: bool = False) -> Cell:
+def _iperf_cell(
+    spot: Spot, result: dict, metrics: dict, lenient: bool = False, streams: int = 0
+) -> Cell:
     """One bulk measurement's cell.
 
     `lenient` is for a **staged** cell, where the bulk spine is one of several
@@ -655,6 +657,10 @@ def _iperf_cell(spot: Spot, result: dict, metrics: dict, lenient: bool = False) 
     }
     built = _counter_cell(spot, metrics, extra)
     built.evidence["iperf_wall_s"] = result.get("wall_s")
+    # **A stage that asked for bulk and carried none is a failure, not a fast
+    # stage** (see `_reject_empty_stage`). Here rather than at the call site so the
+    # cell that knows how many streams were dialed is the cell that fails.
+    _reject_empty_stage(built, streams, metrics)
     return built
 
 
@@ -1566,11 +1572,14 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         stage_metrics["throughput_gbps"] = result.get("gbps_received_own_window")
     # `lenient`: a failed bulk instrument leaves one metric absent instead of
     # discarding the stage (see the note where `bulk_failure` is set).
-    built = _iperf_cell(Spot(ctx, window, label), result, stage_metrics, lenient=True)
+    built = _iperf_cell(
+        Spot(ctx, window, label), result, stage_metrics, lenient=True, streams=streams
+    )
     built.unavailable |= unavailable
     if bulk_failure:
         built.absent("throughput_gbps", bulk_failure)
         built.evidence["iperf_failure"] = bulk_failure
+
     # Everything the stage's own samples said about themselves — the counts, the
     # within-window shape (`interactive_per_s`), the probe's own cadence, and the
     # rate the churn probe was asked for beside the one it achieved. A stage is
@@ -1596,6 +1605,37 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     }
     built.evidence |= drain
     return built
+
+
+def _carried_nothing(streams: int, metrics: dict) -> bool:
+    """Whether a stage asked for bulk and moved no byte at all.
+
+    `0.0` exactly, never a threshold: a **rate-shaped** stage legitimately reads
+    small, and `rate20` carrying 19 Mbit/s against its 20 Mbit/s shaper must not be
+    mistaken for a failure — the smallest honest value here is the shaper's own
+    rate, which is orders of magnitude above zero. A missing metric is not this
+    case either: that is a typed absence, and the stage already carries its reason.
+    """
+    carried = metrics.get("throughput_gbps")
+    return streams > 0 and carried is not None and carried <= 0.0
+
+
+def _reject_empty_stage(built, streams: int, metrics: dict) -> None:
+    """Fail a stage that dialed bulk and moved no byte.
+
+    Its latency is a measurement of an idle path, and a stage that passes while
+    carrying nothing scores the best number of the run — measured five times in six,
+    with iperf3 reporting `max_snd_wnd: 0` and zero bytes (HANDOFF §4.49). Its own
+    function because `_measure_stage` is at the statement budget.
+    """
+    if not _carried_nothing(streams, metrics):
+        return
+    built.ok = False
+    built.reason = (
+        f"the bulk spine carried no bytes in this stage: {streams} stream(s) were "
+        "dialed and the sender reported zero, so this stage's latency is an idle "
+        "path's"
+    )
 
 
 def _breaks_slo(metrics: dict) -> int | None:
