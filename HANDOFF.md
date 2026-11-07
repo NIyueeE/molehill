@@ -244,6 +244,52 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.65 The pick is free, the recovery record is 11 %, and 88 % is still unmeasured (2026-11-07)
+
+§4.64 pre-registered a three-way split of the remaining 1.78 µs per packet, timed at both
+`BTreeMap` sites. The pass criterion was "one of the two operations is at least 40 % of the
+packet's cost". Measured on half a million packets of a clean stage:
+
+| part | µs per packet | share of `flush` |
+|---|---|---|
+| stream pick (`next_stream_range`, a `BTreeMap::range` walk) | **0.001** | **0.0 %** |
+| recovery record (`Sent` insert) | **0.198** | **11.3 %** |
+| payload copy (§4.64) | 0.007 | 0.4 % |
+| **everything else** | **1.555** | **88.3 %** |
+
+**The criterion fails**: the pick is free — a range walk over a few dozen streams costs a
+nanosecond — and the recovery record is a fifth of a microsecond. So the pre-registered
+"if both are small" branch applies to *them*, and it does **not** license the conclusion that
+attached to it ("1.8 µs is this design's cost"), because 88.3 % of the packet has now been
+excluded from three candidate explanations without being explained itself. **Naming a number
+as "the design's cost" is only honest when the remainder has been measured, and here it has
+not.**
+
+**What the remainder can be, listed so the next instrument is chosen rather than guessed.**
+Per packet, still untimed: `advance_cursor()` — **a second cursor walk per packet**, which is
+the single most suspicious item precisely because its sibling turned out free;
+`acks.packet()` (the bitmap and the stream-frontier fields); the header encode
+(`wire::encode`, behind a 1-in-16 sample); `seal_stream_payload`'s check; and roughly fifteen
+`saturating_add` counter updates. Six `Instant::now()` calls per packet are also inside the
+figure now — the instrumentation pays for itself, at ~25 ns each, and the throughput at this
+shape (8.49 Gbit/s) matches the previous stats-on run (8.51) inside run-to-run noise.
+
+**Next experiment, pre-registered before it runs.** Time **`advance_cursor`** the same way, and
+nothing else. It is one site, one pair of clock reads, and it either takes the 88.3 % or it does
+not; if it does, the fix is a cursor that already knows where the next eligible stream is,
+which is exactly the structural change §4.64 hoped for. If `advance_cursor` is also free, then
+the remainder is the sum of a dozen small costs, **that** is when "1.76 µs per packet is this
+design's cost" becomes a measured statement rather than an inference from absence — and it goes
+into the release record as one.
+
+- **Pass**: `advance_cursor` is at least 30 % of `flush`. Then it is the lever, and it does not
+  cost latency.
+- **If it is free**: accept the spread, write the cost down, and stop optimising the build path;
+  the next item is the phase-2 carrier work.
+- **Guard**: same as §4.64 — the uninstrumented arm of the *same commit* must be within noise. The
+  8.49 against 8.51 above is that check at one round each, and it is weak; a two-arm run is owed
+  before any conclusion leans on the instrument being free.
+
 ### 4.64 A packet's microsecond is 99.5 % machinery: the copy costs 8 nanoseconds (2026-11-07)
 
 §4.63 left one throughput lever — the 41.6 % of a busy lane-second spent in `flush` — and
@@ -2747,13 +2793,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Split the remaining 1.78 µs per packet three ways** (§4.64, pre-registered there). The
-   data path is answered and it is a verdict: the payload copy costs **8 ns a packet**, 0.5 % of
-   `flush` and 0.2 % of a busy lane-second, while `flush` is 46.1 % at **1.785 µs a packet**. So
-   the build cost is machinery — lock, stream pick, header encode, recovery record, counters —
-   and no data-path change can win more than half a percent. Next: time the **stream pick**
-   (`BTreeMap::range` per packet) and the **recovery record** (`Sent` insert per packet)
-   separately from the rest, and pass if either is 40 % of the packet's cost.
+1. **Time `advance_cursor`, the second cursor walk per packet** (§4.65, pre-registered
+   there). The three-way split failed its criterion and the failure is informative: the stream
+   pick is **0.001 µs** (a `BTreeMap::range` over a few dozen streams is free), the recovery
+   record is 0.198 µs (11.3 % of `flush`), the copy 0.007, and **1.555 µs — 88.3 % — is
+   still unmeasured**. So "1.78 µs is the design's cost" is **not** yet a measured statement:
+   three candidates have been excluded and the remainder has not been read. The next site is
+   `advance_cursor` — a second cursor walk per packet, the most suspicious item precisely
+   because its sibling is free. Pass: it is ≥ 30 % of `flush`, and then the fix is a cursor that
+   already knows where the next eligible stream is. If it is free too, the cost is a dozen small
+   things, **that** is when it becomes a measured number for the release record.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says

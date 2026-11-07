@@ -332,7 +332,7 @@ fn mbit_per_s(bytes: u64, us: u64) -> u64 {
 /// because the four numbers are read together: passes, packets, and the microseconds of
 /// flush against the microseconds of gap, normalised per 1 000 µs of interval so two
 /// lanes with different interval lengths can be compared (HANDOFF §4.61).
-fn format_cycle(passes: &[u64; 11]) -> String {
+fn format_cycle(passes: &[u64; 13]) -> String {
     let [
         count,
         packets,
@@ -345,6 +345,8 @@ fn format_cycle(passes: &[u64; 11]) -> String {
         copy_us,
         copies,
         copy_bytes,
+        pick_us,
+        record_us,
     ] = *passes;
     if interval_us == 0 {
         return "n/a".to_owned();
@@ -368,7 +370,7 @@ fn format_cycle(passes: &[u64; 11]) -> String {
         "n={count} packets={packets} flush_raw={flush_us}us flush_per_pass={per_pass}us \
          flush={}us/1000 gap_raw={gap_us}us gap={}us/1000 gap_max={gap_max}us gap_slow={gap_slow}\
          ({slow_share}%) yield_raw={yield_us}us copy_raw={copy_us}us copies={copies} \
-         copy_bytes={copy_bytes} of {interval_us}us",
+         copy_bytes={copy_bytes} pick_raw={pick_us}us record_raw={record_us}us of {interval_us}us",
         per_1000(flush_us),
         per_1000(gap_us),
     )

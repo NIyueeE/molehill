@@ -644,6 +644,13 @@ pub(crate) struct Conn {
     copy_us: u64,
     copies: u64,
     copy_bytes: u64,
+    /// Microseconds spent in the stream pick, and in the recovery record.
+    ///
+    /// The two `BTreeMap` operations per packet, timed apart from everything else: §4.64
+    /// showed the payload copy is 0.5 % of the build cost, so the question is now whether
+    /// one of these two is most of the rest (HANDOFF §4.65).
+    pick_us: u64,
+    record_us: u64,
     /// This lane's own interval clock.
     ///
     /// **Not `posted_at`.** The first version reused it and `posted_rate` — called a few
@@ -884,6 +891,8 @@ impl Conn {
             copy_us: 0,
             copies: 0,
             copy_bytes: 0,
+            pick_us: 0,
+            record_us: 0,
             pass_at: now,
             received_total: 0,
             numbers_seen: 0,
@@ -1607,7 +1616,16 @@ impl Conn {
             offset,
             len: want,
             repair,
-        }) = self.next_stream_range()
+        }) = ({
+            let picking = stats::enabled().then(std::time::Instant::now);
+            let picked = self.next_stream_range();
+            if let Some(at) = picking {
+                self.pick_us = self
+                    .pick_us
+                    .saturating_add(u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX));
+            }
+            picked
+        })
         else {
             self.none_reason = Some("no eligible stream");
             return None;
@@ -1755,6 +1773,7 @@ impl Conn {
         }
         encode.stop(&stats::PHASES.tx_encode);
         let book = stats::Timing::start(sampled);
+        let recording = stats::enabled().then(std::time::Instant::now);
         self.recovery.on_sent(
             now,
             number,
@@ -1784,6 +1803,11 @@ impl Conn {
                     state.unsent_at = None;
                 }
             }
+        }
+        if let Some(at) = recording {
+            self.record_us = self
+                .record_us
+                .saturating_add(u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX));
         }
         self.advance_cursor();
         book.stop(&stats::PHASES.tx_book);
@@ -2538,7 +2562,7 @@ impl Conn {
     /// Reported in the same per-lane line as `cwnd` and `srtt`, so "how long a pass
     /// takes here" and "how much of the second that accounts for" are one subtraction
     /// apart (HANDOFF §4.61).
-    pub(crate) fn take_passes(&mut self, now: Instant) -> [u64; 11] {
+    pub(crate) fn take_passes(&mut self, now: Instant) -> [u64; 13] {
         let interval = u64::try_from(now.saturating_duration_since(self.pass_at).as_micros())
             .unwrap_or(u64::MAX);
         self.pass_at = now;
@@ -2554,6 +2578,8 @@ impl Conn {
             self.copy_us,
             self.copies,
             self.copy_bytes,
+            self.pick_us,
+            self.record_us,
         ];
         self.passes = 0;
         self.pass_packets = 0;
@@ -2565,6 +2591,8 @@ impl Conn {
         self.copy_us = 0;
         self.copies = 0;
         self.copy_bytes = 0;
+        self.pick_us = 0;
+        self.record_us = 0;
         out
     }
 
