@@ -351,6 +351,55 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.91 Conditions ③ and ④ measured for the first time, and mhd is ahead on both (2026-11-07)
+
+§4.90 closed the loop on where the clean cell's tail lives: one yamux SYN/ACK round trip through a
+bulk-saturated lane, 1 129 µs typical and 168 ms at its worst second. There is no "fewer round trips"
+to take — it is already one — and the only measured mitigation (the lane root) is priced at 3.13× per
+packet and rejected. So the next step was not another instrument but **the two completion conditions
+this session had never measured**: ③ (`bulk-n` within 15 % of a valid baseline) and ④ (capacity 8/8).
+
+One run, both arms, `--scale 0.2`:
+
+| cell | arm | carried | offered | `cpu_s_per_gbit` | `rss_peak_mib` |
+|---|---|---|---|---|---|
+| `bulk-n` / P8 | **molehill** | **8.63 Gbit/s** | 8.29 | **1.158** | 153.6 |
+| `bulk-n` / P8 | TCP (`l4`) | 8.22 Gbit/s | 8.31 | 1.168 | 117.7 |
+| `capacity` / ramp | **molehill** | — | — | — | **5 streams**, 37.5 % headroom |
+| `capacity` / ramp | TCP (`l4`) | — | — | — | 3 streams, 62.5 % headroom |
+
+**③ passes.** On the eight-stream bulk cell mhd carries **8.63 against TCP's 8.22 Gbit/s — 5 % ahead**,
+comfortably inside the 15 % band, on the same round with the same offered load.
+
+**④ is better for mhd than for TCP and short of the requirement for both.** The ramp reaches **5
+streams on mhd against 3 on TCP** — so the carrier scales further than the kernel-stack arm it is
+judged against — but **neither reaches 8**, and the condition is written as 8/8, not as "not worse than
+TCP". The ladder cells agree with the ramp: mhd carries six rungs (L1–L6, 4.87 / 4.90 / 3.73 / 6.21 /
+6.11 / 5.94 Gbit/s) where TCP stops at four. **A `--scale 0.2` ramp may simply not run long enough to
+find the true ceiling**, and that is the first thing to settle before the condition is called either
+way.
+
+**Two numbers that matter for later phases and had never been measured on this tree:**
+
+- **`cpu_s_per_gbit` is at parity**: **1.158 (mhd) against 1.168 (TCP)** on the bulk cell — mhd
+  marginally *better*. §1.1's archived 2026-10-27 pair (mhd `l3` 4.21 against TCP `l4` 0.650) was
+  measured on the **l3** arm, a different scenario, so it described a different path; phase 6's claim
+  now has its first bulk-path data point and it is favourable. One draw is not a verdict — phase 6 is
+  still decided by a same-round A/A (§5 item 5).
+- **Memory is the axis where mhd is worse**: **153.6 against 117.7 MiB peak, +31 %**. That is the
+  third priority (内存), so it is recorded as a real cost rather than smoothed over.
+
+**Next increment, pre-registered.** Run the capacity ramp at full scale (`--scale 1`, one arm each,
+`capacity` only) to find where mhd's and TCP's ramps actually stop.
+
+- **Pass**: mhd's ramp reaches **8** streams. Then ④ is satisfied and the condition's remaining risk is
+  gone.
+- **If mhd's ramp stops at 5–6 at full scale too**: the condition as written is not met by this design,
+  and the next question is *why* the ramp stops — which is a different investigation from everything
+  above and should be opened as its own section with its own instrument.
+- **Guard**: both arms, same round; the ramp's own `capacity_headroom_pct` is quoted with it, because a
+  ramp that stops with headroom left is a different finding from one that stops at saturation.
+
 ### 4.90 The placement is free; the whole tail is the carrier's stream open (2026-11-07)
 
 §4.89 pre-registered splitting `open_stripe_stream` into placement and the lane's open, and said the
@@ -4072,15 +4121,20 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Count the round trips inside `open_channel`** (§4.90, pre-registered there). The split is done
-   and it exonerates placement completely: over 7 154 slow placements `entry`/`used`/`record` are
-   **0.0 %** each and **`open` is 99.9 %** (p50 1 177 µs, p99 23 954, max 168 553); `lock_wait` reads
-   **p50 3 µs**. So the whole pairing tail is the mhd stream's own open, whose phases are `preface`
-   **1 µs**, `hello_ack` **~0 µs**, and **`open_channel` 1 129 µs** (worst p99 168 534). §4.68 already
-   measured that open at **557 µs with the lane root against 1 610 without**, and §4.70 priced the
-   lane root at 3.13× per packet — so what decides the next step is **how many round trips** the
-   handshake takes: three or more means a shorter handshake is a 6.0 change that costs no throughput;
-   one or two means the cost is crypto and §4.70's verdict stands.
+1. **The capacity ramp at full scale** (§4.91, pre-registered there). The clean cell's tail is one
+   yamux SYN/ACK through a bulk-saturated lane (1 129 µs typical, 168 ms worst) — there is no "fewer
+   round trips" to take and the only measured mitigation is priced at 3.13× per packet, so this line
+   is where it is until something new is measured. Meanwhile the two **never-measured** conditions
+   came back well: **③ passes** (`bulk-n` P8: mhd **8.63** against TCP 8.22 Gbit/s, +5 %, inside the
+   15 % band) and **④ is ahead but short** (ramp reaches **5 streams on mhd against 3 on TCP**, and
+   neither reaches 8 — the condition is 8/8). `--scale 0.2` may not run long enough to find the
+   ceiling, so: **`--scale 1`, `capacity` only, both arms**. **Pass**: mhd's ramp reaches 8.
+   **If it stops at 5–6**: ④ is not met by this design and *why the ramp stops* opens as its own
+   section.
+   **Also new and worth carrying**: `cpu_s_per_gbit` is at **parity** on the bulk cell (1.158 mhd vs
+   1.168 TCP — mhd marginally better; §1.1's 4.21 vs 0.650 was the **l3** arm, a different path), and
+   **memory is where mhd is worse** (153.6 vs 117.7 MiB peak, +31 %) — the third priority, recorded as
+   a real cost.
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
