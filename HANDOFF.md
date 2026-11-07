@@ -351,6 +351,52 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.94 Against the peers, mhd loses the release cell at p50 — and the cause is the same open (2026-11-07)
+
+Condition ②'s peer half, measured for the first time. `just bench peers fetch` brought frp 0.72.0,
+rathole 0.5.0 and nps 0.26.10; one `timeline`, four arms, same round.
+
+| `clean` | p50 | p99 | carried |
+|---|---|---|---|
+| **molehill** | **2.82** | **33.06** | 7.48 Gbit/s |
+| frp | **1.02** | **1.53** | 6.22 |
+| rathole | 1.09 | 3.44 | **28.58** |
+| nps | 1.04 | 15.44 | 0.13 |
+| `clean#2` | p50 | p99 | |
+| **molehill** | **2.17** | **4.88** | 2.21 |
+| frp | 1.01 | 1.51 | 6.21 |
+| rathole | 1.04 | 2.02 | 28.47 |
+| nps | 1.01 | 14.08 | 0.13 |
+
+**The p50 is where this is decided, and it is not a tail phenomenon.** mhd is **2.0–2.8× worse at p50**
+than *every* peer on *both* release cells (2.82 / 2.17 against 1.01–1.09). A median is the one number
+bulk queueing cannot explain, so this is a **fixed per-request cost**, and its size is already known:
+
+> **pairing p50 = 1 709 µs** (§4.84), and the p50 gap is **2.82 − 1.02 = 1.80 ms**. They are the same
+> number. Every visitor pays for a data channel to be opened; the peers do not.
+
+Under bulk that same open becomes the p99 gap (33.06 against 1.53 / 3.44), which is §4.89–§4.90 read
+from the other side. So **① and ② are one defect measured on three instruments** — the timeline's tail,
+the capacity ramp's stop level (§4.93), and now the peers' median.
+
+**One number here is not a carrier result and is flagged rather than claimed.** rathole reports
+**28.58 Gbit/s** where mhd reports 7.48 and frp 6.22 on what should be one offered load. A 4.6× spread
+across arms on the same cell is far more likely a load or accounting difference than a carrier
+difference, and it is recorded as **unverified** until the per-arm `offered_gbps` is checked. The p50/p99
+columns do not depend on it.
+
+**What this means for the objective, stated without softening.** The goal is "make mhd the reasonable
+first carrier". On the release cell it is not one: **frp and rathole are 2.0–2.8× faster at p50 and
+10–22× faster at p99**, while mhd is competitive only on the shaped cells (`loss1` **1 046** against
+1 055–1 085 — the best of the four; `rtt100` and the rate cells level; `jitter` 121 against 108–118).
+And the one measured way to remove the per-request open — the lane root — costs **3.13× per packet**
+(§4.70), which would take the `bulk-n` cell that currently passes (③, +5 % ahead of TCP) and lose it.
+
+**So the honest summary is that ① and ② cannot both be met by this design**: the open is the whole
+gap, and the only fix is priced against the throughput axis that ③ is judged on. The next rounds go to
+the conditions that are still reachable (⑤ the gate axes, ⑥ the final-tree acceptance) and the release
+record states this trade with the numbers above, rather than a claim the measurements do not support.
+
 ### 4.93 The capacity ramp is condition ① with another instrument, and my headroom reading was wrong (2026-11-07)
 
 §4.92 pre-registered four rounds at `--scale 1` to settle ④. They came back:
@@ -4220,16 +4266,17 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **②'s peer half — the last condition that can still change a decision.** ④ is settled as an
-   **identity rather than a measurement** (§4.93): `run_capacity` stops at the first level whose
-   interactive SLO breaks, so `capacity_streams = k` means "at k bulk streams the p99 held and at k+1 it
-   did not", and `headroom` is `1 − k/8` — **④ is ① measured on another axis**. Four draws: mhd
-   **[1, 1, 1, 4]** (median 1, spread 300 %), TCP [2, 1, 2, 3] (median 2); neither anywhere near 8.
-   §4.92's reading of headroom ("two kinds of stop") is **withdrawn as arithmetic**. So ④ is not worked
-   separately: it closes when ① does. That leaves ②'s peer half, then ⑤ and ⑥.
-   **Peer half**: `just bench peers fetch`, then one `timeline` with mhd and the peers compared **per
-   series** (never pooled). **Pass**: mhd's p50/p90/p99 no worse than every peer on like workloads.
-   **Guard**: same-round A/A; a peer behind a different shaper is not a like workload.
+1. **⑤ the gate axes, then ⑥ the final-tree acceptance** (§4.94 closed ②). The peer comparison is
+   decisive and it is not favourable: on the release cells **mhd is 2.0–2.8× worse at p50** than every
+   peer (2.82 / 2.17 against 1.01–1.09) and 10–22× worse at p99, while being competitive only on the
+   shaped cells (`loss1` **1 046** against 1 055–1 085, the best of the four). The p50 gap is **1.80 ms**
+   and pairing p50 is **1 709 µs** — the same number: **every visitor pays for a channel open and the
+   peers do not.** That also explains the capacity stop level (§4.93), so ①, ② and ④ are one defect.
+   The only measured fix (lane root) costs **3.13× per packet** and would lose ③. **So ① and ② cannot
+   both be met by this design**, and the remaining rounds go to what is reachable: ⑤, ⑥, and a release
+   record that states this trade with these numbers.
+   (One number flagged unverified: rathole's 28.58 Gbit/s against mhd's 7.48 on one offered load is more
+   likely a load/accounting difference than a carrier result; the p50/p99 columns do not depend on it.)
 2. **A per-visitor spare channel stays refuted** (§4.20).
 3. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one: `loss1` and `loss5`
    report 1.06 s and 1.46 s of p99, which is where recovery, not setup, decides the number.
