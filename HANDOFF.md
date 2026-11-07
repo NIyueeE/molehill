@@ -351,6 +351,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.97 Even the priced fix does not reach the peers, which settles ①② as unattainable (2026-11-07)
+
+Every section above closed one question and left the same one open: *the per-visitor open is the gap,
+and the only measured way to shrink it is the lane root at 3.13× per packet.* What was never done is
+the arithmetic of **what the tree looks like if that price is paid**.
+
+| | `clean` p50 | `clean` p99 | carried |
+|---|---|---|---|
+| mhd, sealing **off** (this session) | **2.17–2.82** | 4.9–33.1 | 7.48 |
+| mhd, sealing **on** (§4.68) | **1.64** | **16.00** | **3.98** |
+| frp | **1.02** | **1.53** | 6.22 |
+| rathole | **1.09** | **3.44** | **28.58** |
+| nps | **1.04** | 15.44 | 0.13 |
+
+**So the answer is no, and it is not close.** With the lane root fully on — the best latency this
+design has ever produced on this cell — mhd is still **1.50–1.61× behind every peer at p50** and
+**4.7–10.5× behind them at p99**, while carrying **3.98 Gbit/s against rathole's 28.58**. Paying the
+whole 3.13× throughput price buys a p50 that none of the three peers would notice, and still leaves the
+tail an order of magnitude out.
+
+**What this rules out as a class, not as a candidate.** There is now no configuration, measured or
+projected, in which mhd is the reasonable first carrier on the unshaped cell: the gap survives the only
+fix, and the fix costs the axis that currently passes. The objective's own premise — that mhd could be
+made the better first carrier — is **not supported by any measurement in this file**, and the honest
+form of ⑦ is that sentence plus the numbers above rather than a release record.
+
+**One caveat on the table, stated because this file has a rule about it.** The sealing rows come from
+§4.68's ON·OFF pairs and the peer rows from §4.94's four-arm run — **different rounds**, so the two are
+not a same-round comparison. What makes the conclusion safe anyway is that **p50 is the most stable
+statistic here** (mhd 2.17–2.82 across runs, the peers 1.01–1.09, sealing on 1.64): the ordering is the
+same under every pairing of runs, and the p50 gap is larger than any p50 movement this session has
+measured.
+
 ### 4.96 The final-tree acceptance run: every gate green at `1b79085` (2026-11-07)
 
 Condition ⑥, run on the final tree rather than assembled from earlier scattered runs. Revision
