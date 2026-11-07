@@ -24,6 +24,16 @@ mod stripe;
 mod transparent;
 mod transport;
 
+/// The pool-less `mhd` lane pair the bench's protocol-level harness drives.
+///
+/// `#[doc(hidden)]` for the same reason the other measurement-facing exports are:
+/// it is a seam for pricing the engine, not a supported API, and its one promise
+/// is that no product path goes through it (see the module docs for what it
+/// deliberately does not measure).
+#[cfg(all(feature = "mhd", any(feature = "client", feature = "server")))]
+#[doc(hidden)]
+pub mod probe;
+
 pub use cli::Cli;
 use cli::KeypairType;
 pub use common::constants::DEFAULT_UDP_BUFFER_SIZE;

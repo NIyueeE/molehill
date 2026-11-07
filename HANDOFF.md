@@ -367,6 +367,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.99 The carrier can be measured without the pool; the tunnel open cannot (2026-11-07)
+
+The approved plan's phase 0 asks for a measurement that separates *what the carrier costs* from
+*what the product costs*, because every number this file owns today conflates them. The first
+half of that now exists: `src/probe.rs` is a `#[doc(hidden)]` seam over `MhdLane`/`MhdListener`
+that dials, opens, accepts and carries bytes with no pool, no stripe placement, no forwarding
+and no control session — the whole engine (pump, dispatcher, packet numbers, credit, recovery)
+and nothing above it. One test proves the seam is byte-exact and that the open writes the
+product's own plain selector, so the probe cannot quietly measure a path the product never
+takes.
+
+Reading the code to build it produced the finding that changes the plan, and it is a
+**boundary, not a bug**: the harness can measure the carrier's open but *not* the tunnel open.
+
+- `Lane::open` calls `MhdLane::open_channel`, which writes the selector and returns. The
+  product calls `PoolLane::open_stream`, which additionally writes a `DataChannelTunnelHello`
+  and **waits for the server's `Ack::Ok`**.
+- That ack is only produced by `core::server::serve_mhd_stream`, after `reserve_tunnel` has
+  matched the hello's nonce against a live session. A bare probe cannot create that session.
+- So a "carrier + tunnel open" harness would have to either re-implement the server's
+  registration — measuring the re-implementation — or first lift that handshake into a shared
+  library function. The first is forbidden by the plan; the second is a deliberate refactor
+  that must justify itself with a measurement, not precede one.
+
+**What this changes.** Phase 2 (delete the redundant open ack) cannot use the fast L2 screen
+for its own subject. It is screened on L3 (`churn-16` plus a short `timeline[clean]`) together
+with the open-phase histograms that already split `open_channel` / `hello_ack` / `lock_wait` /
+`preface` / `channel_call`, and L2 runs beside it only as a non-regression guard: the carrier
+itself must not get slower while the layer above it loses a round trip. Phase 3 (RACK/PTO) is
+unaffected — it lives entirely inside L2, which is why it stays cheap to iterate.
+
+The metric names carry the distinction rather than a footnote: `transport_open_p99_us` is the
+**bare carrier's** open, and no product SLO may be computed from it.
+
 ### 4.98 Same round, sealing buys 0.8 ms of p50 and nothing of the tail (2026-11-07)
 
 §4.97 concluded from §4.68's numbers that sealing ON would give `clean` p50 1.64 / p99 16.00 and still
