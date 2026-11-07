@@ -244,6 +244,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.57 The lane's socket rate, per lane: the instrument, and two unit errors it caught (2026-11-07)
+
+§4.56's next step was to join *bytes leaving this lane's socket* to `flight` and
+`buffered`, because that number decides whether the send path or a backlog is the
+constraint. Building it produced two findings before it produced any number.
+
+**First, the existing per-lane line was reporting a process-wide counter.** The window line
+printed `posted_datagrams_per_s` from `stats::take_datagrams()`, which `swap`s the
+*process* total — so the first lane to report each second consumed every lane's datagrams
+and the rest read zero. The logs made it visible: `728 624` on lane 1 and `1 937` on lane 3
+in the same second. `Conn::posted_rate` now answers `(bytes, datagrams, µs)` from the
+connection's own counters, and the window line prints that instead.
+
+**Second, I made the unit error again, in the same round I wrote the rule about it.**
+`posted_mbit_per_s` divided by a further `1_000_000` after `bytes × 8 / µs` — which is
+already Mbit/s, because a byte per microsecond *is* 8 Mbit/s. Every lane printed `0` for a
+whole run, and the run's own log is the evidence: `posted_mbit_per_s=0` in 1 308 lines, not
+one non-zero. The fix is the divisor and a comment in place; the measurement is being
+re-taken. This is the third unit error in three rounds (§4.50 Gbit/s read as "near zero",
+§4.55 the per-lane number read as global), and all three share one shape: **a number was
+read without its denominator or its scale, and a mechanism was attached before the
+arithmetic was checked.**
+
 ### 4.56 The rate estimator failed its own pre-registration, and the window is not what limits this lane (2026-11-07)
 
 §4.55 pre-registered one thing: an estimator built from the acknowledgements the lane was

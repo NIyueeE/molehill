@@ -195,7 +195,13 @@ fn report_window(shared: &Arc<Shared>) {
         // `Conn::flight_and_buffered`).
         let (_, buffered, flight_packets) = conn.flight_and_buffered();
         let ceiling = conn.window_ceiling();
-        let (built, posted) = crate::transport::stats::take_datagrams();
+        // **Per lane.** This used to read the process-wide datagram counter, which
+        // the first lane to report each second consumed — one lane printed 728 624
+        // and another 1 937 in the same second. The question now is what *this*
+        // lane's socket took, so both counts come from the connection.
+        let (built, process_posted_now) = crate::transport::stats::take_datagrams();
+        let _ = process_posted_now;
+        let (posted_bytes, posted, posted_us) = conn.posted_rate(now);
         let received = crate::transport::stats::take_received_datagrams_per_s();
         // Inside the same `with` as everything else: a second `with` here would
         // take the same lock and deadlock the pump (which is exactly what it did).
@@ -259,6 +265,14 @@ fn report_window(shared: &Arc<Shared>) {
                 .parked_writers(now, std::time::Duration::from_millis(50))
                 .1,
             posted_datagrams_per_s = posted,
+            // bytes per microsecond times eight **is** Mbit/s: a byte per
+            // microsecond is 8 Mbit/s, so no further divisor. (The first version
+            // divided by a million as well and printed zero on every lane for a
+            // whole run — the kind of unit error this file now has a rule about.)
+            posted_mbit_per_s = posted_bytes
+                .saturating_mul(8)
+                .checked_div(posted_us)
+                .unwrap_or(0),
             received_datagrams_per_s = received,
             own_below,
             first_posted = first_posted.unwrap_or(0),
@@ -370,7 +384,7 @@ async fn flush(
     let before_wait = Instant::now();
     send_run(socket, peer, run, spans).await?;
     crate::transport::stats::note_posted(spans.len());
-    shared.with(|conn| conn.note_posted(spans.len()));
+    shared.with(|conn| conn.note_posted(spans.len(), run.len()));
     // The whole distribution, not only the extreme: a ten-millisecond post is
     // invisible to a hundred-millisecond bar, and ten milliseconds is the same
     // order as the arrival latency this pump is being measured for. Every pass

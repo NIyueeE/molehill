@@ -597,6 +597,15 @@ pub(crate) struct Conn {
     /// without posting — leaving a number consumed and, if the peer never sees it,
     /// a frontier pinned under it for the connection's life.
     issued: u64,
+    /// Bytes this connection has handed to the socket, cumulative.
+    ///
+    /// The rate's numerator (`posted_rate`): what left *this* lane's socket, which
+    /// is the only per-lane answer to "is the send path the constraint".
+    posted: u64,
+    /// When `posted` was last sampled for the one-second report, and its value then.
+    posted_at: Instant,
+    posted_at_report: u64,
+    posted_datagrams_at_report: u64,
     /// Datagrams this connection has posted and read, cumulative.
     ///
     /// Per connection because the process-wide pair cannot say *which* lane loses
@@ -816,6 +825,10 @@ impl Conn {
             acks_attached: 0,
             issued: 0,
             posted_total: 0,
+            posted: 0,
+            posted_at: now,
+            posted_at_report: 0,
+            posted_datagrams_at_report: 0,
             received_total: 0,
             numbers_seen: 0,
             numbers_acked: 0,
@@ -1397,10 +1410,40 @@ impl Conn {
         self.first_seen = Some((number, self.own_below()));
     }
 
-    pub(crate) fn note_posted(&mut self, count: usize) {
+    pub(crate) fn note_posted(&mut self, count: usize, bytes: usize) {
         self.posted_total = self
             .posted_total
             .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        self.posted = self
+            .posted
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    /// What this lane handed to the socket since its last one-second report.
+    ///
+    /// **Per lane, and that is the point.** The window line used to print a
+    /// process-wide counter here, which the *first* lane to report each second
+    /// consumed and every other lane then read as zero — measured as
+    /// `posted_datagrams_per_s` 728 624 on one lane against 1 937 on another in the
+    /// same second. This is the number the next question needs (HANDOFF §4.57):
+    /// bytes leaving *this* lane's socket, to compare with the stage's own
+    /// throughput. The count includes each datagram's own header — 3 % of a full
+    /// 1 400-byte datagram — which is inside the 15 % the pre-registration asks for
+    /// and is stated rather than corrected away.
+    pub(crate) fn posted_rate(&mut self, now: Instant) -> (u64, u64, u64) {
+        let elapsed = now.saturating_duration_since(self.posted_at);
+        let bytes = self.posted.saturating_sub(self.posted_at_report);
+        let datagrams = self
+            .posted_total
+            .saturating_sub(self.posted_datagrams_at_report);
+        self.posted_at = now;
+        self.posted_at_report = self.posted;
+        self.posted_datagrams_at_report = self.posted_total;
+        (
+            bytes,
+            datagrams,
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        )
     }
 
     /// One pass of the scheduler, without the post accounting.
