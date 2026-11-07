@@ -351,6 +351,53 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.89 §4.88's 10.8 ms gap was a sampling error, and the code warned about it (2026-11-07)
+
+§4.88 compared the pairing's `wait_us` p50 (**11 948 µs**) with the channel's `open_us` p50
+(**1 178 µs**) and called the difference a gap nobody had stamped. **That comparison is invalid and
+the gap does not exist.**
+
+`wait_us` comes from `report_pairing`, which **returns early under 5 ms** — it is the slow tail's
+composition. `open_us` came from every `mhd channel open finished` line, which is the **unconditional**
+distribution. Subtracting an unconditional median from a tail-conditional one measures the selection,
+not the system. The comment beside the very instrument says so, and this file has paid for the mistake
+before:
+
+> *"Every open, into a histogram: the log line below is a slow-open sample and was mistaken for the
+> median once already."* — `src/core/client.rs`, above `note_open_us`
+
+**The same groups, which is the only valid comparison**, n = 786:
+
+| | p50 | p90 | p99 |
+|---|---|---|---|
+| pairing `wait_us` (server) | **11 948** | 33 285 | 84 291 |
+| channel `open_us` (**same groups**) | **6 849** | 22 971 | 72 466 |
+| residual | 5 099 | — | — |
+
+**The open is 65.0 % of the wait**, not 10 % of it. The residual is 5.1 ms.
+
+**And the distributions co-move, which is the statement that actually holds.** Per second, the
+pairing's p99 and the open's p99 have a **Spearman rank correlation of 0.88** across 368 seconds; in
+the 47 seconds whose `paired_p99` is at least 20 ms, the open's p99 median is **32 123 µs**. So the
+pairing's tail *is* the open's tail — a distribution-level claim that survives the error above.
+
+**What survives from §4.87 and §4.88.** The client's **scheduling** is genuinely not the problem:
+`started_us` — spawn to first poll — is **5–8 µs** on the slow ones (6, 5, 8), so the runtime is not
+starving the new task. What is slow is `open_us` itself, which `run_mux_data_channel` measures around
+`open_stripe_stream`, and whose own comment defines it as **"the pool's placement (a lock over the
+group's record, then the tunnel order) *and* the lane's open"**.
+
+**Next increment, pre-registered.** Split `open_stripe_stream` into its two halves — the pool's
+placement and the lane's stream open — reported as two histograms beside `report_opens`. The code
+already says the two are indistinguishable from the server and that "only these two numbers tell them
+apart".
+
+- **Pass**: one half is ≥ 80 % of the 6.8 ms. Then the fix is known: a placement lock held across a
+  saturated runtime is a lock-contention fix, and a slow lane open is a carrier fix.
+- **Guard**: instrument only; the pairing line and the open line keep their meaning, and the new pair
+  is *inside* `open_us` so the two must sum to it (a check worth asserting in the reporter).
+- **Rollback**: none needed.
+
 ### 4.88 The open is 1.2 ms and flat, so the 12 ms is a 10.8 ms gap nobody has measured (2026-11-07)
 
 §4.87 pre-registered measuring the client's open span, on the hypothesis that the ~12 ms pairing wait
@@ -3970,17 +4017,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Stamp the server's accept-to-push path** (§4.88, pre-registered there). The client's open span
-   was measured and it **refuted §4.87's own hypothesis**: p50 **1 178 µs**, and **flat in load**
-   (1 139 µs at 92 B of flight against 1 424 µs at 237 516 B — 1.25× for 2 582× the bytes). In the
-   same run the pairing `wait_us` is **11 948 µs**, so there is a **10 770 µs gap** between "the
-   channel finished opening" and "the pairing took it" — the one hop nobody has stamped. Every other
-   stamp on the chain is microseconds (wake-to-resume p99 25 µs), and it is not the shared queue
-   (§ its own comment already fixes that with per-group delivery) nor the retry budget
-   (`attempts=0` on all 786). The remaining segment is the server **accepting and routing** a new
-   data connection while its runtime is saturated with bulk pumps. **Pass**: that span is the missing
-   10.8 ms and is flat in flight again. **If small**: the gap is in the control command hop, which
-   §4.86's 1 ms resolution could not see.
+1. **Split `open_stripe_stream` into placement and lane open** (§4.89, pre-registered there).
+   §4.88's 10.8 ms gap was a **sampling error** — it subtracted an unconditional `open_us` median
+   (1 178 µs) from a tail-conditional `wait_us` median (11 948 µs), which measures the selection, and
+   the code beside `note_open_us` warns about that very mistake. **Same groups (n=786): wait 11 948 µs,
+   open 6 849 µs — the open is 65.0 % of the wait, residual 5 099 µs.** Per second the two p99s have a
+   **Spearman correlation of 0.88**, and in the 47 seconds with `paired_p99 ≥ 20 ms` the open p99
+   median is **32 123 µs**. Client scheduling is not the problem (`started_us` 5–8 µs), so the target
+   is `open_stripe_stream` = *the pool's placement and the lane's open*, which the code says only two
+   numbers can tell apart. **Pass**: one half is ≥80 % of the 6.8 ms.
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
