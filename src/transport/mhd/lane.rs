@@ -594,6 +594,51 @@ mod tests {
     /// The whole seam in one test: a task writes through the async trait, the
     /// pump moves datagrams, and another task reads the bytes back out of the
     /// peer's stream. Nothing here touches a socket.
+    /// A datagram queued on one lane arrives counted on the other, with no stream.
+    ///
+    /// This is the shape the UDP service layer will use: a handle to the lane, an id the
+    /// layer chose, and a payload. Nothing here opens a stream, names an offset or can be
+    /// repaired, and the peer's `datagrams_in` is the whole delivery signal (HANDOFF
+    /// §4.73).
+    #[tokio::test]
+    async fn a_datagram_queued_on_a_lane_arrives_on_the_peer() {
+        let dialer = Shared::new(
+            Conn::new(21, true),
+            crate::transport::health::SessionHealth::new(),
+        );
+        let acceptor = Shared::new(
+            Conn::new(21, false),
+            crate::transport::health::SessionHealth::new(),
+        );
+        let pump = {
+            let dialer = Arc::clone(&dialer);
+            let acceptor = Arc::clone(&acceptor);
+            tokio::spawn(async move {
+                loop {
+                    pump_once(&dialer, &acceptor);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        assert!(dialer.with(|conn| conn.queue_datagram(3, bytes::Bytes::from_static(b"hi"))));
+        let mut seen = 0;
+        for _ in 0..1000 {
+            seen = acceptor.with(|conn| conn.datagram_counts().1);
+            if seen > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        pump.abort();
+        assert_eq!(seen, 1, "the peer must count the datagram");
+        assert_eq!(
+            dialer.with(|conn| conn.flight_and_buffered().2),
+            0,
+            "a datagram leaves nothing in the recovery table"
+        );
+    }
+
     #[tokio::test]
     async fn bytes_written_through_the_trait_arrive_on_the_peer() {
         let dialer = Shared::new(

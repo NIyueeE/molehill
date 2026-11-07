@@ -244,6 +244,56 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.73 A datagram crosses a real lane pair, and the buffer contract was the bug (2026-11-07)
+
+The third increment gives the class a lane-level test and no service wiring — and it caught a real
+defect in the second increment.
+
+**The defect.** `transmit_datagram` called `wire::encode(out, …)`, which writes into a
+**caller-sized slice**. Every other frame goes through `encode_control`, which appends into the run
+the pump is staging, because **the pump's buffer starts empty**. So the datagram arm returned `None`
+on every real pass: `a_datagram_queued_on_a_lane_arrives_on_the_peer` failed with the peer's counter
+at 0 while the `Conn`-pair test passed, and the difference between the two tests is exactly that the
+pump's buffer is a fresh `Vec`. The arm now uses `encode_control` like its siblings, and the reason
+is written where it was wrong: "a bare `encode` would need a caller-sized slice, and the pump's
+buffer starts empty".
+
+**Two assertions had to become honest rather than convenient.**
+
+- The `Conn`-pair test asserted `table_stats().0 == 1` — "the stream packet is still in flight".
+  It is 0, because a pass may owe its peer a credit update first and the stream packet then goes out
+  *after* the datagram the loop stops at. The assertion is now **relative**: the table's size before
+  the datagram is captured, and the test asserts the datagram added nothing to it. That is the
+  property; the absolute size was a coincidence of which control frame came first.
+- The same test read the built packet as `&buf[..encoded]`. With `encode_control` the pass *appends*,
+  so the packet is the **last** `encoded` bytes — `&buf[buf.len() - encoded..]`. The old form worked
+  only while the buffer happened to hold one packet.
+
+**What the lane test establishes**, on a real `Shared` pair driven by `pump_once`: a datagram queued
+with `conn.queue_datagram(3, …)` reaches the peer's `datagrams_in` as **1**, and the sender's
+recovery table is **unchanged** — nothing to retire, nothing to repair. No stream is opened, no offset
+is named.
+
+**Removed rather than waived.** The `MhdLane::queue_datagram`/`datagram_counts` wrappers written
+earlier in the round were unused (the test drives `Shared` directly), so they are **deleted** instead
+of attracting another `expect(dead_code)`. The producer's door gets added in the commit that first
+walks through it, which is the next increment — the waiver already in `Conn` is the only one, and it
+disappears the same day the service layer calls it.
+
+**Next increment, pre-registered.** The service wiring, with its call sites named: the server's
+`route_udp_datagram` currently pushes `(from, data)` into a `UdpWorkerQueue` whose worker writes a
+`UdpTraffic` frame into a reliable stream; it will instead hand the datagram to the **lane** the
+service rides, with the per-visitor id the route map already assigns. On the client,
+`udp_read_loop` currently reads `UdpTraffic` frames off a reliable stream; it will instead take the
+lane's datagrams.
+
+- **Pass**: an `udp-pace` run carries its datagrams on the new class — `datagrams_in` grows at the
+  probe's offered rate while the lane's `flight`, retransmits and credit stay at their idle values.
+- **Guard**: the TCP visitor's `clean` p50/p99 must not move beyond the run's own A/A (the two
+  services share a lane and its pump), and `just bench gate`'s endpoint invariant still holds.
+- **Rollback**: if the route needs the stream's ordering to keep its affinity, the class cannot share
+  a lane with the reliable one as designed, and this increment goes whole.
+
 ### 4.72 A datagram crosses the wire and is counted, still without a producer (2026-11-07)
 
 The second increment of phase 3, and it is again deliberately smaller than the feature.

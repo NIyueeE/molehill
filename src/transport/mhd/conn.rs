@@ -2020,9 +2020,12 @@ impl Conn {
     /// unnumbered, and nothing here touches the flight. What it *does* count is the
     /// datagram, so the next increment can watch `datagrams_in` grow while `flight` stays
     /// where it was (HANDOFF §4.71).
-    fn transmit_datagram(&mut self, out: &mut [u8], ack: Option<wire::Ack>) -> Option<usize> {
+    fn transmit_datagram(&mut self, out: &mut Vec<u8>, ack: Option<wire::Ack>) -> Option<usize> {
         let (id, data) = self.out_datagrams.front()?;
-        let encoded = wire::encode(
+        // `encode_control` appends into the run the pump is staging, which is the same
+        // shape every unnumbered frame uses; a bare `encode` would need a caller-sized
+        // slice, and the pump's buffer starts empty.
+        let encoded = wire::encode_control(
             out,
             self.id,
             self.recovery.last_number(),
@@ -4024,15 +4027,22 @@ mod tests {
         // and neither is this test's subject.
         assert!(a.queue_datagram(7, Bytes::from_static(b"datagram")));
         let number_before_datagram = a.recovery.last_number();
+        // What the table held *before* the datagram, so the assertion is "the datagram
+        // added nothing" rather than "the table has n entries", which depends on which
+        // control frame the pass happened to build first.
+        let table_before = a.recovery.table_stats().0;
         for _ in 0..8 {
             let Some(encoded) = a.poll_transmit(Instant::now(), &mut buf) else {
                 break;
             };
+            // The pass appends to the run, so the packet it built is the last `encoded`
+            // bytes of the buffer rather than the whole of it.
+            let packet = &buf[buf.len() - encoded..];
             let is_datagram = matches!(
-                wire::decode(&buf[..encoded]).map(|packet| packet.frame),
+                wire::decode(packet).map(|decoded| decoded.frame),
                 Ok(wire::Frame::Datagram { .. })
             );
-            b.on_datagram(Instant::now(), &buf[..encoded]).unwrap();
+            b.on_datagram(Instant::now(), packet).unwrap();
             if is_datagram {
                 assert_eq!(
                     a.recovery.last_number(),
@@ -4045,8 +4055,8 @@ mod tests {
         assert_eq!(a.datagram_counts().0, 1, "one datagram reached the wire");
         assert_eq!(b.datagram_counts().1, 1, "the peer counted one datagram");
         assert_eq!(b.datagram_counts().0, 0);
-        // The stream's own flight is untouched by the datagram: still one packet owed.
-        assert_eq!(a.recovery.table_stats().0, 1);
+        // The datagram added nothing to the flight: nothing to retire, nothing to repair.
+        assert_eq!(a.recovery.table_stats().0, table_before);
     }
 
     /// An abandoned stream gives its bytes back after the hold, and not before.
