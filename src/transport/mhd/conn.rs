@@ -13,6 +13,8 @@
 //! window for ever.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use bytes::Bytes;
 use std::time::{Duration, Instant};
 
 use super::recovery::{Expiry, Recovery, SentRange};
@@ -118,6 +120,21 @@ pub(crate) const ABANDON_HOLD: Duration = Duration::from_secs(30);
 /// accounts for decides whether the cycle's 26 % gap is many small waits or a few large
 /// ones.
 pub(crate) const GAP_SLOW_US: u64 = 200;
+
+/// How many datagrams one lane queues for the wire before it drops the oldest.
+///
+/// A queue, not a window: a datagram that waited longer than this many slots is one the
+/// application has already given up on, and holding it would cost the *next* datagram the
+/// latency this frame exists to buy. Small on purpose — a burst absorber, not a buffer.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the producer is the UDP service layer, which is the next increment; \
+                  the queue and its bound are used by the crossing test until then (HANDOFF §4.71)"
+    )
+)]
+pub(crate) const DATAGRAM_QUEUE: usize = 64;
 
 /// Whether a stream is still opening: it has not written a reserve's worth yet.
 fn opening(state: &StreamState) -> bool {
@@ -653,6 +670,19 @@ pub(crate) struct Conn {
     record_us: u64,
     /// Microseconds spent advancing the round-robin cursor, a second walk per packet.
     advance_us: u64,
+    /// Datagrams queued by the layer above, oldest first, and the counters.
+    ///
+    /// **Separate from every stream**, which is the whole point: a datagram has no
+    /// offset, so it cannot be repaired and must not be counted in the flight. Bounded
+    /// because a queue is a queue — a producer faster than the pump drops its oldest
+    /// datagram, which is what a datagram service already tolerates.
+    out_datagrams: VecDeque<(u32, Bytes)>,
+    /// Datagrams handed to the wire, and datagrams received off it.
+    ///
+    /// The receive counter is what the next increment watches: it must grow while the
+    /// flight does not (HANDOFF §4.71).
+    datagrams_out: u64,
+    datagrams_in: u64,
     /// This lane's own interval clock.
     ///
     /// **Not `posted_at`.** The first version reused it and `posted_rate` — called a few
@@ -890,6 +920,9 @@ impl Conn {
             gap_max_us: 0,
             gap_slow: 0,
             yield_us: 0,
+            out_datagrams: VecDeque::new(),
+            datagrams_out: 0,
+            datagrams_in: 0,
             copy_us: 0,
             copies: 0,
             copy_bytes: 0,
@@ -1514,6 +1547,33 @@ impl Conn {
         )
     }
 
+    /// Queue one datagram for the wire, dropping the oldest if the queue is full.
+    ///
+    /// Answers whether it was taken; `false` means the queue was full and the *oldest*
+    /// datagram went instead, which is the only policy a datagram service can accept:
+    /// the newest is the one the application still cares about.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "nothing above the carrier queues a datagram yet — the service layer \
+                      that will is the next increment (HANDOFF §4.71)"
+        )
+    )]
+    pub(crate) fn queue_datagram(&mut self, id: u32, data: Bytes) -> bool {
+        let room = self.out_datagrams.len() < DATAGRAM_QUEUE;
+        if !room {
+            self.out_datagrams.pop_front();
+        }
+        self.out_datagrams.push_back((id, data));
+        room
+    }
+
+    /// Datagrams sent and received, cumulative, for the window line.
+    pub(crate) fn datagram_counts(&self) -> (u64, u64) {
+        (self.datagrams_out, self.datagrams_in)
+    }
+
     /// One pass of the scheduler, without the post accounting.
     fn build_packet(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
         self.none_reason = None;
@@ -1532,6 +1592,13 @@ impl Conn {
         });
         if self.credit_due() {
             return self.transmit_credit(now, out, ack);
+        }
+        // **Before the streams.** A datagram is the latency-sensitive class: it is
+        // already on the wire from the application's point of view, and a queue behind
+        // a bulk stream is exactly the delay this frame exists to remove. One per
+        // packet, so a burst cannot crowd out a stream for a whole run.
+        if let Some(len) = self.transmit_datagram(out, ack) {
+            return Some(len);
         }
         if let Some(len) = self.transmit_stream(now, out, ack) {
             return Some(len);
@@ -1947,6 +2014,30 @@ impl Conn {
     }
 
     /// One stream's abort, if one is queued.
+    /// Put one queued datagram on the wire, or answer nothing.
+    ///
+    /// No packet number, no recovery record, no credit: the frame's own flags say it is
+    /// unnumbered, and nothing here touches the flight. What it *does* count is the
+    /// datagram, so the next increment can watch `datagrams_in` grow while `flight` stays
+    /// where it was (HANDOFF §4.71).
+    fn transmit_datagram(&mut self, out: &mut [u8], ack: Option<wire::Ack>) -> Option<usize> {
+        let (id, data) = self.out_datagrams.front()?;
+        let encoded = wire::encode(
+            out,
+            self.id,
+            self.recovery.last_number(),
+            ack,
+            wire::Frame::Datagram { id: *id, data },
+        );
+        if encoded.is_some() {
+            // Only dequeued once it is on the wire: a datagram that did not fit stays
+            // queued and is tried next pass rather than being silently lost.
+            self.out_datagrams.pop_front();
+            self.datagrams_out = self.datagrams_out.saturating_add(1);
+        }
+        encoded
+    }
+
     fn transmit_reset(
         &mut self,
         now: Instant,
@@ -2685,11 +2776,14 @@ impl Conn {
             self.apply_ack(now, ack, sampled);
         }
         match packet.frame {
-            // Nothing above consumes a datagram frame yet: the wire class exists so the
-            // service layer can be built on it, and until then a datagram arrives, is
-            // recognised and is dropped without touching a stream, a credit or the
-            // recovery table (HANDOFF §4.71).
-            wire::Frame::Datagram { .. } => return Ok(()),
+            // Nothing above consumes a datagram frame yet; it arrives, is counted, and
+            // is dropped without touching a stream, a credit or the recovery table.
+            // The count is the instrument: it must grow while `flight` does not
+            // (HANDOFF §4.71).
+            wire::Frame::Datagram { .. } => {
+                self.datagrams_in = self.datagrams_in.saturating_add(1);
+                return Ok(());
+            }
             Frame::None => {}
             Frame::Stream {
                 id,
@@ -3905,6 +3999,56 @@ mod tests {
     /// The refusal here is the sealing one — a stream marked sealed with no key
     /// is the state `payload_plan` exists to refuse — and the assertion is that
     /// the connection's own numbering did not move.
+    /// A datagram crosses the wire without a packet number and without a flight entry.
+    ///
+    /// The three properties §4.71 names, pinned from the receiving end: the peer counts
+    /// the datagram, the sender's flight stays at zero (nothing to retire, nothing to
+    /// repair), and the packet carries a number it does not consume — so the *next*
+    /// stream packet's number is the one after the last stream packet, not after this
+    /// one.
+    #[test]
+    fn a_datagram_crosses_without_touching_the_flight() {
+        let mut a = Conn::new(1, true);
+        let mut b = Conn::new(1, false);
+        let mut buf = Vec::new();
+        let stream = a.open().id;
+        a.write(stream, &[9u8; 100]);
+        // One stream packet goes out first, so the flight is non-zero to begin with.
+        let first = a.poll_transmit(Instant::now(), &mut buf).unwrap();
+        let mut moving = VecDeque::from([buf[..first].to_vec()]);
+        while let Some(packet) = moving.pop_front() {
+            b.on_datagram(Instant::now(), &packet).unwrap();
+        }
+        // Now a datagram, queued at the layer above. Poll until the pass that carries it:
+        // the connection may first owe its peer a credit update or a bare acknowledgement,
+        // and neither is this test's subject.
+        assert!(a.queue_datagram(7, Bytes::from_static(b"datagram")));
+        let number_before_datagram = a.recovery.last_number();
+        for _ in 0..8 {
+            let Some(encoded) = a.poll_transmit(Instant::now(), &mut buf) else {
+                break;
+            };
+            let is_datagram = matches!(
+                wire::decode(&buf[..encoded]).map(|packet| packet.frame),
+                Ok(wire::Frame::Datagram { .. })
+            );
+            b.on_datagram(Instant::now(), &buf[..encoded]).unwrap();
+            if is_datagram {
+                assert_eq!(
+                    a.recovery.last_number(),
+                    number_before_datagram,
+                    "a datagram must not consume a packet number"
+                );
+                break;
+            }
+        }
+        assert_eq!(a.datagram_counts().0, 1, "one datagram reached the wire");
+        assert_eq!(b.datagram_counts().1, 1, "the peer counted one datagram");
+        assert_eq!(b.datagram_counts().0, 0);
+        // The stream's own flight is untouched by the datagram: still one packet owed.
+        assert_eq!(a.recovery.table_stats().0, 1);
+    }
+
     /// An abandoned stream gives its bytes back after the hold, and not before.
     ///
     /// Its bytes stay in the connection's `buffered` total while it waits for an

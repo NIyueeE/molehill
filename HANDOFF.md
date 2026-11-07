@@ -244,6 +244,52 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.72 A datagram crosses the wire and is counted, still without a producer (2026-11-07)
+
+The second increment of phase 3, and it is again deliberately smaller than the feature.
+
+`Conn` now has a bounded **outgoing datagram queue** (`DATAGRAM_QUEUE = 64`, oldest dropped when
+full — "the newest is the one the application still cares about"), a **transmit arm placed before
+the streams** ("a datagram is the latency-sensitive class: it is already on the wire from the
+application's point of view, and a queue behind a bulk stream is exactly the delay this frame exists
+to remove, but one per packet so a burst cannot crowd out a stream for a whole run"), and a receive
+path that **counts** what arrives instead of dropping it silently. The window line prints
+`sent=/received=` once a second.
+
+**The three properties are pinned by a test that crosses a real datagram between two `Conn`s**
+(`a_datagram_crosses_without_touching_the_flight`):
+
+- the peer's `datagrams_in` goes to 1 and its `datagrams_out` stays 0;
+- the sender's `recovery.last_number()` **does not move** — the datagram carries the number it is
+  given and consumes none, so the next stream packet still takes the next number;
+- `recovery.table_stats().0` stays at **1**, the one stream packet that was in flight: nothing was
+  added to the table, so there is nothing to retire and nothing to repair.
+
+The test also had to learn something the code already knew: `poll_transmit` may first owe its peer a
+credit update or a bare acknowledgement, so the test **polls until the pass that carries the
+datagram** rather than assuming the first call does. Asserting on call order was the first version
+and it failed, which is the instrument behaving correctly.
+
+**What is still missing, stated so it is not mistaken for the feature.** Nothing above the carrier
+*queues* a datagram: `queue_datagram` is called only by the test, and carries a narrow
+`#[cfg_attr(not(test), expect(dead_code, reason = ...))]` naming the next increment as its producer.
+The UDP data plane is therefore **still the framed-into-a-reliable-stream path of §4.58**, and every
+measurement in this file still describes that path. What exists now is the wire class and a carrier
+that can carry one; the service layer is the increment that makes it a feature.
+
+**Next increment, pre-registered.** The producer and the consumer: the UDP service layer queues a
+datagram with its per-visitor `id` instead of writing a `UdpTraffic` frame into a reliable stream,
+and the receive path hands the payload to the visitor's socket instead of counting it.
+
+- **Pass**: an `udp-pace` run carries its datagrams on the new class — `datagrams_in` grows at the
+  probe's offered rate while the lane's `flight`, `retransmits` and credit stay at their idle values.
+  If any of the three moves, a datagram is still paying for reliability somewhere.
+- **Guard**: the TCP visitor's `clean` p50/p99 must not move beyond the run's own A/A (the two
+  services share a lane and its pump); `just bench gate`'s endpoint invariant still holds.
+- **Rollback**: the service layer cannot express its affinity without the reliable stream's ordering,
+  or a `clean` stage moves — then the class cannot share a lane with the reliable one as designed and
+  this increment is reverted whole.
+
 ### 4.71 Phase 3 begins: the datagram frame class exists on the wire (2026-11-07)
 
 The first increment of the unreliable-datagram work is in, and it is deliberately only the wire.

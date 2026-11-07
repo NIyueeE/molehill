@@ -240,6 +240,7 @@ fn report_window(shared: &Arc<Shared>) {
         let worst = conn.worst_stream();
         tracing::debug!(
             cycle = %cycle,
+            datagrams = %format_datagrams(conn.datagram_counts()),
             worst_stream = worst.map_or(0, |w| w.id),
             worst_next = worst.map_or(0, |w| w.next),
             worst_written = worst.map_or(0, |w| w.written),
@@ -332,6 +333,16 @@ fn mbit_per_s(bytes: u64, us: u64) -> u64 {
 /// because the four numbers are read together: passes, packets, and the microseconds of
 /// flush against the microseconds of gap, normalised per 1 000 µs of interval so two
 /// lanes with different interval lengths can be compared (HANDOFF §4.61).
+/// A lane's datagram counters, rendered for the window line.
+///
+/// One string for the same reason `format_cycle` is: `report_window` is at its line
+/// budget, and the two numbers are read together — a lane that receives more than it
+/// sends is a lane whose peer is doing the work, which is the first thing to check when
+/// a datagram service looks asymmetrical.
+fn format_datagrams((out, incoming): (u64, u64)) -> String {
+    format!("sent={out} received={incoming}")
+}
+
 fn format_cycle(passes: &[u64; 14]) -> String {
     let [
         count,
