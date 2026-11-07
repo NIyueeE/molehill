@@ -351,6 +351,48 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.82 The flight cap made the clean cell worse, so it is reverted (2026-11-07)
+
+§4.81 predicted that capping a lane's outstanding bytes would pull the `clean` cell's tail below
+TCP's, because that cell is queueing rather than loss. The cap was built behind
+`MOLEHILL_MHD_FLIGHT_CAP` (default off), applied as a fourth term beside credit, window and the
+buffer ceiling — and then measured, one run per setting, both with the TCP arm present:
+
+| cell | mhd **no cap** p99 | mhd **cap 512 KiB** p99 | TCP p99 (same run pair) |
+|---|---|---|---|
+| `clean` | 27.45 | **114.66** | 39.19 |
+| `jitter` | **115.23** | 128.17 | 124.99 |
+| `clean#2` | 9.14 | **3.74** | 4.08 |
+| `loss5` | 2 468.16 | **1 446.59** | 2 476.63 |
+| `rtt100` | 403.35 | 438.73 | 437.22 |
+| `rate100` / `rate20` | 203.34 / 515.27 | 217.98 / 509.43 | 210.97 / 509.49 |
+
+**The cell it was aimed at got 4× worse, and the guard cell moved the wrong way.** Under the
+pre-registration — pass is `clean` p99 below TCP's *and* `jitter`/`loss5` unchanged — this fails on
+both counts, so **the increment is reverted whole** and the switch is gone from the tree rather than
+left off-by-default: an off switch with a failed hypothesis behind it is a knob nobody should turn.
+
+**Why it failed is worth more than the verdict, and it corrects the hypothesis.** On this cell the
+"queue" is not a buffer sitting beside the pipe — **it is the pipelining itself**. At 8 Gbit/s a
+512 KiB cap is about half a millisecond of data, so the lane must stop and wait for an acknowledgement
+every half millisecond instead of keeping 4 MB outstanding. The echo request does not then find a
+shorter queue; it finds a **slower lane**, because the bulk spine's own packets are now gated. So
+shrinking the outstanding window on a clean cell trades everyone's throughput for nobody's latency —
+and `clean#2` and `loss5`, which improved, are the cells where there *is* a shaper and the cap acts as
+a crude pacing hint.
+
+**That is a real distinction and it re-aims the next step.** The property that would help is not "less
+in flight" but "**the echo does not sit behind the bulk**" — the same total flight, ordered by class.
+That is exactly what phase C (priority scheduling) is, and §4.82 is the measurement that says the
+crude form of it does not work while leaving the precise form untested. C now has both an indication
+(§4.80) and a refuted alternative (§4.82) behind it.
+
+**A method note, because this round nearly lost work.** The cap was never committed when it was
+measured, so "revert the increment" had to mean discarding the worktree; the revert command first
+landed on the previous *docs* commit and had to be undone. Nothing was lost, but the rule it produces
+is worth keeping: **commit the experiment before running it**, so that reverting is a git operation
+and not a judgement about which files are the experiment.
+
 ### 4.81 The TCP comparison: mhd loses on exactly one cell, and it is the same one as ① (2026-11-07)
 
 Condition ② asks for p50/p90/p99 no worse than the in-tree TCP carrier on like workloads. Same run,
@@ -3630,16 +3672,18 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Cap what a latency-bound service puts in flight** (§4.81, pre-registered there). The TCP
-   comparison landed and it collapses ① and ② into one problem: **`clean` is the only cell where mhd
-   is worse, by 4×** (p99 59.04 vs 14.40 ms, p50 3.02 vs 2.63, throughput equal), while `jitter` and
-   `loss5` are wins (loss5 tail 1 455 vs 2 101 and throughput 1.11 vs 0.30) and the rate cells tie.
-   `clean#2`'s TCP arm is **not comparable** — `ok=False`, "the bulk spine carried no bytes", caught by
-   the zero-carry guard. And the failing cell is the same one whose `flight` spans 59 KB–7.8 MB (§4.80):
-   **the queue, not the scheduler.** So: a per-lane outstanding-byte limit for latency-sensitive
-   streams, chosen as the smallest value that keeps `clean` throughput. **Pass**: `clean` p99 below
-   TCP's same-round 14.40 ms **and** throughput inside the run's A/A. **Guard**: `loss5`/`jitter` must
-   not regress. **Rollback**: either moves.
+1. **Phase C (priority scheduling), now with a refuted crude form behind it** (§4.82). The flight
+   cap was built, measured and **reverted**: `clean` p99 went **27.45 → 114.66 ms** (TCP 39.19) and
+   the guard cell `jitter` regressed 115.23 → 128.17. The reason is that on a clean cell the queue
+   **is** the pipelining — 512 KiB at 8 Gbit/s is half a millisecond, so the lane stops and waits
+   instead of keeping 4 MB outstanding, and the echo finds a **slower lane**, not a shorter queue.
+   `clean#2` and `loss5` improved, which are the cells where a shaper exists and the cap acts as
+   crude pacing. So the property that helps is not "less in flight" but "**the echo does not sit
+   behind the bulk**" — the same flight, ordered by class. **Pass**: `clean` p99 below TCP's
+   same-round figure with `loss5`/`jitter` unchanged. **Rollback**: either moves.
+2. **§5's other items stand**: `bulk-n` (③), capacity (④), the gate axes (⑤), the final-tree
+   acceptance run (⑥, `just check` + `just interop` + L3 acceptance), phase 6's CPU/memory judging
+   from §1.1.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
