@@ -244,6 +244,54 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.74 The datagram seam is the pool's data-channel API, and it is drawn here before it is cut (2026-11-07)
+
+§4.73 pre-registered the service wiring with its two call sites named. Reading those call sites
+properly turned up the real obstacle, and it is **not** in either of them: it is the boundary
+between the pool and the service.
+
+**Established by reading, not guessed:**
+
+- the UDP pool takes a data channel as `data_ch_rx.take()` → `(_, mut conn)`, and `conn` is a
+  **stream** — `C: AsyncRead + AsyncWrite + Unpin + Send + 'static`. **The `MhdLane` is dropped at
+  that hand-off**, long before the worker exists;
+- `UdpWorkerSet::spawn_worker` is generic over exactly that `C` (**one** call site), and
+  `udp_forward_worker` carries visitor-bound traffic with
+  `UdpTraffic::write_frame(&mut conn, …)` — a frame on the reliable stream, which is the cost
+  §4.58 measured and this phase exists to remove;
+- the affinity the datagram class must **not** lose already lives in `UdpRouteMap`
+  (`Mutex<HashMap<SocketAddr, UdpRoute>>`, `UdpRoute { worker, last_seen }`), keyed by the
+  visitor's address — so the per-visitor id the frame needs can be the **worker id plus a
+  per-worker sequence**, and no new table is required;
+- the lane handle *does* exist where the stream is accepted (`serve_mhd_stream(stream, lane: Arc<MhdLane>, …)`),
+  so the information is available — it is being thrown away by the channel that carries the stream
+  to the service.
+
+**So the cut is one of three, and the cheapest is named.** Either (a) the pool's data-channel
+channel yields an optional lane beside the stream, (b) the stream type grows a
+`datagrams() -> Option<…>` method that only the mhd carrier answers `Some` from, or (c) the service
+keeps `UdpTraffic` and nothing changes. **(b) is chosen**: it is additive, it changes no existing
+signature, every other carrier answers `None` and keeps today's path byte-for-byte, and the pool
+already hands the service a concrete type rather than a bare `TcpStream`. It also keeps the
+capability where it is used instead of threading a new parameter through `spawn_worker`, the
+worker set and both ends.
+
+**Next increment, pre-registered before it is written.** Give the pool's stream type an optional
+datagram handle filled when the carrier is mhd; `udp_forward_worker` uses it when present and
+`UdpTraffic` otherwise; the visitor id is `worker << 16 | sequence`, and the client's
+`udp_read_loop` reads the lane's datagrams when its channel has the handle.
+
+- **Pass**: an `udp-pace` run carries its datagrams on the new class — `datagrams_in` (already on
+  the window line, §4.72) grows at the probe's offered rate **while the lane's flight, retransmits
+  and credit stay at their idle values**. Any of the three moving means a datagram is still paying
+  for reliability somewhere, and the increment is not done.
+- **Guard**: the TCP visitor's `clean` p50/p99 must not move beyond the run's own A/A (the two
+  services share a lane and its pump), `just bench gate`'s endpoint invariant still holds, and a
+  **TCP-carrier** UDP run is re-measured — it must be indistinguishable from today, because (b)
+  says it answers `None`.
+- **Rollback**: if the route needs the stream's ordering to keep its affinity, the class cannot
+  share a lane with the reliable one as designed, and the whole increment goes.
+
 ### 4.73 A datagram crosses a real lane pair, and the buffer contract was the bug (2026-11-07)
 
 The third increment gives the class a lane-level test and no service wiring — and it caught a real
@@ -3157,20 +3205,17 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **The service wiring, with its call sites named** (§4.73, pre-registered there). The carrier
-   carries a datagram and a lane-level test proves it (peer's counter to 1, sender's recovery
-   table unchanged), and three defects were found and fixed on the way — the buffer contract,
-   two convenience assertions, and two unused wrappers deleted rather than waived. Now the
-   producer: the server's `route_udp_datagram` pushes `(from, data)` into a `UdpWorkerQueue`
-   whose worker writes a `UdpTraffic` frame into a reliable stream; it will hand the datagram to
-   the **lane** the service rides, with the per-visitor id the route map already assigns. On the
-   client, `udp_read_loop` reads `UdpTraffic` frames off a reliable stream; it will take the
-   lane's datagrams. **Pass**: an `udp-pace` run carries its datagrams on the new class —
-   `datagrams_in` grows at the offered rate while the lane's `flight`, retransmits and credit stay
-   at their idle values. **Guard**: the TCP visitor's `clean` p50/p99 must not move beyond the
-   run's own A/A, and the endpoint invariant still holds. **Rollback**: if the route needs the
-   stream's ordering to keep its affinity, the class cannot share a lane as designed and the
-   increment goes whole.
+1. **Give the pool's stream an optional datagram handle** (§4.74, pre-registered there). The
+   wiring's real obstacle was found by reading the call sites: the lane handle is **dropped at the
+   pool's data-channel hand-off** (`data_ch_rx` yields a stream, not a lane), while the affinity the
+   class must keep already exists in `UdpRouteMap`. Chosen cut: **(b)** — an additive
+   `datagrams() -> Option<…>` on the pool's stream type that only the mhd carrier answers `Some`
+   from, so every other carrier keeps today's path byte-for-byte and no signature changes.
+   `udp_forward_worker` uses the handle when present and `UdpTraffic` otherwise; the visitor id is
+   `worker << 16 | sequence`. **Pass**: `udp-pace`'s `datagrams_in` grows at the offered rate while
+   the lane's flight, retransmits and credit stay idle. **Guard**: TCP `clean` p50/p99 within the
+   A/A, and a **TCP-carrier UDP run indistinguishable from today** — that is what (b) promises.
+   **Rollback**: if the route needs the stream's ordering for affinity, the whole increment goes.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
