@@ -3157,19 +3157,20 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Make the datagram class a feature: the UDP service layer as its producer** (§4.72,
-   pre-registered there). The carrier can now carry one — a bounded queue, a transmit arm ahead
-   of the streams, a receive path that counts, and a test pinning the three properties (peer
-   counts it, sender's packet number does not move, recovery table unchanged) — but **nothing
-   above queues one**, so the UDP data plane is still the framed-into-a-reliable-stream path and
-   every measurement in this file describes that. Next: the service layer queues a datagram with
-   its per-visitor `id` instead of writing a `UdpTraffic` frame into a reliable stream, and the
-   receive path hands the payload to that visitor's socket. **Pass**: an `udp-pace` run carries its
-   datagrams on the new class — `datagrams_in` grows at the offered rate while the lane's
-   `flight`, `retransmits` and credit stay at their idle values. **Guard**: the TCP visitor's
-   `clean` p50/p99 must not move (the services share a lane and its pump). **Rollback**: if the
-   service layer cannot express affinity without the stream's ordering, the class cannot share a
-   lane with the reliable one as designed and the increment goes.
+1. **The service wiring, with its call sites named** (§4.73, pre-registered there). The carrier
+   carries a datagram and a lane-level test proves it (peer's counter to 1, sender's recovery
+   table unchanged), and three defects were found and fixed on the way — the buffer contract,
+   two convenience assertions, and two unused wrappers deleted rather than waived. Now the
+   producer: the server's `route_udp_datagram` pushes `(from, data)` into a `UdpWorkerQueue`
+   whose worker writes a `UdpTraffic` frame into a reliable stream; it will hand the datagram to
+   the **lane** the service rides, with the per-visitor id the route map already assigns. On the
+   client, `udp_read_loop` reads `UdpTraffic` frames off a reliable stream; it will take the
+   lane's datagrams. **Pass**: an `udp-pace` run carries its datagrams on the new class —
+   `datagrams_in` grows at the offered rate while the lane's `flight`, retransmits and credit stay
+   at their idle values. **Guard**: the TCP visitor's `clean` p50/p99 must not move beyond the
+   run's own A/A, and the endpoint invariant still holds. **Rollback**: if the route needs the
+   stream's ordering to keep its affinity, the class cannot share a lane as designed and the
+   increment goes whole.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
