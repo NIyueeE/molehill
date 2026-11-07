@@ -244,6 +244,46 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.66 The cursor walk is free too: four candidates excluded, 82 % is a dozen small costs (2026-11-07)
+
+§4.65's last instrument, on the same shape — busy lane-seconds of a clean stage:
+
+| part | µs per packet | share of `flush` |
+|---|---|---|
+| stream pick (`next_stream_range`) | **0.000** | **0.0 %** |
+| cursor advance (`advance_cursor`) | **0.000** | **0.0 %** |
+| recovery record (`Sent` insert) | 0.305 | **17.7 %** |
+| payload copy | 0.006 | 0.3 % |
+| **everything else** | **1.413** | **81.9 %** |
+
+**Both `BTreeMap` walks are free** — a range over a few dozen streams, done twice per packet,
+costs less than a nanosecond each. So the pre-registered "if it is free too" branch has fired, and
+it is the branch that licenses a real statement rather than an inference from absence:
+
+> **Building a packet costs 1.73–1.76 µs, and 82 % of it is not any one thing.** Four candidates
+> have now been measured and excluded — the pick, the cursor advance, the payload copy and (mostly)
+> the recovery record — and what is left is the sum of a dozen small costs: the header encode, the
+> `acks.packet()` bitmap, the seal check, and roughly fifteen counter updates.
+
+That number goes into the release record as a **measured** cost of the design, not a gap. And it
+closes the build-path question this cycle opened at §4.59: the throughput ceiling is
+`packets per second × 1 387 B` with a fixed per-packet cost that no single structural change
+moves.
+
+**A method problem surfaced in the same run and must travel with that conclusion.** The two
+consecutive one-round runs differ in stage throughput by **8.49 against 5.46 Gbit/s** — 36 % —
+while their per-packet cost is nearly identical (1.76 and 1.725 µs). The instrumentation is
+therefore not what moved (its own cost is in the per-packet figure, which held); the rank is.
+But it means the guard the last two pre-registrations asked for — "the uninstrumented arm within
+noise" — **cannot be settled at one round on this cell**: its own floor at eight rounds is 6.7 %
+(§4.47), and at one round the swing observed here is 36 %. Any future claim that an instrument is
+free has to come from the two-arm, eight-round form, or it is not a claim.
+
+**So the built-path line closes here, and the plan moves on.** §5's item 1 is done: the ceiling is
+`SEND_RUN × 44 packets at ~1.75 µs`, `SEND_RUN` is ruled out by the latency order, and the yield
+is priced and un-reclaimable. The next item is the carrier work that has been waiting behind it —
+phase 2, the lane root that is implemented and switched off.
+
 ### 4.65 The pick is free, the recovery record is 11 %, and 88 % is still unmeasured (2026-11-07)
 
 §4.64 pre-registered a three-way split of the remaining 1.78 µs per packet, timed at both
@@ -2793,16 +2833,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Time `advance_cursor`, the second cursor walk per packet** (§4.65, pre-registered
-   there). The three-way split failed its criterion and the failure is informative: the stream
-   pick is **0.001 µs** (a `BTreeMap::range` over a few dozen streams is free), the recovery
-   record is 0.198 µs (11.3 % of `flush`), the copy 0.007, and **1.555 µs — 88.3 % — is
-   still unmeasured**. So "1.78 µs is the design's cost" is **not** yet a measured statement:
-   three candidates have been excluded and the remainder has not been read. The next site is
-   `advance_cursor` — a second cursor walk per packet, the most suspicious item precisely
-   because its sibling is free. Pass: it is ≥ 30 % of `flush`, and then the fix is a cursor that
-   already knows where the next eligible stream is. If it is free too, the cost is a dozen small
-   things, **that** is when it becomes a measured number for the release record.
+1. **Phase 2: the lane root, and the wedge that has kept it switched off** (§4.10, §4.13,
+   §4.66). The build-path line is closed: a packet costs **1.73–1.76 µs**, four candidates are
+   measured and excluded (pick 0 %, cursor advance 0 %, copy 0.3 %, recovery record 17.7 %), and
+   the remaining 82 % is a dozen small costs — recorded as a measured cost of the design, not a
+   gap. `SEND_RUN` is ruled out by the latency order and the yield is priced (§4.46). So the next
+   real work is the carrier's: reproduce `MOLEHILL_MHD_SEAL=1`'s multi-stripe wedge, join both
+   ends on stream, direction and packet, and fix only a root cause that can be proved.
+   **Guard for any future "the instrument is free" claim**: two arms, eight rounds —
+   one-round runs on this cell differ by 36 % in stage throughput (§4.66), so a 5 % guard
+   cannot be settled at one round.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says

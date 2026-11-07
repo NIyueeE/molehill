@@ -651,6 +651,8 @@ pub(crate) struct Conn {
     /// one of these two is most of the rest (HANDOFF §4.65).
     pick_us: u64,
     record_us: u64,
+    /// Microseconds spent advancing the round-robin cursor, a second walk per packet.
+    advance_us: u64,
     /// This lane's own interval clock.
     ///
     /// **Not `posted_at`.** The first version reused it and `posted_rate` — called a few
@@ -893,6 +895,7 @@ impl Conn {
             copy_bytes: 0,
             pick_us: 0,
             record_us: 0,
+            advance_us: 0,
             pass_at: now,
             received_total: 0,
             numbers_seen: 0,
@@ -1809,7 +1812,18 @@ impl Conn {
                 .record_us
                 .saturating_add(u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX));
         }
+        // **The second cursor walk per packet**, and the one thing left untimed in
+        // `build_packet`: `next_stream_range` walks the table forwards to choose, and
+        // this walks it again from `cursor` to remember where to start next time. Its
+        // sibling measured a nanosecond, which is exactly why this one is measured
+        // rather than assumed (HANDOFF §4.65).
+        let advancing = stats::enabled().then(std::time::Instant::now);
         self.advance_cursor();
+        if let Some(at) = advancing {
+            self.advance_us = self
+                .advance_us
+                .saturating_add(u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX));
+        }
         book.stop(&stats::PHASES.tx_book);
         self.ack_pending = false;
         self.keepalive_at = now + KEEPALIVE;
@@ -2562,7 +2576,7 @@ impl Conn {
     /// Reported in the same per-lane line as `cwnd` and `srtt`, so "how long a pass
     /// takes here" and "how much of the second that accounts for" are one subtraction
     /// apart (HANDOFF §4.61).
-    pub(crate) fn take_passes(&mut self, now: Instant) -> [u64; 13] {
+    pub(crate) fn take_passes(&mut self, now: Instant) -> [u64; 14] {
         let interval = u64::try_from(now.saturating_duration_since(self.pass_at).as_micros())
             .unwrap_or(u64::MAX);
         self.pass_at = now;
@@ -2580,6 +2594,7 @@ impl Conn {
             self.copy_bytes,
             self.pick_us,
             self.record_us,
+            self.advance_us,
         ];
         self.passes = 0;
         self.pass_packets = 0;
@@ -2593,6 +2608,7 @@ impl Conn {
         self.copy_bytes = 0;
         self.pick_us = 0;
         self.record_us = 0;
+        self.advance_us = 0;
         out
     }
 
