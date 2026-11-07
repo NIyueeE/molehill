@@ -4230,20 +4230,20 @@ curve and a RACK rewrite that no measurement had asked for yet.
    **Peer half**: `just bench peers fetch`, then one `timeline` with mhd and the peers compared **per
    series** (never pooled). **Pass**: mhd's p50/p90/p99 no worse than every peer on like workloads.
    **Guard**: same-round A/A; a peer behind a different shaper is not a like workload.
-3. **A per-visitor spare channel stays refuted** (§4.20).
-4. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one: `loss1` and `loss5`
+2. **A per-visitor spare channel stays refuted** (§4.20).
+3. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one: `loss1` and `loss5`
    report 1.06 s and 1.46 s of p99, which is where recovery, not setup, decides the number.
-5. **C (priority scheduling): its condition is now met.** This item used to say C was conditional on
+4. **C (priority scheduling): its condition is now met.** This item used to say C was conditional on
    "a `nobulk` run showing the bulk spine is what moves the interactive tail". **That run is §4.83,
    and it shows exactly that** (3.1–3.4 ms without bulk, 9–133 ms with). So C is scheduled, and it
    follows item 1, which says *where* inside the path the wait actually is; §4.82 already refutes
    the crude form (capping outstanding bytes), so what remains is ordering by class at the same
    total flight.
-6. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built: one from
+5. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built: one from
    the acknowledgement frontier (0.18–0.37 of the stage, reverted) and one from posted bytes
    (**0.91–1.05, §4.58, per lane, joining only when lanes are summed**). The socket delivers what
    is posted, so a pacer at the socket would pace a link that is not the constraint.
-7. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and `cpu_s_per_gbit`
+6. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and `cpu_s_per_gbit`
    against a same-round A/A.
 
 Settled and off the list: **one stream, one hop** (§4.47). Built, measured at eight
