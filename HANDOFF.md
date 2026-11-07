@@ -244,6 +244,66 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.56 The rate estimator failed its own pre-registration, and the window is not what limits this lane (2026-11-07)
+
+§4.55 pre-registered one thing: an estimator built from the acknowledgements the lane was
+already applying, and a test that it reproduces the stage's own measured throughput within
+**15 %** before any controller could be built on it. It was built and measured on the same
+shape as the baseline; **it fails**, and it fails by a factor rather than by a margin.
+
+`delivered` counted every byte an acknowledgement moved — both a retired range and a byte
+prefix, because the prefix is the main path on a healthy lane. Per lane, once a second,
+`delivered_mbit_per_s = delivered × 8 / µs`. Against the stage's own `throughput_gbps`:
+
+| stage | arm · round | stage (Mbit/s) | estimate p50 | ratio |
+|---|---|---|---|---|
+| `clean` | molehill · 0 | 9 204 | 3 273 | **0.36** |
+| `clean` | molehill~aa · 1 | 8 821 | 3 169 | 0.36 |
+| `clean` | molehill · 1 | 7 392 | 1 540 | 0.21 |
+| `jitter` | molehill~aa · 1 | 6 840 | 1 617 | 0.24 |
+| `rate100` | all four | 94 | 22–25 | 0.23–0.27 |
+| `rate20` | all four | 19 | 4–7 | 0.21–0.37 |
+
+**Every lane, every stage, 0.18–0.37.** A systematic factor of 3–5 is not noise and not a
+tuning problem: the number is measuring something else, or measuring it in the wrong unit.
+The one thing that would explain the whole column is that `delivered` follows the
+**frontier** while a large `buffered` backlog sits behind it, so the acknowledgement stream
+lags the send stream by the backlog's growth — which is a hypothesis, stated as one, and
+not measured.
+
+**What the same lines did establish, and it corrects §4.55.** The window line reports
+`cwnd = 262 144` (the ceiling), **`flight = 59 356`** and `buffered = 13.5 MB` on a lane
+carrying bulk. So the congestion window is *not* full: 59 KB is in flight against a 256 KB
+window, and 13.5 MB is queued in front of a pump that cannot carry it. §4.55's arithmetic —
+"`W / RTT` is 2.1 Gbit/s per lane, exactly what four lanes carry, so the window is full in
+both modes" — reproduces the *rate* from `ceiling / srtt` but the lane is not window-limited
+while it does so; it is **pump- and backlog-limited**, and `worst_unsent = 13 549 191` says
+the same thing on the stream that is furthest behind. The coincidence of numbers was real;
+the mechanism attached to it was not.
+
+**Both halves are recorded and the code is reverted**, per the pre-registration's own
+rollback clause: an estimator that does not reproduce an independent measurement may not
+feed a controller, and `just bench` must not pay for it either. What survives is the
+measurement — including the correction, which matters more than the estimator would have:
+**the release cell's carrier is not window-limited, it is limited by what the pump can
+hand to the socket while a 13 MB backlog waits.**
+
+**Next experiment, pre-registered before it runs.** The instrument that would settle which
+of the two is the constraint, with no control loop: per lane, once a second, **`posted`
+datagrams and their bytes** beside **`flight`** and **`buffered`**, and the pump's own
+`flush` duration in that same second (`PUMP_FLUSH` already exists and already reports
+per second — it is read, never joined to the window line). The question it answers is
+whether bytes are leaving the socket at the rate the acknowledgement frontier implies.
+
+- **Pass**: on a `clean` stage, the mean of `posted_bytes / elapsed` per lane lands within
+  15 % of the stage's `throughput_gbps`. If it does, the *send* path is not the constraint
+  and the backlog is on the receive side; if it does not, the socket hand-off is.
+- **Guard**: instrument-only, gated, one line a second; an instrumented run's `clean`
+  p50/p99 must not move beyond the A/A of the run it is compared with.
+- **Rollback**: the instrument charges for itself, or the number cannot be joined to a
+  stage's window (which is what made this round's reading possible at all — every line now
+  carries `lane`, `role` and the second's own boundary).
+
 ### 4.55 The clean stage's p99 tracks a lane-level mode: both carrier round trips scale together (2026-11-07)
 
 §4.54 left one question — why one binary reads 20.1 and 141.7 ms at p99 on the same stage
@@ -263,13 +323,12 @@ signature §4.44 measured between a good and a slow `cost` cell, now on the rele
 and with the leak fixed: the stage's p99 is not one bad visitor, it is a **lane-level
 mode** in which every one of the carrier's round trips is ~2.5× slower.
 
-**And the arithmetic of that mode is the window.** With `ceiling = 262 144` (256 KiB) and
-`srtt ≈ 1 004 µs`, `W / RTT` is 2.1 Gbit/s per lane — which is exactly the 8.4 Gbit/s four
-lanes carry. So at the good mode the lane is **window-limited and its queue is one
-millisecond**, by construction. A mode that doubles `paired` doubles the queue too, and
-since `W/RTT = rate` is an identity, a lane that drains slower holds the same bytes
-longer. The window is not misconfigured in either mode; it is *full* in both, and the mode
-difference is what the path delivers while full.
+**And the arithmetic of that mode looked like the window — it is not, and §4.56 corrects
+this.** `ceiling = 262 144` with `srtt ≈ 1 004 µs` gives `W / RTT` = 2.1 Gbit/s per lane,
+which is exactly what four lanes carry; that coincidence held, but the mechanism attached
+to it does not: the same window lines report **`flight ≈ 59 KB` against a 256 KB window**
+while 13.5 MB sits in `buffered`. The lane is not window-limited in that mode — it is
+limited by what the pump hands to the socket, with a backlog in front of it.
 
 **So the two levers left are named, and neither is a constant.** Either the window stops
 being the binding constraint (which §4.43–§4.44 measured as a latency/throughput trade
@@ -2264,14 +2323,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **A rate estimator on the acknowledgements already arriving** (§4.55, pre-registered
-   there). The clean stage's p99 tracks a lane-level mode in which both of the carrier's
-   round trips are 2.4–2.9× slower, and `W / RTT = rate` makes that the window being full
-   at whatever the path delivers — so the levers left are pacing, not another constant.
-   Instrument first: per lane, delivered bytes over one-second windows, printed beside
-   `cwnd`, `srtt` and `flight`. Its pass is that the estimate lands within 15 % of the
-   stage's own measured `throughput_gbps` on all four of §4.54's arm-rounds; a controller
-   built on an unvalidated estimator is the next mistake this file would make.
+1. **Name the constraint on the release cell's carrier: send path or backlog** (§4.56,
+   pre-registered there). The lane reports `flight ≈ 59 KB` against a 256 KB window and
+   13.5 MB in `buffered`, so it is **not** window-limited — §4.55's arithmetic reproduced
+   the rate from `ceiling / srtt` and attached the wrong mechanism to it. The estimator
+   built to steer a pacer failed its own 15 % test (it read 0.18–0.37 of the stage's
+   throughput on every lane and stage) and was reverted. Next is the direct question: per
+   lane, once a second, `posted` bytes beside `flight` and `buffered`. If `posted/elapsed`
+   reproduces the stage throughput, the send path is fine and the backlog is on the receive
+   side; if it does not, the socket hand-off is the constraint.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
@@ -2290,15 +2350,13 @@ curve and a RACK rewrite that no measurement had asked for yet.
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-7. **D (delivery-rate) moves up to item 1's follow-on, and its old reason is refuted.**
-   This item used to say "the clean cell never fills the window". §4.55 measures the
-   opposite: `ceiling` 262 144 with `srtt ≈ 1 004 µs` gives 2.1 Gbit/s per lane against the
-   8.4 Gbit/s four lanes carry, so the window **is** the binding constraint on the release
-   cell and its queue is one millisecond by construction. What the earlier claim got right
-   is narrower: the cell never *suffered* from an under-sized window, which is why three
-   attempts to change the size failed. A controller is wanted for the opposite job — to
-   stop the queue forming while keeping the window full — and it waits on item 1's
-   estimator passing its own validation.
+7. **D (delivery-rate) has no validated estimator, so it waits.** §4.56's estimator read
+   0.18–0.37 of the stage's own throughput on every lane and every stage and was reverted
+   under its own pre-registration. Nothing may steer on a number that disagrees with an
+   independent measurement by a factor of three. What item 1 establishes — whether the
+   constraint is the send path or a backlog — decides whether a controller is wanted at all:
+   a pacer cannot fix a pump that cannot fill the window, which is what `flight ≈ 59 KB`
+   against 256 KB suggests.
 8. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
