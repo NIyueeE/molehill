@@ -4220,22 +4220,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Four rounds of the capacity ramp at `--scale 1`** (§4.92, pre-registered there). The full-scale
-   run **reversed §4.91's finding**: `--scale 0.2` read **5 streams on mhd against 3 on TCP**, and
-   `--scale 1` reads **2 against 5** — same binary, same host, opposite verdict, with each run's ladder
-   coherent internally. So §4.91's "mhd is ahead on ④" is **withdrawn**, and what stands is narrower:
-   **capacity is a one-draw-per-rung metric whose two draws disagree in direction**, and the condition
-   needs a defined rounds/scale before it can be called. Neither draw reaches 8 for either arm. This
-   does not touch ① (still the pairing's stream open, §4.90). **Pass**: four draws all reach 8.
-   **If they spread 2–5**: ④ is not met and the statement is "N ± M, below 8/8", with *why the ramp
-   stops* opening as a new investigation. **Quote `capacity_headroom_pct` with every draw** — 75 % and
-   37.5 % already show two different ways to stop.
-   **Also recorded (§4.91)**: **③ passes** (`bulk-n` P8 mhd 8.63 vs TCP 8.22 Gbit/s, +5 % inside the
-   15 % band); `cpu_s_per_gbit` at **parity** on the bulk cell (1.158 vs 1.168); **memory is worse**
-   (153.6 vs 117.7 MiB, +31 %).
-2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
-   the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
-   carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
+1. **②'s peer half — the last condition that can still change a decision.** ④ is settled as an
+   **identity rather than a measurement** (§4.93): `run_capacity` stops at the first level whose
+   interactive SLO breaks, so `capacity_streams = k` means "at k bulk streams the p99 held and at k+1 it
+   did not", and `headroom` is `1 − k/8` — **④ is ① measured on another axis**. Four draws: mhd
+   **[1, 1, 1, 4]** (median 1, spread 300 %), TCP [2, 1, 2, 3] (median 2); neither anywhere near 8.
+   §4.92's reading of headroom ("two kinds of stop") is **withdrawn as arithmetic**. So ④ is not worked
+   separately: it closes when ① does. That leaves ②'s peer half, then ⑤ and ⑥.
+   **Peer half**: `just bench peers fetch`, then one `timeline` with mhd and the peers compared **per
+   series** (never pooled). **Pass**: mhd's p50/p90/p99 no worse than every peer on like workloads.
+   **Guard**: same-round A/A; a peer behind a different shaper is not a like workload.
 3. **A per-visitor spare channel stays refuted** (§4.20).
 4. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one: `loss1` and `loss5`
    report 1.06 s and 1.46 s of p99, which is where recovery, not setup, decides the number.
