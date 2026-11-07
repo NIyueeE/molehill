@@ -4525,6 +4525,25 @@ is now recorded with a stored baseline to compare against next time.
 > deleted. When a phase lands, write its result in §4 and update the plan file in
 > place.
 
+**Where the plan stands (2026-11-07).**
+
+| phase | state |
+|---|---|
+| 0 — measurement apparatus | **landed**: `src/probe.rs` (pool-less lane seam), `bench/transport_harness` (L1/L2), the gate wiring that makes a compiled bench member un-skippable, and the first two findings (§4.99, §4.100) |
+| 1 — recovery accounting and lifecycle | not started |
+| 2 — no duplicate open ack | not started; screening is L3, not L2 (§3.6 of the plan) |
+| 3 — RACK / PTO / liveness | not started |
+| 4 — re-attribution | not started |
+| 5 — throughput and resources | not started |
+
+**Next step, and it is not phase 1 yet.** Phase 0 found a ~21 ms tail in the bare carrier that
+appears in about one request in five, is quantised, and is *not* the stream open, the reader's
+wake-up or the send buffer's dwell (§4.100). Three candidates are left and one instrument separates
+them: epoch-microsecond stamps at the client's build, the client's post and the server's dispatcher
+receive, joined to the client's own `first_us`. That runs before phase 1 because it may reorder the
+plan: if the tail is a lost pump signal, phase 1's accounting work is not what fixes the arrival
+path, and §4.1's history says a timer constant is not it either.
+
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
 commit with its own A/B and its own revert.
