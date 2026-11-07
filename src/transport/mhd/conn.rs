@@ -2685,6 +2685,11 @@ impl Conn {
             self.apply_ack(now, ack, sampled);
         }
         match packet.frame {
+            // Nothing above consumes a datagram frame yet: the wire class exists so the
+            // service layer can be built on it, and until then a datagram arrives, is
+            // recognised and is dropped without touching a stream, a credit or the
+            // recovery table (HANDOFF §4.71).
+            wire::Frame::Datagram { .. } => return Ok(()),
             Frame::None => {}
             Frame::Stream {
                 id,

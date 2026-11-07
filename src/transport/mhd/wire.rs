@@ -84,6 +84,8 @@ pub(crate) const STREAM: usize = 14;
 pub(crate) const CREDIT: usize = 8;
 /// stream id + reason.
 pub(crate) const RESET: usize = 5;
+/// The datagram frame's fixed part: the layer's `u32` id, then the payload.
+pub(crate) const DATAGRAM: usize = 4;
 
 /// The most stream bytes a reliable frame can carry.
 pub(crate) const MAX_STREAM_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - STREAM;
@@ -107,6 +109,20 @@ pub(crate) enum Kind {
     Credit = 2,
     /// One stream is finished early.
     Reset = 3,
+    /// Unreliable payload for a datagram service, addressed by a layer id.
+    ///
+    /// **The class the v5 dialect was emptied of and this one needs.** A UDP service
+    /// has nothing to gain from ordering or from a repair: a datagram that arrives late
+    /// is a datagram the application has already given up on, and re-sending it costs
+    /// the lane's credit that the *next* datagram needs. So this frame carries no
+    /// stream offset, takes no packet number (`FLAG_UNNUMBERED`), never enters the
+    /// recovery table and never touches connection credit — the loss is the
+    /// application's to absorb, exactly as it would be on the wire without a tunnel.
+    ///
+    /// `id` is opaque to the carrier: the service layer assigns it per visitor and
+    /// reads it back on arrival, so the carrier never learns or cares which socket it
+    /// was.
+    Datagram = 4,
 }
 
 impl Kind {
@@ -116,6 +132,7 @@ impl Kind {
             1 => Some(Self::Stream),
             2 => Some(Self::Credit),
             3 => Some(Self::Reset),
+            4 => Some(Self::Datagram),
             _ => None,
         }
     }
@@ -308,6 +325,13 @@ pub(crate) enum Frame<'a> {
         /// Why.
         code: ResetCode,
     },
+    /// Unreliable payload for a datagram service (see [`Kind::Datagram`]).
+    Datagram {
+        /// The layer's own id for this datagram's destination.
+        id: u32,
+        /// The bytes, exactly as the application handed them over.
+        data: &'a [u8],
+    },
 }
 
 impl Frame<'_> {
@@ -318,6 +342,7 @@ impl Frame<'_> {
             Self::Stream { data, .. } => STREAM + data.len(),
             Self::Credit { .. } => CREDIT,
             Self::Reset { .. } => RESET,
+            Self::Datagram { data, .. } => DATAGRAM + data.len(),
         }
     }
 
@@ -327,8 +352,22 @@ impl Frame<'_> {
             Self::Stream { .. } => Kind::Stream,
             Self::Credit { .. } => Kind::Credit,
             Self::Reset { .. } => Kind::Reset,
+            Self::Datagram { .. } => Kind::Datagram,
         }
     }
+}
+
+/// A datagram frame's body: a fixed-width id, then whatever bytes are left.
+///
+/// Its own function because `decode` is at the line budget. There is no length field on
+/// purpose: a datagram has no offset and nothing to reassemble, so a truncated one is
+/// simply a shorter datagram — which is what "unreliable" means at this layer.
+fn datagram_frame(buf: &[u8], at: usize) -> Result<Frame<'_>, Malformed> {
+    let end = at.checked_add(DATAGRAM).ok_or(Malformed)?;
+    let id = buf.get(at..end).ok_or(Malformed)?;
+    let id = u32::from_le_bytes(id.try_into().map_err(|_| Malformed)?);
+    let data = buf.get(end..).ok_or(Malformed)?;
+    Ok(Frame::Datagram { id, data })
 }
 
 /// A packet that could not be decoded.
@@ -366,7 +405,7 @@ pub(crate) fn encode(
     }
     if matches!(
         frame,
-        Frame::None | Frame::Credit { .. } | Frame::Reset { .. }
+        Frame::None | Frame::Credit { .. } | Frame::Reset { .. } | Frame::Datagram { .. }
     ) {
         // Nothing here is retransmitted, so nothing here may hold a number the
         // peer's frontier would wait for (see `FLAG_UNNUMBERED`).
@@ -386,6 +425,10 @@ pub(crate) fn encode(
     }
     match frame {
         Frame::None => {}
+        Frame::Datagram { id: layer, data } => {
+            buf[at..at + 4].copy_from_slice(&layer.to_le_bytes());
+            buf[at + 4..at + 4 + data.len()].copy_from_slice(data);
+        }
         Frame::Stream {
             id,
             offset,
@@ -629,6 +672,7 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
             let code = ResetCode::from_bits(code).ok_or(Malformed)?;
             Frame::Reset { id: stream, code }
         }
+        Kind::Datagram => datagram_frame(buf, at)?,
     };
     Ok(Packet {
         id,
@@ -689,6 +733,10 @@ mod tests {
                 id: 5,
                 code: ResetCode::Aborted,
             },
+            Frame::Datagram {
+                id: 0xdead_beef,
+                data: &data,
+            },
             Frame::None,
         ];
         for frame in cases {
@@ -699,6 +747,31 @@ mod tests {
             assert_eq!(packet.ack, Some(ack));
             assert_eq!(packet.frame, frame, "frame {frame:?} must survive");
         }
+    }
+
+    /// A datagram frame takes no packet number and never reaches the recovery table.
+    ///
+    /// The one property the class exists for: a lost datagram must not leave a hole in
+    /// the peer's cumulative frontier, or the sender's flight would never retire and the
+    /// next datagram would pay for a repair the application does not want.
+    #[test]
+    fn a_datagram_frame_is_unnumbered() {
+        let data = [7u8; 1200];
+        let frame = Frame::Datagram { id: 9, data: &data };
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let written = encode(&mut buf, 1, 424_242, None, frame).unwrap();
+        assert!(
+            buf[0] & FLAG_UNNUMBERED != 0,
+            "a datagram frame must not consume a packet number"
+        );
+        let packet = decode(&buf[..written]).unwrap();
+        assert_eq!(
+            packet.number, 424_242,
+            "the number repeats the last data packet"
+        );
+        assert_eq!(packet.frame, frame);
+        // A payload that fills a datagram is the size the class is for.
+        assert_eq!(written, HEAD + DATAGRAM + data.len());
     }
 
     /// A packet without an acknowledgement block is four bytes shorter and says

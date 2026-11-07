@@ -244,6 +244,48 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.71 Phase 3 begins: the datagram frame class exists on the wire (2026-11-07)
+
+The first increment of the unreliable-datagram work is in, and it is deliberately only the wire.
+
+**`Kind::Datagram = 4`** with `Frame::Datagram { id, data }`: a fixed-width `u32` layer id
+followed by whatever bytes are left. Three properties are chosen rather than inherited, and each
+one is there because a datagram is not a stream:
+
+- **it takes no packet number** (`FLAG_UNNUMBERED`). A lost datagram that held a number would leave
+  a hole in the peer's cumulative frontier, and the sender's flight would then never retire — the
+  next datagram would pay for a repair the application has already given up on;
+- **it never enters the recovery table and never touches connection credit**. That is what the
+  §4.58 measurement says is worth having: the socket already delivers what is posted, so the cost
+  the UDP path pays today is the *bookkeeping* around each datagram (ARQ record, credit, stream
+  offset), not the wire;
+- **there is no length field.** A truncated datagram is a shorter datagram; nothing above it
+  reassembles anything, so there is nothing a length would protect.
+
+`a_datagram_frame_is_unnumbered` pins the first property from the encoded bytes, and the existing
+`every_frame_round_trips` now carries a datagram case with a non-trivial layer id and payload.
+
+**What this commit does not do, stated so it is not mistaken for the feature.** The receive path
+recognises a datagram frame and **drops it** — `Conn::apply_datagram` returns before touching a
+stream, a credit or the recovery table. Nothing produces one yet, and nothing above the carrier can
+deliver one, so **the UDP data plane is still the framed-into-a-reliable-stream path of §4.58** and
+every measurement in this file still describes that path. The class exists so the service layer can
+be built on it; it is inert until then.
+
+**Next increment, pre-registered.** Deliver a datagram to the layer above: a per-lane `id ->|
+channel` table filled by the service layer, a `Frame::Datagram` produced by `poll_transmit` when one
+is queued, and a receive path that hands the payload to the table's channel instead of dropping it.
+
+- **Pass**: a paced UDP session (`udp-pace`) carried natively reports **fewer** `rx_datagrams` of
+  bookkeeping than the framed path at the same offered rate — measured as retransmits and credit on
+  the lane staying at their idle values while the datagrams flow. If either moves, the frame is
+  still paying for reliability somewhere and the increment is not done.
+- **Guard**: the TCP visitor's `clean` p50/p99 must not move (a datagram service shares the lane and
+  its pump); `just bench gate`'s endpoint invariant must still hold.
+- **Rollback**: a datagram path that needs a retransmit, or a `clean` stage that moves beyond the
+  run's own A/A, means the class cannot share a lane with the reliable one as designed and the
+  increment is reverted whole.
+
 ### 4.70 Sealing costs 3.13× per packet, so the AEAD is the cost and the switch stays off (2026-11-07)
 
 §4.69 re-measured both arms on one shape and **kept both logs** (`pp-on-server.log`,
