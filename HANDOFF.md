@@ -351,6 +351,55 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.87 Two designs refuted before they were written, and the wait is flat in flight (2026-11-07)
+
+§4.86 pre-registered a reserve of depth 1 per service. Three measurements taken before writing it —
+two of them from logs already on disk — say it cannot work, and they re-aim the problem.
+
+**1. A depth-1 reserve cannot hold the tail, by arithmetic.** From the same run: the clean window's
+visitor arrival rate is **34.1/s** (36 in a median second), so the inter-arrival is **27.8 ms**; the
+refill is the open, which costs **11.7 ms at p50 but 114.7 ms at p99**. A single-flight depth-1
+reserve is therefore *empty* whenever a refill lands in its tail, and the fraction of visitors who
+still wait is roughly `refill / inter_arrival` — so the p50 improves and **the p99 barely moves**,
+which is the one number condition ① is written on. Covering the p99 needs a depth of about
+`114.7 / 27.8 ≈ 4`, and at that depth the drain rate is exactly what §4.20 measured as "the belt is
+fed faster than it is consumed". **The reserve is not the fix, and this is known before any code.**
+
+**2. Preferring an opening stream in the picker cannot help either.** `next_stream_range` could be
+taught to serve a stream in its `opening` phase first, which is cheap and tempting. But §4.84 measured
+the sender's queue at **25 µs** — the handshake's packets already leave this end immediately. What
+they wait behind is the **socket's own buffer**, already filled with bulk, and no ordering chosen at
+pick time reorders bytes the kernel has accepted. A sender-side priority scheme is sorting the
+wrong queue, and §4.82's lesson (a queue that is not where the wait is) applies unchanged.
+
+**3. And the wait is not a queue at all.** Joining each slow pairing to the total flight in its
+second:
+
+| flight half | median flight | pairing `wait` p50 |
+|---|---|---|
+| lower | 299 478 B | **12 078 µs** |
+| upper | 2 308 139 B | **11 553 µs** |
+
+**7.7× the bytes in flight buys 0.96× the wait.** So the 11.7 ms is *not* the handshake queueing
+behind bulk data — it is **roughly constant under load**. A constant ~12 ms is a timer or a
+scheduling quantum, not a queue, and it sits on the client: the join in §4.86 says the client *starts*
+dialling inside a millisecond, and what is unmeasured is the span from starting the dial to the
+channel being established (`spawn_data_channel` → handshake done → hello).
+
+**Next increment, pre-registered.** Measure that span on the client: from the `mhd channel open
+started` stamp to the moment the channel is established, reported as its own histogram beside the
+existing line.
+
+- **Pass**: that span is ~12 ms and roughly flat in bulk load (the same flatness test as above).
+  Then the open's cost under load is the **client's runtime** giving the new task small slices while
+  it forwards bulk, and the fix is in how the client shares its runtime — not in the pool, not in the
+  lane, and not in a reserve.
+- **If the span is small** (say 1–2 ms), then the 12 ms is *before* the client's dial after all, the
+  §4.86 join's 1 ms resolution was hiding it, and the next place is the control session's own queuing
+  on the client side.
+- **Guard**: instrument only, behind `MOLEHILL_MHD_STATS`; no behaviour change.
+- **Rollback**: none needed — nothing to revert but the reporter.
+
 ### 4.86 The join: the client acts at once, and the open itself costs 11.7 ms under bulk (2026-11-07)
 
 §4.85 pre-registered joining both ends on the group id. **The join was designed into the tree and
@@ -3871,16 +3920,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **A reserve of depth 1 per service — the experiment §4.20 said was unrun** (§4.86,
-   pre-registered there). The join is done and it excludes the last alternative: the server asks, the
-   client **starts dialling in the same millisecond** (p50 −1 µs, which is the 1 ms resolution), and
-   then **11 664 µs** passes before the channel arrives — p99 **114 749 µs**. So the control hop is
-   0.6 % and **the open is 99.4 %**, at seven times its idle cost (§4.68's 557–1 610 µs), because a
-   handshake is several round trips on a lane saturated with bulk. §4.20 refuted one spare **per
-   visitor** and explicitly left "a reserve of a fixed small depth, refilled only when the pool is
-   empty" unrun. **Pass**: `clean` p99 below TCP's same-round figure and the pairing `wait_us` p50 out
-   of the 11.7 ms region, with `rr-1`, `rr-16` and `churn-16` — the three cells §4.20 lost on —
-   unchanged. **Rollback**: any of those moving, or `loss5`/`jitter`.
+1. **Measure the client's open span** (§4.87, pre-registered there). Two candidate designs were
+   refuted before being written. A **depth-1 reserve** cannot hold the p99: inter-arrival is
+   **27.8 ms** (34.1 visitors/s) while the refill is 11.7 ms at p50 but **114.7 ms at p99**, so
+   covering the tail needs depth ≈ 4 — exactly §4.20's "belt fed faster than consumed". **Picker
+   priority for opening streams** cannot help either: the sender's queue is **25 µs** (§4.84), so the
+   handshake already leaves at once and waits in the socket's buffer, which no pick-order can reorder.
+   And the wait is **not a queue**: joining each slow pairing to the flight in its second gives
+   **12 078 µs at 0.30 MB against 11 553 µs at 2.31 MB** — 7.7× the bytes for 0.96× the wait. A
+   constant ~12 ms is a timer or a scheduling quantum, and it sits on the **client**, whose dial start
+   is already known to be prompt. Measure `spawn_data_channel` → established.
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
