@@ -1344,6 +1344,22 @@ impl Conn {
             .is_some_and(|state| state.reset.is_none())
     }
 
+    /// Whether anyone could still be waiting on this connection.
+    ///
+    /// The pump asks this to decide whether it may sleep for the keepalive or
+    /// must look at its socket more often: a lane with no live stream has no
+    /// visitor to be late for, while one that is carrying something has a reader
+    /// whose latency is bounded by how quickly the pump notices a datagram
+    /// (`pump::READ_POLL`, `HANDOFF.md` §4.101).
+    ///
+    /// A reset stream is not live: both directions are over and it stays in the
+    /// table only until its finish is acknowledged. An *abandoned* one still
+    /// counts — its handle is gone but its bytes are still owed to the peer, so
+    /// the pump keeps looking promptly until it retires.
+    pub(crate) fn has_live_streams(&self) -> bool {
+        self.streams.values().any(|state| state.reset.is_none())
+    }
+
     /// Take bytes a stream has received, answering how many were written.
     ///
     /// The caller's own buffer is filled directly. Staging the prefix in a

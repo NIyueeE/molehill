@@ -14,7 +14,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 
@@ -679,9 +679,38 @@ enum Wake {
     Closed,
 }
 
+/// How long a pump with live streams may sleep without looking at its socket.
+///
+/// **A bound on a recovery cost, not a fix for its cause.** A lone datagram
+/// arriving on a parked pump is sometimes not seen until the pump's own timer
+/// fires, and that timer is the retransmission deadline: 20 ms with one packet in
+/// flight. Measured on loopback (`HANDOFF.md` §4.101), the boundary is exact — a
+/// 1 349-byte request (one datagram) stalls 19–23 times in 120, and a 1 350-byte
+/// request (two datagrams) never does, because a second datagram is a second
+/// readiness edge and one of them is always seen.
+///
+/// So the pump is given a ceiling on how wrong its wake-up may be. One millisecond
+/// is 2 % of the 50 ms arrival budget and two orders below the 20 ms it replaces,
+/// and it costs a wake-up per millisecond **only while a stream is open**: a lane
+/// with nothing on it has no visitor to be late for, and keeps waiting for the
+/// keepalive as it always did. Bulk lanes never reach this bound at all — they
+/// are always sending, so they never park.
+///
+/// The alternative was to find the lost edge inside `tokio`'s readiness
+/// bookkeeping. That search is worth doing, but it must not gate the latency of
+/// every visitor while it happens.
+const READ_POLL: Duration = Duration::from_millis(1);
+
 /// Wait for whichever of the three reasons to look again comes first.
 async fn wait(shared: &Arc<Shared>) -> Wake {
-    let deadline = shared.with(|conn| conn.poll_timeout());
+    let deadline = shared.with(|conn| {
+        let base = conn.poll_timeout();
+        if !conn.has_live_streams() {
+            return base;
+        }
+        let cap = Instant::now() + READ_POLL;
+        Some(base.map_or(cap, |at| at.min(cap)))
+    });
     let timer = async {
         match deadline {
             Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,

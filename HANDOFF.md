@@ -430,17 +430,40 @@ is the number and why it is the same on both ends and in both directions.
 **Why this matters more than the number.** A fresh visitor's first request is exactly one small
 datagram. That is the shape the SLO cell measures, and it is now the shape this defect selects for.
 
-**Next, with its pass criterion fixed before the code exists.** The fix is to stop relying on one
-readiness edge: after a pass that read nothing, re-check the socket before parking, and drain until
-`WouldBlock` rather than until the first short batch. It passes when `--size 1349 --requests 200
---stream-mode reuse` goes from ~19/120 slow to **0/120** while `--size 1350` stays at 0 and the
-`first_us` median does not move by more than the run's own scatter. It fails and is reverted if the
-median regresses or if any packet-count cell grows a new tail.
+**The fix, and it passed the criterion it was given before it existed.** The pump now caps its own
+sleep at `READ_POLL` = 1 ms **while a stream is live** (`Conn::has_live_streams`: any stream not
+reset), so a lost readiness edge costs a millisecond instead of a retransmission deadline. A lane
+with nothing on it keeps waiting for the keepalive exactly as before, and a bulk lane never reaches
+the cap because it never parks.
 
-**Still not claimed.** That the edge is missed *inside tokio's readiness bookkeeping* rather than
-somewhere in `pump.rs`'s own pass loop. The instrument that would separate those is one line per
-pump pass naming the `select!` arm that woke it, and it is only worth adding if the drain-until-
-`WouldBlock` change fails its criterion.
+| 200 requests, one reused stream | slow (>5 ms) | p50 | p99 | max |
+|---|---|---|---|---|
+| 1 349 B, before | 19 / 120 | 533 µs | — | 22 167 µs |
+| **1 349 B, after** | **0 / 200** (twice) | 306–409 µs | 2 637–2 742 µs | 2 680–2 761 µs |
+| 1 350 B, before | 0 / 120 | 506 µs | — | 1 255 µs |
+| 1 350 B, after | 0 / 200 (twice) | 350–431 µs | 611–636 µs | 852–1 020 µs |
+
+The median did not move and the two-datagram cell did not grow a tail, which were the other two
+halves of the criterion.
+
+**The CPU trade was measured rather than assumed, and it goes the other way.** 3 000 requests of
+1 349 B, same binary, only `READ_POLL` changed:
+
+| | user | sys | wall | slow |
+|---|---|---|---|---|
+| poll off (3 600 s) | 1.218 s | 0.232 s | 5.819 s | 200 |
+| poll on (1 ms) | **0.790 s** | **0.156 s** | **1.314 s** | **0** |
+
+Less CPU with the poll, because the stall it removes was itself expensive: a 21 ms park buys a
+retransmission timer, a re-send and a wake of every reader. What this does **not** measure is a lane
+that is *idle with a stream open* — an SSH session doing nothing — where the poll is pure cost at up
+to 1 000 wake-ups a second per lane. That cell is the `cpu_cores` and `rss_peak_mib` guardrail of the
+next milestone run, not of this one, and it is named here so it cannot be forgotten.
+
+**The cause is still not fixed, only bounded.** The lost edge is somewhere between `drain_ready`'s
+bare `try_io` and the `select!` that follows it; a cap makes a lost wake cheap, it does not stop it
+being lost. Finding it is worth a round of its own and no visitor's latency depends on that round
+happening first.
 
 One caveat on `wakes_while_parked`: it counts pump **passes**, because `flush` wakes every reader on
 its way out, so it can never tell a data wake from a timer pass. It was used above only to note that
