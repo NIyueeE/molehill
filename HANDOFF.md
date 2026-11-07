@@ -244,6 +244,54 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.62 The flush fork closes: both readings were right, for different seconds (2026-11-07)
+
+§4.61 left two instruments 27× apart. Printing **raw** microseconds beside the normalised ones
+(`flush_raw`, `flush_per_pass`) and splitting the stage's lane-seconds by load settles it:
+
+| lane-seconds | n | passes/s | packets/s | flush per pass | flush share | gap share |
+|---|---|---|---|---|---|---|
+| idle (54 of 98… see below) | — | ~650 | ~280 (0.4/pass) | **1 µs** | 0.1 % | 0 % |
+| **busy (>20 k packets)** | 72 | 8 700–9 500 | 383 000–408 000 | **43–48 µs** | **40–45 %** | **26 %** |
+
+So the "2.2 %" line of §4.61 and the "74 µs" of §4.60 were both measuring real seconds:
+**a second in which the pump mostly runs empty passes costs 1 µs a pass; a second in which it
+runs full 44-packet runs costs 43–48 µs a pass.** The stage is an interleaving of the two, which
+is why a single line and a single histogram disagreed. Aggregated over the *busy* lane-seconds:
+
+```
+passes=509 890  packets=18 247 401  flush_raw=31 184 190us of 72 134 302us lane-time
+=> 61 µs per pass, flush 43.2 % of the second, gap 25.6 % -- 69 % of the lane's time in the loop
+=> 253 000 packets/s per lane, against a stage of 8.27 Gbit/s
+```
+
+**Three statements this fixes, and one it leaves open.**
+
+- **The pump is neither parked nor saturated**: 43 % flush + 26 % gap leaves ~31 % parked in
+  `wait()`. So §4.61's "parked 96 %" was the low-load seconds and §4.60's "build cost is the
+  constraint" is closer, but neither is the whole picture.
+- **1 µs per packet stands** (43–48 µs for ~44 packets), which matches §4.60's 1.5 µs estimate
+  closely enough that the number is now measured twice by different routes.
+- **The `PUMP_FLUSH` p50 of 20 µs understates a busy lane** by 2–2.4×, because the histogram's
+  median is taken over every pass including the empty ones. A p50 over *full* runs is the number
+  that means anything, and it is not what the histogram reports.
+- **Open**: the gap is 26 % of a busy second in aggregate but 5–7 µs at p50 — so its distribution
+  is tail-dominated, and nothing has looked at that tail. It is the second-largest term and it
+  has never been described.
+
+**Next experiment, pre-registered before it runs.** Give `gap` a p99 and a max per lane per
+second (it is already sampled per pass; only the aggregation is missing), and split the gap into
+its two halves by stamping **before and after the `yield_now`**.
+
+- **Pass**: on busy lane-seconds the gap's p50 is under 20 µs while its p99 is above 200 µs —
+  then the tail is a scheduling delay on a small fraction of passes and the fix is where the
+  pump is descheduled, not in the loop.
+- **If the gap's p50 is above 100 µs on busy seconds**: the 26 % is uniform and the pump is
+  giving up the worker every pass; that is the §4.46 tension again, now with a number attached.
+- **Guard**: instrument-only, one line a second; `clean` p50/p99 inside §4.54's two-arm spread.
+- **Rollback**: the yield split cannot be done without two clock reads per pass on a hot path —
+  in which case only the p99/max are added and the split is dropped as too expensive.
+
 ### 4.61 The cycle is now per lane, and it says the pump is parked most of the second (2026-11-07)
 
 §4.60's instrument, made per lane: `Conn` carries its own `passes`, `pass_packets`, `flush_us`,
@@ -2595,15 +2643,13 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Close the flush-share fork** (§4.61, pre-registered there). The packet accounting now
-   closes exactly — 853 349 pkts/s × **1 387** B/packet = 9.47 Gbit/s, the stage, after the
-   payload guess was corrected from 1 348 and the log was filtered to the stage window. That
-   also closed §4.60's 1.6× as an artefact and showed the lanes are wildly asymmetric
-   (315 187 / 274 / 325 750 / 212 391 pkts/s), so dividing a process total by four was wrong.
-   **But the two flush instruments disagree by 27×**: the per-lane line reads 22 µs/1 000 µs
-   (2.2 %, i.e. 2.8 µs a pass) while the process-wide `PUMP_FLUSH` reads p50 74 µs a pass
-   (59 % busy at 7 960 passes/s). They point in opposite directions, and one of them decides
-   whether the pump or the sender is the subject.
+1. **Describe the gap's tail, which is the second-largest term and has never been read**
+   (§4.62, pre-registered there). The flush fork closed: both readings were right for different
+   seconds. On **busy** lane-seconds (72 of 98 in a clean stage) the pump spends **43 % in flush
+   and 26 % in gap**, leaving ~31 % parked — so it is neither parked (§4.61) nor saturated
+   (§4.60), and 1 µs per packet is now measured twice by different routes. The gap is 5–7 µs at
+   p50 yet 26 % in aggregate, so its **distribution is tail-dominated and nothing has looked at
+   the tail**. Add p99/max per lane per second, and split the gap either side of the `yield_now`.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says

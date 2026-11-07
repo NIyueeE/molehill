@@ -342,8 +342,15 @@ fn format_cycle(passes: &(u64, u64, u64, u64, u64)) -> String {
             .checked_div(interval_us)
             .unwrap_or(0)
     };
+    // **Both the raw and the normalised form.** Reconstructing one from the other is
+    // where this file's arithmetic has slipped four times: the raw microseconds and the
+    // pass count give `flush µs per pass` directly, and that is the same quantity the
+    // process-wide `PUMP_FLUSH` histogram reports — the number that decides whether the
+    // pump is busy or parked (HANDOFF §4.61).
+    let per_pass = flush_us.checked_div(count).unwrap_or(0);
     format!(
-        "n={count} packets={packets} flush={}us/1000 gap={}us/1000 of {interval_us}us",
+        "n={count} packets={packets} flush_raw={flush_us}us flush_per_pass={per_pass}us \
+         flush={}us/1000 gap_raw={gap_us}us gap={}us/1000 of {interval_us}us",
         per_1000(flush_us),
         per_1000(gap_us),
     )
