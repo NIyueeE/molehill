@@ -351,6 +351,53 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.80 The join: the slow request waits in `echo`, and its lane is carrying megabytes (2026-11-07)
+
+§4.79's pre-registration joined the above-SLO round's slow requests to the lane-seconds they ran in.
+Round 1 of `pivot1` is the above-SLO round (`clean` p99 81.09 ms, max 147.36 ms); all three quarters
+of the join already existed.
+
+**Where the time goes, first.** The worst request spent **147.2 of its 147.4 ms in `echo_ms`**, with
+`connect_ms` at **0.15 ms**. The next two are the same shape (121.9 of 122.1; 85.6 of 85.7). So the
+visitor's connection is opened promptly and the carriage is what is slow — the shape §4.46 recorded.
+
+**What the lanes were doing in those seconds: busy and healthy.** In the 147 ms request's second,
+three lanes carried 221 k / 265 k / 332 k packets, with `yield_raw` at 203 / 175 / 218 ms (**17–22 %**,
+the §4.63 baseline is 19.3 %) and gap proportionally normal. **So this is not a scheduling stall**, and
+§5's item 2 (the wake path) is **not** what this round indicates. A lane that was descheduled would
+show yield far above its baseline or a parked second; neither appears.
+
+**What did stand out is `flight`.** In those three seconds the largest flight was **4 392 344 /
+1 726 720 / 652 916 bytes** — where §5 has claimed since §4.6x that "`flight ≈ 59 KB` is exactly one
+run and the window never fills". Across the whole clean window it reads:
+
+```
+flight range: 59 356 .. 7 834 992 bytes     seconds under 100 KB: 2 of 23
+flight >= 1 MB : n=9   worst-request mean 76.1 ms   worst 147.4
+flight <  1 MB : n=14  worst-request mean 50.0 ms   worst  85.7
+```
+
+**Two facts, and the first is a correction to a standing claim.** The window on this cell is *not*
+irrelevant: `flight` spans two orders of magnitude inside one clean stage, and **only 2 of 23 seconds
+are anywhere near the 59 KB the file has been quoting**. That figure is true of the *best* seconds —
+which is where most of the file's per-second instrumentation was read, because those are the seconds
+that look clean.
+
+**The second is directional, not decisive.** Seconds with ≥ 1 MB in flight show a 1.5× worse
+worst-request latency (76.1 against 50.0 ms, n=9 and n=14). That is a real direction and the right
+mechanism — a request arriving while megabytes are outstanding waits behind them — but 1.5× is not
+the 9× of §4.79, so queueing behind bulk is **part of** the variance, not all of it.
+
+**What this decides.** §5 item 4 (phase C, priority scheduling) was conditional on "first prove the
+bulk spine is pushing interactive's tail". **This is that proof**, in the only form the file accepts:
+a same-lane, same-second join, with `echo` carrying the time and `flight` carrying the megabytes. C
+moves from *conditional* to *indicated*. It is still not scheduled ahead of the TCP comparison,
+because C changes scheduling for every service and should be decided with ②'s numbers in hand.
+
+**And what it rules out.** The wake path (§5 item 2) is not indicated: the slow seconds were not
+parked and their yield was at baseline. Chasing the pump's wake-up would have been a detour that this
+join, cheap as it was, prevented.
+
 ### 4.79 The release cell moves 9× between adjacent rounds of one run (2026-11-07)
 
 One arm, two rounds, one binary, one shape, nothing changed between them:
@@ -3528,18 +3575,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Join the p99 request against the lane-second it happened in** (§4.79, pre-registered there).
-   Two rounds of one run read `clean` p99 **9.01 ms** and **81.09 ms** — a 9× swing with no change of
-   binary, session, shape or clock, so condition ① is a coin flip per cell against this distribution
-   and more rounds only price the coin. What is open is the **variance**, and its shape has been
-   recorded since §4.46 (both carrier round trips slow 2.4–2.9× together, visitor first-byte
-   unchanged ⇒ a lane-level mode ⇒ a stall, not congestion). The next measurement crosses instruments
-   that already exist: take the above-SLO round's p99 request and join it against **the same
-   lane-second's** `cycle=` and window line. **Pass**: that second is one the lane spent **parked**
-   (or `yield` far above 19 %) ⇒ the stall is scheduling, the fix is the pump's wake path.
-   **Otherwise**: the delay is above the lane and the next instrument moves there.
-   **Guard**: absolute timestamps on both sides (the run records `group` ids); an above-SLO round
-   without a matched request is skipped, never averaged.
+1. **The TCP comparison (condition ②), with phase C now indicated** (§4.80). The join answered and
+   changed the plan: the slow requests spend their time in `echo` (147.2 of 147.4 ms; `connect` 0.15),
+   their lanes were **busy and healthy** (yield 17–22 %, baseline 19.3 %) so **not a scheduling stall**,
+   and `flight` in those seconds was **0.65–4.4 MB**. Across the clean window flight spans
+   **59 KB .. 7.8 MB with only 2 of 23 seconds under 100 KB** — so the file's standing "`flight ≈ 59 KB`,
+   window irrelevant" is true only of the **best** seconds. Seconds with ≥ 1 MB in flight show a **1.5×**
+   worse worst-request latency (76.1 vs 50.0 ms, n=9/14): directional and the right mechanism, but not
+   the 9×. So **phase C (priority scheduling) moves from conditional to indicated**, and the wake path
+   (old item 2) is **ruled out** by this join. C is still not first: it changes scheduling for every
+   service, so it is decided with ②'s numbers in hand.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
