@@ -14,6 +14,113 @@ Read `AGENTS.md` first for the rules; read this for the state.
 ## 1. Current state
 
 | fact | value |
+
+### 1.1 Archive: the cost gate as it stood on 2026-10-27
+
+Kept because these numbers exist nowhere else: they are the only measurement of
+`cpu_s_per_gbit` in the tree, and §5's phase 6 is judged on that metric. The plan that
+follows this section (six phases, approved 2026-11-06) replaced the sequence this block
+ends with; the *measurements* are still evidence.
+
+- a lost wake-up between a reader's empty read and its park (the stream parked
+  until the pump's next timer — measured as a 450 ms stall per forwarded
+  channel);
+- `on_timeout` being run on every pump wake-up instead of only on the timer
+  (a retransmission of everything in flight on each write, which is a storm);
+- the reordering window collapsing to zero on a loopback RTT (every packet
+  looked lost the moment any ack arrived — now floored at 1 ms);
+- an EOF reported as soon as a FIN arrived, even with a hole before it
+  (a bulk transfer under loss truncated at the first hole);
+- a half-close (`Reset(Finished)`) stopping the *sender's* writes too, which
+  truncated every echo whose reply direction outlived the forward direction;
+- a graceful close that could drop a refusal written just before the lane was
+  marked dead (the valve test's peer waited out its budget);
+- a listener whose dispatchers and admitted lanes kept `SO_REUSEPORT` sockets
+  bound after server shutdown (a restarted server shared the port with a table
+  nobody read);
+- GSO eligibility and partial `sendmmsg` accounting (a run that could not be
+  segmented as one super-packet must fall back whole, and a partial send must
+  resume, never silently drop the rest).
+
+**Verification so far.** `githooks/pre-push` (the whole chain: audit, deny,
+outdated, the serial test suite) is green on `3e8f095`. `cargo test --lib`:
+300 pass (21 in the new engine, including a 100-round-trip Noise stream and an
+8 MiB stream behind a slow reader). `integration_test`: 22/22 pass with
+`MOLEHILL_DATA_CARRIER=mhd` and 22/22 with `=tcp` (serial, separate runs), and
+the striped bulk transfer test ran 12 times in a row. `pool_test` (default
+carrier), `status_api_test`, `log_budget_test`, `session_test`,
+`startup_failure_test`, `noise_keys_test` and `hot_reload_test` are green.
+`pool_test` under a *forced* `tcp` still fails the three tests that use the
+diagnostic cross-carrier handover hatch (the server never binds UDP when the
+client declares TCP); that is a harness/diagnostic interaction, not a data-path
+failure, and the forced modes the release gate names are the integration
+suite's.
+
+**Still open, in order:**
+
+1. **The cost gate was measured and it fails — this is the stop condition.**
+   Two `screen` runs with `--aa` on this host, 2026-10-27, the same method
+   fingerprint (`2bdcdece60a72f0c`), binaries built from `3e8f095`; results
+   (outside the tree, raw evidence beside them):
+   `/home/dsh/tmp/bench-20261027-150525.json` (TCP) and
+   `/home/dsh/tmp/bench-20261027-151428.json` (mhd).
+
+   - **TCP carrier:** `l4` clean cost **0.650 s/Gbit** (11.97 Gbit/s, 7.67
+     cores); `l4~aa` 0.635 (12.22 Gbit/s) — the run's own floor on that cell is
+     **2.4 %**, far below the 15 % materiality floor. `l3` 0.209 s/Gbit
+     (21.2 Gbit/s).
+   - **mhd carrier:** the **`l4` arm does not complete**. The warm-up clean
+     cell timed out after 106 s; every measured round then failed in 3–7 s with
+     `iperf3 error: control socket has closed unexpectedly` (three clean
+     samples, plus the `l4~aa` copy failing the same way, so the failure is the
+     carrier and not one build). The `l3` arm completed at **4.21 s/Gbit**
+     (0.55 Gbit/s), three samples spread 3.22–4.80 — a 49 % spread, so the run
+     cannot resolve anything there either. The raw arm logs are under
+     `/home/dsh/tmp/bench-20261027-151428/round1/arm-l4/` (`client.log`,
+     `server.log`): registration and the four-lane mhd pool succeed, then the
+     iperf3 control connection through the L4 path is lost before any
+     measurement.
+   - **Therefore `cpu_s_per_gbit(mhd) ≤ TCP` is NOT established**, and the l3
+     number is ~20× TCP's on the same run. Per the plan's P2 stop condition,
+     the sequence stops here. The remaining phases (P3b/P3c, P4, P5, P6) are
+     not started, and no cost or tail claim may be made about `mhd`.
+   - **Open question this leaves for the human:** the L4-over-mhd control
+     connection dies under the bench's six-service, TCP+UDP-shared-port,
+     namespaced topology while the integration suite passes the same path in
+     one process. The next step is to reproduce that topology (or run the bench
+     arm with `RUST_LOG=debug` on both daemons) and find out whether it is the
+     lane's pool placement under many concurrent visitor channels, the
+     shared-port service pair, or something the bench path does that loopback
+     does not. A real number is not available until that cell completes.
+   - The earlier note that the screen profile does not measure
+     `cpu_s_per_gbit` was wrong: its `cost` scenario is the headline owner of
+     that metric. The failure is the arm's clean cell, not the profile.
+2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
+   not yet wired into the UDP-forwarding and transparent paths; the header MAC,
+   the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`
+   accounting on the client and the `SessionHealth`/carrier-rule evidence are
+   not done. `mhd` streams currently carry those paths through the reliable
+   stream, which is correct but loses the loss-isolation win.
+3. **P4/P5/P6** — rate-based congestion control, adaptive FEC, bench arms and
+   the bilingual docs sweep are untouched. The docs pages were updated only
+   where the swap made them false (structure, transport's Noise paragraph,
+   internals' definitions); the benchmark numbers and carrier claims still
+   describe the pre-swap method and must be rewritten with the new arms.
+
+The two failed attempts that preceded this swap are why the server side is
+generic over `DataChannel` today; the type-level fixes they produced are in the
+commit history (`ba303aa`, `6a584d0`), and the decision they argued for — a
+generic serve path, not one trait object for both carriers — is now the shape of
+the code.
+
+### 1.0.0: the KCP carrier becomes `mhd` (branch `feat/v1.0.0`, from tag v0.11.2)
+
+The carrier is being rebuilt on its own code rather than another project's
+name, in six gated phases. Landed so far, each green through the fast gates
+and the full serial suite:
+
+| Commit | What |
+
 |---|---|
 | branch | `feat/v1.0.0` (never tagged; no release has been cut) |
 | version | `Cargo.toml` `1.0.0` |
