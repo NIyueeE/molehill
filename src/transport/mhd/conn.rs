@@ -606,6 +606,24 @@ pub(crate) struct Conn {
     posted_at: Instant,
     posted_at_report: u64,
     posted_datagrams_at_report: u64,
+    /// This lane's own pass counters: passes, packets built, and the two waits.
+    ///
+    /// **Per lane, and that is the point again.** The process-wide versions cannot be
+    /// divided by the number of lanes: `posted_mbit_per_s` already showed the lanes are
+    /// not symmetric, so "19 207 flushes a second over four lanes is 208 µs each" was
+    /// arithmetic over an assumption (HANDOFF §4.60). Reported once a second, so this
+    /// costs two adds per pass and nothing per packet.
+    passes: u64,
+    pass_packets: u64,
+    flush_us: u64,
+    gap_us: u64,
+    /// This lane's own interval clock.
+    ///
+    /// **Not `posted_at`.** The first version reused it and `posted_rate` — called a few
+    /// lines earlier in the same window report — had just set it to `now`, so the
+    /// interval came out zero and every line printed `cycle=n/a` for a whole run. Two
+    /// independent samples need two independent clocks.
+    pass_at: Instant,
     /// Datagrams this connection has posted and read, cumulative.
     ///
     /// Per connection because the process-wide pair cannot say *which* lane loses
@@ -829,6 +847,11 @@ impl Conn {
             posted_at: now,
             posted_at_report: 0,
             posted_datagrams_at_report: 0,
+            passes: 0,
+            pass_packets: 0,
+            flush_us: 0,
+            gap_us: 0,
+            pass_at: now,
             received_total: 0,
             numbers_seen: 0,
             numbers_acked: 0,
@@ -2431,6 +2454,51 @@ impl Conn {
     /// the original record is held until its number is acknowledged or
     /// [`LOST_HOLD`](super::recovery) expires) or the flight is real and the
     /// window is not a bound. These three distinguish them without a rebuild.
+    /// Record one pass of this lane's pump.
+    ///
+    /// Called once per flush and once per gap, so two adds per pass and nothing per
+    /// packet. What it keeps is the cycle's whole shape: passes, packets, and
+    /// microseconds of flush against microseconds of gap.
+    pub(crate) fn note_pass(&mut self, built: usize, flush: std::time::Duration) {
+        self.passes = self.passes.saturating_add(1);
+        self.pass_packets = self
+            .pass_packets
+            .saturating_add(u64::try_from(built).unwrap_or(u64::MAX));
+        self.flush_us = self
+            .flush_us
+            .saturating_add(u64::try_from(flush.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    /// Record the post-to-next-pass gap of this lane.
+    pub(crate) fn note_gap(&mut self, gap: std::time::Duration) {
+        self.gap_us = self
+            .gap_us
+            .saturating_add(u64::try_from(gap.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    /// This lane's pass counters since the last read, with the interval they cover.
+    ///
+    /// Reported in the same per-lane line as `cwnd` and `srtt`, so "how long a pass
+    /// takes here" and "how much of the second that accounts for" are one subtraction
+    /// apart (HANDOFF §4.61).
+    pub(crate) fn take_passes(&mut self, now: Instant) -> (u64, u64, u64, u64, u64) {
+        let interval = u64::try_from(now.saturating_duration_since(self.pass_at).as_micros())
+            .unwrap_or(u64::MAX);
+        self.pass_at = now;
+        let out = (
+            self.passes,
+            self.pass_packets,
+            self.flush_us,
+            self.gap_us,
+            interval,
+        );
+        self.passes = 0;
+        self.pass_packets = 0;
+        self.flush_us = 0;
+        self.gap_us = 0;
+        out
+    }
+
     pub(crate) fn flight_and_buffered(&self) -> (u64, u64, usize) {
         (
             self.recovery.flight_bytes(),

@@ -244,6 +244,55 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.61 The cycle is now per lane, and it says the pump is parked most of the second (2026-11-07)
+
+§4.60's instrument, made per lane: `Conn` carries its own `passes`, `pass_packets`, `flush_us`,
+`gap_us` and a **separate** `pass_at` clock, and the window line prints
+`cycle=n=… packets=… flush=…us/1000 gap=…us/1000 of …us`. It is filled once per flush and once
+per gap, so two adds per pass and nothing per packet.
+
+**Two instrument bugs were fixed in building it, both caught by reading output rather than
+by review.** The first version reused `posted_at` for the interval, which `posted_rate` — a
+few lines earlier in the same report — had just set to `now`, so every line printed
+`cycle=n/a` for a whole run: two independent samples need two independent clocks. And
+`report_window` went over its line budget twice before the cycle rendering and the Mbit/s
+conversion were each lifted into a named helper.
+
+**What the lines say, one second of one lane, verbatim:**
+
+```
+cycle=n=523 packets=15524 flush=22us/1000 gap=14us/1000 of 1000019us
+```
+
+That is **flush 2.2 % and gap 1.4 % of the second** — 3.6 % together. If that sample is
+typical, then **~96 % of the lane's second is spent in `wait()`, i.e. the pump is parked**
+with nothing to send, and the throughput is set by whoever *fills* it — the stripe send
+loop — not by the pump's build cost. That would overturn §4.60's reading ("throughput is
+packets per microsecond of build") the same way §4.60 overturned §4.59's.
+
+**It is recorded as a candidate, not a conclusion, because my own arithmetic slipped twice
+getting it.** Aggregating the stage, I computed "1.70 Gbit/s from `packets × 1 348` against a
+stage reading of 9.47", and separately printed `flush=0.0 %` because I divided an
+already-normalised per-1000 number by a raw interval. Both are the §4.58 family — a number
+used without its denominator — and the rule in this objective says compute it once before
+believing it. **A per-lane packet count and a stage throughput disagreeing by 5× is either a
+payload-size mistake (a run carries 44 frames of up to 1 348 bytes each, not 44 × 1 348) or a
+window mismatch, and the next step settles which.**
+
+**Next experiment, pre-registered before it runs.** A reconciliation, in the bench's own
+terms, of three independent measures of the same bytes on a `clean` stage: the stage's
+`throughput_gbps`, Σ per-lane `posted_mbit_per_s` (§4.58, already validated at 0.91–1.05), and
+Σ per-lane `packets × mean_datagram_bytes` from the cycle line. It needs one extra field —
+**bytes per packet** beside `packets` — so the payload assumption stops being an assumption.
+
+- **Pass**: all three agree within 10 %. Then the cycle shares stand as measured and the
+  conclusion is that the pump is parked 96 % of the second, which makes the **stripe send
+  loop** the next subject rather than the pump.
+- **If they do not**: the disagreeing pair names which instrument is wrong, and that
+  instrument is fixed or withdrawn before anything is built on it.
+- **Guard**: instrument-only, one line a second; `clean` p50/p99 inside §4.54's two-arm
+  spread. **Rollback**: the third number cannot be produced without touching a hot path.
+
 ### 4.60 The gap is microseconds, so the yield is not the cost — and one number does not close (2026-11-07)
 
 §4.59's instrument, measured on the same shape:
@@ -2512,36 +2561,40 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Make the two pass counters per lane, then read the cycle** (§4.60, pre-registered
-   there). The gap instrument settled §4.59's question on its failure branch: after posting a
-   full run the pump is polled again in **5–7 µs** (p90 13), so the `yield_now` costs nothing
-   measurable and `SEND_RUN` remains the only loop-shape lever, ruled out by the latency it
-   costs. The cycle is `flush` — 63–74 µs at p50 for 44 packets, 1.5 µs per packet.
-   **But one number does not close**: four lanes at 19 207 flushes/s implies a 208 µs cadence
-   while flush+gap is 80 µs, and `passes`/`flush` are still **process-wide** counters — the
-   same defect §4.57 fixed for `posted_datagrams_per_s`. Make them per lane and report
-   flushes, flush p50 and gap p50 per lane per second; pass if per-lane flushes × flush p50
-   accounts for the second within 25 %. Then the next move is inside `flush`: the per-packet
-   build cost, which is the throughput ceiling on this cell.
-2. **A lane root that is actually usable** (phase A: implemented, default off). The
+1. **Reconcile three measures of the same bytes, then read the cycle** (§4.61,
+   pre-registered there). The per-lane `cycle=` line now exists, and a sample reads
+   `n=523 packets=15524 flush=22us/1000 gap=14us/1000 of 1000019us` — flush 2.2 % and gap
+   1.4 % of the second, which would mean the pump is **parked about 96 % of it** and the
+   throughput is set by whoever fills it (the stripe send loop), not by the build cost
+   §4.60 named. That is **not** a conclusion yet: aggregating the stage I got
+   `packets × 1 348` = 1.70 Gbit/s against a stage reading of 9.47, and printed `flush=0.0 %`
+   by dividing an already-normalised number by a raw interval — two more of the family
+   §4.58 named. Add **bytes per packet** beside `packets`, then check three independent
+   measures of the same bytes (the stage's `throughput_gbps`, Σ per-lane
+   `posted_mbit_per_s`, Σ per-lane packets × mean datagram bytes) against 10 %.
+2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
+   second means the queue is never filled fast enough, and that moves the subject from the
+   pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says
+   which number was wrong.
+3. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
    design reads well. §4.10's and §4.13's numbers decide its default afterwards.
-3. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
+4. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
    (`wire.rs` says so), so a UDP service is framed into a reliable stream and pays
    an ARQ, a route map, two worker queues and a Noise record for a packet that must
    not be retransmitted at all. Only after 1 and 3, and never as a second fallback.
-4. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
+5. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
-5. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
+6. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
    `loss1` and `loss5` report 1.06 s and 1.46 s of p99, which is where recovery, not
    setup, decides the number.
-6. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
+7. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-7. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built:
+8. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built:
    one from the acknowledgement frontier (read 0.18–0.37 of the stage, reverted under its
    own pre-registration) and one from posted bytes (**0.91–1.05, §4.58, and it is per lane
    and only joins when the lanes are summed**). So a *rate is measurable* — but the pass
@@ -2549,7 +2602,7 @@ curve and a RACK rewrite that no measurement had asked for yet.
    would be pacing a link that is not the constraint. Item 1 decides whether a controller is
    wanted at all; if the pump stops for a budget reason, the fix is in the budget, not in a
    rate.
-8. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
+9. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
 Settled and off the list: **one stream, one hop** (§4.47). Built, measured at eight

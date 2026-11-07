@@ -202,6 +202,11 @@ fn report_window(shared: &Arc<Shared>) {
         let (built, process_posted_now) = crate::transport::stats::take_datagrams();
         let _ = process_posted_now;
         let (posted_bytes, posted, posted_us) = conn.posted_rate(now);
+        // This lane's own pass cycle, beside the numbers it explains: how many passes,
+        // how many packets, and the microseconds of flush against the microseconds of
+        // gap — so "how long is a pass here" and "how much of the second is it" are one
+        // subtraction apart (§4.61).
+        let cycle = format_cycle(&conn.take_passes(now));
         let received = crate::transport::stats::take_received_datagrams_per_s();
         // Inside the same `with` as everything else: a second `with` here would
         // take the same lock and deadlock the pump (which is exactly what it did).
@@ -234,6 +239,7 @@ fn report_window(shared: &Arc<Shared>) {
         // post, and the sealed striped stall has neither.
         let worst = conn.worst_stream();
         tracing::debug!(
+            cycle = %cycle,
             worst_stream = worst.map_or(0, |w| w.id),
             worst_next = worst.map_or(0, |w| w.next),
             worst_written = worst.map_or(0, |w| w.written),
@@ -269,10 +275,7 @@ fn report_window(shared: &Arc<Shared>) {
             // microsecond is 8 Mbit/s, so no further divisor. (The first version
             // divided by a million as well and printed zero on every lane for a
             // whole run — the kind of unit error this file now has a rule about.)
-            posted_mbit_per_s = posted_bytes
-                .saturating_mul(8)
-                .checked_div(posted_us)
-                .unwrap_or(0),
+            posted_mbit_per_s = mbit_per_s(posted_bytes, posted_us),
             received_datagrams_per_s = received,
             own_below,
             first_posted = first_posted.unwrap_or(0),
@@ -314,6 +317,38 @@ fn report_window(shared: &Arc<Shared>) {
     });
 }
 
+/// Bytes over an interval, as Mbit/s: a byte per microsecond is 8 Mbit/s.
+///
+/// Its own function after the first version divided by a further million and printed
+/// zero on every lane for a whole run (HANDOFF §4.57) — the arithmetic is stated once,
+/// here, with the unit in the name.
+fn mbit_per_s(bytes: u64, us: u64) -> u64 {
+    bytes.saturating_mul(8).checked_div(us).unwrap_or(0)
+}
+
+/// One lane's pass cycle, rendered for the window line.
+///
+/// A string rather than five fields because `report_window` is at its line budget and
+/// because the four numbers are read together: passes, packets, and the microseconds of
+/// flush against the microseconds of gap, normalised per 1 000 µs of interval so two
+/// lanes with different interval lengths can be compared (HANDOFF §4.61).
+fn format_cycle(passes: &(u64, u64, u64, u64, u64)) -> String {
+    let (count, packets, flush_us, gap_us, interval_us) = *passes;
+    if interval_us == 0 {
+        return "n/a".to_owned();
+    }
+    let per_1000 = |us: u64| {
+        us.saturating_mul(1000)
+            .checked_div(interval_us)
+            .unwrap_or(0)
+    };
+    format!(
+        "n={count} packets={packets} flush={}us/1000 gap={}us/1000 of {interval_us}us",
+        per_1000(flush_us),
+        per_1000(gap_us),
+    )
+}
+
 async fn flush(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -321,6 +356,7 @@ async fn flush(
     staging: &mut Staging,
 ) -> std::io::Result<usize> {
     let Staging { run, spans } = staging;
+    let pass = std::time::Instant::now();
     let build = crate::transport::stats::Timing::start(crate::transport::stats::enabled());
     while spans.len() < SEND_RUN {
         let now = Instant::now();
@@ -341,6 +377,10 @@ async fn flush(
     // companion to `note_none_reason`, and together they say whether a pass ends on
     // the run's cap, on a budget, or on the walk finding nothing (§4.58).
     crate::transport::stats::note_pass_built(spans.len());
+    // **Per lane**, from inside `flush` itself: the process-wide line cannot be divided
+    // by a lane count the measurement does not justify (§4.60), and this is the same
+    // number attached to the connection that owns it.
+    shared.with(|conn| conn.note_pass(spans.len(), pass.elapsed()));
     if spans.is_empty() {
         // Nothing was built. Two causes look identical from outside and are
         // fixed in different places: the state machine refused every packet (a
@@ -375,6 +415,7 @@ async fn flush(
                 );
             }
         }
+        shared.with(|conn| conn.note_pass(0, pass.elapsed()));
         return Ok(0);
     }
     let sent = spans.len();
@@ -718,7 +759,9 @@ fn spawn_sender(
                 crate::transport::stats::note_pump_pass(started.elapsed());
             }
             if let Some(at) = posted_full.take() {
-                crate::transport::stats::note_pass_gap(at.elapsed());
+                let gap = at.elapsed();
+                crate::transport::stats::note_pass_gap(gap);
+                shared.with(|conn| conn.note_gap(gap));
             }
             staging.clear();
             let flushing = std::time::Instant::now();
