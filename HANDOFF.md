@@ -351,6 +351,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.98 Same round, sealing buys 0.8 ms of p50 and nothing of the tail (2026-11-07)
+
+§4.97 concluded from §4.68's numbers that sealing ON would give `clean` p50 1.64 / p99 16.00 and still
+lose to the peers. **That comparison crossed runs and the p99 was wrong.** The same four arms were then
+run in one round with `MOLEHILL_MHD_SEAL=1`, so the two molehill columns below differ only in that
+switch:
+
+| `clean` | p50 | p99 | carried |
+|---|---|---|---|
+| molehill, sealing **off** | 2.82 | 33.06 | 7.48 |
+| molehill, sealing **on** | **2.03** | **31.62** | **5.00** |
+| frp | **1.02** | **1.53** | 6.28 |
+| rathole | **1.04** | **1.75** | **28.27** |
+
+**Sealing, measured in one round: p50 −28 %, p99 −4 %, throughput −33 %.** The tail does not move. §4.68's
+"p99 16.00 against 125.01" was a cross-run pair whose OFF arm sat in a bad draw — the same trap §4.88
+paid for, in the opposite direction: there the tail sample was used as a median, here a tail
+**improvement** was read off two runs instead of one.
+
+So the correction makes the conclusion stronger, not weaker: **the priced fix recovers 0.79 ms of a
+1.80 ms p50 gap and leaves p99 at 31.6 ms against the peers' 1.5–1.8** — 19× out, with a third of the
+throughput gone. §4.97's direction stands, its p99 figure is withdrawn, and option B of the decision
+point is now measurably worse than it was described.
+
+**One thing to keep, because it is a failure the guard caught.** The sealing-ON `clean#2` cell reports
+`ok=False` with **zero carried**: the zero-carry guard from `c8ac062` refused it rather than letting a
+0.0 Gbit/s stage score a fast latency. That is the second time this campaign the guard has turned a
+silent empty stage into a stated failure.
+
+**And the p50 movement is worth quoting as the measured effect-size of the whole lane-root idea**: 28 %,
+on the one statistic this file trusts most, for a third of the throughput. Everything else §4.83–§4.96
+measured about the open stands unchanged.
+
 ### 4.97 Even the priced fix does not reach the peers, which settles ①② as unattainable (2026-11-07)
 
 Every section above closed one question and left the same one open: *the per-visitor open is the gap,
