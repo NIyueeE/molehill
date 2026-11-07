@@ -2889,16 +2889,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Phase 2: the lane root, and the wedge that has kept it switched off** (§4.10, §4.13,
-   §4.66). The build-path line is closed: a packet costs **1.73–1.76 µs**, four candidates are
-   measured and excluded (pick 0 %, cursor advance 0 %, copy 0.3 %, recovery record 17.7 %), and
-   the remaining 82 % is a dozen small costs — recorded as a measured cost of the design, not a
-   gap. `SEND_RUN` is ruled out by the latency order and the yield is priced (§4.46). So the next
-   real work is the carrier's: reproduce `MOLEHILL_MHD_SEAL=1`'s multi-stripe wedge, join both
-   ends on stream, direction and packet, and fix only a root cause that can be proved.
-   **Guard for any future "the instrument is free" claim**: two arms, eight rounds —
-   one-round runs on this cell differ by 36 % in stage throughput (§4.66), so a 5 % guard
-   cannot be settled at one round.
+1. **Decide sealing with interleaved pairs** (§4.67, pre-registered there). Phase 2's
+   precondition is met: the multi-stripe wedge **does not reproduce** — six passes of six under
+   `MOLEHILL_MHD_SEAL=1`, against the 3-of-6 recorded in §4.13 — and both ends agree on one
+   distinct transcript per lane, which is what `(lane hash, direction, stream id)` needs. And the
+   first pair of runs shows the trade the priority order is about: the open falls from **1 494 to
+   513 µs** (`paired_p50`) and the clean cell's p99 from **125.01 to 16.00 ms**, while throughput
+   falls on `loss1` (7.68 → 1.38 Gbit/s) and `jitter` (4.75 → 0.90) beyond what the swing
+   explains. Two single runs cannot decide it (§4.66), so: **ON · OFF · ON · OFF**, same shape,
+   pass if the open falls ≥ 30 %, `clean` p99 falls ≥ 30 %, and throughput is no worse than the
+   spread *between* the two ON runs and the two OFF runs.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says
