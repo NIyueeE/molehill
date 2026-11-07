@@ -351,6 +351,68 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.84 The tail is the pairing wait, not the data path — and every carrier instrument agrees (2026-11-07)
+
+§4.83 pre-registered one measurement before writing any scheduler: how long a byte waits in this
+end's send buffer. The instrument already existed — `stats::note_dwell` has been called on every
+wait since it was written — and had **never been printed**; this round added the reporter and ran
+once.
+
+**Every carrier-side number is microseconds, in a run whose cell p99 is 83.76 ms.**
+
+| instrument | value in this run |
+|---|---|
+| send-buffer dwell, server | median reported p99 **25 µs**, worst **7.0 ms** |
+| send-buffer dwell, client | **11 µs** |
+| pump's post to the socket | p99 **53 µs**, max **3.0 ms** |
+| parked pump after its wake | p99 **57 µs** |
+| request-to-reply turnaround (group) | p50 **658 µs**, max **3.6 ms** |
+| writes refused | by the **window** (cwnd), thousands — normal flow control |
+
+So the byte leaves this end promptly, the socket write is fast, and the wake is fast. **A
+sender-side scheduler cannot fix an 83 ms tail that the sender spends 25 µs on.** §4.83's second
+branch is the one that happened.
+
+**The instrument that does explain it was already in the log**, one line per second:
+
+```
+visitor arrival, split at the pairing n=32 paired_p50_us=1709 paired_p99_us=88533 first_p99_us=34
+```
+
+`paired` is the wait from a visitor arriving to a data channel being paired to it; `first` is the
+wait from the pairing to the first byte. **88.5 ms against 34 µs.** And the same line under each
+condition:
+
+| | pairing p99 | the cell's p99 |
+|---|---|---|
+| no bulk (§4.83's run) | **3.2 ms** | 3.08 / 3.10 / 3.41 / 3.31 ms |
+| with bulk (this run) | **88.5 ms** (worst per-second report 263 ms) | **83.76 ms** |
+
+**The pairing wait and the cell's p99 are the same number.** The visitor's request is not slow
+because data moves slowly; it is slow because **there is no data channel to move it on yet**, and
+under a bulk transfer the pool takes tens of milliseconds to produce one.
+
+**What this changes.** Phase C as it was scoped — class-aware scheduling *inside the lane* — would
+have measured a data path that is already fast and left the actual wait untouched. The work that
+remains is at the **pool**: how a visitor obtains a data channel while the tunnels it would take are
+busy carrying bulk. That is the subject §4.20 examined and refuted in a different form ("a fixed
+small reserve refilled only when the pool is empty"), and it is back with a number attached.
+
+**Next increment, pre-registered.** Find which of the three waits the pairing actually is, because
+they have different fixes: **(a)** waiting for a *free* tunnel in a pool that is all busy, **(b)**
+waiting for the client to *open* a new one (a control round trip plus the carrier's own open), or
+**(c)** waiting for the control channel or the client's task to be *scheduled*.
+
+- **Measure**: bracket the pairing on the server into "request sent to the client", "channel
+  arrived", "paired", and report each as its own histogram beside the existing `paired` line — the
+  instrument shape is already there and adds no clock to the data path.
+- **Pass**: one of the three accounts for ≥ 80 % of the 88.5 ms under bulk. Then the fix is known
+  before it is written, which is the whole point of this round's discipline.
+- **If it is (a)**: the pool needs a channel that is *not* carrying bulk — which is a scheduling
+  decision at the pool, not in the lane, and it is what a reserve is for.
+- **If it is (b) or (c)**: the fix is in how the client answers a channel request under load.
+- **Rollback**: instrument only; the unobstructed path must not move.
+
 ### 4.83 The bulk spine is the whole of condition ①, and the two distributions do not overlap (2026-11-07)
 
 §4.82 ended with the crude form of priority scheduling refuted and the precise form untested. Before
@@ -3713,16 +3775,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Locate the wait before scheduling: measure `pickup`** (§4.83, pre-registered there). The
-   `nobulk` experiment is decisive and it re-frames condition ①: **without the bulk spine the
-   `clean` cell's p99 is 3.08 / 3.10 / 3.41 / 3.31 ms** (four draws, 11 % spread), **with it
-   9.01 … 133.0 ms** — the ranges **do not overlap**, and the 15× variance collapses to 1.1×
-   without bulk. So bulk is the *cause*, the variance is a function of bulk occupancy rather than
-   ambient noise, and **the carrier alone already beats both the 50 ms SLO (by 15×) and TCP's
-   same-round 14.40 ms (by 4×)**. Before writing a scheduler, measure how long a byte waits in
-   this end's queue — `pickup_p50/p99/max`, one sample per waiting episode per lane. If it is tens
-   of milliseconds the fix is in the sender; if it is microseconds the wait is downstream and a
-   sender-side scheduler would fix nothing. **Rollback**: the instrument costs >5 % throughput.
+1. **Split the pairing wait into its three parts** (§4.84, pre-registered there). The tail is not
+   the data path: in a run whose `clean` p99 is 83.76 ms the send-buffer dwell is **25 µs** (p99),
+   the socket post **53 µs**, the wake **57 µs**, the group turnaround **658 µs** — while
+   `paired_p99` is **88.5 ms** against `first_p99` of **34 µs**. And without bulk the pairing p99 is
+   **3.2 ms**, matching the 3.08–3.41 ms cell. **So phase C as scoped (in-lane scheduling) would
+   have measured a fast path and missed the wait.** Measure which of (a) no free tunnel, (b) waiting
+   for the client to open one, (c) control-channel scheduling, accounts for the 88.5 ms.
+   **Pass**: one accounts for ≥80 %. **Rollback**: instrument only.
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
