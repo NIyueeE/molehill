@@ -100,20 +100,28 @@ take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 | 7 | bench model | `just bench-selfcheck` | the performance model's own rules: metric registry, verdicts, comparability (see "The performance model", below) |
 | 8 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
 | 9 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
+| 10 | clippy (harness) | `cargo clippy -p mhd-transport-harness --all-targets -- -D warnings` | the bench's protocol-level harness (`bench/transport_harness`), a workspace member that links this crate: gates 8 and 9 build only the default members, so without this row a change on either side can break the tool silently |
 
 Note the template difference: clippy runs twice (default features, then
 `server,client` only) instead of once with `--all-features`, because the
 second pass covers the minimal no-default-features build that the
 default-feature pass never compiles. `just check` runs the identical chain.
 
+Gate 10 exists because the harness is a **second package in the same
+workspace**: it shares `Cargo.lock` (so it is built from the versions the
+product ships, not a fresh resolution) but not the default-member selection
+(so the product's clippy passes never see it). `githooks/benches-only` matches
+that: a `.rs`, `Cargo.toml` or `Cargo.lock` anywhere under `bench/` is **not** a
+benches-only change, because it is code that is compiled.
+
 ## On every branch push — `githooks/pre-push`
 
 | # | Gate | Command | Purpose |
 |---|------|---------|---------|
-| 10 | audit | `cargo audit` | RustSec security advisories |
-| 11 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
-| 12 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
-| 13 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
+| 11 | audit | `cargo audit` | RustSec security advisories |
+| 12 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
+| 13 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
+| 14 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
 
 Tests run **serially** (`--test-threads=1`): the integration suite spawns real
 server/client pairs on fixed ports; parallel execution races on them.

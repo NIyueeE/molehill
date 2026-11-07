@@ -7,7 +7,10 @@
 #
 # What this buys: the fast gate (githooks/pre-commit) compiles nothing for
 # such a change. The project is runtime tooling — run via `uv run` or as
-# plain shell — they are not compiled, linked, or depended on by any Rust
+# plain shell — with one exception, `bench/transport_harness`, which is a Cargo
+# package in this workspace: a `.rs`, `Cargo.toml` or `Cargo.lock` under bench/
+# therefore classifies as NOT benches-only, so the cargo gates run for it.
+# Everything else there is not compiled, linked, or depended on by any Rust
 # target, so `cargo fmt`, `cargo machete` and both clippy passes cannot move;
 # the quality gates that CAN move (ruff, pyright, the bench-model
 # selfcheck, the docs gate that keeps model.py's registry and
@@ -33,6 +36,14 @@ while IFS= read -r path; do
   case "$path" in
     bench/*|benches/records/*) ;;
     *) benches_only=0 ;;
+  esac
+  # ...except anything under it that is *compiled*. The bench project is runtime
+  # tooling with one exception: `bench/transport_harness` is a real Cargo package
+  # in this workspace, so a change there can break a build that the skipped
+  # cargo gates would have caught. Matching by shape rather than by path keeps
+  # that true for the next helper nobody has written yet.
+  case "$path" in
+    *.rs|*/Cargo.toml|*/Cargo.lock) benches_only=0 ;;
   esac
 done
 

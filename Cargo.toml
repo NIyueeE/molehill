@@ -10,6 +10,21 @@ readme = "README.md"
 build = "build.rs"
 include = ["src/**/*", "tests/**", "LICENSE", "README.md", "build.rs"]
 
+# One workspace, one `Cargo.lock`, one dependency resolution.
+#
+# The bench's protocol-level harness (`bench/transport_harness`) links this
+# package, so it must be built from the *same* resolved versions the product
+# ships: a harness that resolved its own `tokio` would report the latency of a
+# library nobody deploys, and the two numbers would look comparable while
+# describing different software. `publish = false` on that member keeps it out
+# of the crate; membership is about the lock, not about shipping it.
+#
+# The default members remain just this package (`cargo build` at the root does
+# not build the harness), so nothing about the ordinary build changes. The
+# harness is built by name: `cargo clippy -p mhd-transport-harness`.
+[workspace]
+members = ["bench/transport_harness"]
+
 [[bin]]
 name = "molehill"
 path = "src/main.rs"

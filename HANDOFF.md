@@ -367,6 +367,63 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.100 The harness earned its keep on day one: two findings (2026-11-07)
+
+The protocol-level harness (§4.99) ran its first real workload — 64-byte echo, loopback, one
+fresh stream per request — and produced two results that are worth more than the tool.
+
+**1. Two clients share one lane id, and the server routes them into each other.** The carrier's
+connection id is allocated by a process-local counter (`multiplex::next_tunnel_id`, starting at
+0), and the listener's registry is keyed by that number **alone**. Three sequential probe clients
+against one server:
+
+| client | lane id | result |
+|---|---|---|
+| 1 | 1 | 20/20 ok |
+| 2 | 1 (counter restarts per process) | request 0 `early eof`, then every open `the lane is gone` |
+| 3 | 1 | the same |
+
+The server never admitted lanes 2 and 3: its table already held id 1, so their datagrams were
+delivered to the first client's connection — which accepted them, because `apply_datagram` only
+rejects a packet whose id differs from its own. Passing distinct `--lane-id` values fixed the
+probe (3 runs, 20/20 each). **The product has the same allocator**: `establish_one_mhd_tunnel`
+takes `next_tunnel_id()` and hands it to `MhdLane::dial` as the wire id, so the first lane of
+*every* client process is id 0. Two clients behind one server therefore collide, and the
+consequence is not a refused lane but one lane receiving another's packets. Not yet demonstrated
+with two real daemons; the code path is the same one the probe exercised.
+
+**2. The first stream on a fresh lane costs 21–22 ms on loopback, and the server is not slow.**
+Three fresh lanes, three runs, same numbers:
+
+| what | value |
+|---|---|
+| `lane_setup` (dial) | 89–133 µs |
+| `open` (carrier stream) | 24–72 µs |
+| `post` (request written) | 38–97 µs |
+| **`first_us`, request 0** | **21 227 / 21 966 / 22 158 µs** |
+| `first_us`, requests 1–3 | 370–648 µs |
+| server `read_us`, request 0 | **7 µs** |
+| server `write_us`, request 0 | **13 µs** |
+
+The tail is on every fresh lane, but not on the lane's creation (`lane_setup` is 0.1 ms) and not
+on the first *request's* open — it is the first *exchange* that pays it. The 20 ms is the same
+number as `SMALL_FLIGHT_INITIAL_RTO` and `MIN_RTO_SMALL_FLIGHT`, and §4.1 already records that two
+one-constant A/Bs on those constants moved `churn-16` by nothing, so a match is a reason to look,
+not a finding.
+
+**What is excluded and what is not.** The server's `read_us`/`write_us` are microseconds, so the
+echo was cheap once the handler ran; but `read_us` starts *inside* the handler, so those two
+numbers cannot distinguish "the handler started 21 ms late and found the bytes already buffered"
+from "the echo left immediately and took 21 ms to come back". Three candidates remain, and they
+have different fixes: (a) the accepted stream's handler task was scheduled late, (b) the echo's
+packet was repaired by the small-flight timer, (c) the client's reader was woken late.
+
+**Pre-registered next experiment.** One exchange with absolute epoch-microsecond stamps on both
+ends — the join key `stats::epoch_us` already provides for the pairing line — plus
+`MOLEHILL_MHD_STATS=1` so the retransmit counters can speak. Pass: the four stamps are monotone
+and their sum equals the client's `first_us`, which names one of (a)/(b)/(c) outright. Rollback:
+none needed; this is an instrument, not a change.
+
 ### 4.99 The carrier can be measured without the pool; the tunnel open cannot (2026-11-07)
 
 The approved plan's phase 0 asks for a measurement that separates *what the carrier costs* from

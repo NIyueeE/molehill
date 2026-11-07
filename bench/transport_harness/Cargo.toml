@@ -1,0 +1,29 @@
+[package]
+name = "mhd-transport-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The bench's protocol-level carrier harness: raw TCP against the mhd carrier, with nothing above either of them."
+
+[[bin]]
+name = "transport-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+# The subject. Default features are the point: the probe seam is gated on `mhd`,
+# and the harness must measure the build the product ships, not a variant.
+molehill-rathole = { path = "../.." }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+# The same core set the library denies: a measurement tool that can panic on a
+# missing value is a measurement that stops for a reason nobody wrote down.
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
+todo = "warn"

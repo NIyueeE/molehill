@@ -67,4 +67,10 @@ cargo clippy --all-targets -- -D warnings
 echo "==> cargo clippy (server+client only — minimal no-default-features build)"
 cargo clippy --all-targets --no-default-features --features server,client -- -D warnings
 
+# The workspace member that is a measurement tool, not the product. It links this
+# crate, so a change to either side can break it; `cargo clippy --all-targets`
+# above stays on the default members, which is the product alone.
+echo "==> cargo clippy (bench harness — the protocol-level measurement tool)"
+cargo clippy -p mhd-transport-harness --all-targets -- -D warnings
+
 echo "pre-commit checks passed"
