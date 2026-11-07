@@ -3061,13 +3061,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Phase 3: native unreliable datagrams** (§4.70 closes phase 2). Sealing is decided and the
-   answer is negative: it costs **9.12 µs per packet against 2.91** — **3.13×**, past the
-   pre-registered 2× — so the AEAD is the cost on this host, the switch stays off, and the release
-   record cites that ratio. The per-visitor handshake can go; the crypto that replaces it costs three
-   times the build. With that closed, the next carrier work is the datagram class this dialect
-   declares no frame for: a UDP service is framed into a reliable stream and pays an ARQ, a route
-   map, two worker queues and a Noise record for a packet that must not be retransmitted at all.
+1. **Deliver a datagram to the layer above** (§4.71, pre-registered there). The wire class is
+   in and inert: `Kind::Datagram = 4`, a fixed-width layer id plus payload, **no packet
+   number**, no recovery record, no credit. The receive path recognises one and drops it.
+   Next increment: a per-lane `id → channel` table filled by the service layer, a
+   `Frame::Datagram` produced by `poll_transmit` when one is queued, and a receive path that
+   hands the payload to that channel. **Pass**: a paced UDP session carried natively keeps the
+   lane's retransmits and credit at their idle values while datagrams flow; if either moves,
+   the frame is still paying for reliability somewhere. **Guard**: the TCP visitor's `clean`
+   p50/p99 must not move (the services share the lane and its pump). **Rollback**: a datagram
+   path that needs a retransmit, or a `clean` stage that moves beyond the A/A.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
