@@ -4311,17 +4311,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **⑤ the gate axes, then ⑥ the final-tree acceptance** (§4.94 closed ②). The peer comparison is
-   decisive and it is not favourable: on the release cells **mhd is 2.0–2.8× worse at p50** than every
-   peer (2.82 / 2.17 against 1.01–1.09) and 10–22× worse at p99, while being competitive only on the
-   shaped cells (`loss1` **1 046** against 1 055–1 085, the best of the four). The p50 gap is **1.80 ms**
-   and pairing p50 is **1 709 µs** — the same number: **every visitor pays for a channel open and the
-   peers do not.** That also explains the capacity stop level (§4.93), so ①, ② and ④ are one defect.
-   The only measured fix (lane root) costs **3.13× per packet** and would lose ③. **So ① and ② cannot
-   both be met by this design**, and the remaining rounds go to what is reachable: ⑤, ⑥, and a release
-   record that states this trade with these numbers.
-   (One number flagged unverified: rathole's 28.58 Gbit/s against mhd's 7.48 on one offered load is more
-   likely a load/accounting difference than a carrier result; the p50/p99 columns do not depend on it.)
+1. **⑥ the final-tree acceptance run** (§4.95 closed ⑤). The gate **passes** on the four-arm run:
+   coverage 36 triples, endpoint invariant on 32 samples, 2 SLO cells gated, 0 drowned cells, drift and
+   wedges checked, revision `v0.11.2-744-g7539b05` (regression half unrun — no baseline supplied).
+   §4.94's flagged number also resolved **the other way from the flag**: `offered_gbps` tracks `carried`
+   in every arm (molehill 7.48/7.51, frp 6.22/6.15, rathole 28.58/28.08, nps 0.13/0.14), so **rathole
+   genuinely carries 3.8× mhd's throughput on the same unshaped cell**. Which completes the picture in
+   one sentence: **where the shaper is the constraint mhd competes** (`loss1` p99 **1 046**, best of
+   four), **and where the host is the constraint it loses** — the host-bound cost is §4.66's
+   1.73–1.76 µs/packet, which the peers do not pay.
 2. **A per-visitor spare channel stays refuted** (§4.20).
 3. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one: `loss1` and `loss5`
    report 1.06 s and 1.46 s of p99, which is where recovery, not setup, decides the number.
