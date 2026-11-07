@@ -1648,6 +1648,45 @@ fn report_wake_latency() {
     );
 }
 
+/// How long a data channel took to open, from the dial to a finished handshake.
+///
+/// §4.87's discriminator. The pairing wait is ~12 ms under bulk and **flat in in-flight bytes**
+/// (7.7x the bytes bought 0.96x the wait), so it is not a queue; it is a timer or a scheduling
+/// quantum. This is the span inside that, and the test is the same flatness: a span that is also
+/// ~12 ms and flat means the client's runtime is giving the new task small slices while it forwards
+/// bulk.
+static OPEN_SPAN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one data channel's open span.
+pub(crate) fn note_open_span(span: Duration) {
+    if !enabled() {
+        return;
+    }
+    let us = u32::try_from(span.as_micros()).unwrap_or(u32::MAX);
+    let mut samples = OPEN_SPAN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(us);
+    }
+}
+
+/// Report this window's data-channel open spans, beside the pairing line.
+fn report_open_span() {
+    let samples = take_sorted(&OPEN_SPAN);
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50_us = pct_us(&samples, 50, 100),
+        p90_us = pct_us(&samples, 90, 100),
+        p99_us = pct_us(&samples, 99, 100),
+        max_us = samples.last().copied().unwrap_or(0),
+        "mhd-stats: how long a data channel took to open"
+    );
+}
+
 /// Report how long a byte waited in the send buffer before a packet carried it.
 ///
 /// Collected since the instrument was written and, until now, **never printed** — the only
@@ -1986,6 +2025,7 @@ fn report_all() {
         report_idle_passes,
         report_wake_latency,
         report_dwell,
+        report_open_span,
         report_build_stop,
         report_pump_loop,
         report_tasks,

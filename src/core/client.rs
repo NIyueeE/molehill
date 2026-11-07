@@ -1324,8 +1324,15 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>, group: u32) -> Result<(
     // dial itself says neither "connected" nor "failed". One line before the
     // handshake and one after it name the step that stops.
     debug!(service = %args.service_id, "data channel: handshake starting");
+    // **The open's own span** (§4.87): from the dial to a finished handshake. The pairing wait
+    // measured on the server is ~12 ms under bulk and flat in in-flight bytes, which is not what a
+    // queue looks like; this says whether that time is inside the open.
+    let opening = crate::transport::stats::enabled().then(std::time::Instant::now);
     // Do the handshake
     let (conn, lane) = do_data_channel_handshake(args.clone(), group).await?;
+    if let Some(at) = opening {
+        crate::transport::stats::note_open_span(at.elapsed());
+    }
     debug!(service = %args.service_id, "data channel: handshake done");
 
     // Forward
