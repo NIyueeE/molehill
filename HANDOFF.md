@@ -498,6 +498,19 @@ the cap because it never parks.
 The median did not move and the two-datagram cell did not grow a tail, which were the other two
 halves of the criterion.
 
+**Re-confirmed in the release profile**, which is the one that ships: 200 requests each, the same
+harness built `--release` —
+
+| | p50 | p99 | max | slow |
+|---|---|---|---|---|
+| 1 349 B | **64–80 µs** | 115–300 µs | 454–2 200 µs | 0 / 200 |
+| 1 350 B | 63–73 µs | 115–121 µs | 320–395 µs | 0 / 200 |
+
+The debug build reads 306–431 µs at p50 for the same cells, so that six-fold gap is the debug
+build's own cost rather than the carrier's. **64 µs is the bare mhd round trip on loopback** in the
+profile a user runs, which is the number any future claim about "the carrier's own latency" has to be
+measured against.
+
 **The CPU trade was measured rather than assumed, and it goes the other way.** 3 000 requests of
 1 349 B, same binary, only `READ_POLL` changed:
 
