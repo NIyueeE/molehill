@@ -126,14 +126,6 @@ pub(crate) const GAP_SLOW_US: u64 = 200;
 /// A queue, not a window: a datagram that waited longer than this many slots is one the
 /// application has already given up on, and holding it would cost the *next* datagram the
 /// latency this frame exists to buy. Small on purpose — a burst absorber, not a buffer.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the producer is the UDP service layer, which is the next increment; \
-                  the queue and its bound are used by the crossing test until then (HANDOFF §4.71)"
-    )
-)]
 pub(crate) const DATAGRAM_QUEUE: usize = 64;
 
 /// Whether a stream is still opening: it has not written a reserve's worth yet.
@@ -683,6 +675,14 @@ pub(crate) struct Conn {
     /// flight does not (HANDOFF §4.71).
     datagrams_out: u64,
     datagrams_in: u64,
+    /// Datagrams that arrived, waiting for the layer above to take them.
+    ///
+    /// Bounded like the outgoing queue and for the same reason: an arriving datagram
+    /// that has waited this long is one the application has given up on, and holding it
+    /// delays the next one. The receive counter counts everything that *arrived*; this
+    /// queue holds what has not been collected yet, so the two differ by exactly the
+    /// drops.
+    in_datagrams: VecDeque<(u32, Bytes)>,
     /// This lane's own interval clock.
     ///
     /// **Not `posted_at`.** The first version reused it and `posted_rate` — called a few
@@ -923,6 +923,7 @@ impl Conn {
             out_datagrams: VecDeque::new(),
             datagrams_out: 0,
             datagrams_in: 0,
+            in_datagrams: VecDeque::new(),
             copy_us: 0,
             copies: 0,
             copy_bytes: 0,
@@ -1556,8 +1557,8 @@ impl Conn {
         not(test),
         expect(
             dead_code,
-            reason = "nothing above the carrier queues a datagram yet — the service layer \
-                      that will is the next increment (HANDOFF §4.71)"
+            reason = "the producer is the UDP service layer, which lands with the server \
+                      side of the switch; the receive door below is already used (HANDOFF §4.76)"
         )
     )]
     pub(crate) fn queue_datagram(&mut self, id: u32, data: Bytes) -> bool {
@@ -1572,6 +1573,37 @@ impl Conn {
     /// Datagrams sent and received, cumulative, for the window line.
     pub(crate) fn datagram_counts(&self) -> (u64, u64) {
         (self.datagrams_out, self.datagrams_in)
+    }
+
+    /// Account for one arriving datagram and queue it for the layer above.
+    ///
+    /// Its own function because `apply_datagram` is at the line budget, and because the
+    /// two things it does are the two things a datagram service depends on: count what
+    /// arrived, and drop the *oldest* queued one when the queue is full.
+    fn accept_datagram(&mut self, id: u32, data: &[u8]) {
+        self.datagrams_in = self.datagrams_in.saturating_add(1);
+        if self.in_datagrams.len() >= DATAGRAM_QUEUE {
+            self.in_datagrams.pop_front();
+        }
+        self.in_datagrams
+            .push_back((id, Bytes::copy_from_slice(data)));
+    }
+
+    /// Take every datagram that has arrived since the last call.
+    ///
+    /// The layer above empties this queue; nothing else may, or a datagram would be
+    /// counted as received and never delivered. Cheap when the carrier is not carrying
+    /// datagrams: the queue is empty and this allocates nothing.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the consumer is the client's udp_read_loop, which needs a wake \
+                      mechanism of its own and is the next increment (HANDOFF §4.76)"
+        )
+    )]
+    pub(crate) fn take_datagrams(&mut self) -> VecDeque<(u32, Bytes)> {
+        std::mem::take(&mut self.in_datagrams)
     }
 
     /// One pass of the scheduler, without the post accounting.
@@ -2783,8 +2815,8 @@ impl Conn {
             // is dropped without touching a stream, a credit or the recovery table.
             // The count is the instrument: it must grow while `flight` does not
             // (HANDOFF §4.71).
-            wire::Frame::Datagram { .. } => {
-                self.datagrams_in = self.datagrams_in.saturating_add(1);
+            wire::Frame::Datagram { id, data } => {
+                self.accept_datagram(id, data);
                 return Ok(());
             }
             Frame::None => {}

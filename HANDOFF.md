@@ -351,6 +351,47 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.77 The receive door exists, and one waiver went away as another arrived (2026-11-07)
+
+§4.76 pre-registered the client read path. What landed is the half that can be verified by not
+changing behaviour: **the carrier now stores what arrives and hands it over on request**.
+
+- `Conn` gained `in_datagrams` (bounded by the same `DATAGRAM_QUEUE`, oldest dropped) and
+  `accept_datagram`, its own function because `apply_datagram` is at the line budget — and because the
+  two things it does are exactly what a datagram service depends on: count what arrived, and drop the
+  *oldest* queued one when full.
+- `take_datagrams` empties the queue, so the layer above collects each datagram **once**; nothing else
+  may, or a datagram would be counted as received and never delivered.
+- The lane test now asserts all three: the peer counts **1**, the collected queue holds **exactly one**
+  entry, and it is the id the sender chose (`3`) with the bytes it sent (`b"hi"`). The id stays opaque
+  to the carrier — the test names it as the sender's, not the carrier's.
+
+**The waiver count moved down by one and up by one, and both moves are honest.** `DATAGRAM_QUEUE` and
+`queue_datagram` no longer needed theirs: `accept_datagram` uses the bound in **real** code, and
+`queue_datagram` is the sender's door that the server side will call. `take_datagrams` needs one
+because its caller is `udp_read_loop`, which is **not** wired yet — and that is deliberate, because the
+loop needs something this section does not have.
+
+**What the loop still needs, stated rather than assumed.** `udp_read_loop` waits on `read_u8` from the
+reliable stream and has **no wake-up for a datagram**: the lane's arrivals are delivered to `Conn`
+without waking anyone. The options are a `Notify` per lane (correct, and it touches `Shared`), a
+periodic poll (wrong: a timer on the client's read path costs CPU for a queue that is empty today), or
+having the pump wake the reader the way it already wakes writers (`wake_readers` exists for streams —
+the datagram path would need its own reason bit so a stream read does not spin). **None of these is
+the next paragraph's business to guess**, so the loop hook is pre-registered as its own increment with
+the mechanism as its first decision.
+
+**Next increment, pre-registered.** Choose and implement the wake mechanism, then hook
+`udp_read_loop`: when the channel is mhd, the loop takes datagrams and delivers them through the same
+per-visitor sink `UdpTraffic` fills.
+
+- **Pass**: behaviour identical while the server does not switch — a `udp-pace` run's `udp_recv_mbit`,
+  `udp_loss_pct` and `udp_gap_p99_ms` inside the run's own A/A, the lane's `datagrams_in` still **0**,
+  and the client's CPU (`cpu_s_per_gbit`) not worse than the A/A, which is what rules out a poll.
+- **Guard**: `just check` and the integration suite.
+- **Rollback**: any movement in the UDP cell, or a CPU cost above the A/A, means the mechanism is wrong
+  and the hook comes out.
+
 ### 4.76 The wiring has an order, and getting it backwards breaks UDP quietly (2026-11-07)
 
 Before cutting into (b′) I checked which end can move first. It is not symmetric, and the asymmetry
@@ -3399,18 +3440,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **The client read path only — the wiring has an order** (§4.76, pre-registered there). Cut
-   (b′) is settled (`DataChannel::RawMhd(CarrierStream, Option<DatagramSink>)`), but the two
-   directions are not symmetric: if the **server** switches first it stops writing `UdpTraffic` for
-   visitor-bound datagrams while the client is still reading `UdpTraffic`, so they arrive at a reader
-   not looking for them and are **counted and dropped with no error, no reset, no log** — a
-   regression that looks like network loss. **So the client reads first, the server switches
-   second**, and the switch is **conditional on the client declaring the capability** in its control
-   registration (the `TransparentCapabilities` precedent), never simultaneous. This increment:
-   `MhdLane::take_datagrams()` drained by `udp_read_loop` into the existing per-visitor sink, with
-   **nothing on the server changed**. **Pass**: behaviour identical — a `udp-pace` run's
-   `udp_recv_mbit`, `udp_loss_pct`, `udp_gap_p99_ms` inside the A/A, and the lane's
-   `datagrams_in` **still 0**. **Rollback**: any movement in the UDP cell.
+1. **The wake mechanism, then the client read hook** (§4.77, pre-registered there). The carrier
+   now **stores** arriving datagrams and hands them over once (`take_datagrams`, asserted by the lane
+   test: count 1, one entry collected, the sender's id and bytes). What is missing is a wake-up:
+   `udp_read_loop` waits on `read_u8` and nothing wakes it when a datagram arrives. Options are a
+   per-lane `Notify` (correct, touches `Shared`), a periodic poll (**rejected**: a timer on the
+   client's read path for a queue that is empty today), or reusing the pump's existing reader wake
+   with its own reason bit. Decide the mechanism first, then hook the loop. **Pass**: behaviour
+   identical while the server does not switch — `udp_recv_mbit`, `udp_loss_pct`, `udp_gap_p99_ms`
+   inside the A/A, `datagrams_in` still **0**, and `cpu_s_per_gbit` not worse (which is what rules out
+   the poll). **Rollback**: any UDP-cell movement or CPU above the A/A.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.

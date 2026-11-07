@@ -630,8 +630,14 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
+        // The layer above collects it: the id the sender chose, the bytes it sent.
+        let taken = acceptor.with(Conn::take_datagrams);
         pump.abort();
         assert_eq!(seen, 1, "the peer must count the datagram");
+        assert_eq!(taken.len(), 1, "and it must be collectable exactly once");
+        let (id, data) = taken.into_iter().next().unwrap();
+        assert_eq!(id, 3, "the id is the sender's, opaque to the carrier");
+        assert_eq!(&data[..], b"hi");
         assert_eq!(
             dialer.with(|conn| conn.flight_and_buffered().2),
             0,
