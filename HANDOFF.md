@@ -244,6 +244,62 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.67 The sealed wedge is gone, and sealing is now the cycle's first real latency win (2026-11-07)
+
+Phase 2's precondition was "reproduce the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1`, then fix
+only a proved root cause". **It does not reproduce.**
+
+`tests/integration_test.rs::striped_data_channels` with `MOLEHILL_MHD_SEAL=1`, six consecutive
+runs: **6 passed, 0 failed.** §4.13 recorded the opposite — "sealed 3 of 6 runs, unsealed 6 of 6,
+same test, same host" — and the tree has changed enough since (the 30-second reorder deadline of
+`4ce0f24`'s neighbourhood, the abandon hold of §4.50, the window-ceiling fix) that the stall it
+described no longer happens. A six-of-six is not proof of absence, but it is the opposite of the
+recorded rate and the right amount of evidence to stop treating the wedge as a blocker.
+
+**And the property the derivation depends on holds, measured rather than assumed.** Both ends
+print the handshake transcript per lane; across four lanes the client reports
+`79fa8db1 / b75a9db3 / 481f14f3 / 80f078de` and the server reports the **same four values**
+(one per stream, all on stream 1). So the two ends agree on one root per lane, and the four roots
+are distinct — which is what `(lane handshake hash, direction, stream id)` needs to keep keys and
+nonces from colliding across lanes.
+
+**Then the measurement, and it is the most promising latency result of this cycle.** Two runs of
+the same shape, seal on and seal off, back to back:
+
+| | seal **on** | seal **off** |
+|---|---|---|
+| `paired_p50` (accept → channel taken, **the open**) | **513 µs** (n=377) | **1 494 µs** (n=325) |
+| `clean` p50 / p99 | **1.64 / 16.00 ms** | 10.85 / 125.01 ms |
+| `clean#2` p50 / p99 | 1.80 / 24.48 ms | 2.46 / 7.60 ms |
+| throughput `clean` | 3.98 Gbit/s | 6.06 |
+| throughput `loss1` | **1.38** | **7.68** |
+| throughput `jitter` | **0.90** | **4.75** |
+
+**Sealing cuts the open to a third and the release cell's tail by an order of magnitude** — and
+it costs throughput on `loss1`, `jitter` and `clean#2` far beyond what the run-to-run swing can
+explain. That is exactly the trade the objective's order ranks: **latency above throughput**. But
+it is **two single runs**, and §4.66's own rule says a 36 % swing lives on this cell at one round,
+so the throughput column cannot be read from one pair and neither can the latency be *claimed*
+from it. What can be said now is directional and stated as such: the open and the clean tail both
+move in the wanted direction by margins far larger than any noise this file has measured, and the
+throughput loss is real on at least two stages.
+
+**Next experiment, pre-registered before it runs.** Interleaved pairs, **ON · OFF · ON · OFF**, the
+same shape (one arm, `--scale 0.2 --rounds 1`, stats on), which gives two ON and two OFF runs with
+each pair adjacent in time — the cheapest form that respects §4.66's 36 % swing.
+
+- **Pass**: the open's `paired_p50` falls ≥ 30 % (it is 3× at one pair), **and** `clean`'s p99
+  falls ≥ 30 %, **and** throughput on `clean` and `loss1` is no worse than the spread *between the
+  two ON runs and the two OFF runs* — measured, not assumed from a single pair.
+- **If throughput holds**: sealing becomes the default and the release cell is re-measured on it,
+  because a 3× faster open and a 10× tighter clean tail are the two numbers the objective's
+  latency clause is about.
+- **If throughput does not hold**: the trade is recorded, the switch stays off, and the finding
+  stands as the reason it is off — a latency win that costs a quarter of the throughput is a
+  decision for the operator, not for this file.
+- **Guard**: `just interop` (6.0 refuses older dialects both ways) and the 6/6 stripe test re-run
+  on the final tree; `rss_peak_mib` recorded (sealing keeps a `TransportState` per stream).
+
 ### 4.66 The cursor walk is free too: four candidates excluded, 82 % is a dozen small costs (2026-11-07)
 
 §4.65's last instrument, on the same shape — busy lane-seconds of a clean stage:
