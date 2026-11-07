@@ -244,6 +244,69 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.59 The pump is not window-limited and not starved: throughput is passes × 44 packets (2026-11-07)
+
+§4.58 asked why the pump holds 59 KB against a 262 144 window with 13.5 MB queued. The
+answer is in the pass instrument, and it reframes the whole question:
+
+```
+how each pump pass ended  passes=19 281  built_p50=44  built_p99=44  built_max=44
+                          stopped=2 803..4 369   reasons="no eligible stream"=2803..4369
+```
+
+**Every pass builds exactly `SEND_RUN` (44) packets.** The p50, p99 and max are all 44 —
+there is no distribution, so the pump is never short of work: it fills the run, posts it,
+and goes round again. Only ~15–20 % of passes end on a reason, and that reason is
+`no eligible stream` — the walk found nothing *because the previous 44 packets covered
+everything queued*.
+
+**And then the arithmetic closes, which is what makes this the answer rather than another
+lead.** 19 281 passes a second across four lanes is ~4 820 per lane; × 44 packets
+× 1 348 payload bytes = 285 MB/s per lane ≈ **2.3 Gbit/s**, × 4 = **9.1 Gbit/s** — the stage
+reads 7.1–9.7. So:
+
+> **throughput = passes per second × SEND_RUN × payload**, and on this cell it is
+> exactly that product.
+
+**`flight ≈ 59 KB` is one pass, not a shortfall.** 44 × 1 348 = 59 312 bytes. The lane never
+accumulates more than one run in flight because the acknowledgements return before the next
+pass is built. Which means the *real* round trip is far below the 1 000 µs the estimator
+reports — that number is `recovery::GRANULARITY`, the estimator's own floor (§4.43), and
+59 KB per 50 µs is 9.4 Gbit/s, which is the cell. **The lane's window is 4.4 passes wide and
+is never filled because the path drains faster than the pump cycles.** §4.55's "the window
+is full" and §4.58's "the pump does not fill its window" were both describing this: the
+window is irrelevant here, and the pass cycle is everything.
+
+**So the throughput ceiling is `SEND_RUN`, and it is a latency trade — already measured.**
+A pass is ~207 µs apart (4 820/s) while its own `flush` is 18–21 µs, so ~185 µs goes to the
+`yield_now` and to being scheduled. Raising `SEND_RUN` would raise throughput in proportion
+(96 would be ~2.2×), and §6 row 7 already tried it: **`SEND_RUN` 8 or 96 produced 5 530 and
+7 853 slow opens, with stage medians 2.5 → 13 ms.** That is the trade this objective's own
+priority order forbids — latency above throughput — so it is not a candidate.
+
+**What is a candidate, and it is not a constant.** The product above is bounded by two
+things that can be changed *independently*: how many packets a pass may build, and **how
+long a pass waits before building the next one**. If the ~185 µs is the yield rather than
+work, then a pass that yields *after* posting but resumes as soon as the socket is writable
+would raise the product without delaying a small packet — because there is no queue to jump,
+`flight` being one pass. That distinction is measurable with the instrument this round
+built, so it is the next experiment rather than another guess.
+
+**Next experiment, pre-registered before it runs.** Per pass, the interval from "run posted"
+to "next pass started" — reported beside `built_p50` — so the ~207 µs cycle is split into
+`flush` (18–21 µs, measured) and *the gap after it*.
+
+- **Pass**: the gap's p50 is above 100 µs on a `clean` stage. Then the cycle is waiting, not
+  working, and the fix is where it waits — the `yield_now` after a full run, which §4.46
+  measured as load-bearing for the *dispatcher* but never split from scheduling delay.
+- **If it fails** (gap below 20 µs): the cycle is `flush` plus nothing, the pump is already
+  posting back-to-back, and `SEND_RUN` is the only remaining lever — which the priority order
+  rules out, making the throughput at this cell a property of the design and not a defect.
+- **Guard**: instrument-only, one line a second, `MOLEHILL_MHD_STATS` gated; `clean` p50/p99
+  inside §4.54's two-arm spread.
+- **Rollback**: the gap cannot be measured (the pass has no single "posted" point after a
+  full run — `flush` is one call), in which case the split is done inside `flush` instead.
+
 ### 4.58 The socket posts exactly what the stage delivers, so the constraint is upstream of it (2026-11-07)
 
 §4.57's instrument, measured, with the `1_000_000` removed. **Summed over the four lanes,
@@ -2401,14 +2464,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Find out why the pump does not fill its own window** (§4.58, pre-registered there).
-   The socket posts exactly what the stage delivers — 32 of 32 cells within 0.91–1.05 — so
-   nothing is lost or stalled downstream of it. And `flight ≈ 59 KB` against a 262 144
-   window while `worst_unsent` reads 13.5 MB means the pump has data queued and stops short
-   of its own window. Instrument the build loop's refusal: packets built per pass, and which
-   `none_reason` (`NoneSnapshot` already carries `reason`, `queued`, `credit`, `window`,
-   `cursor`) ended it, grouped by reason. A dominant budget reason is controller-addressable;
-   `no eligible stream` with unsent bytes is the scheduler's walk.
+1. **Split the pump's pass cycle: work or wait** (§4.59, pre-registered there). The pass
+   instrument settled the previous question: every pass builds exactly `SEND_RUN` (44)
+   packets, and `passes/s × 44 × 1 348 B` reproduces the stage throughput (19 281 passes/s
+   → 9.1 Gbit/s against a measured 7.1–9.7). `flight ≈ 59 KB` is *one pass*, not a
+   shortfall, so the window is irrelevant on this cell and the pass cycle is everything.
+   A pass is ~207 µs apart while its `flush` is 18–21 µs, so ~185 µs is waiting. Instrument
+   the gap from "run posted" to "next pass started"; above 100 µs means the cycle is waiting
+   (fix where it waits, without raising `SEND_RUN`), below 20 µs means the pump is already
+   back-to-back and there is no lever left that does not cost latency.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the

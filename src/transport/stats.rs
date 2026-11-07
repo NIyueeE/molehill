@@ -1523,6 +1523,87 @@ fn take_sorted(slot: &std::sync::Mutex<Vec<u32>>) -> Vec<u32> {
     sorted
 }
 
+/// Packets one `flush` built before `poll_transmit` answered `None`.
+///
+/// The question this answers (HANDOFF §4.58): the pump holds `flight ≈ 59 KB` against a
+/// 262 144 window while 13.5 MB waits, so it stops short of its own window. A pass that
+/// builds `SEND_RUN` (44) packets ended on the run's cap and will go round again; a pass
+/// that builds three and then finds nothing ended on a **reason**, and that reason is
+/// what decides whether a budget or the scheduler's walk is the limit.
+static PASS_BUILT: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// How many passes ended on each `none_reason` this second.
+///
+/// A fixed table rather than a map: the reasons are `&'static str` set in
+/// `Conn::snapshot_none`, so a new one is a compile-time omission that the reporter
+/// prints as "other" instead of silently dropping.
+static NONE_REASONS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Note one pass's built-packet count.
+pub(crate) fn note_pass_built(packets: usize) {
+    if !enabled() {
+        return;
+    }
+    let n = u32::try_from(packets).unwrap_or(u32::MAX);
+    let mut samples = PASS_BUILT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if samples.len() < DWELL_WINDOW_MAX {
+        samples.push(n);
+    }
+}
+
+/// Note one pass ending on this reason.
+pub(crate) fn note_none_reason(reason: &'static str) {
+    if !enabled() {
+        return;
+    }
+    let mut table = NONE_REASONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match table.iter_mut().find(|(name, _)| *name == reason) {
+        Some((_, count)) => *count = count.saturating_add(1),
+        None => table.push((reason, 1)),
+    }
+}
+
+/// Report how a pass ended and why, once a second.
+fn report_build_stop() {
+    let built = take_sorted(&PASS_BUILT);
+    let mut reasons = {
+        let mut table = NONE_REASONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = std::mem::take(&mut *table);
+        drop(table);
+        taken
+    };
+    if built.is_empty() && reasons.is_empty() {
+        return;
+    }
+    // Loudest first, so the line can be read without sorting it by eye.
+    reasons.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let table: String = reasons
+        .iter()
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The **count** of passes that stopped, not the length of the rendered table:
+    // the first version printed `table.len()` and read `stopped=23` beside reasons
+    // summing to 2 803 — a string's length where a count belongs, in the very line
+    // that exists to be counted.
+    let stopped: u64 = reasons.iter().map(|(_, count)| *count).sum();
+    info!(
+        passes = built.len(),
+        built_p50 = pct_us(&built, 50, 100),
+        built_p99 = pct_us(&built, 99, 100),
+        built_max = built.last().copied().unwrap_or(0),
+        stopped,
+        reasons = %table,
+        "mhd-stats: how each pump pass ended"
+    );
+}
+
 /// Report this second's wake latencies: the whole distribution, not a tail.
 fn report_wake_latency() {
     let samples = take_sorted(&WAKE_LATENCY);
@@ -1855,6 +1936,7 @@ fn report_all() {
         report_pump_wakes,
         report_idle_passes,
         report_wake_latency,
+        report_build_stop,
         report_pump_loop,
         report_tasks,
         report_open_steps,

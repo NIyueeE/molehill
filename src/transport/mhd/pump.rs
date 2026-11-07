@@ -337,6 +337,10 @@ async fn flush(
         crate::transport::stats::note_built(1);
     }
     build.stop(&crate::transport::stats::PHASES.tx_build);
+    // How many packets this pass built before the connection answered `None`: the
+    // companion to `note_none_reason`, and together they say whether a pass ends on
+    // the run's cap, on a budget, or on the walk finding nothing (§4.58).
+    crate::transport::stats::note_pass_built(spans.len());
     if spans.is_empty() {
         // Nothing was built. Two causes look identical from outside and are
         // fixed in different places: the state machine refused every packet (a

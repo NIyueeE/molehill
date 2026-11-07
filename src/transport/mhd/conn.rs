@@ -1990,6 +1990,10 @@ impl Conn {
 
     /// Capture why this pass built nothing, while the lock is still held.
     fn snapshot_none(&mut self, reason: &'static str) {
+        // Counted here, once per pass that built nothing: the distribution of *why*
+        // the pump stops is the number that says whether a budget or the scheduler's
+        // walk is what keeps `flight` below the window (HANDOFF §4.58).
+        crate::transport::stats::note_none_reason(reason);
         self.none_snapshot = Some(NoneSnapshot {
             reason,
             visited: self.streams.len(),
