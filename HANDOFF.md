@@ -244,6 +244,61 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.58 The socket posts exactly what the stage delivers, so the constraint is upstream of it (2026-11-07)
+
+§4.57's instrument, measured, with the `1_000_000` removed. **Summed over the four lanes,
+per second**, `posted_mbit_per_s` reproduces the stage's own `throughput_gbps` in **32 of
+32 cells, ratio 0.91–1.05** — well inside the pre-registered 15 %:
+
+| stage | arm·round | stage (Mbit/s) | Σ posted | ratio |
+|---|---|---|---|---|
+| `clean` | molehill·0 | 7 130 | 7 291 | **1.02** |
+| `clean` | molehill~aa·0 | 9 554 | 9 698 | **1.02** |
+| `rtt100` | molehill·0 | 2 395 | 2 287 | 0.95 |
+| `loss1` | molehill·0 | 2 255 | 2 305 | 1.02 |
+| `loss5` | molehill~aa·1 | 304 | 306 | 1.01 |
+| `rate100` | molehill·1 | 94 | 93 | 0.99 |
+| `rate20` | four cells | 18–19 | 17 | 0.93–0.94 |
+| `jitter` | molehill~aa·0 | 4 581 | 4 801 | 1.05 |
+
+**And the per-lane column is what made it work, after a fourth denominator error.** The
+first read gave ratios of 0.25–0.35 on most cells and 1.0 on a few, which looked like two
+populations and suggested a real split; **0.25 is a quarter, and a quarter is one lane of
+four.** A single iperf3 `-P 4` run opens four connections that land on four lanes, so a
+per-lane number compared with an aggregate reads exactly one quarter low — the same mistake
+as §4.50 (Gbit/s read as "near zero") and §4.55 (per-lane read as global), now with a
+denominator instead of a unit. The cells that read 1.0 were the ones where one lane carried
+everything (`flight = 0`, the other three idle), which is why the split looked meaningful.
+
+**What the pass means, stated narrowly.** Every byte this end posted arrived at the
+visitor's `iperf3` — nothing is lost or stalled between the socket and the receiver, and
+the plateau in every stage is set by *how fast the pump posts*, not by the peer and not by
+a full send buffer. That is a measurement, not an inference: the two numbers are computed
+from different instruments on different ends of the run.
+
+**So the question sharpens to one line, and it is not the window and not the socket.**
+With `flight ≈ 59 KB` at p50 against a 262 144 window, the pump never has more than a
+quarter of its window in flight — while `worst_unsent` reads 13.5 MB. **The pump has data
+queued and does not fill its own window.** That is upstream of the socket (which posts
+whatever it is given) and downstream of `write` (which admits), so it is inside
+`flush`'s build loop: `SEND_RUN` packets per pass, then a `yield_now`, and the run ends
+when `poll_transmit` returns `None` — which it does as soon as the per-stream picks run
+out, not when the window is full.
+
+**Pre-registered, before it runs.** Instrument what one *build* iteration's refusal
+actually is, per second: for each pass, how many packets were built before
+`poll_transmit` answered `None`, and **which** `none_reason` stopped it (`NoneSnapshot`
+already carries `reason`, `queued`, `credit`, `window` and `cursor`). Grouped by reason.
+
+- **Pass**: on a `clean` stage where `flight` is far below `cwnd`, the dominant
+  `none_reason` is a **budget** (`credit`/`window`/`buffer` at zero) — which would mean the
+  pump stops for a reason a controller could address — or `no eligible stream` while
+  streams hold unsent bytes, which would mean the scheduler's walk is the limit.
+- **Guard**: instrument-only, gated on `MOLEHILL_MHD_STATS`, once a second per lane; the
+  run's `clean` p50/p99 must stay inside the two-arm spread of §4.54's baseline.
+- **Rollback**: the instrument charges for itself, or the reasons come back flat — a flat
+  distribution is a metric without contrast (AGENTS §10) and says nothing.
+
 ### 4.57 The lane's socket rate, per lane: the instrument, and two unit errors it caught (2026-11-07)
 
 §4.56's next step was to join *bytes leaving this lane's socket* to `flight` and
@@ -2346,15 +2401,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Name the constraint on the release cell's carrier: send path or backlog** (§4.56,
-   pre-registered there). The lane reports `flight ≈ 59 KB` against a 256 KB window and
-   13.5 MB in `buffered`, so it is **not** window-limited — §4.55's arithmetic reproduced
-   the rate from `ceiling / srtt` and attached the wrong mechanism to it. The estimator
-   built to steer a pacer failed its own 15 % test (it read 0.18–0.37 of the stage's
-   throughput on every lane and stage) and was reverted. Next is the direct question: per
-   lane, once a second, `posted` bytes beside `flight` and `buffered`. If `posted/elapsed`
-   reproduces the stage throughput, the send path is fine and the backlog is on the receive
-   side; if it does not, the socket hand-off is the constraint.
+1. **Find out why the pump does not fill its own window** (§4.58, pre-registered there).
+   The socket posts exactly what the stage delivers — 32 of 32 cells within 0.91–1.05 — so
+   nothing is lost or stalled downstream of it. And `flight ≈ 59 KB` against a 262 144
+   window while `worst_unsent` reads 13.5 MB means the pump has data queued and stops short
+   of its own window. Instrument the build loop's refusal: packets built per pass, and which
+   `none_reason` (`NoneSnapshot` already carries `reason`, `queued`, `credit`, `window`,
+   `cursor`) ended it, grouped by reason. A dominant budget reason is controller-addressable;
+   `no eligible stream` with unsent bytes is the scheduler's walk.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
@@ -2373,13 +2427,14 @@ curve and a RACK rewrite that no measurement had asked for yet.
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-7. **D (delivery-rate) has no validated estimator, so it waits.** §4.56's estimator read
-   0.18–0.37 of the stage's own throughput on every lane and every stage and was reverted
-   under its own pre-registration. Nothing may steer on a number that disagrees with an
-   independent measurement by a factor of three. What item 1 establishes — whether the
-   constraint is the send path or a backlog — decides whether a controller is wanted at all:
-   a pacer cannot fix a pump that cannot fill the window, which is what `flight ≈ 59 KB`
-   against 256 KB suggests.
+7. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built:
+   one from the acknowledgement frontier (read 0.18–0.37 of the stage, reverted under its
+   own pre-registration) and one from posted bytes (**0.91–1.05, §4.58, and it is per lane
+   and only joins when the lanes are summed**). So a *rate is measurable* — but the pass
+   says the socket already delivers what is posted, which means a pacer placed at the socket
+   would be pacing a link that is not the constraint. Item 1 decides whether a controller is
+   wanted at all; if the pump stops for a budget reason, the fix is in the budget, not in a
+   rate.
 8. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
