@@ -351,61 +351,6 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.81 The TCP comparison: mhd loses on exactly one cell, and it is the same one as ① (2026-11-07)
-
-Condition ② asks for p50/p90/p99 no worse than the in-tree TCP carrier on like workloads. Same run,
-same round, both arms, `--scale 0.15`:
-
-| cell | mhd p50 | tcp p50 | mhd p99 | tcp p99 | mhd thr | tcp thr |
-|---|---|---|---|---|---|---|
-| `clean` | 3.02 | 2.63 | **59.04** | **14.40** | 8.61 | 8.50 |
-| `clean#2` | 2.15 | 2.68 | **4.70** | **23.83** *(no measurement)* | 2.61 | 0 |
-| `rtt100` | 402.26 | 402.43 | 403.24 | 410.13 | 2.57 | 2.51 |
-| `loss1` | 42.47 | 42.94 | 1 061.06 | 1 052.12 | **4.79** | **6.07** |
-| `loss5` | 402.76 | 403.05 | **1 454.86** | **2 100.77** | **1.11** | **0.30** |
-| `rate100` | 177.41 | 177.42 | 233.20 | 228.12 | 0.09 | 0.09 |
-| `rate20` | 391.15 | 383.22 | 549.13 | 508.05 | 0.02 | 0.02 |
-| `jitter` | **83.41** | **90.88** | **117.96** | **171.77** | 4.02 | 5.82 |
-
-**`clean` is the only cell where mhd is clearly worse, and it is worse by 4×.** p99 59.04 against
-14.40 ms, p50 3.02 against 2.63, throughput identical (8.61 / 8.50). Every other cell is a tie or a
-win — `jitter` better on both latency axes, `loss5` better on both the tail (1 455 against 2 101) and
-throughput (**1.11 against 0.30**, 3.7×), `rtt100` and the rate cells equal, `loss1` equal on latency
-with TCP 27 % ahead on throughput.
-
-**`clean#2`'s TCP arm is not comparable and must not be read.** It is `ok=False` with the reason the
-zero-carry guard from `c8ac062` gives: *"the bulk spine carried no bytes in this stage: 4 stream(s)
-were dialed and the sender reported zero"*. So mhd's 4.70 ms there has **no counterpart** — and the
-guard is what stopped a zero-carry TCP cell from being read as a 0.00 Gbit/s win for mhd. That is the
-mechanism working on the first occasion it mattered.
-
-**What this does to the plan is the point of the section: ① and ② are one problem.** The cell that
-fails the SLO (①) is the cell where the carrier loses to TCP (②), and it is the *same* cell whose
-`flight` spans 59 KB to 7.8 MB (§4.80). Three independent measurements now point at one place:
-the clean cell's tail, when a lane is carrying megabytes behind an echo.
-
-**And it explains why the lossy and jitter cells are wins.** There the TCP carrier's kernel stack is
-doing congestion control over a shaper; mhd's own recovery is doing it directly, and it wins. On the
-clean cell there is no shaper to fight, and what is left is **queueing**: 4.8 MB of flight behind a
-small echo request costs exactly what §4.80 measured (76 ms worst-request mean in ≥1 MB seconds).
-TCP does not lose that request because its stack keeps the queue small; mhd allows it to grow because
-its window is 16 MiB and the `ceiling` never binds on this cell.
-
-**Next increment, pre-registered.** Attack the queue, not the scheduler: **cap what a latency-bound
-service puts in flight** — a per-lane outstanding-byte limit applied to streams whose service is
-latency-sensitive, chosen as the smallest value that does not cost throughput on `clean` (the two are
-measured in the same cell, so one run decides both).
-
-- **Pass**: `clean` p99 falls **below TCP's on the same round** (14.40 ms here) **and** `clean`
-  throughput stays within the same round's A/A of the uncapped arm. A cap that buys p99 by losing
-  throughput is not a win under the stated priority order unless it is large, and the objective's
-  first condition is latency.
-- **If the cap cannot beat 14.40**: phase C (priority scheduling) is next, because a cap is the
-  crude form of the same idea.
-- **Guard**: `loss5` and `jitter` must not regress — they are the cells mhd currently wins, and a
-  blanket cap would trade them away.
-- **Rollback**: any of `loss5`/`jitter` moving, or `clean` throughput outside the A/A.
-
 ### 4.80 The join: the slow request waits in `echo`, and its lane is carrying megabytes (2026-11-07)
 
 §4.79's pre-registration joined the above-SLO round's slow requests to the lane-seconds they ran in.
@@ -3630,16 +3575,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Cap what a latency-bound service puts in flight** (§4.81, pre-registered there). The TCP
-   comparison landed and it collapses ① and ② into one problem: **`clean` is the only cell where mhd
-   is worse, by 4×** (p99 59.04 vs 14.40 ms, p50 3.02 vs 2.63, throughput equal), while `jitter` and
-   `loss5` are wins (loss5 tail 1 455 vs 2 101 and throughput 1.11 vs 0.30) and the rate cells tie.
-   `clean#2`'s TCP arm is **not comparable** — `ok=False`, "the bulk spine carried no bytes", caught by
-   the zero-carry guard. And the failing cell is the same one whose `flight` spans 59 KB–7.8 MB (§4.80):
-   **the queue, not the scheduler.** So: a per-lane outstanding-byte limit for latency-sensitive
-   streams, chosen as the smallest value that keeps `clean` throughput. **Pass**: `clean` p99 below
-   TCP's same-round 14.40 ms **and** throughput inside the run's A/A. **Guard**: `loss5`/`jitter` must
-   not regress. **Rollback**: either moves.
+1. **The TCP comparison (condition ②), with phase C now indicated** (§4.80). The join answered and
+   changed the plan: the slow requests spend their time in `echo` (147.2 of 147.4 ms; `connect` 0.15),
+   their lanes were **busy and healthy** (yield 17–22 %, baseline 19.3 %) so **not a scheduling stall**,
+   and `flight` in those seconds was **0.65–4.4 MB**. Across the clean window flight spans
+   **59 KB .. 7.8 MB with only 2 of 23 seconds under 100 KB** — so the file's standing "`flight ≈ 59 KB`,
+   window irrelevant" is true only of the **best** seconds. Seconds with ≥ 1 MB in flight show a **1.5×**
+   worse worst-request latency (76.1 vs 50.0 ms, n=9/14): directional and the right mechanism, but not
+   the 9×. So **phase C (priority scheduling) moves from conditional to indicated**, and the wake path
+   (old item 2) is **ruled out** by this join. C is still not first: it changes scheduling for every
+   service, so it is decided with ②'s numbers in hand.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
