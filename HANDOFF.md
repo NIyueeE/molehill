@@ -351,6 +351,54 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.92 The capacity ramp reverses between scales, so ④ cannot be judged from one draw (2026-11-07)
+
+§4.91 pre-registered the full-scale ramp to settle ④, having read 5 streams on mhd against 3 on TCP at
+`--scale 0.2`. **The full-scale run reverses it.**
+
+| scale | mhd `capacity_streams` | TCP (`l4`) |
+|---|---|---|
+| `--scale 0.2` | **5** (headroom 37.5 %) | 3 (62.5 %) |
+| `--scale 1` | **2** (headroom 75 %) | **5** (37.5 %) |
+
+Same binary, same host, same scenario, opposite verdict. And the ladders inside each run behave
+coherently — mhd's stops after three rungs when its ramp finds capacity at 2, TCP's runs six when its
+ramp finds 5 — so this is not a broken cell; it is a metric whose answer moves with the hold length.
+
+**So §4.91's "mhd is ahead on ④" was premature and is withdrawn.** What can be said is narrower and
+worth stating plainly: **capacity is a one-draw-per-rung measurement whose two draws disagree in
+direction**, so the condition "容量 8/8" needs a defined number of rounds and a defined scale before it
+can be called either way. Neither draw reaches 8 for either arm.
+
+**Why this is not a surprise in hindsight.** Every other metric in this file has needed the same
+treatment — the release cell's p99 moves 9× between adjacent rounds (§4.79), and the gate's own floor is
+6.7 % throughput / 65 % p99 across eight rounds (§4.47). Capacity had simply never been measured twice,
+and the first two measurements disagree.
+
+**What this changes about the plan, and what it does not.**
+
+- It **does not** reopen the latency work: ① is still the pairing's stream open (§4.90), and nothing
+  here touches it.
+- It **does** mean ④ cannot be closed by another single run. The next one is **four rounds per arm at
+  `--scale 1`**, and the verdict is the *range*, not a point — which is exactly how §4.47 forced the
+  release cell to be treated.
+- And it puts a **second** axis where mhd is worse than TCP: memory is **+31 %** (§4.91) and capacity
+  reads worse at full scale. Both are below latency and throughput in the priority order, and both are
+  recorded rather than smoothed away.
+
+**Next increment, pre-registered.** `capacity` only, `--scale 1`, `--rounds 4`, both arms, with the A/A
+inside the run.
+
+- **Pass**: mhd's four draws all reach **8** streams. Then ④ is satisfied and this section's reversal is
+  explained as `--scale 0.2` under-running the ramp.
+- **If the draws spread across 2–5**: ④ is not met by this design at this hold length, and the honest
+  statement is "capacity is N ± M, below the 8/8 the condition asks for" with the four draws beside it.
+  Then the question becomes *why* the ramp stops, which is a new investigation with its own instrument —
+  not a continuation of anything above.
+- **Guard**: quote `capacity_headroom_pct` with every draw; a ramp that stops with 75 % headroom left is
+  a different defect from one that stops saturated, and the two draws already show both (75 % and
+  37.5 %).
+
 ### 4.91 Conditions ③ and ④ measured for the first time, and mhd is ahead on both (2026-11-07)
 
 §4.90 closed the loop on where the clean cell's tail lives: one yamux SYN/ACK round trip through a
@@ -4121,20 +4169,19 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **The capacity ramp at full scale** (§4.91, pre-registered there). The clean cell's tail is one
-   yamux SYN/ACK through a bulk-saturated lane (1 129 µs typical, 168 ms worst) — there is no "fewer
-   round trips" to take and the only measured mitigation is priced at 3.13× per packet, so this line
-   is where it is until something new is measured. Meanwhile the two **never-measured** conditions
-   came back well: **③ passes** (`bulk-n` P8: mhd **8.63** against TCP 8.22 Gbit/s, +5 %, inside the
-   15 % band) and **④ is ahead but short** (ramp reaches **5 streams on mhd against 3 on TCP**, and
-   neither reaches 8 — the condition is 8/8). `--scale 0.2` may not run long enough to find the
-   ceiling, so: **`--scale 1`, `capacity` only, both arms**. **Pass**: mhd's ramp reaches 8.
-   **If it stops at 5–6**: ④ is not met by this design and *why the ramp stops* opens as its own
-   section.
-   **Also new and worth carrying**: `cpu_s_per_gbit` is at **parity** on the bulk cell (1.158 mhd vs
-   1.168 TCP — mhd marginally better; §1.1's 4.21 vs 0.650 was the **l3** arm, a different path), and
-   **memory is where mhd is worse** (153.6 vs 117.7 MiB peak, +31 %) — the third priority, recorded as
-   a real cost.
+1. **Four rounds of the capacity ramp at `--scale 1`** (§4.92, pre-registered there). The full-scale
+   run **reversed §4.91's finding**: `--scale 0.2` read **5 streams on mhd against 3 on TCP**, and
+   `--scale 1` reads **2 against 5** — same binary, same host, opposite verdict, with each run's ladder
+   coherent internally. So §4.91's "mhd is ahead on ④" is **withdrawn**, and what stands is narrower:
+   **capacity is a one-draw-per-rung metric whose two draws disagree in direction**, and the condition
+   needs a defined rounds/scale before it can be called. Neither draw reaches 8 for either arm. This
+   does not touch ① (still the pairing's stream open, §4.90). **Pass**: four draws all reach 8.
+   **If they spread 2–5**: ④ is not met and the statement is "N ± M, below 8/8", with *why the ramp
+   stops* opening as a new investigation. **Quote `capacity_headroom_pct` with every draw** — 75 % and
+   37.5 % already show two different ways to stop.
+   **Also recorded (§4.91)**: **③ passes** (`bulk-n` P8 mhd 8.63 vs TCP 8.22 Gbit/s, +5 % inside the
+   15 % band); `cpu_s_per_gbit` at **parity** on the bulk cell (1.158 vs 1.168); **memory is worse**
+   (153.6 vs 117.7 MiB, +31 %).
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
