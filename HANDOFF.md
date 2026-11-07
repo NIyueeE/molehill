@@ -401,25 +401,50 @@ packet in flight it is the RTO — 20 ms at the small-flight floor — and with 
 the 2 s keepalive. 21.4–21.8 ms is 20 ms plus a margin, and it is the same constant on both ends and
 in both directions, which no queue explains and a timer does.
 
-**What this predicts, and how to check it without another instrument.** If the RTO is what recovers
-a missed wake-up, then lengthening the pump's deadline must lengthen the stall in proportion:
+**The prediction I wrote first was tested and it failed, in a way that is more useful than it
+succeeding.** I predicted the stall would follow the retransmission floor: a wide flight (3+ packets)
+puts the deadline at `MIN_RTO` = 200 ms, so the stall should read ~200 ms instead of ~21. Measured:
 
-- a **wide** flight (bulk) puts the deadline at `MIN_RTO` = 200 ms, so the same lost wake should read
-  ~200 ms, not ~21;
-- a lane with **nothing in flight** has no recovery timer at all, so the deadline is the keepalive and
-  the stall should read ~2 s — which is the shape of the "two-second parks" this file has recorded
-  since §4.45 without a mechanism.
+| request size | packets in flight | slow (>5 ms) |
+|---|---|---|
+| 64 B | 1 | **23 / 120** |
+| 1 349 B | 1 | **19 / 120** |
+| **1 350 B** | **2** | **0 / 120** |
+| 2 700 B | 3 | 0 / 120 |
+| 4 096 B, 12 000 B, 200 000 B | 4, 9, 143 | 0 / 80, 0 / 80, 0 / 20 |
 
-Both are cheap: the first is a bulk stream beside an interactive one on the same lane; the second is
-a request whose flight has retired before the reply is queued. Either one distinguishes "the timer is
-the recovery path" from "something else happens to take 20 ms", and neither needs a new counter.
+`MAX_STREAM_PAYLOAD` is 1 349 (1400 − 9 head − 28 ack − 14 stream), so **one extra byte** is the whole
+difference between the stall and no stall. The stall did not become 200 ms; it disappeared. My
+prediction could not be tested that way at all, because `SMALL_FLIGHT_PACKETS = 2` makes a lone
+datagram *always* the small-flight case — there is no way to give one packet a 200 ms floor. The
+prediction is withdrawn, not rescheduled.
 
-**Not yet claimed.** That the readiness wake-up is *missed* (rather than the task not being
-scheduled) is the leading explanation, not a demonstration: `wakes_while_parked=3` counts pump passes
-because `flush` wakes every reader on its way out, so it cannot tell a data wake from a timer pass.
-The next instrument that can is one line per pump pass naming the `select!` arm that woke it; it is
-worth adding only if the prediction above fails, because a proportional stall already names the
-timer.
+**What the boundary does say.** A second datagram in the same request removes a 21 ms stall that a
+single datagram reliably suffers. Task-scheduling starvation does not behave that way — an
+unscheduled task stays unscheduled however many datagrams arrive. A **missed readiness edge** does:
+the first datagram's edge is lost, the second one's is not, and the pump runs immediately (measured
+max for the two-packet case: 1 255 µs). So the reading is: for a lone datagram the pump sleeps until
+its own timer; its timer with one packet in flight is the 20 ms small-flight RTO, which is why 21 ms
+is the number and why it is the same on both ends and in both directions.
+
+**Why this matters more than the number.** A fresh visitor's first request is exactly one small
+datagram. That is the shape the SLO cell measures, and it is now the shape this defect selects for.
+
+**Next, with its pass criterion fixed before the code exists.** The fix is to stop relying on one
+readiness edge: after a pass that read nothing, re-check the socket before parking, and drain until
+`WouldBlock` rather than until the first short batch. It passes when `--size 1349 --requests 200
+--stream-mode reuse` goes from ~19/120 slow to **0/120** while `--size 1350` stays at 0 and the
+`first_us` median does not move by more than the run's own scatter. It fails and is reverted if the
+median regresses or if any packet-count cell grows a new tail.
+
+**Still not claimed.** That the edge is missed *inside tokio's readiness bookkeeping* rather than
+somewhere in `pump.rs`'s own pass loop. The instrument that would separate those is one line per
+pump pass naming the `select!` arm that woke it, and it is only worth adding if the drain-until-
+`WouldBlock` change fails its criterion.
+
+One caveat on `wakes_while_parked`: it counts pump **passes**, because `flush` wakes every reader on
+its way out, so it can never tell a data wake from a timer pass. It was used above only to note that
+the pump ran at all, not to decide what woke it.
 
 ### 4.100 The harness earned its keep on day one: two findings (2026-11-07)
 
