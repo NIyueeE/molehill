@@ -1354,6 +1354,7 @@ dependencies = [
  "anyhow",
  "molehill-rathole",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

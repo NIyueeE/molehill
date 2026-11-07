@@ -15,6 +15,11 @@ anyhow = "1.0"
 # and the harness must measure the build the product ships, not a variant.
 molehill-rathole = { path = "../.." }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# The engine reports through `tracing`, so a harness without a subscriber sees
+# nothing it says: `MOLEHILL_MHD_STATS=1` would turn the counters on and no line
+# would appear. This is the same `tracing-subscriber` the product installs, with
+# the environment filter, so one `RUST_LOG` drives both.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]
 unsafe_code = "deny"

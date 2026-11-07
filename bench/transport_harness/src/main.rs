@@ -176,8 +176,26 @@ fn parse_args() -> Result<Args> {
     })
 }
 
+/// Install the subscriber the engine reports through, on stderr.
+///
+/// Without it the carrier's own lines — the one-second `mhd window` with its
+/// retransmit and flight counters, the slow-open splits — are emitted into
+/// nothing, so `MOLEHILL_MHD_STATS=1` would measure exactly as much as it does
+/// in a build with the switch off. Default level `warn`, so an ordinary run is
+/// silent and stdout stays pure NDJSON.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     let args = parse_args()?;
     match (args.role, args.mode) {
         (Role::Server, Mode::Tcp) => serve_tcp(args.addr, args.size).await,

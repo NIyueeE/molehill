@@ -426,18 +426,41 @@ number as `SMALL_FLIGHT_INITIAL_RTO` and `MIN_RTO_SMALL_FLIGHT`, and §4.1 alrea
 one-constant A/Bs on those constants moved `churn-16` by nothing, so a match is a reason to look,
 not a finding.
 
-**What is excluded and what is not.** The server's `read_us`/`write_us` are microseconds, so the
-echo was cheap once the handler ran; but `read_us` starts *inside* the handler, so those two
-numbers cannot distinguish "the handler started 21 ms late and found the bytes already buffered"
-from "the echo left immediately and took 21 ms to come back". Three candidates remain, and they
-have different fixes: (a) the accepted stream's handler task was scheduled late, (b) the echo's
-packet was repaired by the small-flight timer, (c) the client's reader was woken late.
+**Second round of evidence, and it moves the candidate.** The tail is not tied to a stream's
+creation: with `--stream-mode reuse` (one stream, 20 sequential requests) it still appears, 4 of 20
+at 20 962–22 413 µs, while the TCP arm of the same harness never leaves 100–200 µs. The values are
+quantised at ~21 ms, which is a timer, not a queue.
 
-**Pre-registered next experiment.** One exchange with absolute epoch-microsecond stamps on both
-ends — the join key `stats::epoch_us` already provides for the pairing line — plus
-`MOLEHILL_MHD_STATS=1` so the retransmit counters can speak. Pass: the four stamps are monotone
-and their sum equals the client's `first_us`, which names one of (a)/(b)/(c) outright. Rollback:
-none needed; this is an instrument, not a change.
+The engine's own park line names the end. On the slow request the **server's** reader reports:
+
+```
+DEBUG mhd stream reader was parked stream=11 parked_us=21403 ready_us=75 \
+      hole=Some((1, 65, 1, Some(0))) wakes_while_parked=2
+```
+
+`ready_us` 75 µs against a 21.4 ms park means the bytes became *readable* 75 µs before they were
+read — the data was **inserted late**, not woken late. So the reader's wake-up is exonerated, and so
+is the stream open: `open_us` is 24–79 µs on every attempt. On the client, `post_us` is 3–23 µs and
+the `mhd stream byte waited in the send buffer` line (which fires at ≥ 20 ms) never appears, so the
+payload packet was **built** promptly.
+
+Three candidates remain, and they are now downstream of the build: (a) the client's pump did not
+*post* the built packet for ~20 ms, (b) the packet was posted and the server's **dispatcher** did
+not process it for ~20 ms, (c) the packet was posted, arrived, and its insertion was delayed inside
+the connection's own receive path. The server's `hole` says the insertion is what was late; it does
+not say which side of the socket the delay sits on.
+
+**Pre-registered next experiment.** One epoch-microsecond stamp at each of three points on the same
+request — client build, client post (the instant `send_run` returns), server dispatcher receive —
+joined to the client's `first_us`, which is the accounting `stats::epoch_us` already does for the
+pairing line. Pass: the three stamps are monotone and their sum equals `first_us`, which names
+(a), (b) or (c) outright. Rollback: none needed; this is an instrument, not a change.
+
+**Two candidate causes already excluded** so the next round does not re-check them: the reader's
+wake-up (above) and the send buffer's dwell (the log line is absent). What is *not* excluded is a
+**lost pump signal**: a 20 ms timer waking a pump that a `write` had already asked to run would look
+exactly like this, and `MIN_RTO_SMALL_FLIGHT`/`SMALL_FLIGHT_INITIAL_RTO` are both 20 ms — so the
+quantisation is a reason to look at the pump's wait, not yet a finding about it.
 
 ### 4.99 The carrier can be measured without the pool; the tunnel open cannot (2026-11-07)
 
