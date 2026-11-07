@@ -1541,6 +1541,9 @@ static PASS_BUILT: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new()
 /// bound — a different quantity that would swamp this one (HANDOFF §4.59).
 static PASS_GAP: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// Time spent inside `yield_now` after a full run, per pass.
+static PASS_YIELD: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 /// Note the interval from a full run's post to the next pass.
 pub(crate) fn note_pass_gap(gap: Duration) {
     note_us(&PASS_GAP, gap);
@@ -1565,6 +1568,11 @@ pub(crate) fn note_pass_built(packets: usize) {
     if samples.len() < DWELL_WINDOW_MAX {
         samples.push(n);
     }
+}
+
+/// Note the microseconds one full run's `yield_now` took.
+pub(crate) fn note_pass_yield(waited: Duration) {
+    note_us(&PASS_YIELD, waited);
 }
 
 /// Note one pass ending on this reason.

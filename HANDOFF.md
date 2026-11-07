@@ -244,6 +244,66 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.63 The gap is the yield: 27 µs a pass, 19.8 % of a busy lane-second (2026-11-07)
+
+§4.62 pre-registered the gap's tail and a split either side of the `yield_now`. On busy
+lane-seconds (71 of 96 in a clean stage) the answer is neither of the two branches it wrote,
+and it is more useful than both:
+
+```
+passes=519 703   flush=41.6%   gap=20.4%   yield=19.8%   gap_max=57 512us
+gap per pass = 28us   yield per pass = 27us   => the non-yield gap is 1us
+slow gaps (>=200us) = 1 809 of 519 703 passes = 0.3%
+```
+
+**The gap is 97 % the yield.** 27 of its 28 microseconds per pass are spent *inside*
+`yield_now`, and the time between the yield returning and the next pass starting is **1 µs**.
+So §4.62's "the gap is 26 % of a busy second, tail-dominated" is right about the size and wrong
+about the shape: it is not a tail at all, it is every pass, and the slow-gap count (0.3 %)
+accounts for 1 809 × ~200 µs ≈ 0.36 s out of the 20.4 % — a rounding error beside the 19.8 %
+the yield costs.
+
+**That corrects §4.60, and the correction matters more than the number.** §4.60 read "gap p50
+5–7 µs ⇒ the give is not the cost" and closed the yield as a lever. Those 5–7 µs were a median
+over **every** pass including the empty ones, which return in about a microsecond. On a lane
+carrying bulk, `yield_now` costs **27 µs per pass** — 9 100 passes a second is 246 ms, i.e.
+**19.8 % of the lane's whole second**. The give is one of the two largest terms in the cycle.
+
+**And it is not obviously reclaimable, which is the part that matters for the plan.** §4.46
+tried both ways out of it and both were worse: removing the yield entirely took throughput to
+**0.74 Gbit/s** with a 20-second listener gap, and `consume_budget` (which yields once per ~128
+polls rather than every pass) read 6.17 / 6.42 / 5.21 / 7.32 against a baseline of 7.11 / 7.22 /
+9.18 / 7.05. So the 19.8 % is **the price of the dispatcher being able to run**, not waste — and
+the two cheapest alternatives have already been measured and lost.
+
+**So the cycle now reads, on a busy lane-second:**
+
+| term | share | what it is |
+|---|---|---|
+| `flush` | **41.6 %** | building 44 packets: lock, pick, encode, 1 387-byte copy, recovery bookkeeping — **1 µs per packet** |
+| `yield_now` | **19.8 %** | giving the worker back so the listener's dispatcher can feed this lane its acknowledgements |
+| between yield and next pass | 1.2 % | nothing |
+| parked in `wait()` | ~37 % | waiting for the writer to produce the next run |
+
+**Which leaves exactly one throughput lever**: the 41.6 % in `flush`. The yield is priced and
+already has two failed alternatives; the parked share is the writer's, not the pump's.
+
+**Next experiment, pre-registered before it runs.** Split the 1 µs per packet inside `flush`
+into its parts, per lane per second: the **lock wait** (`Shared::with` acquired per packet),
+the **pick** (`next_stream_range`), the **copy** (the payload into the run buffer) and the
+**bookkeeping** (recovery record, credits, counters) — the last three as a single "inside
+`build_packet`" figure to keep the clock reads to two per packet.
+
+- **Pass**: one of the three parts is at least half the packet's cost. Then the next change is
+  in that part and it is a real lever, not a tuning.
+- **If the cost is spread evenly**: no single structural change buys much, and the honest
+  answer is that `SEND_RUN × 44 packets at 1 µs` is the design's throughput and the objective's
+  throughput clause is met or not by that number — which is worth knowing for the release
+  record.
+- **Guard**: two clock reads per packet is the perturbation this must survive; measure the
+  same cell with the split **off** in the same run (an arm of its own) and require throughput
+  within the run's A/A. **Rollback**: the split costs more than 5 % of throughput.
+
 ### 4.62 The flush fork closes: both readings were right, for different seconds (2026-11-07)
 
 §4.61 left two instruments 27× apart. Printing **raw** microseconds beside the normalised ones
@@ -2643,13 +2703,14 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Describe the gap's tail, which is the second-largest term and has never been read**
-   (§4.62, pre-registered there). The flush fork closed: both readings were right for different
-   seconds. On **busy** lane-seconds (72 of 98 in a clean stage) the pump spends **43 % in flush
-   and 26 % in gap**, leaving ~31 % parked — so it is neither parked (§4.61) nor saturated
-   (§4.60), and 1 µs per packet is now measured twice by different routes. The gap is 5–7 µs at
-   p50 yet 26 % in aggregate, so its **distribution is tail-dominated and nothing has looked at
-   the tail**. Add p99/max per lane per second, and split the gap either side of the `yield_now`.
+1. **Split the 1 µs per packet inside `flush`** (§4.63, pre-registered there). The cycle on a
+   busy lane-second now reads: `flush` **41.6 %**, `yield_now` **19.8 %**, between them 1.2 %,
+   parked ~37 %. The gap is 97 % the yield (27 of its 28 µs per pass), which corrects §4.60's
+   "the give is not the cost" — that median was taken over the empty passes too. But the yield's
+   19.8 % is **priced and already has two failed alternatives** (§4.46: removing it gave 0.74
+   Gbit/s and a 20 s listener gap; `consume_budget` was worse on every arm), so it is the price
+   of the dispatcher running, not waste. **The one throughput lever left is the 41.6 % in
+   `flush`**: split its 1 µs per packet into lock wait, pick, copy and bookkeeping.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says

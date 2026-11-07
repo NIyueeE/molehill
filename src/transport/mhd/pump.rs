@@ -332,8 +332,12 @@ fn mbit_per_s(bytes: u64, us: u64) -> u64 {
 /// because the four numbers are read together: passes, packets, and the microseconds of
 /// flush against the microseconds of gap, normalised per 1 000 µs of interval so two
 /// lanes with different interval lengths can be compared (HANDOFF §4.61).
-fn format_cycle(passes: &(u64, u64, u64, u64, u64)) -> String {
-    let (count, packets, flush_us, gap_us, interval_us) = *passes;
+#[allow(
+    clippy::type_complexity,
+    reason = "one line's worth of counters, read once"
+)]
+fn format_cycle(passes: &(u64, u64, u64, u64, u64, u64, u64, u64)) -> String {
+    let (count, packets, flush_us, gap_us, interval_us, gap_max, gap_slow, yield_us) = *passes;
     if interval_us == 0 {
         return "n/a".to_owned();
     }
@@ -348,9 +352,14 @@ fn format_cycle(passes: &(u64, u64, u64, u64, u64)) -> String {
     // process-wide `PUMP_FLUSH` histogram reports — the number that decides whether the
     // pump is busy or parked (HANDOFF §4.61).
     let per_pass = flush_us.checked_div(count).unwrap_or(0);
+    // The gap's tail, and how much of the gap is the yield itself: a gap that is mostly
+    // yield is the runtime handing the worker elsewhere, and one that is not is the pump
+    // not being polled at all (HANDOFF §4.62).
+    let slow_share = gap_slow.saturating_mul(100).checked_div(count).unwrap_or(0);
     format!(
         "n={count} packets={packets} flush_raw={flush_us}us flush_per_pass={per_pass}us \
-         flush={}us/1000 gap_raw={gap_us}us gap={}us/1000 of {interval_us}us",
+         flush={}us/1000 gap_raw={gap_us}us gap={}us/1000 gap_max={gap_max}us gap_slow={gap_slow}\
+         ({slow_share}%) yield_raw={yield_us}us of {interval_us}us",
         per_1000(flush_us),
         per_1000(gap_us),
     )
@@ -786,7 +795,12 @@ fn spawn_sender(
                 // acknowledgements flowing while this pass sends, but give the
                 // runtime a chance to run it.
                 posted_full = Some(std::time::Instant::now());
+                let yielding = std::time::Instant::now();
                 tokio::task::yield_now().await;
+                // **The split.** Whatever the gap is, this part of it is the yield.
+                let waited = yielding.elapsed();
+                crate::transport::stats::note_pass_yield(waited);
+                shared.with(|conn| conn.note_yield(waited));
                 continue;
             }
             // **Where this pass came from, counted only when it matters.** A pass

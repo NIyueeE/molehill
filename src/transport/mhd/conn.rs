@@ -111,6 +111,14 @@ pub(crate) const OPEN_RESERVE: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
 /// has been abandoned for longer than all of those is one nobody is waiting for.
 pub(crate) const ABANDON_HOLD: Duration = Duration::from_secs(30);
 
+/// A gap long enough to count as a tail event rather than scheduling noise.
+///
+/// The pre-registration in HANDOFF §4.62 is stated against 200 µs: the gap is 5–7 µs at
+/// p50, so a gap past this is either a descheduling or a page fault, and the share it
+/// accounts for decides whether the cycle's 26 % gap is many small waits or a few large
+/// ones.
+pub(crate) const GAP_SLOW_US: u64 = 200;
+
 /// Whether a stream is still opening: it has not written a reserve's worth yet.
 fn opening(state: &StreamState) -> bool {
     state.send.written() < OPEN_RESERVE
@@ -617,6 +625,17 @@ pub(crate) struct Conn {
     pass_packets: u64,
     flush_us: u64,
     gap_us: u64,
+    /// The gap's tail: its maximum, and how many gaps reached `GAP_SLOW_US`.
+    ///
+    /// The gap is the second-largest term in the cycle (26 % of a busy lane-second) yet
+    /// 5-7 µs at p50, so its distribution is tail-dominated and nothing had read the
+    /// tail (HANDOFF §4.62). Two fields, two comparisons per pass: enough to say whether
+    /// the 26 % is many small gaps or a few large ones, which is the question that
+    /// decides where the fix goes.
+    gap_max_us: u64,
+    gap_slow: u64,
+    /// Microseconds spent inside `yield_now`, so the gap can be split either side of it.
+    yield_us: u64,
     /// This lane's own interval clock.
     ///
     /// **Not `posted_at`.** The first version reused it and `posted_rate` — called a few
@@ -851,6 +870,9 @@ impl Conn {
             pass_packets: 0,
             flush_us: 0,
             gap_us: 0,
+            gap_max_us: 0,
+            gap_slow: 0,
+            yield_us: 0,
             pass_at: now,
             received_total: 0,
             numbers_seen: 0,
@@ -2469,11 +2491,21 @@ impl Conn {
             .saturating_add(u64::try_from(flush.as_micros()).unwrap_or(u64::MAX));
     }
 
-    /// Record the post-to-next-pass gap of this lane.
+    /// Record the post-to-next-pass gap of this lane, and its tail.
     pub(crate) fn note_gap(&mut self, gap: std::time::Duration) {
-        self.gap_us = self
-            .gap_us
-            .saturating_add(u64::try_from(gap.as_micros()).unwrap_or(u64::MAX));
+        let us = u64::try_from(gap.as_micros()).unwrap_or(u64::MAX);
+        self.gap_us = self.gap_us.saturating_add(us);
+        self.gap_max_us = self.gap_max_us.max(us);
+        if us >= GAP_SLOW_US {
+            self.gap_slow = self.gap_slow.saturating_add(1);
+        }
+    }
+
+    /// Record time spent inside the run's `yield_now`.
+    pub(crate) fn note_yield(&mut self, waited: std::time::Duration) {
+        self.yield_us = self
+            .yield_us
+            .saturating_add(u64::try_from(waited.as_micros()).unwrap_or(u64::MAX));
     }
 
     /// This lane's pass counters since the last read, with the interval they cover.
@@ -2481,7 +2513,7 @@ impl Conn {
     /// Reported in the same per-lane line as `cwnd` and `srtt`, so "how long a pass
     /// takes here" and "how much of the second that accounts for" are one subtraction
     /// apart (HANDOFF §4.61).
-    pub(crate) fn take_passes(&mut self, now: Instant) -> (u64, u64, u64, u64, u64) {
+    pub(crate) fn take_passes(&mut self, now: Instant) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         let interval = u64::try_from(now.saturating_duration_since(self.pass_at).as_micros())
             .unwrap_or(u64::MAX);
         self.pass_at = now;
@@ -2491,11 +2523,17 @@ impl Conn {
             self.flush_us,
             self.gap_us,
             interval,
+            self.gap_max_us,
+            self.gap_slow,
+            self.yield_us,
         );
         self.passes = 0;
         self.pass_packets = 0;
         self.flush_us = 0;
         self.gap_us = 0;
+        self.gap_max_us = 0;
+        self.gap_slow = 0;
+        self.yield_us = 0;
         out
     }
 
