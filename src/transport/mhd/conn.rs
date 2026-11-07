@@ -636,6 +636,14 @@ pub(crate) struct Conn {
     gap_slow: u64,
     /// Microseconds spent inside `yield_now`, so the gap can be split either side of it.
     yield_us: u64,
+    /// Microseconds spent in the payload copy, and how many copies it came from.
+    ///
+    /// `flush` is 41.6 % of a busy lane-second at 1 µs a packet, and the copy is the one
+    /// part of a packet that moves a kilobyte; everything else is bookkeeping. Separating
+    /// them is what decides whether the next change is in the data path or around it.
+    copy_us: u64,
+    copies: u64,
+    copy_bytes: u64,
     /// This lane's own interval clock.
     ///
     /// **Not `posted_at`.** The first version reused it and `posted_rate` — called a few
@@ -873,6 +881,9 @@ impl Conn {
             gap_max_us: 0,
             gap_slow: 0,
             yield_us: 0,
+            copy_us: 0,
+            copies: 0,
+            copy_bytes: 0,
             pass_at: now,
             received_total: 0,
             numbers_seen: 0,
@@ -1704,7 +1715,21 @@ impl Conn {
         // longer capped by the chunk boundary the send point happens to sit in.
         self.built = self.built.saturating_add(1);
         let payload_at = out.len();
+        // **The copy, on its own clock.** One pair of reads per packet is the whole
+        // perturbation this instrument asks for, and it is what separates the payload
+        // copy from everything else in a packet's microsecond — the split the next
+        // change needs (HANDOFF §4.63). Off unless the stats switch is on.
+        let copying = stats::enabled().then(std::time::Instant::now);
         let copied = state.send.append_to(offset, len, out);
+        if let Some(at) = copying {
+            self.copy_us = self
+                .copy_us
+                .saturating_add(u64::try_from(at.elapsed().as_micros()).unwrap_or(u64::MAX));
+            self.copies = self.copies.saturating_add(1);
+            self.copy_bytes = self
+                .copy_bytes
+                .saturating_add(u64::try_from(len).unwrap_or(0));
+        }
         debug_assert_eq!(copied, len, "the framing length matches what is copied");
         // A seal that cannot be produced must not become a plaintext packet, and
         // the packet number it already took must not become a **hole** either: a
@@ -2513,11 +2538,11 @@ impl Conn {
     /// Reported in the same per-lane line as `cwnd` and `srtt`, so "how long a pass
     /// takes here" and "how much of the second that accounts for" are one subtraction
     /// apart (HANDOFF §4.61).
-    pub(crate) fn take_passes(&mut self, now: Instant) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    pub(crate) fn take_passes(&mut self, now: Instant) -> [u64; 11] {
         let interval = u64::try_from(now.saturating_duration_since(self.pass_at).as_micros())
             .unwrap_or(u64::MAX);
         self.pass_at = now;
-        let out = (
+        let out = [
             self.passes,
             self.pass_packets,
             self.flush_us,
@@ -2526,7 +2551,10 @@ impl Conn {
             self.gap_max_us,
             self.gap_slow,
             self.yield_us,
-        );
+            self.copy_us,
+            self.copies,
+            self.copy_bytes,
+        ];
         self.passes = 0;
         self.pass_packets = 0;
         self.flush_us = 0;
@@ -2534,6 +2562,9 @@ impl Conn {
         self.gap_max_us = 0;
         self.gap_slow = 0;
         self.yield_us = 0;
+        self.copy_us = 0;
+        self.copies = 0;
+        self.copy_bytes = 0;
         out
     }
 

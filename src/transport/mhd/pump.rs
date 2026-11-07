@@ -332,12 +332,20 @@ fn mbit_per_s(bytes: u64, us: u64) -> u64 {
 /// because the four numbers are read together: passes, packets, and the microseconds of
 /// flush against the microseconds of gap, normalised per 1 000 µs of interval so two
 /// lanes with different interval lengths can be compared (HANDOFF §4.61).
-#[allow(
-    clippy::type_complexity,
-    reason = "one line's worth of counters, read once"
-)]
-fn format_cycle(passes: &(u64, u64, u64, u64, u64, u64, u64, u64)) -> String {
-    let (count, packets, flush_us, gap_us, interval_us, gap_max, gap_slow, yield_us) = *passes;
+fn format_cycle(passes: &[u64; 11]) -> String {
+    let [
+        count,
+        packets,
+        flush_us,
+        gap_us,
+        interval_us,
+        gap_max,
+        gap_slow,
+        yield_us,
+        copy_us,
+        copies,
+        copy_bytes,
+    ] = *passes;
     if interval_us == 0 {
         return "n/a".to_owned();
     }
@@ -359,7 +367,8 @@ fn format_cycle(passes: &(u64, u64, u64, u64, u64, u64, u64, u64)) -> String {
     format!(
         "n={count} packets={packets} flush_raw={flush_us}us flush_per_pass={per_pass}us \
          flush={}us/1000 gap_raw={gap_us}us gap={}us/1000 gap_max={gap_max}us gap_slow={gap_slow}\
-         ({slow_share}%) yield_raw={yield_us}us of {interval_us}us",
+         ({slow_share}%) yield_raw={yield_us}us copy_raw={copy_us}us copies={copies} \
+         copy_bytes={copy_bytes} of {interval_us}us",
         per_1000(flush_us),
         per_1000(gap_us),
     )

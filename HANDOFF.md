@@ -244,6 +244,50 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.64 A packet's microsecond is 99.5 % machinery: the copy costs 8 nanoseconds (2026-11-07)
+
+§4.63 left one throughput lever — the 41.6 % of a busy lane-second spent in `flush` — and
+pre-registered a split of its 1 µs per packet into lock, pick, copy and bookkeeping. Timing the
+**payload copy alone** (one pair of clock reads per packet, off unless the switch is on) answers
+the data-path half of it, and the answer is lopsided to the point of being a verdict:
+
+```
+busy lane-seconds (71 of 96): passes=494 661  packets=18 383 586   stage 8.51 Gbit/s
+flush = 46.1 %   gap = 20.0 %   yield = 19.3 %   copy = 0.2 %
+flush per packet = 1.785 us      copy per packet = 0.008 us  (8 ns, 1 349 B)
+copy share of flush = 0.5 %      everything else = 45.9 % of the lane-second
+```
+
+**The data path is 0.5 % of the build cost.** Copying 349 MB/s of payload into the run buffer
+costs eight nanoseconds a packet; the other 1.777 µs is the machinery around it — taking the
+connection lock, walking the stream range, encoding the header, inserting the recovery record,
+and updating a dozen counters. The pre-registered "if the cost is spread evenly" branch does not
+apply: the cost is **not** spread, it is almost entirely in the bookkeeping, and the copy is not
+worth optimising at all.
+
+**What that rules out, concretely.** Any plan to reduce the build cost by touching the data
+path — a cheaper buffer, fewer copies, `Bytes` instead of a copy, a bigger `STRIPE_CHUNK_SIZE` —
+can win at most half a percent of `flush`, which is 0.2 % of the lane's second. §4.63's finding
+that `SEND_RUN` is the second ceiling and §4.60's 1 µs per packet therefore point at the same
+place: the per-packet **machinery**, not the bytes.
+
+**Next experiment, pre-registered before it runs.** Split the remaining 1.777 µs three ways
+inside `build_packet`, with two clock reads a packet as before: **the stream pick**
+(`next_stream_range`, a `BTreeMap` range walk per packet), **the recovery record** (the
+`Sent` insert per packet), and **everything else** (header encode, counters, the seal check).
+
+- **Pass**: one of the two `BTreeMap` operations is at least 40 % of the packet's cost. Then the
+  change is structural and specific — a cursor that remembers where the last packet came from,
+  or a recovery ring instead of a map — and it is the first throughput lever this cycle has found
+  that does not cost latency.
+- **If both are small**: the microsecond is spread across many small costs, and the honest
+  answer for the release record is that **1.8 µs per packet is this design's cost** and the
+  throughput clause is decided by it.
+- **Guard**: the same cell with stats **off** in the same run must match the instrumented arm
+  within the run's A/A — this is now two clock reads per packet on the hot path, twice what
+  §4.63's split used, and it has to pay for itself or be withdrawn.
+- **Rollback**: throughput falls more than 5 % against the uninstrumented arm.
+
 ### 4.63 The gap is the yield: 27 µs a pass, 19.8 % of a busy lane-second (2026-11-07)
 
 §4.62 pre-registered the gap's tail and a split either side of the `yield_now`. On busy
@@ -2703,14 +2747,13 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Split the 1 µs per packet inside `flush`** (§4.63, pre-registered there). The cycle on a
-   busy lane-second now reads: `flush` **41.6 %**, `yield_now` **19.8 %**, between them 1.2 %,
-   parked ~37 %. The gap is 97 % the yield (27 of its 28 µs per pass), which corrects §4.60's
-   "the give is not the cost" — that median was taken over the empty passes too. But the yield's
-   19.8 % is **priced and already has two failed alternatives** (§4.46: removing it gave 0.74
-   Gbit/s and a 20 s listener gap; `consume_budget` was worse on every arm), so it is the price
-   of the dispatcher running, not waste. **The one throughput lever left is the 41.6 % in
-   `flush`**: split its 1 µs per packet into lock wait, pick, copy and bookkeeping.
+1. **Split the remaining 1.78 µs per packet three ways** (§4.64, pre-registered there). The
+   data path is answered and it is a verdict: the payload copy costs **8 ns a packet**, 0.5 % of
+   `flush` and 0.2 % of a busy lane-second, while `flush` is 46.1 % at **1.785 µs a packet**. So
+   the build cost is machinery — lock, stream pick, header encode, recovery record, counters —
+   and no data-path change can win more than half a percent. Next: time the **stream pick**
+   (`BTreeMap::range` per packet) and the **recovery record** (`Sent` insert per packet)
+   separately from the rest, and pass if either is 40 % of the packet's cost.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says
