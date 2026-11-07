@@ -133,10 +133,26 @@ not merely one that passes a gate. Priorities are fixed:
 **latency > throughput > memory > processor**. Nothing about the configuration
 model moves: no key is added, removed or renamed, and no default changes.
 
-**Where the plan lives.** This file is the durable copy of the plan (§4 open
-problems, §5 decisions and order). The session's goal objective carries the same
-order in one paragraph so that it survives a long context; §5 says how the two are
-kept in step. If they ever disagree, this file wins and the objective is corrected.
+**Where the plan lives — read this first after a context loss.**
+
+The **approved plan's original text** is `MHD-FINALIZATION-PLAN.md` in the
+checkout root. It is **deliberately untracked** (`.gitignore` names it): it is the
+recovery copy this file and the session objective both point at, so a compacted
+or resumed session can reread the whole plan verbatim instead of reconstructing
+it from summaries. Never `git add` it, never rewrite it as release copy, and
+treat it as authoritative over both summaries below.
+
+Three copies, in this order of authority:
+
+1. `MHD-FINALIZATION-PLAN.md` — the approved plan, verbatim, untracked.
+2. This file — the durable, committed record of the same decisions: §4 holds the
+   measurements they rest on, §5 holds the order and its costs.
+3. The session's goal objective — one paragraph so it survives a long context.
+
+If they disagree, fix the lower one. The plan is a working document: when a
+phase lands, its result is written into §4/§5 here and the plan file is updated
+in place rather than amended with a second story — a superseded paragraph in an
+untracked file is a paragraph nobody can date.
 
 ---
 
@@ -4373,6 +4389,13 @@ is now recorded with a stored baseline to compare against next time.
 
 ## 5. Active architecture decisions
 
+> **The governing plan is `MHD-FINALIZATION-PLAN.md`** (checkout root, untracked
+> on purpose — see §1, "Where the plan lives"). Its phase order supersedes the
+> "Order, as of this commit" list further down this section; that list still
+> carries the measurements and reasoning behind each item, so it is kept, not
+> deleted. When a phase lands, write its result in §4 and update the plan file in
+> place.
+
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
 commit with its own A/B and its own revert.
@@ -4407,7 +4430,9 @@ percentiles, not the task count.
 Memory and CPU work is **phase 6**: it may not preempt A–E, and it is judged on
 `rss_peak_mib` and `cpu_s_per_gbit` against a same-round A/A.
 
-**Order, as of this commit.** §4 carries the findings; this is the sequence only.
+**Order, as of the 2026-11-06 rewrite — superseded in sequence by
+`MHD-FINALIZATION-PLAN.md`, kept for the measurements and reasoning it carries.**
+§4 carries the findings; this is the sequence only.
 Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with a
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.

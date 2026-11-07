@@ -12,3 +12,10 @@ __pycache__/
 # The bench project's own environment (uv installs into bench/.venv by
 # default; `just bench` points UV_PROJECT_ENVIRONMENT outside the tree).
 .venv/
+
+# The approved mhd finalization plan, kept in the checkout on purpose and
+# deliberately untracked: it is the recovery copy a long session rereads, and
+# `HANDOFF.md` points at it. A working plan is not a published document —
+# the durable, committed record of the same decisions is `HANDOFF.md` §5, and
+# a user-facing summary would belong in `CHANGELOG.md`. Never `git add` this.
+/MHD-FINALIZATION-PLAN.md
