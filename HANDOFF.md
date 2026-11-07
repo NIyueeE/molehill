@@ -367,6 +367,60 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.101 The 21 ms is a missed socket wake-up, and the RTO is what recovers it (2026-11-07)
+
+§4.100 left three candidates after excluding the stream open, the reader's wake-up and the send
+buffer's dwell. One stamp settles it. The harness now records absolute epoch microseconds at four
+points — the client's post, the server's read start, the server's echo *enqueue*, and the client's
+first byte — and `pump::note_run_posted` records the fifth: when the echo actually left the server's
+socket. Forty requests on one reused stream, all five points on one clock:
+
+| seq | client `first_us` | echo queued → **posted** | posted → **client saw it** |
+|---|---|---|---|
+| 7 | 22 068 | **52 µs** | **21 787 µs** |
+| 26 | 21 922 | **42 µs** | **21 682 µs** |
+| 34 | 21 963 | **52 µs** | **21 696 µs** |
+| 0 | 22 198 | 90 µs | 144 µs (its wait is on the *request* leg) |
+
+So the send path is **exonerated twice over**: the echo is queued and on the wire inside 90 µs. What
+is slow is the other end — the datagram sits in the receiving socket until that process's pump reads
+it. The client's own park line agrees and dates the insert:
+
+```
+mhd stream reader was parked stream=1 parked_us=21428 ready_us=102 \
+    hole=Some((65, 128, 1, Some(64))) wakes_while_parked=3
+```
+
+`ready_us` 102 µs against a 21.4 ms park: the bytes became readable a tenth of a millisecond before
+they were read, so the *insert* is what was late, and the only code that reads that socket is the
+pump. **The datagram was in the kernel, and the pump did not run for 21 ms.**
+
+**The length is the clue, and it is the pump's own timer.** The pump parks in a `select!` over the
+socket and `Conn::poll_timeout()`, and that deadline is `min(recovery timer, keepalive)`: with one
+packet in flight it is the RTO — 20 ms at the small-flight floor — and with an empty flight it is
+the 2 s keepalive. 21.4–21.8 ms is 20 ms plus a margin, and it is the same constant on both ends and
+in both directions, which no queue explains and a timer does.
+
+**What this predicts, and how to check it without another instrument.** If the RTO is what recovers
+a missed wake-up, then lengthening the pump's deadline must lengthen the stall in proportion:
+
+- a **wide** flight (bulk) puts the deadline at `MIN_RTO` = 200 ms, so the same lost wake should read
+  ~200 ms, not ~21;
+- a lane with **nothing in flight** has no recovery timer at all, so the deadline is the keepalive and
+  the stall should read ~2 s — which is the shape of the "two-second parks" this file has recorded
+  since §4.45 without a mechanism.
+
+Both are cheap: the first is a bulk stream beside an interactive one on the same lane; the second is
+a request whose flight has retired before the reply is queued. Either one distinguishes "the timer is
+the recovery path" from "something else happens to take 20 ms", and neither needs a new counter.
+
+**Not yet claimed.** That the readiness wake-up is *missed* (rather than the task not being
+scheduled) is the leading explanation, not a demonstration: `wakes_while_parked=3` counts pump passes
+because `flush` wakes every reader on its way out, so it cannot tell a data wake from a timer pass.
+The next instrument that can is one line per pump pass naming the `select!` arm that woke it; it is
+worth adding only if the prediction above fails, because a proportional stall already names the
+timer.
+
 ### 4.100 The harness earned its keep on day one: two findings (2026-11-07)
 
 The protocol-level harness (§4.99) ran its first real workload — 64-byte echo, loopback, one

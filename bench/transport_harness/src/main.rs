@@ -116,6 +116,22 @@ fn us(elapsed: std::time::Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Microseconds since the Unix epoch, for the cross-process timeline.
+///
+/// Durations inside one process are enough to say *how long* something took and
+/// useless for saying *which end* it happened on: the two ends' `Instant`s share
+/// no origin, so a 21 ms wait on the client and a 21 ms wait on the server look
+/// identical until they are placed on one clock. This is that clock, and the
+/// same one the carrier's own pairing line uses (`stats::epoch_us`).
+///
+/// Zero on a clock before the epoch — a host whose time is that wrong is not a
+/// host to measure latency on, and a zero is visibly not a real stamp.
+fn epoch_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, us)
+}
+
 /// Parse `--flag value` pairs, refusing anything unknown.
 fn parse_args() -> Result<Args> {
     let mut mode = None;
@@ -218,6 +234,7 @@ where
     let mut served = 0u64;
     loop {
         let started = Instant::now();
+        let started_at = epoch_us();
         if stream.read_exact(&mut buf).await.is_err() {
             return Ok(served);
         }
@@ -228,12 +245,19 @@ where
             .await
             .with_context(|| format!("echo of request {served} failed"))?;
         stream.flush().await.ok();
+        let write_us = us(writing.elapsed());
         emit(
             "served",
             &[
                 ("seq", served.to_string()),
                 ("read_us", read_us.to_string()),
-                ("write_us", us(writing.elapsed()).to_string()),
+                ("write_us", write_us.to_string()),
+                // The absolute pair, so a request's three points — the client's
+                // post, this read, and this echo — land on one clock and the
+                // slow leg names itself instead of being inferred from two
+                // durations that cannot see across the process boundary.
+                ("started_at", started_at.to_string()),
+                ("echo_at", epoch_us().to_string()),
             ],
         );
         served += 1;
@@ -308,6 +332,9 @@ struct Attempt {
     post_us: u64,
     first_us: u64,
     complete_us: u64,
+    /// Absolute microseconds at two points, for the cross-process timeline.
+    post_at: u64,
+    first_at: u64,
     ok: bool,
 }
 
@@ -322,6 +349,8 @@ impl Attempt {
                 ("post_us", self.post_us.to_string()),
                 ("first_us", self.first_us.to_string()),
                 ("complete_us", self.complete_us.to_string()),
+                ("post_at", self.post_at.to_string()),
+                ("first_at", self.first_at.to_string()),
                 ("ok", u8::from(self.ok).to_string()),
             ],
         );
@@ -343,6 +372,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let posting = Instant::now();
+    attempt.post_at = epoch_us();
     stream
         .write_all(payload)
         .await
@@ -356,6 +386,7 @@ where
         .await
         .context("waiting for the first response byte")?;
     attempt.first_us = us(first.elapsed());
+    attempt.first_at = epoch_us();
     if reply.len() > 1 {
         stream
             .read_exact(&mut reply[1..])

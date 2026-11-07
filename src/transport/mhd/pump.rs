@@ -388,6 +388,31 @@ fn format_cycle(passes: &[u64; 14]) -> String {
     )
 }
 
+/// Stamp *when* a run left, not only how long the socket took to accept it.
+///
+/// `note_post` answers "was the socket blocked", which is a duration inside one
+/// pass; it cannot answer "was this pass late", because a pass that posts 64
+/// bytes 21 ms after the writer asked for them still took microseconds once it
+/// ran. Joined to the writer's own epoch stamp this is the leg between *queued*
+/// and *on the wire* (`HANDOFF.md` §4.100).
+///
+/// Only a small run is stamped: a request/response lane posts one or two
+/// datagrams per pass, while a bulk lane posts a full run per pass and would turn
+/// this into a line per 45 KiB — the volume would distort what it measures. Gated
+/// on the stats switch like everything else here.
+///
+/// Its own function because `flush` is at the lint's line budget, and because the
+/// measurement is one idea rather than a step of the pass.
+fn note_run_posted(sampled: bool, sent: usize) {
+    if sampled && sent <= 2 {
+        tracing::debug!(
+            datagrams = sent,
+            at_us = crate::transport::stats::epoch_us(),
+            "mhd pump posted a run"
+        );
+    }
+}
+
 async fn flush(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -475,6 +500,7 @@ async fn flush(
     // contributes one sample, gated on the switch.
     let posted = before_wait.elapsed();
     crate::transport::stats::note_post(posted);
+    note_run_posted(sampled, sent);
     if sampled && posted >= std::time::Duration::from_millis(100) {
         let blocked = socket
             .try_io(tokio::io::Interest::WRITABLE, || Ok(()))
