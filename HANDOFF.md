@@ -270,28 +270,62 @@ with nothing to send, and the throughput is set by whoever *fills* it — the st
 loop — not by the pump's build cost. That would overturn §4.60's reading ("throughput is
 packets per microsecond of build") the same way §4.60 overturned §4.59's.
 
-**It is recorded as a candidate, not a conclusion, because my own arithmetic slipped twice
-getting it.** Aggregating the stage, I computed "1.70 Gbit/s from `packets × 1 348` against a
-stage reading of 9.47", and separately printed `flush=0.0 %` because I divided an
-already-normalised per-1000 number by a raw interval. Both are the §4.58 family — a number
-used without its denominator — and the rule in this objective says compute it once before
-believing it. **A per-lane packet count and a stage throughput disagreeing by 5× is either a
-payload-size mistake (a run carries 44 frames of up to 1 348 bytes each, not 44 × 1 348) or a
-window mismatch, and the next step settles which.**
+**The reconciliation was done, and the packet accounting closes exactly — after two of my own
+arithmetic errors were found and fixed.** Filtered to the stage window (the first pass summed
+the whole log, all eight stages, into each stage's figure) and parsed from the whole line
+(`cycle=`'s value contains spaces, so splitting the line on spaces shredded it into separate
+keys), the clean stage reads:
 
-**Next experiment, pre-registered before it runs.** A reconciliation, in the bench's own
-terms, of three independent measures of the same bytes on a `clean` stage: the stage's
-`throughput_gbps`, Σ per-lane `posted_mbit_per_s` (§4.58, already validated at 0.91–1.05), and
-Σ per-lane `packets × mean_datagram_bytes` from the cycle line. It needs one extra field —
-**bytes per packet** beside `packets` — so the payload assumption stops being an assumption.
+```
+lane 0: passes=191 032 packets=7 579 147  pkts/s=315 187  pk/pass=39.7
+lane 1: passes= 16 572 packets=    6 598  pkts/s=    274  pk/pass= 0.4
+lane 2: passes=199 840 packets=7 830 904  pkts/s=325 750  pk/pass=39.2
+lane 3: passes=135 088 packets=5 104 475  pkts/s=212 391  pk/pass=37.8
+SUM 853 349 pkts/s × 1 387 B/packet = 9.47 Gbit/s = the stage, exactly
+```
 
-- **Pass**: all three agree within 10 %. Then the cycle shares stand as measured and the
-  conclusion is that the pump is parked 96 % of the second, which makes the **stripe send
-  loop** the next subject rather than the pump.
-- **If they do not**: the disagreeing pair names which instrument is wrong, and that
-  instrument is fixed or withdrawn before anything is built on it.
-- **Guard**: instrument-only, one line a second; `clean` p50/p99 inside §4.54's two-arm
-  spread. **Rollback**: the third number cannot be produced without touching a hot path.
+Three things that closes, each of which corrects something:
+
+- **The payload is 1 387 bytes per packet, not 1 348** — that is `MAX_DATAGRAM` (1 400) minus
+  the 21-byte head, i.e. the pump is filling its datagrams. `packets × 1 348` was my guess and
+  it was wrong by exactly the amount that made the numbers look irreconcilable.
+- **The lanes are nothing like symmetric**: 315 187 / 274 / 325 750 / 212 391 packets per
+  second. Dividing a process total by four — which §4.59 and §4.60 both did — is wrong here by
+  up to three orders of magnitude on the idle lane.
+- **The 1.6× of §4.60 is therefore closed as an artefact**, not a mystery: it came from that
+  division, plus the payload guess.
+
+**But a new fork opened, and it has to close before anything is built.** The per-lane instrument
+says flush is **22 µs per 1 000 µs (2.2 %)**; the process-wide `PUMP_FLUSH` histogram in the
+same runs says **p50 74 µs per pass**. With 7 960 passes/s on lane 0, 74 µs a pass would be
+**59 % busy**, and 2.2 % would be **2.8 µs a pass**. The two differ by 27×, and they point in
+opposite directions: if the second is right, the pump's build cost is the constraint (as §4.60
+concluded); if the first is right, the pump is parked ~96 % of the second and the constraint is
+whoever fills it (§4.61's candidate).
+
+**A second slip of the same family is in this section's own parsing**, recorded so it is not
+repeated: `format_cycle` prints **per-1 000-µs normalised** values, so summing them and dividing
+by a raw interval divides by 1 000 twice. The shares above are read off single lines
+(`22us/1000`), not recomputed from sums.
+
+**Next experiment, pre-registered before it runs.** One number, two ways, and they must agree:
+**the microseconds of one flush**. Both instruments are already in the tree — `PUMP_FLUSH`
+(process-wide, called from `flush`) and the per-lane `flush_us` (called from the same place via
+`note_pass`) — so this is not a build, it is a check that the two are measuring the same span.
+Sample the *raw* per-flush microseconds per lane, sum them over a second, and compare with
+`passes × PUMP_FLUSH_p50` for the same second on the same lane.
+
+- **Pass**: the two agree within 20 %. Then the shares stand, and the fork closes on whichever
+  one they agreed on — with the consequence stated in advance: **agreement at ~2.2 % means the
+  pump is parked and the stripe send loop is the subject (item 2); agreement at ~59 % means the
+  build cost is the constraint and §4.60 stands.**
+- **If they do not agree**: one of the two is measuring a different span than it claims, and the
+  wrong one is fixed or removed before any throughput work is done. That is the cheapest half
+  day this investigation can spend, given how many readings a wrong flush share would explain.
+- **Guard**: instrument-only, one line a second, gated; `clean` p50/p99 inside §4.54's two-arm
+  spread. **Rollback**: the raw per-flush sample cannot be produced per lane without adding a
+  clock read per pass — which is one read per 44 packets and is affordable, so a refusal here
+  would itself be the finding.
 
 ### 4.60 The gap is microseconds, so the yield is not the cost — and one number does not close (2026-11-07)
 
@@ -2561,17 +2595,15 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Reconcile three measures of the same bytes, then read the cycle** (§4.61,
-   pre-registered there). The per-lane `cycle=` line now exists, and a sample reads
-   `n=523 packets=15524 flush=22us/1000 gap=14us/1000 of 1000019us` — flush 2.2 % and gap
-   1.4 % of the second, which would mean the pump is **parked about 96 % of it** and the
-   throughput is set by whoever fills it (the stripe send loop), not by the build cost
-   §4.60 named. That is **not** a conclusion yet: aggregating the stage I got
-   `packets × 1 348` = 1.70 Gbit/s against a stage reading of 9.47, and printed `flush=0.0 %`
-   by dividing an already-normalised number by a raw interval — two more of the family
-   §4.58 named. Add **bytes per packet** beside `packets`, then check three independent
-   measures of the same bytes (the stage's `throughput_gbps`, Σ per-lane
-   `posted_mbit_per_s`, Σ per-lane packets × mean datagram bytes) against 10 %.
+1. **Close the flush-share fork** (§4.61, pre-registered there). The packet accounting now
+   closes exactly — 853 349 pkts/s × **1 387** B/packet = 9.47 Gbit/s, the stage, after the
+   payload guess was corrected from 1 348 and the log was filtered to the stage window. That
+   also closed §4.60's 1.6× as an artefact and showed the lanes are wildly asymmetric
+   (315 187 / 274 / 325 750 / 212 391 pkts/s), so dividing a process total by four was wrong.
+   **But the two flush instruments disagree by 27×**: the per-lane line reads 22 µs/1 000 µs
+   (2.2 %, i.e. 2.8 µs a pass) while the process-wide `PUMP_FLUSH` reads p50 74 µs a pass
+   (59 % busy at 7 960 passes/s). They point in opposite directions, and one of them decides
+   whether the pump or the sender is the subject.
 2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
    second means the queue is never filled fast enough, and that moves the subject from the
    pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says
