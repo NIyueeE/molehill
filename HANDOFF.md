@@ -351,6 +351,47 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.83 The bulk spine is the whole of condition ①, and the two distributions do not overlap (2026-11-07)
+
+§4.82 ended with the crude form of priority scheduling refuted and the precise form untested. Before
+writing a scheduler, one cheap experiment settled whether the premise even holds: **run the same
+timeline with the bulk spine removed** (`nobulk` profile: `streams: 0`, two rounds, one arm).
+
+| | `clean` p99 | `clean#2` p99 | p50 | max |
+|---|---|---|---|---|
+| **no bulk**, round 0 | **3.08** | **3.10** | 2.40 / 2.43 | 22.9 / 3.6 |
+| **no bulk**, round 1 | **3.41** | **3.31** | 2.52 / 2.61 | 24.2 / 23.6 |
+| with bulk, ten draws (§4.79, §4.81, §4.82) | **9.01 … 133.0** | — | 2.55 … 10.85 | 147.4 |
+
+**The two distributions do not overlap.** The worst no-bulk draw is 3.41 ms; the best with-bulk draw
+is 9.01 ms — a **2.6× gap between the ranges**, and the spread itself collapses from 15× to 1.1×
+(3.08–3.41). Error rate 0.0 % throughout.
+
+**Three things follow, and the second changes the plan.**
+
+1. **Bulk is the cause, not a contributor.** §4.80's flight join could only offer 1.5× and said so; this
+   is a clean separation, which is the only form this file accepts as proof.
+2. **The 9× variance of §4.79 is not ambient noise.** Without bulk the p99 is stable to 11 %; with it,
+   it moves 15× between draws. So the variance is a *function of how much bulk is in flight when the
+   probe samples* — which means it is **controllable**, and "condition ① is a coin flip" was a
+   description of the symptom rather than of the system. The system has a cause.
+3. **The carrier alone is already better than the target.** 3.1–3.4 ms is under the 50 ms SLO by 15×
+   and under TCP's same-round 14.40 ms by 4×. **mhd without bulk is the better carrier.** Everything
+   standing between the tree and condition ① is how it shares a lane with a bulk transfer.
+
+**Next increment, pre-registered.** Locate the wait inside the carrier before changing the scheduler —
+the same discipline §4.82 earned. For each packet the pump builds, measure **how long the byte it
+carries waited** in this end's queue: sampled once per waiting episode, per lane, reported as
+`pickup_p50/p99/max` beside the cycle line.
+
+- **Pass (the fix is in the sender's scheduler)**: `pickup` p99 for the echo's lane is of the same
+  order as the observed 40–80 ms tail. Then class-aware selection fixes it, and it is a real fix.
+- **If `pickup` is microseconds**: the byte left this end promptly, so the wait is downstream — the
+  socket's own queue, the wire, or the receiver's pump — and a sender-side scheduler would fix
+  nothing. The next place to look is what the pump does with 4 MB already in the socket.
+- **Guard**: instrument only, gated on `MOLEHILL_MHD_STATS`; the unobstructed path must not move.
+- **Rollback**: if the instrument costs more than 5 % of throughput against an uninstrumented arm.
+
 ### 4.82 The flight cap made the clean cell worse, so it is reverted (2026-11-07)
 
 §4.81 predicted that capping a lane's outstanding bytes would pull the `clean` cell's tail below
@@ -3672,38 +3713,34 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Phase C (priority scheduling), now with a refuted crude form behind it** (§4.82). The flight
-   cap was built, measured and **reverted**: `clean` p99 went **27.45 → 114.66 ms** (TCP 39.19) and
-   the guard cell `jitter` regressed 115.23 → 128.17. The reason is that on a clean cell the queue
-   **is** the pipelining — 512 KiB at 8 Gbit/s is half a millisecond, so the lane stops and waits
-   instead of keeping 4 MB outstanding, and the echo finds a **slower lane**, not a shorter queue.
-   `clean#2` and `loss5` improved, which are the cells where a shaper exists and the cap acts as
-   crude pacing. So the property that helps is not "less in flight" but "**the echo does not sit
-   behind the bulk**" — the same flight, ordered by class. **Pass**: `clean` p99 below TCP's
-   same-round figure with `loss5`/`jitter` unchanged. **Rollback**: either moves.
-2. **§5's other items stand**: `bulk-n` (③), capacity (④), the gate axes (⑤), the final-tree
-   acceptance run (⑥, `just check` + `just interop` + L3 acceptance), phase 6's CPU/memory judging
-   from §1.1.
-2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
-   refilled only when the pool is empty is a *different* experiment and is unrun; it
-   is not in this list until 1 says the pool is the constraint.
-3. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
-   `loss1` and `loss5` report 1.06 s and 1.46 s of p99, which is where recovery, not
-   setup, decides the number.
-4. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
-   *write* budget, not a packet-scheduling guarantee, so the question is open — but
-   it is worth building only if a `nobulk` run (`streams: 0`) against the same
-   timeline shows the bulk spine is what moves the interactive tail.
-5. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built:
-   one from the acknowledgement frontier (read 0.18–0.37 of the stage, reverted under its
-   own pre-registration) and one from posted bytes (**0.91–1.05, §4.58, and it is per lane
-   and only joins when the lanes are summed**). So a *rate is measurable* — but the pass
-   says the socket already delivers what is posted, which means a pacer placed at the socket
-   would be pacing a link that is not the constraint. Item 1 decides whether a controller is
-   wanted at all; if the pump stops for a budget reason, the fix is in the budget, not in a
-   rate.
-6. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
-   `cpu_s_per_gbit` against a same-round A/A.
+1. **Locate the wait before scheduling: measure `pickup`** (§4.83, pre-registered there). The
+   `nobulk` experiment is decisive and it re-frames condition ①: **without the bulk spine the
+   `clean` cell's p99 is 3.08 / 3.10 / 3.41 / 3.31 ms** (four draws, 11 % spread), **with it
+   9.01 … 133.0 ms** — the ranges **do not overlap**, and the 15× variance collapses to 1.1×
+   without bulk. So bulk is the *cause*, the variance is a function of bulk occupancy rather than
+   ambient noise, and **the carrier alone already beats both the 50 ms SLO (by 15×) and TCP's
+   same-round 14.40 ms (by 4×)**. Before writing a scheduler, measure how long a byte waits in
+   this end's queue — `pickup_p50/p99/max`, one sample per waiting episode per lane. If it is tens
+   of milliseconds the fix is in the sender; if it is microseconds the wait is downstream and a
+   sender-side scheduler would fix nothing. **Rollback**: the instrument costs >5 % throughput.
+2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
+   the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
+   carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
+3. **A per-visitor spare channel stays refuted** (§4.20).
+4. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one: `loss1` and `loss5`
+   report 1.06 s and 1.46 s of p99, which is where recovery, not setup, decides the number.
+5. **C (priority scheduling): its condition is now met.** This item used to say C was conditional on
+   "a `nobulk` run showing the bulk spine is what moves the interactive tail". **That run is §4.83,
+   and it shows exactly that** (3.1–3.4 ms without bulk, 9–133 ms with). So C is scheduled, and it
+   follows item 1, which says *where* inside the path the wait actually is; §4.82 already refutes
+   the crude form (capping outstanding bytes), so what remains is ordering by class at the same
+   total flight.
+6. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built: one from
+   the acknowledgement frontier (0.18–0.37 of the stage, reverted) and one from posted bytes
+   (**0.91–1.05, §4.58, per lane, joining only when lanes are summed**). The socket delivers what
+   is posted, so a pacer at the socket would pace a link that is not the constraint.
+7. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and `cpu_s_per_gbit`
+   against a same-round A/A.
 
 Settled and off the list: **one stream, one hop** (§4.47). Built, measured at eight
 rounds with the A/A inside the run, and it does not move either axis — so the group
