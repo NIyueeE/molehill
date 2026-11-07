@@ -1532,6 +1532,20 @@ fn take_sorted(slot: &std::sync::Mutex<Vec<u32>>) -> Vec<u32> {
 /// what decides whether a budget or the scheduler's walk is the limit.
 static PASS_BUILT: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
+/// The gap from posting a full run to the next pass starting.
+///
+/// Only sampled after a pass that built `SEND_RUN`: that is the one path with no
+/// await between the post and the next build except the `yield_now`, so the number
+/// is that yield plus however long the runtime took to poll the task again. A pass
+/// after a *short* run goes to `wait()` instead, and its gap is a wait with no
+/// bound — a different quantity that would swamp this one (HANDOFF §4.59).
+static PASS_GAP: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Note the interval from a full run's post to the next pass.
+pub(crate) fn note_pass_gap(gap: Duration) {
+    note_us(&PASS_GAP, gap);
+}
+
 /// How many passes ended on each `none_reason` this second.
 ///
 /// A fixed table rather than a map: the reasons are `&'static str` set in
@@ -1570,6 +1584,7 @@ pub(crate) fn note_none_reason(reason: &'static str) {
 /// Report how a pass ended and why, once a second.
 fn report_build_stop() {
     let built = take_sorted(&PASS_BUILT);
+    let gap = take_sorted(&PASS_GAP);
     let mut reasons = {
         let mut table = NONE_REASONS
             .lock()
@@ -1599,6 +1614,12 @@ fn report_build_stop() {
         built_p99 = pct_us(&built, 99, 100),
         built_max = built.last().copied().unwrap_or(0),
         stopped,
+        // The cycle's other half: a pass posts its run and yields, and this is how
+        // long it takes to be polled again.
+        gap_n = gap.len(),
+        gap_p50_us = pct_us(&gap, 50, 100),
+        gap_p99_us = pct_us(&gap, 99, 100),
+        gap_max_us = gap.last().copied().unwrap_or(0),
         reasons = %table,
         "mhd-stats: how each pump pass ended"
     );

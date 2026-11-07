@@ -709,9 +709,16 @@ fn spawn_sender(
         // One pass is `wait()` returning to the next `wait()`: everything this task
         // does between waking and going back to sleep.
         let mut pass_started: Option<std::time::Instant> = None;
+        // When the previous pass posted a **full** run: the gap from there to this
+        // pass starting is the `yield_now` plus the time the runtime took to poll
+        // this task again, and nothing else (see `stats::note_pass_gap`).
+        let mut posted_full: Option<std::time::Instant> = None;
         loop {
             if let Some(started) = pass_started.take() {
                 crate::transport::stats::note_pump_pass(started.elapsed());
+            }
+            if let Some(at) = posted_full.take() {
+                crate::transport::stats::note_pass_gap(at.elapsed());
             }
             staging.clear();
             let flushing = std::time::Instant::now();
@@ -728,6 +735,7 @@ fn spawn_sender(
                 // More is queued; the listener's dispatcher keeps the
                 // acknowledgements flowing while this pass sends, but give the
                 // runtime a chance to run it.
+                posted_full = Some(std::time::Instant::now());
                 tokio::task::yield_now().await;
                 continue;
             }

@@ -244,6 +244,54 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.60 The gap is microseconds, so the yield is not the cost — and one number does not close (2026-11-07)
+
+§4.59's instrument, measured on the same shape:
+
+```
+how each pump pass ended  passes=19 513  built_p50=44  built_p99=44  built_max=44
+                          stopped=3 837   gap_n=15 676
+                          gap_p50_us=5  gap_p99_us=121  gap_max_us=27 826
+```
+
+**The gap's p50 is 5–7 µs and its p90 is 13 µs.** The pre-registered pass was "above 100 µs
+means the cycle is waiting", and the pre-registered failure was "below 20 µs means the pump
+is already posting back-to-back and `SEND_RUN` is the only lever left". **The failure branch
+is the one that happened**: after posting a full run the pump is polled again five
+microseconds later. The `yield_now` costs nothing measurable here — which also explains why
+§4.46's two alternatives to it were both worse: the give was never the expense, and removing
+it gave up the dispatcher for nothing.
+
+**So the cycle is `flush`, not waiting — and `flush` is 63–74 µs at p50 for a 44-packet
+run.** That is 1.5 µs per packet: the lock, the pick, the encode, the 1 348-byte copy and
+the recovery bookkeeping, 44 times. On this cell the throughput is therefore
+`packets per µs of build`, and `SEND_RUN` is bounded by the latency it costs a small packet
+(§6 row 7), so **the remaining lever is the cost of building a packet, not the shape of the
+loop**.
+
+**One number does not close, and it is recorded rather than smoothed.** Four lanes at
+19 207 flushes/s would be 4 802 per lane, i.e. a 208 µs cadence — while `flush` (74) + gap
+(6) is 80 µs. About 128 µs per cycle is unaccounted. Two candidate explanations, neither
+measured: the process-wide `passes` counter cannot be split by lane, so dividing by four
+assumes the lanes are symmetric, which the per-lane `posted_mbit_per_s` already shows they
+are not; or `send_run`'s `socket.writable()` wait is inside `flush` and sits in the tail
+(`flush` p99 427–537 µs) rather than the median. **A per-lane flush count would settle it**,
+and that is the next instrument rather than a conclusion drawn over a factor of 1.6.
+
+**Next experiment, pre-registered before it runs.** Make `passes` and `flush` per lane
+rather than process-wide — the same defect §4.57 fixed for `posted_datagrams_per_s`, in the
+two counters that are still shared — and report, per lane and per second, flushes, the flush
+p50 and the gap p50.
+
+- **Pass**: per-lane flushes × flush p50 accounts for the second within 25 %. Then the cycle
+  is understood and the next move is inside `flush` (the per-packet build cost).
+- **If it does not**: the missing time is a wait this loop's own timers cannot see, and the
+  next instrument is on `send_run`'s writability await, which `note_post` already brackets
+  but only for the *posting* half.
+- **Guard/rollback**: instrument-only, gated, one line a second; revert if the counters
+  cannot be made per lane without touching a hot path (they are incremented once per pass,
+  not per packet, so this should not be possible).
+
 ### 4.59 The pump is not window-limited and not starved: throughput is passes × 44 packets (2026-11-07)
 
 §4.58 asked why the pump holds 59 KB against a 262 144 window with 13.5 MB queued. The
@@ -2464,15 +2512,17 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Split the pump's pass cycle: work or wait** (§4.59, pre-registered there). The pass
-   instrument settled the previous question: every pass builds exactly `SEND_RUN` (44)
-   packets, and `passes/s × 44 × 1 348 B` reproduces the stage throughput (19 281 passes/s
-   → 9.1 Gbit/s against a measured 7.1–9.7). `flight ≈ 59 KB` is *one pass*, not a
-   shortfall, so the window is irrelevant on this cell and the pass cycle is everything.
-   A pass is ~207 µs apart while its `flush` is 18–21 µs, so ~185 µs is waiting. Instrument
-   the gap from "run posted" to "next pass started"; above 100 µs means the cycle is waiting
-   (fix where it waits, without raising `SEND_RUN`), below 20 µs means the pump is already
-   back-to-back and there is no lever left that does not cost latency.
+1. **Make the two pass counters per lane, then read the cycle** (§4.60, pre-registered
+   there). The gap instrument settled §4.59's question on its failure branch: after posting a
+   full run the pump is polled again in **5–7 µs** (p90 13), so the `yield_now` costs nothing
+   measurable and `SEND_RUN` remains the only loop-shape lever, ruled out by the latency it
+   costs. The cycle is `flush` — 63–74 µs at p50 for 44 packets, 1.5 µs per packet.
+   **But one number does not close**: four lanes at 19 207 flushes/s implies a 208 µs cadence
+   while flush+gap is 80 µs, and `passes`/`flush` are still **process-wide** counters — the
+   same defect §4.57 fixed for `posted_datagrams_per_s`. Make them per lane and report
+   flushes, flush p50 and gap p50 per lane per second; pass if per-lane flushes × flush p50
+   accounts for the second within 25 %. Then the next move is inside `flush`: the per-packet
+   build cost, which is the throughput ceiling on this cell.
 2. **A lane root that is actually usable** (phase A: implemented, default off). The
    switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
    root-caused with a two-end join on stream, direction and packet — not until the
