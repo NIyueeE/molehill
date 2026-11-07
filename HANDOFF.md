@@ -351,6 +351,51 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.75 Cut (b) is blocked by a blanket impl, and the seam below it is the real one (2026-11-07)
+
+§4.74 chose cut (b): an additive `datagrams() -> Option<…>` on the pool's stream type, "only the mhd
+carrier answers `Some`". Reading the type to implement it shows that sentence cannot be written as
+stated, and the reason is worth recording before someone tries anyway.
+
+**The type is erased twice over.**
+
+- `pub(crate) type CarrierStream = Box<dyn CarrierIo>`, and
+- `CarrierIo` is a **marker trait with a blanket impl**:
+  `impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> CarrierIo for T {}`.
+
+So there is no "the pool's stream type" whose method could answer `Some` for one carrier and `None`
+for another: the box holds a `dyn CarrierIo` that knows only I/O, and any `datagram_sink` added to
+the trait would either arrive through the blanket impl (**every** type answering the default, and no
+type able to override it, because a concrete impl would collide with the blanket one) or require
+deleting that impl and writing an impl per stream type — a change to every carrier's plumbing for the
+benefit of one.
+
+**What that means for the cut.** The sink cannot travel *inside* the trait object. It has to travel
+**beside** it, and the place that already holds a pair is the enum the pool actually moves:
+`DataChannel { Raw(ServerStream), RawMhd(CarrierStream), Mux(MuxStream) }`. `DataChannel` is also the
+concrete type the UDP pool is instantiated with — `run_udp_connection_pool::<DataChannel>`, one call
+site — so it is the right place to carry a sink and the only place that needs to.
+
+**Revised cut (b′), pre-registered before it is written.** `DataChannel::RawMhd` carries
+`(CarrierStream, Option<DatagramSink>)`, filled where the mhd stream is accepted (the same place
+`serve_mhd_stream` already has `lane: Arc<MhdLane>` in hand); `parallel_udp`'s worker takes the sink
+as a parameter from `spawn_worker`, which reads it off the `DataChannel` it was given. Every other
+struct variant carries no sink, so **a TCP carrier's UDP path is unchanged by construction**, not by
+a runtime branch that must be tested to stay unchanged.
+
+- **Pass**: unchanged from §4.74 — `udp-pace`'s `datagrams_in` grows at the offered rate while the
+  lane's flight, retransmits and credit stay idle.
+- **Guard**: unchanged, plus one this round adds: **the compiler is the guard for "TCP is
+  unchanged"** — if the non-mhd variants cannot carry a sink, no runtime branch can regress them.
+- **Rollback**: if `DataChannel` cannot carry the sink without changing its `AsyncRead`/`AsyncWrite`
+  behaviour (it is a plain enum today, so this is a real risk only if a variant's wrapping is
+  load-bearing), the increment goes whole.
+
+**Not started this round, deliberately.** The change touches `multiplex.rs`'s boxed type, the
+`DataChannel` enum, `spawn_worker`, `udp_forward_worker` and the client's `udp_read_loop`; landing
+part of it would leave a type nothing produces and a waiver to cover it, which this file's rules
+forbid. The round's deliverable is the corrected cut, which is the part that was wrong.
+
 ### 4.74 The datagram seam is the pool's data-channel API, and it is drawn here before it is cut (2026-11-07)
 
 §4.73 pre-registered the service wiring with its two call sites named. Reading those call sites
@@ -3312,17 +3357,18 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Give the pool's stream an optional datagram handle** (§4.74, pre-registered there). The
-   wiring's real obstacle was found by reading the call sites: the lane handle is **dropped at the
-   pool's data-channel hand-off** (`data_ch_rx` yields a stream, not a lane), while the affinity the
-   class must keep already exists in `UdpRouteMap`. Chosen cut: **(b)** — an additive
-   `datagrams() -> Option<…>` on the pool's stream type that only the mhd carrier answers `Some`
-   from, so every other carrier keeps today's path byte-for-byte and no signature changes.
-   `udp_forward_worker` uses the handle when present and `UdpTraffic` otherwise; the visitor id is
-   `worker << 16 | sequence`. **Pass**: `udp-pace`'s `datagrams_in` grows at the offered rate while
-   the lane's flight, retransmits and credit stay idle. **Guard**: TCP `clean` p50/p99 within the
-   A/A, and a **TCP-carrier UDP run indistinguishable from today** — that is what (b) promises.
-   **Rollback**: if the route needs the stream's ordering for affinity, the whole increment goes.
+1. **Carry the datagram sink beside the stream, in `DataChannel::RawMhd`** (§4.75, revised cut
+   **b′**). Cut (b) as written is blocked: the pool's stream is `Box<dyn CarrierIo>` over a
+   **marker trait with a blanket impl**, so no method on it can answer `Some` for one carrier and
+   `None` for another without either colliding with that impl or rewriting every carrier's plumbing.
+   The sink travels where a pair already exists: `DataChannel::RawMhd(CarrierStream, Option<DatagramSink>)`,
+   filled where the stream is accepted (which already holds `Arc<MhdLane>`), read by `spawn_worker`,
+   passed to `udp_forward_worker`. **The other variants cannot carry a sink, so the TCP carrier's UDP
+   path is unchanged by construction** — the compiler is the guard, not a tested branch.
+   **Pass**: `udp-pace`'s `datagrams_in` grows at the offered rate while the lane's flight,
+   retransmits and credit stay idle. **Guard**: TCP `clean` p50/p99 within the A/A; endpoint invariant
+   holds. **Rollback**: if a variant's wrapping turns out load-bearing for its `AsyncRead`/`AsyncWrite`
+   behaviour, the increment goes whole.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
