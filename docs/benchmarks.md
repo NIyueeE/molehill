@@ -981,6 +981,40 @@ and multiplexes every stream inside it. A visitor's channel open costs 2 648 µs
 of which 1 818 µs is that handshake; everything after it is at parity, and the
 first byte follows the pairing in 12 µs.
 
+### Where mhd wins, and where it loses (2026-11-07)
+
+The carrier question has an answer per path condition, and it is not one carrier. Same binary, same
+round, `--scenarios timeline`, one arm per carrier with `MOLEHILL_DATA_CARRIER` pinning each:
+
+| cell | what the condition is | mhd p99 | TCP p99 | mhd Gbit/s | TCP Gbit/s | verdict |
+|---|---|---|---|---|---|---|
+| `clean` | nothing shaped | **59.0 ms** | **14.4 ms** | 8.61 | 8.50 | **TCP**, by 4× on the tail |
+| `rtt100` | 100 ms added delay | 403.2 | 410.1 | 2.57 | 2.51 | parity |
+| `rate100` / `rate20` | shaped to a rate | 233.2 / 549.1 | 228.1 / 508.0 | 0.09 / 0.02 | 0.09 / 0.02 | parity |
+| `loss1` | 1 % loss | 1 061.1 | 1 052.1 | **4.79** | **6.07** | **TCP**, on throughput |
+| `jitter` | 20 ms ± jitter | **118.0** | **171.8** | 4.02 | **5.82** | mixed — mhd's tail, TCP's throughput |
+| `loss5` | 5 % loss | **1 454.9** | **2 100.8** | **1.11** | **0.30** | **mhd**, both axes |
+
+**Read it as one sentence**: mhd's own recovery beats a TCP carrier inside a tunnel once the path loses
+enough to make the kernel stack collapse — at 5 % loss it hands over **3.7× the throughput and a 31 %
+tighter tail** — and it loses everywhere the path is clean, by **4× on the tail**, because a new
+visitor channel's handshake queues behind the bulk already in its shared UDP sockets while a TCP
+tunnel gives every channel its own connection. The crossover sits **between 1 % and 5 % loss**: at 1 %
+the carriers agree on latency and TCP is 27 % ahead on throughput.
+
+So the honest statement for an operator is not "one carrier is better". It is: **on a lossy path mhd
+is the better first carrier; on a clean path TCP is.** The default tries mhd and falls back to TCP when
+a session cannot be established — which is a statement about *establishment*, not about *which is
+faster*, and those are different questions. A deployment that expects packet loss should prefer mhd; a
+deployment on a datacentre or a well-provisioned link should prefer TCP, and the `clean` row is the
+reason.
+
+Two things this table does **not** say. It does not compare either carrier against other tools — that
+is the sweep's job, and on the same `clean` cell the peers measured 1.02–1.09 ms at p50 against both
+molehill carriers' 2.63–2.82 (§"The carrier axis is a path condition now" above explains why the pool
+pays that). And it is loopback in a container: the loss and jitter cells are shaped, the clean one is
+not, so `clean` is a lower bound on what a real path does to both carriers.
+
 ### Warm and cold
 
 The staged schedule's first stage and its last carry the **same condition**, and they

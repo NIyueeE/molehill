@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Each carrier now has a stated path condition, measured rather than assumed.** mhd
+  wins on a lossy path and TCP wins on a clean one, and the crossover is between 1 %
+  and 5 % loss: at 5 % loss mhd carries 3.7× the throughput with a 31 % tighter tail,
+  while on an unshaped cell TCP's tail is 4× tighter (14.4 ms against 59.0 ms at p99).
+  The fallback keeps its meaning — it fires when a session cannot be *established*,
+  which is a different question from which carrier is faster — so the documentation
+  now says which path each one is for instead of leaving the comparison to the
+  reader. The table and its conditions are in
+  [Benchmarks](docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-07).
+
 - **The congestion window's ceiling follows the path** rather than sitting at a flat
   2 MiB. A loopback path's bandwidth-delay product is a small fraction of that, and
   the difference was a standing queue every small request waited behind: the first
