@@ -351,6 +351,54 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.85 The pairing wait splits 99.9 % into one component: waiting for a channel to be produced (2026-11-07)
+
+§4.84 pre-registered splitting the pairing into its parts, with the pass criterion "one of them is at
+least 80 % of the 88.5 ms". **The split was already in the log** — `report_pairing` prints a
+four-part breakdown for every pairing over 5 ms — so this round needed no new run.
+
+641 slow pairings from the dwell run, in microseconds:
+
+| component | p50 | p90 | p99 | max | share of all pairing time |
+|---|---|---|---|---|---|
+| `accept` (visitor taken off the listen queue) | 51 | 71 | 95 | 167 | **0.3 %** |
+| `enqueue` (request put on the pool's queue) | 1 | 1 | 3 | 10 | **0.0 %** |
+| **`wait` (until a data channel is taken)** | **11 794** | **37 496** | **114 748** | **263 146** | **99.9 %** |
+| `write` (channel handed to the visitor) | 5 | 22 | 267 | 575 | **0.1 %** |
+
+**`wait` is 99.9 % of it**, which clears the pre-registered 80 % by a wide margin. `attempts` is 0 on
+every one of the 641, so this is not a retry loop, and `accept` being 51 µs says the listen queue is
+not where visitors queue either.
+
+**The sample is the tail by construction, and that is the right sample here.** `report_pairing`
+returns early under 5 ms — a threshold-gated log, which this file forbids as a way to characterise a
+*distribution*. The question was never the distribution: §4.84 already had it from the `paired_*`
+percentiles (p50 1.7 ms, p99 88.5 ms). The question was **what the slow ones are made of**, and for
+that a sample of slow ones is exactly right. Stated so the next reader does not add these to the
+percentile.
+
+**What is now narrowed and what is not.** Of §4.84's three candidates, **(a) "no free tunnel" is
+excluded**: `enqueue` is 1 µs, so the pool accepted the request instantly, and the wait is on the
+*answer*, not on the queue. What remains inside `wait` is either **(b)** the client's own open work
+(the control round trip plus the carrier's stream open, whose own cost is ~557 µs per §4.68) or
+**(c)** the client's task not being scheduled to act on the request. **A 11.8 ms median against a
+0.6 ms open is twenty round trips, so (c) is the better suspect — but this measurement cannot tell
+them apart, and guessing here is what this cycle has twice paid for.**
+
+**Next increment, pre-registered.** Join the two ends on the group id the file already carries for
+exactly this purpose: the server's `debug!("Visitor paired with a striped group", group, at_us)` line
+carries an absolute epoch stamp, and the client logs its own line for the same group. The gap between
+them is "how long after the server asked did the client act", which separates (b) from (c).
+
+- **Pass**: the client's decision lands **within a millisecond** of the server's stamp, i.e. the
+  client acted at once and the time went into the open itself ⇒ **(b)**, and the fix is a pool that
+  does not have to open a channel per visitor.
+- **If the gap is tens of milliseconds**: **(c)**, the client is not scheduling the request, and the
+  fix is in how the client's channel-request path shares a runtime with bulk forwarding.
+- **Guard**: the join needs both ends' logs, so this run's work directory must be preserved before
+  any clean-up — the rule §4.69 paid for.
+- **Rollback**: nothing but reading logs; no code changes this increment.
+
 ### 4.84 The tail is the pairing wait, not the data path — and every carrier instrument agrees (2026-11-07)
 
 §4.83 pre-registered one measurement before writing any scheduler: how long a byte waits in this
@@ -3775,14 +3823,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Split the pairing wait into its three parts** (§4.84, pre-registered there). The tail is not
-   the data path: in a run whose `clean` p99 is 83.76 ms the send-buffer dwell is **25 µs** (p99),
-   the socket post **53 µs**, the wake **57 µs**, the group turnaround **658 µs** — while
-   `paired_p99` is **88.5 ms** against `first_p99` of **34 µs**. And without bulk the pairing p99 is
-   **3.2 ms**, matching the 3.08–3.41 ms cell. **So phase C as scoped (in-lane scheduling) would
-   have measured a fast path and missed the wait.** Measure which of (a) no free tunnel, (b) waiting
-   for the client to open one, (c) control-channel scheduling, accounts for the 88.5 ms.
-   **Pass**: one accounts for ≥80 %. **Rollback**: instrument only.
+1. **Join both ends on the group id to separate (b) from (c)** (§4.85, pre-registered there). The
+   split is done and it is decisive: of the pairing, `accept` is **0.3 %** (51 µs), `enqueue`
+   **0.0 %** (1 µs), `write` **0.1 %**, and **`wait` is 99.9 %** — p50 **11 794 µs**, p99
+   **114 748 µs**, max 263 146 µs over 641 slow pairings, `attempts` always 0. So **(a) "no free
+   tunnel" is excluded**: the pool took the request in a microsecond. What is left is (b) the open
+   itself or (c) the client not being scheduled — and 11.8 ms against a ~0.6 ms open says (c), which
+   this measurement cannot prove. Join the server's `at_us` for a group against the client's line for
+   the same group: if the client acts within a millisecond the time is in the open (**b**), and if the
+   gap is tens of milliseconds it is the client's scheduling (**c**). **Preserve both ends' logs
+   before any clean-up.**
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
