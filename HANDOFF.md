@@ -351,6 +351,54 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.86 The join: the client acts at once, and the open itself costs 11.7 ms under bulk (2026-11-07)
+
+§4.85 pre-registered joining both ends on the group id. **The join was designed into the tree and
+had never been used**: the server logs `mhd pairing request group=G ask_ms=…`, the client logs
+`mhd channel open started group=G now_ms=… queued_us=…`, and the comment beside the client's line
+already says what the subtraction means. 6 425 groups, **6 425 matched**, and 641 of them are the
+slow pairings §4.85 measured.
+
+| segment | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| server asks → client **starts** dialling | **−1 µs** | 999 | 1 000 | 4 999 |
+| dialling → channel arrives | **11 664 µs** | 37 290 | 114 749 | 262 147 |
+
+**The control hop is 0.6 % of the wait; the open is 99.4 %.** The client acts immediately — the
+`−1 µs` is the 1 ms resolution of `as_millis()`, not a negative duration, and it means "inside the
+same millisecond". So **(c) is excluded**: the client is not being starved of scheduling. **(b) is
+the answer**: the channel's own open is what costs 11.7 ms.
+
+**Which is seven times its idle cost.** §4.68 measured an open at **557 µs** with sealing and
+**1 610 µs** without; here it is 11.7 ms median and 115 ms at p99, while every data-path instrument
+in the same run reads microseconds (§4.84). The open is a handshake — several round trips on a lane
+that is saturated — so each round trip queues behind the bulk. That is consistent with everything
+measured so far and it is the first statement in this file that says *where* the bulk contention
+lands: not on the bulk's own packets, and not on the sender's queue, but on **a new stream's
+handshake**.
+
+**What this means for a fix, and why §4.20 has to be read carefully before acting.** The obvious
+answer is "keep a channel ready". §4.20 built exactly that — one spare **per paired visitor** — and it
+**lost on every cell** (rr-1 0.208 against 0.151 ms, rr-16 20 095 against 23 382, churn-16 no
+improvement), because one spare per visitor doubles the opens and the belt is fed faster than it is
+consumed. That section ends with the sentence this round can now act on: *"A reserve of a fixed small
+depth, refilled only when the pool is empty, is a different experiment and has not been run."*
+
+**Next increment, pre-registered.** That experiment: **a reserve of depth 1 per service**, refilled
+in the background only when it is empty, so a visitor takes the ready channel instead of waiting for
+a handshake.
+
+- **Pass**: `clean` p99 falls below TCP's same-round figure **and** the pairing `wait_us` p50 drops
+  out of the 11.7 ms region, **without** moving `rr-1`, `rr-16` or `churn-16` — the three cells
+  §4.20 lost on. Those three are the guard because they are exactly what a badly-sized reserve costs.
+- **If the refill cannot keep up** (the reserve is empty whenever a visitor arrives): the measurement
+  says so directly — `wait_us` stays put — and the answer is that a per-service reserve cannot beat a
+  handshake whose cost is the contention itself. Then the fix has to be fewer round trips in the
+  open, which is a wire change and belongs to 6.0.
+- **Rollback**: any of the three guard cells moving, or `loss5`/`jitter` regressing.
+- **Discipline**: implemented behind a switch, committed **before** the run (§4.82), reverted whole if
+  it loses, numbers kept (§4.20's own precedent).
+
 ### 4.85 The pairing wait splits 99.9 % into one component: waiting for a channel to be produced (2026-11-07)
 
 §4.84 pre-registered splitting the pairing into its parts, with the pass criterion "one of them is at
@@ -3823,16 +3871,16 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Join both ends on the group id to separate (b) from (c)** (§4.85, pre-registered there). The
-   split is done and it is decisive: of the pairing, `accept` is **0.3 %** (51 µs), `enqueue`
-   **0.0 %** (1 µs), `write` **0.1 %**, and **`wait` is 99.9 %** — p50 **11 794 µs**, p99
-   **114 748 µs**, max 263 146 µs over 641 slow pairings, `attempts` always 0. So **(a) "no free
-   tunnel" is excluded**: the pool took the request in a microsecond. What is left is (b) the open
-   itself or (c) the client not being scheduled — and 11.8 ms against a ~0.6 ms open says (c), which
-   this measurement cannot prove. Join the server's `at_us` for a group against the client's line for
-   the same group: if the client acts within a millisecond the time is in the open (**b**), and if the
-   gap is tens of milliseconds it is the client's scheduling (**c**). **Preserve both ends' logs
-   before any clean-up.**
+1. **A reserve of depth 1 per service — the experiment §4.20 said was unrun** (§4.86,
+   pre-registered there). The join is done and it excludes the last alternative: the server asks, the
+   client **starts dialling in the same millisecond** (p50 −1 µs, which is the 1 ms resolution), and
+   then **11 664 µs** passes before the channel arrives — p99 **114 749 µs**. So the control hop is
+   0.6 % and **the open is 99.4 %**, at seven times its idle cost (§4.68's 557–1 610 µs), because a
+   handshake is several round trips on a lane saturated with bulk. §4.20 refuted one spare **per
+   visitor** and explicitly left "a reserve of a fixed small depth, refilled only when the pool is
+   empty" unrun. **Pass**: `clean` p99 below TCP's same-round figure and the pairing `wait_us` p50 out
+   of the 11.7 ms region, with `rr-1`, `rr-16` and `churn-16` — the three cells §4.20 lost on —
+   unchanged. **Rollback**: any of those moving, or `loss5`/`jitter`.
 2. **The remaining completion conditions**: `bulk-n` (③), capacity 8/8 (④), the gate axes (⑤), and
    the final-tree acceptance run (⑥: `just check` + `just interop` + L3 acceptance, mhd and TCP
    carriers, single/multi stream, Noise on/off, UDP/L3 no regression).
