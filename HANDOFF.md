@@ -351,6 +351,48 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.76 The wiring has an order, and getting it backwards breaks UDP quietly (2026-11-07)
+
+Before cutting into (b′) I checked which end can move first. It is not symmetric, and the asymmetry
+is worth a paragraph because the wrong order has no loud failure.
+
+**The two directions carry different traffic.** Server → client is visitor-bound datagrams; client
+→ server is the service's replies. Today **both** are `UdpTraffic` frames on a reliable stream.
+
+**If the server switches first**, it stops writing `UdpTraffic` for visitor-bound datagrams and
+writes `Frame::Datagram` instead. The client it is talking to still reads `UdpTraffic` — so those
+datagrams arrive at a reader that is not looking for them and are **counted by the carrier and
+dropped** (§4.73's receive path returns early after incrementing). No error, no reset, no log line:
+`datagrams_in` rises, the visitor sees nothing, and the UDP cell's loss metric attributes it to the
+network. That is the worst shape a defect can have here — a regression that looks like the thing
+the benchmark already measures.
+
+**So the order is: the client reads first, the server switches second.** The client can be taught to
+read a datagram frame while the server still sends `UdpTraffic` with no cost at all — the read path
+is additive and never fires until the server switches. The reverse is not available.
+
+**And the switch itself must be conditional, not simultaneous.** Two builds of one repository are
+not one process: a client from an older commit (or the other end of a release boundary) may still be
+`UdpTraffic`-only, and dialect 6.0 is unreleased, so both ends can be rebuilt together — but the
+bench runs peers and the integration suite runs both, and a silent drop is exactly what the release
+gate would not catch. The capability belongs in the control-channel registration, next to the
+existing `TransparentCapabilities` precedent: the client declares it can receive native datagrams,
+and **the server uses `Frame::Datagram` only for a client that declared it**. Absent the declaration,
+every datagram stays on `UdpTraffic` — the same property (b′) gets from the types, obtained here from
+the handshake.
+
+**Next increment, pre-registered.** The **client read path only**: `MhdLane` exposes
+`take_datagrams()` and the client's `udp_read_loop` drains it into the same per-visitor sink that
+`UdpTraffic` fills. Nothing on the server changes; nothing switches.
+
+- **Pass**: with the server still sending `UdpTraffic`, the client behaves **identically** — a
+  `udp-pace` run's `udp_recv_mbit`, `udp_loss_pct` and `udp_gap_p99_ms` land inside the run's own
+  A/A against a pre-change baseline, and the lane's `datagrams_in` stays **0** (nothing is being sent
+  on the class yet). This is the increment that can only be verified by *not* changing behaviour.
+- **Guard**: `just check` and the integration suite; the new path must be unreachable without a
+  producer, which the `datagrams_in == 0` assertion above pins.
+- **Rollback**: any movement in the UDP cell means the read path is not as additive as claimed.
+
 ### 4.75 Cut (b) is blocked by a blanket impl, and the seam below it is the real one (2026-11-07)
 
 §4.74 chose cut (b): an additive `datagrams() -> Option<…>` on the pool's stream type, "only the mhd
@@ -3357,18 +3399,18 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Carry the datagram sink beside the stream, in `DataChannel::RawMhd`** (§4.75, revised cut
-   **b′**). Cut (b) as written is blocked: the pool's stream is `Box<dyn CarrierIo>` over a
-   **marker trait with a blanket impl**, so no method on it can answer `Some` for one carrier and
-   `None` for another without either colliding with that impl or rewriting every carrier's plumbing.
-   The sink travels where a pair already exists: `DataChannel::RawMhd(CarrierStream, Option<DatagramSink>)`,
-   filled where the stream is accepted (which already holds `Arc<MhdLane>`), read by `spawn_worker`,
-   passed to `udp_forward_worker`. **The other variants cannot carry a sink, so the TCP carrier's UDP
-   path is unchanged by construction** — the compiler is the guard, not a tested branch.
-   **Pass**: `udp-pace`'s `datagrams_in` grows at the offered rate while the lane's flight,
-   retransmits and credit stay idle. **Guard**: TCP `clean` p50/p99 within the A/A; endpoint invariant
-   holds. **Rollback**: if a variant's wrapping turns out load-bearing for its `AsyncRead`/`AsyncWrite`
-   behaviour, the increment goes whole.
+1. **The client read path only — the wiring has an order** (§4.76, pre-registered there). Cut
+   (b′) is settled (`DataChannel::RawMhd(CarrierStream, Option<DatagramSink>)`), but the two
+   directions are not symmetric: if the **server** switches first it stops writing `UdpTraffic` for
+   visitor-bound datagrams while the client is still reading `UdpTraffic`, so they arrive at a reader
+   not looking for them and are **counted and dropped with no error, no reset, no log** — a
+   regression that looks like network loss. **So the client reads first, the server switches
+   second**, and the switch is **conditional on the client declaring the capability** in its control
+   registration (the `TransparentCapabilities` precedent), never simultaneous. This increment:
+   `MhdLane::take_datagrams()` drained by `udp_read_loop` into the existing per-visitor sink, with
+   **nothing on the server changed**. **Pass**: behaviour identical — a `udp-pace` run's
+   `udp_recv_mbit`, `udp_loss_pct`, `udp_gap_p99_ms` inside the A/A, and the lane's
+   `datagrams_in` **still 0**. **Rollback**: any movement in the UDP cell.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
