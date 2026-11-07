@@ -351,6 +351,56 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.79 The release cell moves 9× between adjacent rounds of one run (2026-11-07)
+
+One arm, two rounds, one binary, one shape, nothing changed between them:
+
+| round | `clean` p50 | `clean` p99 | errors | `clean#2` p99 | `clean` thr |
+|---|---|---|---|---|---|
+| 0 | 2.64 | **9.01 ms** | 0.0 % | 4.76 ms | 8.39 Gbit/s |
+| 1 | 5.03 | **81.09 ms** | 0.0 % | 8.74 ms | 7.78 Gbit/s |
+
+**A 9× swing in p99, between two rounds of the same run, with the throughput moving 7 %.** Every
+earlier measurement in this file described the spread as living "between arms and rounds" — §4.48's
+four reads, §4.54's four, §4.68's four. This pair sharpens that: the spread needs no change of
+binary, session, load shape or clock; it is present in the **narrowest comparison the harness can
+make**, and it is what §4.66's 36 % throughput swing was a shadow of.
+
+**Two things follow, and the second is the important one.**
+
+- **Condition ① cannot be settled by any number of rounds of this cell.** Eight draws now read
+  9.0 / 23.2 / 24.1 / 47.3 / 59.6 / 80.5 / 81.1 / 96.8 / 133.0 ms — about half under the 50 ms SLO
+  and about half over, with the best and worst separated by 15×. A criterion written as "each of two
+  cells at p99 ≤ 50 ms, no averaging, no warmup, no deleting the first stage" is, against this
+  distribution, a **coin flip per cell**, and running it more times only prices the coin.
+- **So the work that remains for ① is not measurement, it is the variance itself** — and the
+  variance has a known shape that has never been attacked: §4.46's p99 pathology (both carrier round
+  trips slow 2.4–2.9× together while the visitor's first-byte delay is unchanged) is a **lane-level
+  mode**, and a lane-level mode that arrives and leaves between rounds is what a *stall* looks like,
+  not what congestion looks like.
+
+**What is known about stalls on this cell, and what has never been measured.** The 2-second reader
+park appears in every arm (§4.68: 1 999–2 386 ms, including both OFF arms), so a long stall is
+present even when nothing about the carrier changed. `wake_pump→pass` latency was instrumented in
+§4.46. What has **not** been measured is where the *p99 sample itself* spends its time: a 81 ms p99
+means some request waited 81 ms, and this file can say what the lane's cycle looks like second by
+second (§4.62–§4.66) but has never asked **which of those seconds the slow request was in, and what
+the lane was doing then**.
+
+**Next experiment, pre-registered.** Cross the two instruments that already exist: for a round whose
+`clean` p99 is above the SLO, take the request whose wait is at p99 (the interactive series records
+it) and join it against **the same lane-second's** `cycle=` line — flush, gap, yield, parked — and the
+window line's `flight`/`buffered`. The question is only "what was the lane doing in the second the
+slow request happened in", and both halves of the join are already recorded.
+
+- **Pass**: the p99 request's second is a second the lane spent **parked** (or with `yield` far above
+  19 %). Then the stall is the lane not being scheduled, the fix is in the pump's wake path, and
+  §4.46's `consume_budget` result becomes explainable rather than a dead end.
+- **If the lane was busy and healthy in that second**: the delay is above the lane — in the pool, the
+  stripe group, or the service — and the next instrument moves there. That is also an answer.
+- **Guard**: the join needs absolute timestamps on both sides, which the run already records
+  (`group` ids); a round with no above-SLO request is not evidence and is skipped, not averaged.
+
 ### 4.78 A stop to the datagram plumbing, and the reason is the completion conditions (2026-11-07)
 
 Phase 3 has now run eight sections — §4.71 through §4.77 — and the honest accounting is that it has
@@ -3478,14 +3528,18 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **The release cell's distribution, then the TCP comparison** (§4.78 parks phase 3). The
-   completion conditions do not price the datagram class; "UDP does not regress" is already satisfied
-   by the framed path. What is open is ① (`clean`/`clean#2` p99 ≤ 50 ms, ≤ 0.5 % errors), ② (not worse
-   than in-tree TCP and the same-method peers at p50/p90/p99), ③ (`bulk-n` resolution) and ⑤ (the gate
-   axes). This round adds **two draws** to the release cell's distribution — no new instrument — because
-   six draws that read 23.2 / 24.1 / 47.3 / 59.6 / 80.5 / 96.8 / 133.0 ms cannot yet support a verdict
-   and the next decision (reduce the spread, or argue the SLO against the cell's own floor) needs more
-   than one sample. Phase 3 resumes from §4.77's pre-registration, unchanged.
+1. **Join the p99 request against the lane-second it happened in** (§4.79, pre-registered there).
+   Two rounds of one run read `clean` p99 **9.01 ms** and **81.09 ms** — a 9× swing with no change of
+   binary, session, shape or clock, so condition ① is a coin flip per cell against this distribution
+   and more rounds only price the coin. What is open is the **variance**, and its shape has been
+   recorded since §4.46 (both carrier round trips slow 2.4–2.9× together, visitor first-byte
+   unchanged ⇒ a lane-level mode ⇒ a stall, not congestion). The next measurement crosses instruments
+   that already exist: take the above-SLO round's p99 request and join it against **the same
+   lane-second's** `cycle=` and window line. **Pass**: that second is one the lane spent **parked**
+   (or `yield` far above 19 %) ⇒ the stall is scheduling, the fix is the pump's wake path.
+   **Otherwise**: the delay is above the lane and the next instrument moves there.
+   **Guard**: absolute timestamps on both sides (the run records `group` ids); an above-SLO round
+   without a matched request is skipped, never averaged.
 2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
