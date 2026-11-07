@@ -1648,6 +1648,26 @@ fn report_wake_latency() {
     );
 }
 
+/// Report how long a byte waited in the send buffer before a packet carried it.
+///
+/// Collected since the instrument was written and, until now, **never printed** — the only
+/// reading in this tree is the note beside [`DWELL`] (p99 0.5 ms and 0.14 ms at full scale).
+/// It is the discriminator for the question §4.83 asks: a byte that leaves this end promptly
+/// means the tail bulk creates is downstream, and no sender-side scheduler can fix it.
+fn report_dwell() {
+    let samples = take_sorted(&DWELL);
+    if samples.is_empty() {
+        return;
+    }
+    info!(
+        n = samples.len(),
+        p50_us = pct_us(&samples, 50, 100),
+        p99_us = pct_us(&samples, 99, 100),
+        max_us = samples.last().copied().unwrap_or(0),
+        "mhd-stats: how long a byte waited in the send buffer"
+    );
+}
+
 /// Report this second's pump passes and their flushes.
 fn report_pump_loop() {
     for (name, slot) in [("pass", &PUMP_PASS), ("flush", &PUMP_FLUSH)] {
@@ -1965,6 +1985,7 @@ fn report_all() {
         report_pump_wakes,
         report_idle_passes,
         report_wake_latency,
+        report_dwell,
         report_build_stop,
         report_pump_loop,
         report_tasks,
