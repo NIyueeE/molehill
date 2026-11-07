@@ -244,6 +244,88 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.70 Sealing costs 3.13× per packet, so the AEAD is the cost and the switch stays off (2026-11-07)
+
+§4.69 re-measured both arms on one shape and **kept both logs** (`pp-on-server.log`,
+`pp-off-server.log` beside their results in `~/tmp/results-series/`). Busy lane-seconds, straight
+from the `cycle=` line so nothing is assumed:
+
+| arm | `clean` throughput | packets/pass | `flush`/pass | **`flush`/packet** |
+|---|---|---|---|---|
+| seal **off** | **8.77 Gbit/s** | 27.6 | 80 µs | **2.91 µs** |
+| seal **on** | 3.75 Gbit/s | 35.5 | 324 µs | **9.12 µs** |
+
+**The pre-registered pass was "sealed at most 2× per packet"; it is 3.13×.** So the second branch is
+the one that happened, in its own words: **the AEAD is the cost on this host, sealing stays off, and
+these numbers go into the release record as the reason.**
+
+Two things worth keeping from it:
+
+- **The per-pass ratio (4.05×) overstates the per-packet ratio (3.13×)** because the sealed arm
+  actually runs *more* packets a pass (35.5 against 27.6) — so part of the per-pass figure is a
+  consequence, not a cause. §4.69's "between 3.4× and 3.6×" is corrected by this table.
+- **9.12 − 2.91 = 6.2 µs per packet for one ChaCha20-Poly1305 call on 1 387 bytes**, with no key
+  derivation and no allocation on that path (§4.69's code read). That is roughly **an order of
+  magnitude above** what the cipher costs in software on a modern core. It is not this cycle's
+  question any more — sealing stays off either way — but it is recorded as a measured anomaly rather
+  than smoothed away, because if the AEAD is ever wanted for another reason (a hostile middlebox, a
+  policy requirement) this number is where that work starts, and it should start from "the call costs
+  6.2 µs, which is too much for what it does" rather than from the cipher's reputation.
+
+**What this closes.** Phase 2's original question — "can the per-visitor handshake go away" — has a
+measured answer now: **the handshake goes, the latency halves, and the crypto that replaces it costs
+three times the build.** On the priority order 延迟 > 吞吐 that is a favourable trade only if the
+throughput loss is acceptable, and the pre-registration said it is not. The switch stays off, the
+`DERIVED_SELECTOR` path stays tested-and-inert, and the release record cites 3.13×.
+
+### 4.69 Two corrections to §4.68: a denominator, and evidence this round destroyed (2026-11-07)
+
+Both corrections are mine, found while trying to act on §4.68's conclusion, and both are the kind
+this file already has rules against.
+
+**1. The per-packet cost was a per-pass number divided by an assumed packet count.** §4.68 turned
+`flush` per pass (ON 273 µs, OFF 73–81) into "+4.5 µs per packet" by assuming 44 packets a pass —
+the `SEND_RUN` cap. Measured from a surviving log: a busy lane-second actually runs **29.6 packets a
+pass**, so OFF's cost is **81 / 29.6 = 2.74 µs a packet**, not the 1.73–1.76 §4.66 reports at a
+different load, and not derivable from the per-pass figure at 44. This is the sixth unit-or-denominator
+error of the cycle and the same shape as the fifth: a quotient read without its divisor.
+
+**2. Two of the four arms' logs no longer exist, because this round's clean-up deleted them.** The
+`~/tmp` sweep kept only the newest `bench-*` directory, which removed `on2`'s and `off1`'s logs — the
+only evidence of what the sealed arm's `packets` and `passes` actually were. So the *ON* per-packet
+cost **cannot be recomputed at all** from what survives: `flush_per_pass` for ON was quoted while the
+line existed, but its companion `packets` was not, and the arithmetic needs both. The rule "list what
+will be deleted and count it first" was followed for the directory *count* and not for its *content*:
+no check asked "does a conclusion in HANDOFF depend on this?"
+
+**What survives, stated precisely.** OFF: `flush` **2.74 µs per packet** at 29.6 packets a pass on a
+busy lane-second. ON: `flush` **273 µs per pass** (quoted while the log existed). **Sealing costs the
+build somewhere between 3.4× and 3.6× per pass, and the per-packet attribution is open.**
+
+**And a code fact that narrows where it can be.** `StreamCipher::seal` is one `encrypt_inout_detached`
+with a nonce from the packet number and a stack `[u8; TAG]` return — **no per-packet key derivation
+and no allocation on that path**. The one allocation `seal_stream_payload` does make is `to_vec()` on
+the 9–12-byte header, which is tens of nanoseconds, not microseconds. So §4.68's guess ("the suspect
+is the per-packet derivation") is **wrong**: there is no derivation per packet. Whatever the 3.4–3.6×
+is, it is inside the AEAD call itself or in how it is invoked — which makes §4.68's "if the AEAD is
+most of it, the cipher is the cost on this host" branch the likely one, and that branch's answer is
+"sealing stays off, and the trade is recorded".
+
+**Next experiment, pre-registered before it runs.** Re-measure **both** arms on the same shape, and
+**keep both logs** by writing them to `~/tmp/results-series/` before any clean-up: per arm, the busy
+lane-second's `flush per pass`, `packets per pass` and therefore `flush per packet`, plus `flush` as a
+share of the second.
+
+- **Pass**: the sealed arm's `flush per packet` is **at most 2×** the unsealed arm's. Then the 3.6×
+  per-pass figure is mostly *fewer packets a pass* (a consequence, not a cause), sealing's throughput
+  cost is a pacing artefact rather than a crypto cost, and the next question is why the sealed build
+  produces fewer packets a pass.
+- **If sealed is 3× or more per packet**: the AEAD is the cost on this host, sealing stays off, and
+  §4.68's numbers plus this one go into the release record as the reason.
+- **Guard**: nothing but the two runs; `--scale 0.15 --rounds 1` each, ~14 minutes. **Artefacts are
+  copied out of the work directory before it is removed** — that is the deliverable, after this round
+  lost them.
+
 ### 4.68 Sealing passes the latency test and fails the throughput one, and the cost is in the build: 273 µs a pass against 73 (2026-11-07)
 
 §4.67's pre-registration: **ON · OFF · ON · OFF**, same shape, pass if the open falls ≥ 30 %, `clean`
@@ -264,13 +346,13 @@ OFF runs. Four runs, and one of them died at the readiness probe:
 5.10 — below both OFF runs by more than the OFF pair's own spread (6.26–7.93, i.e. 1.67 Gbit/s wide).
 So under its own rule **the switch stays off**.
 
-**And the cost is now located, which is worth more than the verdict.** Per-pass `flush` on busy
-lane-seconds: **ON 273 µs (p50), OFF 73–81 µs** — sealing **triples** the build. At ~44 packets a
-pass that is **+4.5 µs per packet**, on top of the 1.73–1.76 µs §4.66 measured. ChaCha20-Poly1305 on
-1 387 bytes is a fraction of a microsecond in software, so 4.5 µs is **not the cipher**: the suspect
-is the per-packet work around it — deriving a key and nonce per packet rather than advancing a
-counter, or an allocation per seal. That is a specific, testable defect in a path that is otherwise
-finished.
+**And the cost was located, then that location was withdrawn within a round — see §4.69.** Per-pass
+`flush` on busy lane-seconds read **ON 273 µs (p50), OFF 73–81 µs**, which seals the build by about
+3.6×. What this section then wrote — "at ~44 packets a pass that is +4.5 µs per packet" — **divided a
+per-pass figure by an assumed packet count**, and §4.69 measured the real figure: a busy lane-second
+runs **29.6 packets a pass, not 44**, so OFF's cost is **2.74 µs a packet**. The ON arm's per-packet
+figure is **unrecoverable**, because this round deleted its logs. The claim "+4.5 µs per packet" is
+withdrawn: the per-pass numbers stand, the per-packet conversion does not.
 
 **One thing the pairs settle, and it is not sealing's fault.** The **2-second reader park appears in
 all four arms** — 1 999–2 386 ms — including both OFF runs, so it is the ambient stall this file has
@@ -2937,39 +3019,24 @@ Rewritten on 2026-11-06 after §4.39's correction: the previous list opened with
 live-task count whose premise §4.37 had already refuted, and behind it a 12-worker
 curve and a RACK rewrite that no measurement had asked for yet.
 
-1. **Split the sealed packet's 4.5 µs** (§4.68, pre-registered there). The interleaved pairs decided
-   the verdict and named the cost: sealing **passes latency** (open 557 µs against 1 610, −65 %;
-   `clean` p99 lower than both OFF runs) and **fails throughput** (`clean` 4.13 against 6.26/7.93,
-   `loss1` 1.86 against 4.33/5.10, beyond the OFF pair's own spread), so under its own pre-registration
-   **the switch stays off**. But the cost is located: `flush` per pass is **273 µs ON against 73–81
-   OFF** — **+4.5 µs per packet**, and ChaCha20 on 1 387 B is a fraction of that, so the suspect is the
-   per-packet key/nonce derivation or an allocation, not the cipher. Split `seal_stream_payload` into
-   derivation and AEAD; if derivation is ≥ half, sealing becomes a latency win at no throughput cost.
-   **Also recorded**: the 2-second reader park is present in **all four arms** (1 999–2 386 ms), so it
-   is ambient and not seal-specific; `on1`'s death was the probe landing inside it.
-2. **The stripe send loop, if the reconciliation passes** (§4.61): a pump parked 96 % of the
-   second means the queue is never filled fast enough, and that moves the subject from the
-   pump's build cost to the sender that feeds it — measured, not assumed, once item 1 says
-   which number was wrong.
-3. **A lane root that is actually usable** (phase A: implemented, default off). The
-   switch stays off until the multi-stripe wedge under `MOLEHILL_MHD_SEAL=1` is
-   root-caused with a two-end join on stream, direction and packet — not until the
-   design reads well. §4.10's and §4.13's numbers decide its default afterwards.
-4. **Native unreliable datagrams** for UDP. This dialect declares no datagram frame
-   (`wire.rs` says so), so a UDP service is framed into a reliable stream and pays
-   an ARQ, a route map, two worker queues and a Noise record for a packet that must
-   not be retransmitted at all. Only after 1 and 3, and never as a second fallback.
-5. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
+1. **Phase 3: native unreliable datagrams** (§4.70 closes phase 2). Sealing is decided and the
+   answer is negative: it costs **9.12 µs per packet against 2.91** — **3.13×**, past the
+   pre-registered 2× — so the AEAD is the cost on this host, the switch stays off, and the release
+   record cites that ratio. The per-visitor handshake can go; the crypto that replaces it costs three
+   times the build. With that closed, the next carrier work is the datagram class this dialect
+   declares no frame for: a UDP service is framed into a reliable stream and pays an ARQ, a route
+   map, two worker queues and a Noise record for a packet that must not be retransmitted at all.
+2. **A per-visitor spare channel stays refuted** (§4.20). A fixed small reserve
    refilled only when the pool is empty is a *different* experiment and is unrun; it
    is not in this list until 1 says the pool is the constraint.
-6. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
+3. **B (RACK + PTO)**, judged on the shaped cells rather than the clean one:
    `loss1` and `loss5` report 1.06 s and 1.46 s of p99, which is where recovery, not
    setup, decides the number.
-7. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
+4. **C (priority scheduling) is conditional, not scheduled.** `OPEN_RESERVE` buys a
    *write* budget, not a packet-scheduling guarantee, so the question is open — but
    it is worth building only if a `nobulk` run (`streams: 0`) against the same
    timeline shows the bulk spine is what moves the interactive tail.
-8. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built:
+5. **D (delivery-rate) waits, and now for a measured reason.** Two estimators were built:
    one from the acknowledgement frontier (read 0.18–0.37 of the stage, reverted under its
    own pre-registration) and one from posted bytes (**0.91–1.05, §4.58, and it is per lane
    and only joins when the lanes are summed**). So a *rate is measurable* — but the pass
@@ -2977,7 +3044,7 @@ curve and a RACK rewrite that no measurement had asked for yet.
    would be pacing a link that is not the constraint. Item 1 decides whether a controller is
    wanted at all; if the pump stops for a budget reason, the fix is in the budget, not in a
    rate.
-9. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
+6. **Phase 6 (memory, CPU)** stays last and stays judged on `rss_peak_mib` and
    `cpu_s_per_gbit` against a same-round A/A.
 
 Settled and off the list: **one stream, one hop** (§4.47). Built, measured at eight
