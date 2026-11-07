@@ -4638,13 +4638,27 @@ is now recorded with a stored baseline to compare against next time.
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step, and it is not phase 1 yet.** Phase 0 found a ~21 ms tail in the bare carrier that
-appears in about one request in five, is quantised, and is *not* the stream open, the reader's
-wake-up or the send buffer's dwell (§4.100). Three candidates are left and one instrument separates
-them: epoch-microsecond stamps at the client's build, the client's post and the server's dispatcher
-receive, joined to the client's own `first_us`. That runs before phase 1 because it may reorder the
-plan: if the tail is a lost pump signal, phase 1's accounting work is not what fixes the arrival
-path, and §4.1's history says a timer constant is not it either.
+**Next step: phase 1, recovery accounting.** The detour is over. Phase 0's tail is found, named and
+bounded (§4.101): a lone datagram's readiness edge is sometimes lost, the pump then slept to a
+retransmission deadline, and capping that sleep at 1 ms while a stream is live removed the tail
+without moving the median. So the sequence returns to the plan's order, and phase 1 is what it says:
+`flight` and the stream buffers must agree before any new recovery rule is built on them — §4.65
+records `flight` at 3.4–12 MB against a `cwnd` of 262 144, and that number is an input to the write
+path's backpressure.
+
+Two things from the detour stay open, deliberately and with their evidence:
+
+- the lost readiness edge is **bounded, not fixed** — it is still between `drain_ready`'s bare
+  `try_io` and the `select!` that follows it, and no visitor's latency depends on that round
+  happening first;
+- a lane that is *idle with a stream open* now pays up to 1 000 wake-ups a second, which is the
+  poll's pure cost and is unmeasured. It belongs to the next milestone's `cpu_cores` and
+  `rss_peak_mib` guardrail, and §4.101 says so.
+
+**The session objective is one round behind this section** — it still says the next step is the
+five-stamp instrument, which is done. A goal edit is refused outside a direct human turn, so it is
+corrected at the next one; until then this section and `MHD-FINALIZATION-PLAN.md` §0 are the accurate
+copies.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
