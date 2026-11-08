@@ -367,7 +367,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.146 `bulk-n` passes the 85 % line at 96.8 % of its baseline (2026-11-08)
+### 4.147 An idle live connection costs 0.00 % of a core — and the 1 ms clamp is not what I thought (2026-11-08)
+
+The open item since §4.101: a lane with a live stream wakes at `READ_POLL` (1 ms), so the design allows up to
+a thousand wake-ups a second per lane, and nobody had measured what that costs. The harness could not hold a
+connection open, so it gained `--hold-ms` — the client keeps its lane alive and idle after its requests —
+and both ends' CPU is sampled from `/proc/<pid>/stat` over five seconds.
+
+| transport | end | CPU over 5 s |
+|---|---|---|
+| tcp | server / client | **0.000 cpu-s / 0.000 cpu-s** |
+| mhd | server / client | **0.000 cpu-s / 0.000 cpu-s** (two runs) |
+
+**The idle cost is nil, at this instrument's resolution.** Whatever the clamp allows, an idle lane does not
+spend measurable CPU. The item is closed as measured rather than as assumed.
+
+**But the shape is not what the clamp implies, and that part is unexplained.** With `MOLEHILL_MHD_STATS=1`
+the pump's own line during the hold reads:
+
+```
+cycle=n=3 packets=1
+```
+
+**Three passes a second, not a thousand.** `has_live_streams()` is true here (the held stream is not reset),
+and `wait()` caps the deadline at `now + READ_POLL` when nothing else is armed — so the pump should be
+waking about a thousand times a second and the line should say so. It does not, and I did not find out why
+inside this round. Recorded as an observation with its evidence and **not** as a finding: either the clamp
+is not in the path I think it is, or `cycle` counts something narrower than passes.
+
+**What that means for the item.** The cost question is answered — nil — and the mechanism question is a new
+one, smaller: why does an idle lane with a live stream run three passes a second when the code says it may
+run a thousand? It is not a performance problem in either direction, which is why it is written down rather
+than chased this round.
+
+### 4.146 `bulk-n` passes the 85 % line at 96.8 % of its baseline (2026-11-08)### 4.146 `bulk-n` passes the 85 % line at 96.8 % of its baseline (2026-11-08)
 
 The first phase-5 measurement, against the baseline §4.143 recorded rather than against a neighbour:
 

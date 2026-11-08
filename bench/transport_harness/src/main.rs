@@ -87,6 +87,14 @@ struct Args {
     size: usize,
     requests: usize,
     stream_mode: StreamMode,
+    /// Keep the connection open and idle for this long before exiting.
+    ///
+    /// The idle cost of a live lane had no instrument at all: the pump wakes at
+    /// `READ_POLL` (1 ms) while any stream is live, so the design says up to a
+    /// thousand wake-ups a second per lane, and nobody had measured what that
+    /// costs (`HANDOFF.md` §4.147). This holds the stream open so the process's
+    /// own CPU can be sampled.
+    hold_ms: u64,
 }
 
 /// Emit one NDJSON line.
@@ -140,6 +148,7 @@ fn parse_args() -> Result<Args> {
     let mut size = 64usize;
     let mut requests = 1000usize;
     let mut stream_mode = StreamMode::Fresh;
+    let mut hold_ms = 0u64;
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -175,9 +184,10 @@ fn parse_args() -> Result<Args> {
                     other => bail!("--stream-mode takes fresh or reuse, got {other:?}"),
                 };
             }
+            "--hold-ms" => hold_ms = value.parse().context("--hold-ms wants milliseconds")?,
             other => bail!(
                 "unknown argument {other:?}; the flags are --mode, --role, --addr, \
-                 --size, --requests, --stream-mode"
+                 --size, --requests, --stream-mode, --hold-ms"
             ),
         }
     }
@@ -189,6 +199,7 @@ fn parse_args() -> Result<Args> {
         size: size.max(1),
         requests: requests.max(1),
         stream_mode,
+        hold_ms,
     })
 }
 
@@ -460,6 +471,11 @@ async fn client_tcp(args: &Args) -> Result<()> {
     if failed > 0 {
         bail!("{failed} of {} requests failed", args.requests);
     }
+    // The control for §4.147: an idle TCP connection is the comparison.
+    if args.hold_ms > 0 {
+        emit("holding", &[("ms", args.hold_ms.to_string())]);
+        tokio::time::sleep(std::time::Duration::from_millis(args.hold_ms)).await;
+    }
     Ok(())
 }
 
@@ -522,5 +538,12 @@ async fn client_mhd(args: &Args) -> Result<()> {
     if failed > 0 {
         bail!("{failed} of {} requests failed", args.requests);
     }
+    // Hold the lane open and idle, so its polling cost can be sampled from
+    // outside (`HANDOFF.md` §4.147).
+    if args.hold_ms > 0 {
+        emit("holding", &[("ms", args.hold_ms.to_string())]);
+        tokio::time::sleep(std::time::Duration::from_millis(args.hold_ms)).await;
+    }
+    drop(lane);
     Ok(())
 }
