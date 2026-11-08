@@ -367,7 +367,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.147 An idle live connection costs 0.00 % of a core — and the 1 ms clamp is not what I thought (2026-11-08)
+### 4.148 The closing record: three user-visible fixes and one refused comparison, written down (2026-11-08)
+
+The changelog and the user-facing benchmark page had fallen behind the work, and both are pages a reader
+takes at face value.
+
+**`CHANGELOG.md`'s `[Unreleased]` had two `### Fixed` headings** — a defect in its own right, since the
+release ritual extracts a section by its first heading — and none of this round of fixes. Now one heading,
+with three entries a user would recognise: a carrier that stopped delivering one direction no longer stalls
+a transfer (§4.114, and the 10-of-10 / 2.96–3.90 s measurement is quoted); a packet arriving after its stream
+ended no longer opens a new one (§4.121); a new stream can no longer be given an id a live stream holds
+(§4.122).
+
+**They are late, and the rule says they should not be.** AGENTS.md asks for the entry in the same commit as
+the change; these landed 2–14 commits afterwards. Recording it here rather than pretending the discipline
+held: the reason is that each fix was made inside a measurement round and the changelog was never opened —
+which is exactly the failure mode the rule exists for.
+
+**`docs/benchmarks.md` and its mirror gained the one bullet a reader most needs.** The list of what the model
+cannot answer did not say that a TCP-based tool wins on this host: on a clean loopback cell mhd's round trip
+is 45 µs against 20, and a proxied request 113 against rathole's 61, because TCP's loopback path is kernel to
+kernel. The bullet says so in both languages, states that the change which would remove it was declined, and
+says plainly that the carrier's case — per-stream recovery, no head-of-line blocking, datagram semantics — is
+not measured by any scenario here.
+
+### 4.147 An idle live connection costs 0.00 % of a core — and the 1 ms clamp is not what I thought (2026-11-08)### 4.147 An idle live connection costs 0.00 % of a core — and the 1 ms clamp is not what I thought (2026-11-08)
 
 The open item since §4.101: a lane with a live stream wakes at `READ_POLL` (1 ms), so the design allows up to
 a thousand wake-ups a second per lane, and nobody had measured what that costs. The harness could not hold a

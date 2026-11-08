@@ -765,6 +765,19 @@ Stated so a reader does not ask a chart for something it never measured:
   null on 2026-11-08 (see [HANDOFF.md](../HANDOFF.md) §4.125) and the change was
   reverted, so a reorder-window claim needs a cell the model does not have yet.
 
+- **A carrier that beats a TCP-based tool on this host.** On a clean loopback
+  cell the mhd carrier's round trip is about **45 µs against 20 µs for a plain TCP
+  socket**, and a proxied request about **113 µs against rathole's 61** — because
+  TCP's loopback path is kernel to kernel while a userspace datagram carrier needs
+  a task hop the kernel does not, measured at 9.4 µs per direction. Removing it
+  would take one socket per connection and was declined as too large a change to
+  the configuration surface, so no cell on this page shows mhd ahead of frp or
+  rathole. What the carrier buys — per-stream recovery over an unreliable
+  datagram, no head-of-line blocking across the pool's streams, optional datagram
+  semantics — is **not measured by any scenario here**: the loss cells tie because
+  the shaper dominates, and the reorder-window cell does not exist. See
+  [HANDOFF.md](../HANDOFF.md) §4.134 and §4.145.
+
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
   two runs on one machine whose probes drifted beyond tolerance are refused

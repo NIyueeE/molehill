@@ -35,6 +35,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of six last-stage cells in one campaign carried nothing while reporting a pass,
   because a tool that stops forwarding scores its best number on its emptiest
   stage. The test is exactly zero — a rate-shaped stage legitimately reads small.
+- **A carrier that stopped delivering one direction no longer stalls a transfer.**
+  A lane's reader took one datagram per wake-up, so above roughly 700 datagrams a
+  second its socket queue filled and the kernel dropped the rest — measured as 97 %
+  of one direction — and a bulk transfer through a striped group stopped partway and
+  never resumed. A wake-up now drains the socket until it is empty. Measured on the
+  integration suite: ten of ten runs pass in 2.96–3.90 s, where the same cell
+  previously failed about one run in four after 40–70 s.
+- **A packet that arrives after its stream ended no longer opens a new one.** A
+  retired stream on the accepting side was re-created by a late packet from the
+  peer, which gave the server a channel for a visitor whose connection had already
+  closed and left the window its bytes spent unrecovered. Stream ids are monotonic,
+  so an unknown id below the highest accepted one is late, not new.
+- **A new stream can no longer be given an id a live stream still holds.** Stream
+  ids wrap, and the minter inserted without checking, so a wrapped id could replace
+  a live stream's state — its keys, its reader's position and its place in the
+  window — with no error anywhere. The minter now skips an id that is in use.
 - **A comparison the run cannot pair is reported, not crashed.** `just bench report`
   raised `StatisticsError` when two arms carried a metric in disjoint rounds; it now
   returns an `unavailable` verdict whose reason names both arms' rounds.
@@ -42,8 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovering. The reorder deadline was two seconds, shorter than a carrier stall
   measured at nearly twelve; a group now waits thirty, so the side that can still
   make progress decides when a transfer has failed.
-
-### Fixed
 
 - **A transparent (L3) claim is reachable from the first packet.** A claim's first
   data lane was read twice on the server — once as a stream prologue and again as a
