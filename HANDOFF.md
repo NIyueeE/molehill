@@ -379,7 +379,7 @@ moves anything.
 | 1 | packet/stream id wraparound | **nothing.** Worse, `open_at` wraps `next_stream` by two and `streams.insert` would *overwrite* a live stream that still holds the wrapped id — untested |
 | 2 | a duplicate open does not accept twice | **pinned now** — see below |
 | 3 | a late packet does not resurrect a retired stream | implemented (`retired` branch: drop, then `advance_read` to give the window back), **unpinned** — and it only covers the end's own parity, so a late packet for an *accepted* stream that was later retired would re-create it |
-| 4 | credit advances with no data | implemented — `credit_due()` is the first check in `build_packet`, independent of whether any stream has bytes — **unpinned**, and a single test would do it |
+| 4 | credit advances with no data | **pinned now** — see below |
 | 5 | FIN over a hole; reset against unsent data | **partial**: `the_finishing_range_carries_the_fin` and `a_hole_stops_the_prefix_and_reports_itself` pin FIN *in* a range and holes; FIN *across* a hole and reset-vs-unacknowledged are not pinned |
 | 6 | close releases pump, dispatcher, socket, receive | **partial**: §4.114's drain loop now guarantees `receive` returns when closed, but not one of the four releases is asserted |
 | 7 | sustained loss keeps tasks, memory and the table bounded | **partial**: the table cap, the dead path and an abandoned stream's buffer are pinned; task and memory bounds are not measured |
@@ -391,7 +391,14 @@ makes the sender re-send the opening packet, so a duplicate open is ordinary tra
 asserts the second one queues no accept. **It is load-bearing**: removing `apply_datagram`'s `if !known`
 guard fails it with "a repeated opening frame must not queue a second accept for stream 1".
 
-That is the standard the other seven are now measured against — a test that fails when its guard is
+**Two of the eight are pinned by this round.** The second is #4:
+`credit_goes_out_from_an_end_that_has_nothing_else_to_send` drives the policy rather than a transfer,
+because credit falls due only once the reader has consumed a quarter of the window (4 MiB) and pushing
+that through a `Link` would take thousands of passes to assert one ordering. It pins three things: a fresh
+end advertises its whole window, an end that has drained past `WINDOW / 4` owes more, and paying it
+settles the debt. Removing `build_packet`'s `credit_due()` branch fails it at the first packet.
+
+That is the standard the other six are now measured against — a test that fails when its guard is
 removed, not one that merely passes.
 
 **What phase 3 must pin before it moves.** It changes retire, liveness and the hold, which are #3, #6 and

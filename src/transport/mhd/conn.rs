@@ -3945,6 +3945,66 @@ mod tests {
         );
     }
 
+    /// Credit goes out even when this end has nothing else to say.
+    ///
+    /// The fourth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+    /// a reader that has drained its buffer must be able to tell the peer it may
+    /// send more, and it must be able to do so **while its own writer is silent** —
+    /// otherwise a one-way flow stalls the moment the receiver is the quiet end.
+    /// `build_packet` checks `credit_due()` first for exactly this reason, and
+    /// nothing pinned it.
+    #[test]
+    fn credit_goes_out_from_an_end_that_has_nothing_else_to_send() {
+        // The fourth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+        // a reader that has drained must tell the peer it may send more, and must be
+        // able to do so **while its own writer is silent** — otherwise a one-way flow
+        // stalls the moment the receiver is the quiet end. `build_packet` checks
+        // `credit_due()` before datagrams and streams for exactly this reason.
+        //
+        // Driven at the policy rather than through a transfer: credit is due only
+        // once the reader has consumed a quarter of the window (4 MiB), and pushing
+        // that much through a `Link` would take thousands of passes to assert one
+        // ordering.
+        let now = Instant::now();
+        let mut conn = Conn::new(1, false);
+        // A fresh end owes the whole window: the peer may not send until it is told.
+        assert!(conn.credit_due(), "a fresh end advertises its window");
+        let mut out = Vec::new();
+        let Some(len) = conn.poll_transmit(now, &mut out) else {
+            unreachable!("the first packet an end produces is its credit")
+        };
+        assert!(
+            matches!(
+                super::wire::decode(&out[out.len() - len..]).unwrap().frame,
+                super::wire::Frame::Credit { .. }
+            ),
+            "the first packet has to carry the window"
+        );
+        assert!(!conn.credit_due(), "paying it settles the debt");
+
+        // The invariant proper: the reader drains, and the end owes more — with no
+        // stream of its own to carry it.
+        conn.advance_read(WINDOW / 4 + 1);
+        assert!(
+            conn.credit_due(),
+            "past a quarter of the window, credit is owed"
+        );
+        let Some(len) = conn.poll_transmit(now, &mut out) else {
+            unreachable!("an end with nothing to send still hands back its credit")
+        };
+        assert!(
+            matches!(
+                super::wire::decode(&out[out.len() - len..]).unwrap().frame,
+                super::wire::Frame::Credit { .. }
+            ),
+            "the packet a quiet end produces has to carry the credit"
+        );
+        assert!(
+            !conn.credit_due(),
+            "paying it must settle the debt, or every pass would repeat it"
+        );
+    }
+
     /// A second opening frame for a stream the peer already has is not a second
     /// stream.
     ///
