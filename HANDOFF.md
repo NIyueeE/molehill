@@ -367,6 +367,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.118 The drain fix is a no-op on `rr-16` too, and `rr-16` is the latency instrument (2026-11-08)
+
+§4.117 left the drain fix unpriced on the one shape it was supposed to help — many small datagrams — so
+the next run pre-registered `rtt_p99_ms` on `rr-16[l4-plain]`, eight rounds, three arms. It resolves the
+metric to **1.19 %** (A/A difference 0.56 %), the tightest this project has ever seen on a latency cell,
+in **81 s** (3.38 s per arm-round).
+
+| arm | `rtt_p50_ms` | `rtt_p99_ms` | `rtt_max_ms` | `rate_per_s` | `cpu_cores` |
+|---|---|---|---|---|---|
+| pre-drain | 0.595 | 1.615 | 10.518 | 23 893 | 5.516 |
+| drain | 0.593 | **1.601** | 10.614 | 23 997 | 5.511 |
+| A/A twin | 0.594 | 1.604 | 11.426 | 23 950 | 5.527 |
+
+**−0.9 % at a 1.19 % resolution: no change.** Not a claim, and this time the run could have made one.
+
+**So the fix is a correctness fix, not a performance one, and the arithmetic says why.** The
+one-datagram-per-wake-up cap is the reader's *loop rate*, and that rate depends on the build: the
+integration test is a **debug** binary and its listener managed about 690 wake-ups a second, while these
+cells run a **release** binary whose loop is fast enough that the cap never bound — 24 000 requests a
+second are served with p99 at 1.6 ms. The striped test lost 97 % because its reader was twenty times too
+slow for the traffic it had; a release reader at the same traffic is not. Whether a *release* deployment
+can reach a rate where the drain loop matters is now an open question, and it needs a cell that
+saturates the listener with non-coalesced datagrams — the striped shape, which the model does not have
+(§4.117).
+
+**And the run repays the detour with a better instrument.** `rr-16[l4-plain]` resolves `rtt_p99_ms` to
+1.19 % in 81 s, against the `timeline` cell's 39–167 % between two copies of one binary (§4.104). So
+**phase 2's latency is judged here, not on `timeline` at a shrunken scale**: same cell, pre-registered
+`rtt_p99_ms`, three arms, 81 s. That replaces the plan's "judge phase 2 on `timeline` + `l4-plain` with
+`rtt_worst_1s_ms` / `rtt_max_ms`", which was written when no cell could resolve a per-connection latency
+difference at all.
+
 ### 4.117 The drain fix does nothing for bulk, and that is the useful part (2026-11-08)
 
 §4.116 could not score the drain fix on four rounds. Six rounds of the cheapest cell can, and the answer
