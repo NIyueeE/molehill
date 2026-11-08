@@ -367,7 +367,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.137 The 25 µs is scheduling, not computation — and the carrier's own work is 1.5 µs (2026-11-08)
+### 4.138 Bounding the drain pass did not help, so the drain loop is not the reader's shadow (2026-11-08)
+
+§4.137 raised one hypothesis it could not test: that §4.114's unbounded drain lets the dispatcher hold its
+worker while a reader's wake waits behind it. This tests it by bounding the pass at **64 datagrams per
+wake-up** — far above the one-per-wake that lost 97 %, and low enough to yield at a bound.
+
+| build | `complete_us` p50 | p99 | **`park_p50_us`** | park p99 |
+|---|---|---|---|---|
+| unbounded (three runs) | 48–54 | 75–78 | **13–15** | 31–34 |
+| bounded at 64 (three runs) | 50–53 | 74–79 | **15–16** | 30–35 |
+| unbounded again, after reverting | 52 | 75 | **16** | 35 |
+
+**No effect, and the third row is the point**: the unbounded build reads `park_p50_us = 16` on a rerun, so
+13–16 is this instrument's run-to-run noise. The park cannot resolve a 1–2 µs change, and there was no
+change to resolve. **Reverted**, and the hypothesis is dead: the drain loop is not what delays the reader.
+
+**A mistake worth recording, because it nearly produced a false conclusion.** The first attempt at this
+measurement printed three "bounded" runs that were **measurements of the unchanged code**: the edit script
+asserted on an anchor that no longer existed and threw *before* writing the file, and I read the numbers
+before checking that the change was in the tree. `grep -c DATAGRAMS_PER_PASS` returned 0 and `git diff
+--stat` was empty — that is now the first thing I check before quoting a number from a change.
+
+**Where this leaves the 25 µs.** The park is a task-wake latency of ~15 µs with nothing left to blame
+upstream of it: the apply is 1.5 µs, the syscall batching works, the dispatcher's pass is not in the way, and
+the sender's dwell is 2–3 µs. What is left is the cost of the wake itself — the waker path (a custom
+`Waker` behind `Wakes`, plus a `Notify`) and the runtime's readiness to run the reader's task. That is the
+next measurement, and it needs a different instrument than the park: the park says how long, not why.
+
+### 4.137 The 25 µs is scheduling, not computation — and the carrier's own work is 1.5 µs (2026-11-08)### 4.137 The 25 µs is scheduling, not computation — and the carrier's own work is 1.5 µs (2026-11-08)
 
 The receive path was said to be the next target (§4.136). Before adding anything, the instrument that
 already existed was made reachable from the harness — `probe::start_stats()`, which starts the product's own
