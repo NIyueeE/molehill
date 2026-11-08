@@ -646,6 +646,12 @@ impl Recovery {
         // one carries most of a healthy acknowledgement, so a sample taken only
         // from the bitmap window would never fire and the congestion window
         // would never grow.
+        // **The reorder window, taken before this acknowledgement samples the
+        // path.** A window computed after the sample cannot fire: the sample is
+        // `now - anchor`, so the deadline `anchor + 9/8 × sample` is always ahead of
+        // `now`, and the check would be dead code that looks alive
+        // (`HANDOFF.md` §4.124).
+        let reorder = self.rtt.loss_delay();
         let mut newest: Option<(u32, Instant)> = None;
         let mut note = |sent: &Sent| {
             if newest.is_none_or(|(number, _)| sent.number > number) {
@@ -731,6 +737,31 @@ impl Recovery {
                     result.opening_lost = true;
                 }
                 result.lost.push(sent);
+            }
+        }
+        // **RACK: the reorder window runs from the most recently acknowledged
+        // packet's send time, not from each packet's own.** A packet sent before
+        // that anchor, which the block does not name and which is not below the
+        // frontier, is lost once the window has passed — even with fewer than three
+        // later packets. That case is not hypothetical: `SMALL_FLIGHT_PACKETS` is
+        // two, so a short flight can never reach the three-packet threshold and
+        // could only ever be declared lost by the timer.
+        if let Some((anchor, sent_at)) = newest
+            && now >= sent_at + reorder
+        {
+            let ragged: Vec<u32> = self
+                .in_flight
+                .range(..anchor)
+                .filter(|(_, sent)| sent.lost_at.is_none())
+                .map(|(number, _)| *number)
+                .collect();
+            for number in ragged {
+                if let Some(sent) = self.declare_lost(now, number) {
+                    if sent.opening {
+                        result.opening_lost = true;
+                    }
+                    result.lost.push(sent);
+                }
             }
         }
         self.arm(now, result.opening_lost);
@@ -1173,6 +1204,70 @@ mod tests {
 
     /// Three later acknowledgements are what turns a gap into a loss; two are
     /// reordering and must not.
+    /// One packet behind is a loss once the reorder window has run from the anchor.
+    ///
+    /// The three-packet threshold cannot see this: `SMALL_FLIGHT_PACKETS` is two, so
+    /// a two-packet flight would wait for the retransmission timer. RACK anchors the
+    /// window at the **most recently acknowledged** packet's send time, so the older
+    /// packet is named as soon as that window has passed (`HANDOFF.md` §4.124).
+    #[test]
+    fn one_packet_behind_is_lost_once_the_reorder_window_has_run() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let _first = send_one(&mut recovery, start, 0);
+        let second = send_one(&mut recovery, start + Duration::from_millis(20), 100);
+        assert_eq!(recovery.in_flight(), 2);
+
+        // Only the second arrives. One behind is below the packet threshold, so
+        // nothing but a time deadline can name the first.
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(500),
+            Ack {
+                largest: second,
+                below: 0,
+                bits: 0,
+                ..Ack::default()
+            },
+        );
+        assert_eq!(
+            acked.lost.len(),
+            1,
+            "the packet one behind the anchor is lost once the window has run"
+        );
+        // `in_flight` counts *live* records; a declared loss leaves the table's live
+        // count and stays as a lost record, so a late acknowledgement of the original
+        // still lands (`HANDOFF.md` §4.102).
+        assert_eq!(recovery.in_flight(), 0, "nothing is still live");
+        assert_eq!(
+            recovery.lost_records(),
+            1,
+            "and the loss is held for a late ack"
+        );
+    }
+
+    /// The same gap, but *before* the window has run, is reordering.
+    #[test]
+    fn one_packet_behind_is_reordering_inside_the_reorder_window() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let _first = send_one(&mut recovery, start, 0);
+        let second = send_one(&mut recovery, start + Duration::from_millis(20), 100);
+
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(30),
+            Ack {
+                largest: second,
+                below: 0,
+                bits: 0,
+                ..Ack::default()
+            },
+        );
+        assert!(
+            acked.lost.is_empty(),
+            "ten milliseconds after the anchor is reordering, not loss"
+        );
+    }
+
     #[test]
     fn three_later_acks_declare_a_loss() {
         let start = Instant::now();

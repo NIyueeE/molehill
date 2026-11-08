@@ -367,6 +367,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.124 Phase 3's first cut: RACK anchored at the acknowledged packet (2026-11-08)
+
+The plan's §6.1 asks for loss detection anchored at the **most recently acknowledged** packet rather than
+at each packet's own age. What existed was the three-packet threshold (`ack.largest - number >= 3`) plus the
+timer's per-packet staleness — and `SMALL_FLIGHT_PACKETS` is **two**, so a two-packet flight could never
+reach the threshold and could only ever be declared lost by the retransmission timer.
+
+`Recovery::on_ack` now takes `reorder = self.rtt.loss_delay()` — which is already `9/8 × max(latest,
+smoothed)` with the granularity floor, exactly the window §6.1 names — and declares lost any in-flight
+packet **below the anchor** that the block does not name, once `now >= anchor.sent_at + reorder`.
+
+**One arithmetic trap, and it would have made the change dead code that looks alive.** The window has to
+be read *before* this acknowledgement samples the path: the sample is `now - anchor`, so a window computed
+afterwards gives a deadline of `anchor + 9/8 × (now - anchor)`, which is always **ahead** of `now` and can
+never fire. The deadline is therefore captured at the top of `on_ack`.
+
+Two tests pin both sides: `one_packet_behind_is_lost_once_the_reorder_window_has_run` (500 ms after an
+anchor 20 ms later, the packet one behind is lost — and the three-packet threshold cannot see it) and
+`one_packet_behind_is_reordering_inside_the_reorder_window` (10 ms after the anchor is reordering, not
+loss). Disabling the block fails the first with "the packet one behind the anchor is lost once the window
+has run", and the whole suite is green at 377.
+
+**What this is not, yet.** The plan requires loss1/loss5/jitter in the same round, plus clean and `bulk-n`
+as regression guards, and a p99 or worst-1s gain beyond noise before the change stays. So this is the
+code and its unit evidence; the bench judgement is still owed, and the revert rule stands if the lossy
+cells do not improve.
+
 ### 4.120 The eight lifecycle invariants, audited one by one (2026-11-08)
 
 Phase 3 touches the retire/repair path, liveness and the hold, so the plan's eight lifecycle invariants
