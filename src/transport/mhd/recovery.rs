@@ -1259,6 +1259,46 @@ mod tests {
     /// packet instead multiplies the flight by the number of probes — the window
     /// closes on a path that lost nothing, and each pass re-sends more than the
     /// last, which is the shape §4.107 measured.
+    /// The one timer already fires no later than any probe deadline would.
+    ///
+    /// §6.2 asks for the probe deadline to be computed "independently from the latest
+    /// still-outstanding packet". That is a **no-op in this design**, and the reason is
+    /// arithmetic rather than taste: `arm` anchors the timer on the **oldest** data
+    /// packet with the same `rto` a probe would use, and `oldest ≤ latest`, so
+    /// `oldest + rto ≤ latest + rto` always — a second timer taking `min` of the two
+    /// could only ever pick the one that exists. What §6.2 actually wants is that the
+    /// timer is a *backstop* while loss is decided by evidence, and that is what
+    /// `on_timeout` does: it declares whatever is past the reorder window and probes
+    /// only when nothing is.
+    ///
+    /// This pins the ordering, so that a future change anchoring the timer on the
+    /// newest packet — which would delay every repair by a send interval — fails here.
+    #[test]
+    fn the_timer_is_never_later_than_a_latest_anchored_probe_would_be() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        // An old hole and a fresh packet behind it.
+        let _old = send_one(&mut recovery, start, 0);
+        let latest = start + Duration::from_millis(30);
+        let _newest = send_one(&mut recovery, latest, 100);
+        recovery.arm(latest, false);
+        let deadline = recovery.poll_timeout().unwrap();
+
+        assert_eq!(
+            recovery.oldest_data_time().unwrap(),
+            start,
+            "the anchor is the old hole, not the newest send"
+        );
+        // Two packets is a small flight, so the timeout is 20 ms: armed from the old
+        // hole it lands 10 ms *before* the newest packet was even sent. Anchoring it
+        // on the newest instead would land 20 ms after, and every repair would wait a
+        // send interval longer.
+        assert!(
+            deadline <= latest,
+            "the timer must not wait for the newest packet: {deadline:?} vs {latest:?}"
+        );
+    }
+
     #[test]
     fn a_probe_re_sends_one_range_not_the_flight() {
         let start = Instant::now();
@@ -1365,6 +1405,46 @@ mod tests {
     /// `DEAD_LINK` retries in a fraction of a second, so the count alone would
     /// end a lane that a busy host merely delayed. The loop below therefore runs
     /// until the path dies rather than assuming it dies at the tenth retry.
+    /// A real receipt resets the silence, so probe counts alone cannot kill a path.
+    ///
+    /// §6.2: "真实接收/静默决定存活，廉价 PTO 次数不能单独杀死路径". `Expiry::Dead` needs
+    /// `DEAD_LINK` unanswered retransmissions **and** `DEAD_FLOOR` of silence — and the
+    /// pair is reset by one datagram that arrives. This pins the reset, which is the half
+    /// `ten_silent_retries_need_five_seconds_of_silence` does not cover: that test shows
+    /// the count and the floor, this one shows that a receipt clears both, so the very
+    /// next timeout cannot be dead however the counts stood a moment before.
+    #[test]
+    fn a_real_receipt_resets_the_silence_that_would_have_killed_the_path() {
+        let now = Instant::now();
+        let mut recovery = Recovery::new();
+        send_one(&mut recovery, now, 0);
+
+        // The state that kills (the other test proves it does): a full count of
+        // unanswered retransmissions and more than the floor of silence.
+        recovery.silent = DEAD_LINK;
+        recovery.silent_since = Some(
+            now.checked_sub(DEAD_FLOOR + Duration::from_secs(1))
+                .unwrap(),
+        );
+        recovery.heard();
+
+        assert_eq!(recovery.silent, 0, "a receipt clears the unanswered count");
+        assert!(
+            recovery.silent_since.is_none(),
+            "and the clock the floor is measured from"
+        );
+
+        // So the next timeout is a probe, not a death, even though a moment ago the
+        // same counters said otherwise.
+        recovery.timer = Some(now);
+        let (expiry, _) = recovery.on_timeout(now);
+        assert_ne!(
+            expiry,
+            Expiry::Dead,
+            "a path its peer just answered must not be declared dead"
+        );
+    }
+
     #[test]
     fn silence_backs_off_and_then_kills_the_path() {
         let start = Instant::now();
