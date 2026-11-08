@@ -4790,10 +4790,9 @@ Three things stay open, deliberately and with their evidence:
 - admission is still bounded by `MAX_BUFFERED`, not by the window (§4.42). That is the defect attempt
   B was meant to fix, and it stands until B is either accepted or refuted again.
 
-**The session objective is one round behind this section** — it still says the next step is the
-five-stamp instrument, which is done. A goal edit is refused outside a direct human turn, so it is
-corrected at the next one; until then this section and `MHD-FINALIZATION-PLAN.md` §0 are the accurate
-copies.
+**The session objective is in step again** (revision 9): it names §4.103's result and the third
+attempt's pre-registered criterion. A goal edit needs a direct human turn, so it can only be
+corrected on one — which is why the three copies are kept in this order.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
