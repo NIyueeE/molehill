@@ -367,7 +367,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.159 The next release is a re-baseline release, and it is recorded before the ritual (2026-11-08)
+### 4.160 The loop's work is finished, and here is exactly what that means (2026-11-08)
+
+Every section of the plan now carries a status, and no row of its progress table says "not started" — the
+last one, phase 4, was a *standing process* rather than a phase and now says so with the four times this
+session used it. So this is the point to say what is finished and what is not, rather than to keep finding one
+more thing to measure.
+
+**Of the six acceptance criteria, four are met, one is met at an indication, one was declined:**
+
+| criterion | state |
+|---|---|
+| `bulk-n` ≥ 13.35 Gbit/s | **met** — 15.339, 96.8 % of its recorded baseline (§4.146) |
+| `capacity` 8/8 | **met** — `capacity_streams` 8, `slo_broken` 0 at every level (§4.129) |
+| gate green | **met** — `just check`, `interop` 3/3, `l3-accept` 16 PASS, both carriers 430/0 (§4.149), under a stated repeat policy (§4.158) |
+| no resource leak | **met** — `drift_rss` 3.29 MiB/min against a floor of 50, no wedge (§4.150) |
+| `timeline[clean]` p99 ≤ 50 ms | **indication only** — 24.87 / 14.34 ms with zero errors at `--scale 0.05`; the formal judgement is the release sweep at `--scale 1.0`, 15.9 hours (§4.143) |
+| no worse than TCP and peers | **declined** — unmet on the clean loopback cell, and the change that would fix it was refused as too much configuration surface (§4.145) |
+
+**What "finished" therefore means**: the plan is executed as far as this branch's authority allows, and the two
+items that remain are outside it — one by the plan's own design (a release-time measurement, and the loop is
+told not to run release sweeps) and one by the human's decision. Running that ritual is a new instruction, not
+an unfinished task, and it needs the "no release-oriented sweep" constraint lifted to happen here.
+
+**What a future round would need to be worth starting**: a new instruction, or a defect. There is no third
+kind — the measurement queue is empty, the decision queue is empty, and the record says so in three places
+(`§0`, §5 and the session objective).
+
+### 4.159 The next release is a re-baseline release, and it is recorded before the ritual (2026-11-08)### 4.159 The next release is a re-baseline release, and it is recorded before the ritual (2026-11-08)
 
 Checking whether the release path is healthy turned up one fact worth having early, and one false alarm of my
 own.
@@ -6604,14 +6631,15 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step** (revision 17): phases 0–3 closed, the 25 µs closed **as declined**
-(§4.145), the peers criterion recorded as unmet-by-decision, every acceptance measurement run, and **every
-product call answered** — the poll interval stays at 1 ms (§4.153), decided against the three-point curve of
-§4.152 rather than against a principle.
+**The session objective is finished and marked complete** (revision 17, closed after §4.160). Four of the six
+acceptance criteria are met, one is met at an indication with its formal judgement assigned to the release
+ritual, and one was declined by the human. §4.160 tabulates the six and states what "finished" covers, so a
+reader can check the claim instead of taking it.
 
-Nothing is waiting on a human any more. What remains outside this loop's authority is `timeline[clean]` at
-`--scale 1.0` — the release sweep's 15.9-hour measurement (§4.143) — and the peers criterion, closed as
-declined. Both are recorded as such rather than left looking like work.
+**Nothing is queued.** No measurement is outstanding, no decision is unanswered, and no row of the plan's
+progress table says "not started". The next round worth starting needs either a new instruction or a defect —
+and if the release ritual itself is wanted here, that needs the "no release-oriented sweep" constraint lifted
+first, because `timeline[clean]` at `--scale 1.0` is a 15.9-hour measurement (§4.143).
 
 And the record has been corrected three times in this session for the same reason — a fact taken from my own
 notes instead of from the code or a fresh measurement (§4.133's stale 45 µs, §4.141's two unverified
