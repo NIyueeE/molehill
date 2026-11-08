@@ -3986,6 +3986,59 @@ mod tests {
         );
     }
 
+    /// A queued reset leaves, even with bytes for that stream still unsent.
+    ///
+    /// The second half of the plan's fifth lifecycle invariant (`HANDOFF.md`
+    /// §4.120): "reset interleaved with unsent or unacknowledged data". A peer that
+    /// never sees the reset keeps a dead stream for the connection's life — its own
+    /// comment says so — and the writer that outran its reader is exactly the case
+    /// that produces unsent bytes alongside a queued reset.
+    #[test]
+    fn a_reset_leaves_even_with_bytes_still_unsent() {
+        let mut conn = Conn::new(7, true);
+        let stream = conn.open();
+        // More than one pass can carry, so bytes are still queued when it closes.
+        assert!(conn.write(stream.id, &payload(64 * 1024)) > 0);
+        conn.close_stream(stream.id);
+        // The hold starts at the real clock inside `close_stream`, not at this
+        // test's `now`, and the write above costs real time — so derive the deadline
+        // from the stream's own stamp.
+        let abandoned_at = conn
+            .streams
+            .get(&stream.id)
+            .and_then(|state| state.abandoned_at)
+            .unwrap();
+        let later = abandoned_at + ABANDON_HOLD + Duration::from_millis(1);
+        let _ = conn.on_timeout(later);
+        assert!(
+            !conn.resets.is_empty(),
+            "the retired stream owes the peer a reset"
+        );
+
+        // Drain what this end wants to send, in order, and stop at the reset.
+        let mut out = Vec::new();
+        let mut saw_reset = false;
+        let mut before = 0usize;
+        while let Some(len) = conn.poll_transmit(later, &mut out) {
+            let datagram = &out[out.len() - len..];
+            if let Ok(packet) = super::wire::decode(datagram)
+                && matches!(packet.frame, super::wire::Frame::Reset { .. })
+            {
+                saw_reset = true;
+                break;
+            }
+            before += 1;
+        }
+        assert!(
+            saw_reset,
+            "the reset has to reach the wire: {before} packets went out without it"
+        );
+        assert!(
+            conn.resets.is_empty(),
+            "and sending it has to empty the queue, or every pass repeats it"
+        );
+    }
+
     /// A packet that arrives after this end retired a stream must not bring it
     /// back.
     ///
