@@ -367,6 +367,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.112 The listener reads thousands of batches and almost no datagrams (2026-11-08)
+
+§4.111 left the loss narrowed to "read and not routed" or "never read". Two counters settle it, and the
+answer is the second of those in a form the file has met before.
+
+- **Not a decode failure, not a routing failure.** The dispatcher's silent decode path is counted now
+  (`malformed_decode`) and reads **12** for the whole run; the unroutable path (an id the table does not
+  hold, on a packet that opens nothing) is counted on the cadence line (`unrouted`) and reads **8**.
+- **The dispatcher is reading almost nothing while spinning.** `batches` summed to **44 086** over the
+  run — 330 to 770 a second — and `receive` returns `Ok(())` for *both* "I read a batch" and "`try_io`
+  said `WouldBlock`". The four lanes' `received_total` sum to about **14 000**, against roughly 467 000
+  datagrams the clients posted. So the overwhelming majority of those batches were **empty**, and the
+  listener was awake, iterating, and reading nothing.
+
+**This is the §4.101 defect on the other reader.** `receive` performs exactly one
+`socket.try_io(READABLE, …)` per call; a readiness edge that is observed and finds nothing is consumed,
+and the loop re-arms and is woken again — so the dispatcher burns the CPU spinning on a stale edge while
+the socket buffer fills and the kernel drops 97 % of a direction. On the per-lane pump §4.101 bounded
+that with a 1 ms ceiling; the listener has no such bound, which is why the same flaw is fatal here and
+merely expensive there.
+
+**The next instrument is one field, and it is already half-built.** `stats::received_run(datagrams, bytes)`
+is called on every batch and feeds a process-wide per-second count that the *first* lane to report
+consumes; printing that per second on the cadence line beside `batches` turns "mostly empty" from an
+inference into a number. If it reads near zero while `batches` reads hundreds, the spin is proven and the
+fix is the one §4.101 used, applied where it matters: drain until the socket is empty, and never treat an
+empty `try_io` as a completed read.
+
 ### 4.111 Ninety-seven percent of one direction never reaches the reader (2026-11-08)
 
 §4.110 pre-registered one number: this end's `sent` against the peer's `received`, per lane. The window

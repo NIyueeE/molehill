@@ -1552,6 +1552,15 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
 /// measured on the *sender's* side could sit unexplained while the receiver was
 /// the one not being fed. One line a second, and the number that matters is the
 /// longest gap between batches — that is the whole of what a waiting reader pays.
+/// Datagrams the listener read and could not route, since the last report.
+///
+/// **The last silent drop.** An id the table does not hold, on a packet that is
+/// not opening a stream, is discarded with no counter and no line — which is
+/// indistinguishable from a sender that never posted it, and for a whole round
+/// that ambiguity hid a direction losing 97 % of its datagrams
+/// (`HANDOFF.md` §4.111).
+static UNROUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Default)]
 struct Cadence {
     batches: u64,
@@ -1582,6 +1591,7 @@ fn report_dispatch(cadence: &mut Cadence) {
     tracing::debug!(
         batches = cadence.batches,
         max_gap_us = u64::try_from(cadence.max_gap.as_micros()).unwrap_or(u64::MAX),
+        unrouted = UNROUTED.swap(0, std::sync::atomic::Ordering::Relaxed),
         "mhd listener cadence"
     );
     cadence.batches = 0;
@@ -1699,6 +1709,14 @@ fn spawn_dispatcher(
                 }
                 read = receive(&socket, &mut batch, |from, datagram| {
                     let Ok(packet) = crate::transport::mhd::wire::decode(datagram) else {
+                        // **Counted, not silent.** This path used to `return` with
+                        // nothing recorded, so a listener that rejected every
+                        // datagram of one direction looked exactly like one that
+                        // received none — the difference between "the sender never
+                        // posted it" and "the receiver threw it away"
+                        // (`HANDOFF.md` §4.111). It feeds the same per-second
+                        // refusal line the connection-level rejects use.
+                        crate::transport::stats::note_rejected("malformed_decode");
                         return;
                     };
                     // **A lane is only created by a datagram that could be opening
@@ -1734,6 +1752,7 @@ fn spawn_dispatcher(
                         }
                     }
                     if !opening {
+                        UNROUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
                     {
