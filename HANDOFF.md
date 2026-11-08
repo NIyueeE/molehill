@@ -367,7 +367,71 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.103 Attempt B, second time: the clean cell finally meets ①, and the shaped cells pay for it (2026-11-07)
+### 4.104 Three buffer sizes, three failures: this line is closed (2026-11-08)
+
+Attempt B was tried a third time with a 4 MiB floor under a window-sized ceiling, and run with the
+A/A twin §4.103 said was mandatory. The twin did its job twice over: it refuted the previous attempt's
+headline **and** it named a new regression.
+
+Method: `timeline`, `--scale 0.15`, two rounds, **three arms** — `molehill` (current tree),
+`molehill~aa` (a second copy of the same binary, the noise floor) and `molehill~b` (B3, 4 MiB floor).
+Binaries `32423b9d` and `d0da4168`. 2 395.6 s, 399 s per arm-round.
+
+| cell | metric | `molehill` | `molehill~aa` (**same binary**) | `molehill~b` (B3) |
+|---|---|---|---|---|
+| `clean` | p99 | 137.210 ms | **83.966** | 51.288 |
+| `clean` | throughput | 7.236 | 7.344 | 6.060 |
+| `clean` | `slo_broken` | 1 | 0.5 | 0.5 |
+| `clean#2` | p99 | 13.856 | **3.663** | 10.270 |
+| `rtt100` | throughput | 2.971 | 2.950 | **3.171** |
+| `loss1` | throughput | 5.643 | 5.542 | **3.718** |
+| `rate100` | p99 | 213.700 | 231.014 | 229.609 |
+| `jitter` | p99 | 139.811 | 154.689 | 119.679 |
+
+**The 4 MiB floor did fix `rtt100`** — 3.171 Gbit/s against the A/A pair's 2.971/2.950, so it is above
+both copies, where the previous attempt read 0.855. That part of the hypothesis was right, and it is
+the one clean result here.
+
+**And `loss1` broke instead: 3.718 against 5.643/5.542.** The A/A pair agrees to 1.8 %, so a 34 % gap
+is not noise. So the floor cannot be chosen at all: 2 windows starves a delayed path, 4 MiB starves
+a lossy one, and 32 MiB is what the clean cell's tail is made of.
+
+**The A/A also refutes §4.103's headline, and that correction is the more important half.** Two copies
+of one binary read 137.210 and 83.966 ms on the clean cell — a **39 % difference with no change in the
+code** — and the model's own accounting flags same-binary "claims" of 32 % (`rtt100` p99) and 278 %
+(`clean#2` p99) on this cell at this scale. §4.103's 168 → 12.7 ms came from a run without a twin and
+is therefore **suggestive, not established**: a 92 % improvement against a 39–167 % same-binary scatter
+is not a claim. It is withdrawn as evidence for condition ① and left standing only as a hypothesis
+for a run that can resolve it.
+
+**The structural conclusion, after three settings and three failures.**
+
+| attempt | change | what it cost |
+|---|---|---|
+| §4.43 | admission on `buffered` | throughput −25 % |
+| §4.103 | ceiling `2 × max(cwnd, WINDOW_FLOOR)` | `rtt100` throughput −74 % |
+| §4.104 (this) | the same, floored at 4 MiB | `loss1` throughput −34 % |
+
+The send buffer is the **only** shock absorber the carrier has for a visitor-side path it cannot see
+(§4.104's floor arithmetic: the lane's own round trip is 1 ms on every stage while the visitor's is
+shaped). Shrinking it always costs a shaped cell, and the clean-cell tail it removes cannot even be
+measured at this scale. **So the line is closed: no fourth buffer size.** The clean cell's tail has to
+be attacked where it is actually created, and §4.101 plus the arrival measurements are the remaining
+levers.
+
+**What a future attempt would need first, before any code.** A cell that can resolve the effect: the
+model reports this one needs ~131 rounds for `clean` p99 at scale 0.15, and `clean#2`'s scatter is
+"too noisy for rounds to fix". So the next thing to build is a *measurement* of the clean-cell tail
+with a resolution worth a claim — a longer clean stage at `--scale 1.0`, or `rtt_worst_1s_ms` and
+`rtt_max_ms` (which the run resolves at 3–4 rounds) as the pre-registered endpoints instead of p99.
+
+### 4.103 Attempt B, second time: a large clean-cell win that this cell cannot resolve, bought with three shaped regressions (2026-11-07)
+
+> **Corrected by §4.104.** That run had no A/A twin; the twin has since shown the clean cell's p99
+> varies by 39–167 % between two copies of **the same binary** at this scale. The 168 → 12.674 ms
+> below is therefore **suggestive, not established**, and it is not evidence for condition ①. The
+> three shaped-cell regressions stand: they were outside the scatter and one of them repeated to three
+> decimals.
 
 §4.102 left one policy question, and §4.101 had just removed the mechanism that made attempt B fail
 the first time. So B was re-applied — `held = 2 × max(cwnd, WINDOW_FLOOR) − buffered`, capped at
@@ -379,7 +443,7 @@ rounds each, **no A/A**, fingerprint `b88da0128d18fb5b`, 1 585.7 s. Both binarie
 seconds, so its p99 rests on 427 (baseline) and 480 (B) interactive samples — enough for a 13-fold
 gap, not enough for a 20 % one.
 
-**The win, and it is the first time condition ① has been met by any build in this file.**
+**The win — large, and (as §4.104 later showed) not resolvable by this design.**
 
 | `timeline` stage | metric | baseline | attempt B |
 |---|---|---|---|
@@ -393,8 +457,9 @@ gap, not enough for a 20 % one.
 | `jitter` | p99 | 170.883 ms | **110.812** |
 
 Per round, `clean` p99 reads 105.954 / 229.958 against 15.713 / 9.636, and `rtt_p99_ms ≤ 50` with a
-zero error rate in both B rounds. **The clean-cell tail was the admitted-but-unpacketised buffer**,
-exactly as §4.42 argued and §4.43 predicted: bound it by the window and the 100 ms tail goes with it.
+zero error rate in both B rounds. If the effect is real it says **the clean-cell tail is the
+admitted-but-unpacketised buffer**, which is what §4.42 argued and §4.43 predicted from the other
+direction — but §4.104's twin means this run cannot carry that claim on its own.
 
 **And the rollback fired anyway, on three shaped cells.** Same rounds, both arms:
 
@@ -4765,19 +4830,20 @@ is now recorded with a stored baseline to compare against next time.
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: attempt B a third time, with a floor that cannot starve a long path.** Attempt B was run
-(§4.103) and **reverted**: on the scaled `timeline` cell it took `clean` p99 from 167.96 to **12.674
-ms** and `clean#2` from 64.823 to **4.683 ms**, with `slo_broken` reading 0 on both — the first build
-in this file to meet condition ①. But `rtt100` throughput fell 3.31 → **0.855 Gbit/s, identically in
-both rounds**, and that is a bound rather than a measurement: on a 100 ms path the sender runs out of
-slack between acknowledgements and pays a wake per refill, which is the same mechanism §4.45 named the
-first time attempt B failed.
+**Next step: phase 2 — the duplicate open acknowledgement.** The buffer line is closed (§4.104): three
+settings, three failures, and the reason is structural — the send buffer is the only place the carrier
+can absorb a visitor-side path it cannot see, so shrinking it always costs a shaped cell. A fourth
+number would not end differently. So the sequence returns to the plan's own order and takes the one
+arrival-path item that is independent of the buffer: a registered lane's later streams still wait for
+an application-level `Ack::Ok` the lane's establishment has already made redundant. §3.6 of the plan
+says why the screen for it is L3 rather than the harness.
 
-So the third attempt gives the ceiling a floor of one pump's work — `cwnd + SEND_RUN × MAX_DATAGRAM`
-per live stream — while keeping the `2 × cwnd` growth rule that produced the clean win. Pass:
-`clean` p99 ≤ 50 ms with `slo_broken` = 0 **and** `rtt100` throughput, `loss1` throughput and
-`rate100` p99 all inside the same-round A/A. **This run must carry an A/A twin**: two rounds without
-one cannot separate 20 %, which is the width of two of the three regressions.
+**And nothing about the clean cell may be claimed again until a measurement can resolve it.** §4.104's
+twin reads a 39–167 % spread between two copies of **the same binary** on that cell at this scale, while
+the model itself computes ~131 rounds for `clean` p99 there and calls `clean#2` "too noisy for rounds to
+fix". The next claim about that cell uses a longer clean stage at `--scale 1.0`, or registers
+`rtt_worst_1s_ms` / `rtt_max_ms` — which the run resolves in 3–4 rounds — as the endpoint instead of
+p99.
 
 Three things stay open, deliberately and with their evidence:
 
@@ -4787,12 +4853,15 @@ Three things stay open, deliberately and with their evidence:
 - a lane that is *idle with a stream open* now pays up to 1 000 wake-ups a second, which is the
   poll's pure cost and is unmeasured. It belongs to the next milestone's `cpu_cores` and
   `rss_peak_mib` guardrail, and §4.101 says so;
-- admission is still bounded by `MAX_BUFFERED`, not by the window (§4.42). That is the defect attempt
-  B was meant to fix, and it stands until B is either accepted or refuted again.
+- admission is still bounded by `MAX_BUFFERED`, not by the window (§4.42), and §4.104 says that stays:
+  three settings were measured and each cost a shaped cell, because the buffer is the carrier's only
+  shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
+  honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
 **The session objective is in step again** (revision 9): it names §4.103's result and the third
-attempt's pre-registered criterion. A goal edit needs a direct human turn, so it can only be
-corrected on one — which is why the three copies are kept in this order.
+attempt's pre-registered criterion — and §4.104 then settled that attempt, so the objective is one
+settlement behind. A goal edit needs a direct human turn, which is why the three copies are kept in
+this order.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
