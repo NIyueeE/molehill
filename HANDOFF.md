@@ -5315,11 +5315,17 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step** (revision 11): it names §4.107/§4.108 as the blocker, the
-pre-registered ACK-block instrument as the next step, and the eight local commits the flake is holding
-back. A goal edit needs a direct human turn, which is why the three copies keep a stated order — but
-none of them may drift between turns: this section, the plan's §0 and the objective say the same thing
-or one of them is wrong.
+**The session objective is one finding behind** (revision 11): it still names §4.107/§4.108 as the
+blocker, and §4.114 fixed it — ten of ten striped runs pass and sixteen commits landed. A goal edit needs
+a direct human turn, so it stays as written until one comes; this section and the plan's §0 are the
+current ones for the two items it has not caught up with:
+
+- the blocker is closed (§4.114, the drain loop), and
+- the drain fix is measured as a **no-op for bulk** (§4.117), so it is a many-small-datagrams fix and the
+  bench's bulk cells cannot price that class — now stated on both `benchmarks` pages.
+
+What survives from revision 11 and still binds: phase 2's latency is judged on `timeline` + `l4-plain`
+with `rtt_worst_1s_ms` / `rtt_max_ms` pre-registered rather than p99, and phase 3 comes after that.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
