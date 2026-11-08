@@ -367,7 +367,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.135 On the lossy cell every tool ties, because the shaper is the measurement (2026-11-08)
+### 4.136 Inline send from the writer: built, measured, reverted — and it rules a suspect out (2026-11-08)
+
+The user chose "attack the 25 µs" over restating the criterion, so the first attack was the most direct
+one: let the writer send its own packet instead of hopping to the pump's task.
+
+**What was built.** `Shared` gained the socket and peer (`attach_link`), a `pumping` flag the pump sets
+around `flush`, and `try_send_inline`, which builds one packet with the same `poll_transmit`, sends it with
+`try_send_to`, keeps the same counters, and falls back to `wake_pump` on anything it cannot do without
+waiting. `poll_write` tries it first. The guard exists because two senders on one socket are fine for UDP but
+a packet built now could overtake a run the pump has already staged.
+
+**It changed nothing.** Same harness, same 20 000 requests, 64 bytes, one reused connection:
+
+| build | p50 | p90 | p99 |
+|---|---|---|---|
+| pump only (before) | 45.0 µs | 55.0 | 65.0 |
+| inline send | **45.0 µs** | 53.0 | 61.0 |
+
+p50 identical, p99 −6 % on a single run. **Reverted**, by the same rule RACK went by: a second sender plus a
+new ordering invariant is not worth a p99 difference that a rerun could erase.
+
+**The value is what it rules out.** The client's wake-up-to-pump hop is **not** the 25 µs. That is a
+hypothesis killed cheaply, and it points the next attack at the other end: the server's `read_us` is 41 µs
+over mhd against 15 µs over TCP, and that is measured *after* the datagram has arrived — so the suspect is
+the receive path (dispatcher `recvmsg` → route → `on_datagram` → apply → reader wake), not the send one.
+
+**And a process note, because it is the second time.** The first attempt at this measurement was killed by
+`pkill -f 'role server --addr …'` matching **its own command line** — the exact self-match AGENTS.md warns
+about, and I had already hit it once this session. The rerun used `kill $PID`. Both times the work was fine
+and the measurement died.
+
+### 4.135 On the lossy cell every tool ties, because the shaper is the measurement (2026-11-08)### 4.135 On the lossy cell every tool ties, because the shaper is the measurement (2026-11-08)
 
 The complement to §4.134: if the clean cell is structurally unwinnable, does the *shaped* cell show the
 carrier winning? `rr-16` under `--condition loss1`, four arms, six rounds each, 28 samples, 279 s:
