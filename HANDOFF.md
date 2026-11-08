@@ -367,7 +367,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.157 §4.105 was wrong about which default the bench was measuring (2026-11-08)
+### 4.158 "Green" now means a stated repeat policy, not one lucky run (2026-11-08)
+
+The acceptance asks for both integration suites green, and this session's own record says that was not enough
+to mean anything: before §4.114 the striped cell failed about one run in four, and §4.107 quoted a day of
+6/6 followed by a day of 13/24. A single pass therefore proved nothing, which is why the criterion needed a
+repeat policy rather than a tick.
+
+**Measured now**, on the current tree:
+
+| what | runs | result |
+|---|---|---|
+| `striped_data_channels` alone | 20 | **20 passed, 0 failed** |
+| `integration_test` whole suite (22 cases) | 3 | **22 passed each**, 90.3 s / 91.0 s / 92.6 s |
+
+So the policy this record adopts: **the integration suite is called green when a full run passes three times
+in a row and the once-flaky cell passes twenty times in a row.** Twenty is not a statistical proof of
+zero rate — at a 1-in-20 rate the chance of seeing none in twenty is 36 % — but it is the difference between
+"it passed" and "it passes", and it is what the earlier measurements of the same cell never had.
+
+**The stability shows in the durations too.** The full suite used to take 40–70 s per failing run plus the
+stall; it now finishes in 90–93 s consistently, which is the same wall-clock every time — a stall would show
+as one run an order of magnitude slower, and none did.
+
+### 4.157 §4.105 was wrong about which default the bench was measuring (2026-11-08)### 4.157 §4.105 was wrong about which default the bench was measuring (2026-11-08)
 
 Following a user-facing claim to its source turned up a mistake of mine, ten rounds old and published on both
 `benchmarks` pages.
