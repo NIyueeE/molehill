@@ -428,6 +428,50 @@ impl Recovery {
         self.flight_bytes
     }
 
+    /// Retire every record the peer's byte prefix has already confirmed.
+    ///
+    /// **The escape hatch the design already had, applied to the number that
+    /// gates admission** (`HANDOFF.md` §4.108). A packet number lost for good
+    /// stops the peer's cumulative number frontier, and the acknowledgement
+    /// bitmap only carries 64 numbers behind the largest seen — so a record older
+    /// than that window can never be reported again by the block. The peer's
+    /// *byte* prefix cannot stall that way (it is the contiguous prefix of one
+    /// stream), and `Conn::apply_ack` already used it to free the stream's send
+    /// buffer. It never used it here, so the same bytes stayed in the flight for
+    /// ever: the congestion window closed on a lane whose peer had received
+    /// everything, the writer was refused, no new data went out, and the flow
+    /// deadlocked with 32 KB in flight against a 13 KB window.
+    ///
+    /// A record is retired only when its **whole** range sits below the prefix —
+    /// a partially confirmed range is still owed from its own first byte, and
+    /// retiring it would leave a hole the prefix cannot describe. `len == 0`
+    /// records (a bare finish) are left to the number path, because a prefix of
+    /// `offset` says the bytes arrived and not that the peer saw the close.
+    ///
+    /// Answers the bytes retired, for the connection's own accounting.
+    pub(crate) fn confirm_prefix(&mut self, stream: u32, prefix: u64) -> u64 {
+        let confirmed: Vec<u32> = self
+            .in_flight
+            .iter()
+            .filter(|(_, sent)| {
+                sent.range.is_some_and(|range| {
+                    range.stream == stream
+                        && range.len > 0
+                        && range.offset.saturating_add(u64::from(range.len)) <= prefix
+                })
+            })
+            .map(|(number, _)| *number)
+            .collect();
+        let before = self.flight_bytes;
+        for number in confirmed {
+            // `take` is the one place that knows how to remove a record without
+            // double-retiring a declared loss, so the accounting stays in one pair
+            // of hands.
+            let _ = self.take(number);
+        }
+        before.saturating_sub(self.flight_bytes)
+    }
+
     /// Drop one packet's bytes from the flight total.
     ///
     /// Called exactly once for every packet that was on the wire, whichever
@@ -992,6 +1036,70 @@ mod tests {
             "a late acknowledgement of the original must not drive the flight negative"
         );
         assert_eq!(recovery.lost_records(), 0, "and no lost record is left");
+    }
+
+    /// The byte prefix retires what the number block can no longer name.
+    ///
+    /// The defect this exists for (`HANDOFF.md` §4.108): a number lost for good
+    /// stops the peer's cumulative frontier, and the bitmap only covers 64 numbers
+    /// behind the largest seen, so older records can never be acknowledged again.
+    /// The flight then keeps `cwnd` closed while the peer has every byte — measured
+    /// as 32 KB in flight against a 13 KB window, with the writer refused and both
+    /// ends idle.
+    #[test]
+    fn a_confirmed_prefix_retires_records_the_number_block_cannot_name() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let _ = send_one(&mut recovery, start, 0);
+        let _ = send_one(&mut recovery, start, 100);
+        let _ = send_one(&mut recovery, start, 200);
+        assert_eq!(recovery.flight_bytes(), 300);
+
+        // A prefix that ends inside the second range confirms only the first: a
+        // partly confirmed range is still owed from its own first byte.
+        assert_eq!(recovery.confirm_prefix(1, 180), 100);
+        assert_eq!(recovery.flight_bytes(), 200, "the partial range stays");
+        assert_eq!(recovery.in_flight(), 2);
+
+        // Another stream's records are not this stream's business.
+        assert_eq!(recovery.confirm_prefix(9, 10_000), 0);
+        assert_eq!(recovery.flight_bytes(), 200);
+
+        // The rest of the stream confirmed: everything the prefix covers goes.
+        assert_eq!(recovery.confirm_prefix(1, 300), 200);
+        assert_eq!(recovery.flight_bytes(), 0);
+        assert_eq!(recovery.in_flight(), 0);
+    }
+
+    /// A record already declared lost is retired once, not twice, when the prefix
+    /// later covers it.
+    #[test]
+    fn a_prefix_over_a_declared_loss_does_not_retire_the_bytes_twice() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let first = send_one(&mut recovery, start, 0);
+        let _ = send_one(&mut recovery, start, 100);
+        assert_eq!(recovery.flight_bytes(), 200);
+
+        assert!(recovery.declare_lost(start, first).is_some());
+        assert_eq!(
+            recovery.flight_bytes(),
+            100,
+            "a declared loss leaves the flight"
+        );
+        assert_eq!(recovery.lost_records(), 1);
+
+        // The prefix now covers both ranges. The lost record contributes nothing
+        // to the flight — it left when it was declared lost — and must not be
+        // subtracted a second time.
+        assert_eq!(recovery.confirm_prefix(1, 200), 100);
+        assert_eq!(recovery.flight_bytes(), 0);
+        assert_eq!(recovery.in_flight(), 0);
+        assert_eq!(
+            recovery.lost_records(),
+            0,
+            "and its lost record goes with it"
+        );
     }
 
     /// A record nobody can still acknowledge is forgotten, so the table cannot

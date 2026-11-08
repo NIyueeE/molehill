@@ -367,6 +367,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.108 The prefix now retires the flight — correct, and not enough (2026-11-08)
+
+§4.107 named the shape: a packet number lost for good stops the peer's cumulative frontier, the
+acknowledgement bitmap carries only 64 numbers behind the largest seen, and a record older than that
+window can never be acknowledged — so the sender's `flight` stays above `cwnd` while the peer has every
+byte.
+
+**The design already had the escape hatch, and the flight was the one place it was not used.**
+`Conn::apply_ack` advanced the stream's send buffer with the peer's byte prefix (`advance_to`) but never
+told the recovery table, so the same bytes left `buffered` and stayed in `flight`. `Recovery::confirm_prefix`
+now retires every record whose whole range sits below the prefix, through `take` so a declared loss is
+not retired twice; a partially confirmed range stays, because it is still owed from its first byte, and
+a `len == 0` finish is left to the number path.
+
+Two tests pin it: `a_confirmed_prefix_retires_records_the_number_block_cannot_name` (partial prefix,
+other stream untouched, then the rest) and
+`a_prefix_over_a_declared_loss_does_not_retire_the_bytes_twice`.
+
+**It does not fix the flake, and the honest reading is that I cannot tell whether it changed anything.**
+With the fix the striped cell passed **1 of 5** runs; without it, 3 of 4 on a drained port table and 2 of
+4 on a polluted one. At a ~25–40 % failure rate those samples are the same observation. The port table
+was checked and drained before the five runs (8 sockets on 23xx, down to 2), so this was not the
+pollution of §4.107.
+
+So: the fix makes an invariant true that was false, and it is kept on that ground — not as the cure. The
+stall has either a second cause or a different one, and the next instrument is the one §4.107 named: the
+ACK block's `below` and the repaired numbers, on both ends, for two seconds of a failing run. That is
+what distinguishes "the prefix never advances past the stuck records" from "it advances and the flight
+still sticks".
+
 ### 4.107 The striped stall is a window livelock, and it blocks every push (2026-11-08)
 
 `striped_data_channels` fails often enough that it stops every push — five attempts in this round, one

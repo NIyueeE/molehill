@@ -2983,6 +2983,17 @@ impl Conn {
             state.acknowledged = true;
             self.buffered = self.buffered.saturating_sub(moved);
         }
+        // **And the same confirmation retires the recovery records it covers.** The
+        // prefix is the only acknowledgement that cannot stall on a lost packet
+        // number, and the flight is what `write` admits against: freeing the stream
+        // buffer while leaving the bytes in the flight closed the window on a lane
+        // whose peer had received everything (`HANDOFF.md` §4.108).
+        //
+        // `buffered` is not touched again: `advance_to` above already released those
+        // bytes from the stream's buffer, and the flight is a separate total.
+        if ack.prefix > 0 {
+            self.recovery.confirm_prefix(ack.stream, ack.prefix);
+        }
         // A loss only rewinds the send point: the bytes are still in the
         // buffer, so the next pass carries them again from the same offset.
         // Its bytes have already left the flight — the recovery table is the
