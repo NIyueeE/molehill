@@ -448,6 +448,14 @@ striped history in §4.30–§4.45 (6/6 one day, 13/24 another). It matters for 
 ⑥ requires both integration suites green, and a flaky cell means "green" needs a stated repeat policy
 rather than one run.
 
+**And by the end of this round it became the blocker.** Measured rates on an otherwise idle host:
+**4 failures in 6 runs with phase 2, 1 in 3 on the `df43d57~1` sources** (Fisher p ≈ 0.47, so the
+samples do not establish that phase 2 makes it worse — and they are small). Two things it is *not*:
+the new server path never fires during a failure (zero `claimed a registered lane` lines in three
+diagnostic runs), and there are no stray daemons or port conflicts (`ss` shows nothing on the fixture
+ports, load 1.0). The push of three verified commits is blocked on it, four attempts in a row, which
+makes stabilising that test the next task rather than a background worry.
+
 ### 4.104 Three buffer sizes, three failures: this line is closed (2026-11-08)
 
 Attempt B was tried a third time with a 4 MiB floor under a window-sized ceiling, and run with the
