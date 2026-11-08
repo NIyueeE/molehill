@@ -6377,10 +6377,14 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step** (revision 14): phases 0–3 closed, the 25 µs closed **as declined**
-(§4.145: one port per lane is too much configuration surface, so the extra task hop stays), the peers
-criterion recorded as unmet-by-decision rather than pending, `bulk-n` judged at 96.8 % of its baseline
-(§4.146), and the next step named as the last two measurements plus the closing record.
+**The session objective is in step** (revision 15): phases 0–3 closed, the 25 µs closed **as declined**
+(§4.145), the peers criterion recorded as unmet-by-decision, and every acceptance measurement either run or
+priced — `bulk-n` 96.8 % of baseline (§4.146), the gates green (§4.149), the soak leak-free (§4.150), and the
+idle cost of a live lane at 2.2 % of a core (§4.151, which also corrected §4.147's wrong state).
+
+**One product call is open and it is the only thing left**: whether 2.2 % of a core per idle live lane is
+acceptable, against the alternative of waking on the timer only and paying §4.101's 21 ms p99 tail. That
+changes what `READ_POLL` means, so it is not a tuning decision and it is not mine to make.
 
 None of the three copies may drift between turns: this section, the plan's §0 and the objective say the same
 thing, or one of them is wrong — and when they disagree the plan's original wins, because it is the approved
