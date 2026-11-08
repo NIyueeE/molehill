@@ -367,7 +367,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.153 The poll interval stays at 1 ms, decided with the curve in hand (2026-11-08)
+### 4.154 §6.3's acknowledgement policy, stated and pinned (2026-11-08)
+
+The plan's §6.3 was the one item never touched: "state which packets must trigger an acknowledgement
+immediately, and whether holes and credit updates reach the peer promptly". The code's answer, now written
+down and pinned:
+
+- **Every packet that carried stream data makes an acknowledgement pending** (`apply_datagram`'s stream arm),
+  and so does **every credit change** (`credit_due`, §4.101's one-way-flow fix). There is **no delayed-ack
+  timer**: the block rides the next packet this end builds, and if that packet also carries credit or data,
+  the acknowledgement rides along.
+- **A packet that carries only an acknowledgement takes no packet number** (`FLAG_UNNUMBERED`), so it can
+  never leave a hole in the peer's number frontier — the clause §6.3 asks to keep.
+- **The bitmap is not widened.** §6.3 says only a measurement showing the single-stream byte prefix limits
+  recovery would justify it; §4.108's prefix retirement and §4.142's numbers never showed that, so it stands
+  at 64.
+
+`a_packet_that_carried_data_is_acknowledged_in_a_packet_of_its_own` pins the first clause: a fresh end's
+first packet is its **credit**, so the test takes the first packet that actually carries stream data, delivers
+only that, and asserts the receiver answers with a packet carrying an acknowledgement, unnumbered. Disabling
+the block's attachment fails it at "a packet that carried data must be acknowledged"; suite green at 379.
+
+**Two wrong assumptions in my own test, and they are the interesting part.** The first version delivered the
+*sender's first* packet and expected an ack — but that packet is the sender's credit, carrying no data, so
+nothing was owed. The second expected the acknowledgement to travel alone — but it rides the receiver's credit
+packet, which is both correct and cheaper. Both were me assuming a state instead of checking it, which is the
+same failure §4.141 and §4.151 recorded; the fix is the same, and this time it was two rounds of it inside one
+test.
+
+### 4.153 The poll interval stays at 1 ms, decided with the curve in hand (2026-11-08)### 4.153 The poll interval stays at 1 ms, decided with the curve in hand (2026-11-08)
 
 §4.152 put three points on the table and the human's answer was to **keep 1 ms**, the shipped value. No code
 change: the constant was restored before the measurement and `git diff` is empty, so this entry records a

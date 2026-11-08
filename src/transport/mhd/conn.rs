@@ -4039,6 +4039,68 @@ mod tests {
         );
     }
 
+    /// A datagram that carried stream data makes an acknowledgement pending, and
+    /// the next packet this end sends carries it — with nothing else in it.
+    ///
+    /// §6.3 of the plan asks which packets must trigger an acknowledgement
+    /// immediately, and the answer the code gives is **every packet that carried
+    /// stream data** (`apply_datagram`'s stream arm), plus every credit change
+    /// (`credit_due`). There is no delayed-acknowledgement timer: the pending block
+    /// rides the next packet this end builds, and if there is nothing else to say it
+    /// goes alone. That is the whole policy, and nothing pinned it — a carrier that
+    /// silently stopped scheduling acknowledgements would look healthy from every
+    /// counter and stall on the sender's window instead.
+    #[test]
+    fn a_packet_that_carried_data_is_acknowledged_in_a_packet_of_its_own() {
+        let now = Instant::now();
+        let mut sender = Conn::new(7, true);
+        let mut receiver = Conn::new(7, false);
+        let stream = sender.open();
+        assert!(sender.write(stream.id, b"hello") > 0);
+
+        // **A fresh end's first packet is its credit**, not its data (§6.3's policy is
+        // about packets that *carry stream data*), so take the first one that does.
+        let mut buf = Vec::new();
+        let mut delivered = false;
+        for _ in 0..4 {
+            let Some(len) = sender.poll_transmit(now, &mut buf) else {
+                break;
+            };
+            let datagram = buf[buf.len() - len..].to_vec();
+            let packet = super::wire::decode(&datagram).unwrap();
+            if matches!(packet.frame, super::wire::Frame::Stream { .. }) {
+                receiver.on_datagram(now, &datagram).unwrap();
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "the write has to reach the wire as stream data");
+
+        // The receiver has nothing of its own to send, so within a few packets
+        // whatever it produces is the acknowledgement (a fresh connection also owes
+        // its first credit, which is a separate packet and legitimately comes first).
+        let mut carried_ack = false;
+        let mut unnumbered = false;
+        for _ in 0..4 {
+            let Some(len) = receiver.poll_transmit(now, &mut buf) else {
+                break;
+            };
+            let packet = super::wire::decode(&buf[buf.len() - len..]).unwrap();
+            if packet.ack.is_some() {
+                carried_ack = true;
+                unnumbered = packet.unnumbered;
+            }
+        }
+        assert!(
+            carried_ack,
+            "a packet that carried data must be acknowledged"
+        );
+        assert!(
+            unnumbered,
+            "an acknowledgement-only packet takes no packet number (§6.3)"
+        );
+    }
+
     /// A packet that arrives after this end retired a stream must not bring it
     /// back.
     ///
