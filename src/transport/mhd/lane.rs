@@ -75,6 +75,13 @@ pub(crate) struct Shared {
     /// ran (starvation). Different fixes, and a park duration cannot tell them
     /// apart.
     wakes: std::sync::atomic::AtomicU64,
+    /// Epoch microseconds of the last reader wake, or zero when none is pending.
+    ///
+    /// Taken by `poll_read` on entry to measure how long a woken consumer took to
+    /// come back (`HANDOFF.md` §4.142). One slot, not one per stream: a wake for
+    /// another stream landing first would attribute its wait to this one, which is
+    /// why the meter reports a count beside the duration.
+    woke_at_us: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -91,6 +98,7 @@ impl Shared {
             wakes: std::sync::atomic::AtomicU64::new(0),
             parked: std::sync::atomic::AtomicBool::new(false),
             wake_stamp_us: std::sync::atomic::AtomicU64::new(0),
+            woke_at_us: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -266,6 +274,10 @@ impl Shared {
     pub(crate) fn wake_stream(&self, stream: u32) {
         self.wakes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.woke_at_us.store(
+            crate::transport::stats::epoch_us(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let parked = self.wakers.lock().readers.remove(&stream);
         for waker in parked.unwrap_or_default() {
             waker.wake();
@@ -409,6 +421,18 @@ impl AsyncRead for StreamIo {
         // The caller's own buffer is the destination: a staging buffer here
         // would be one copy per byte into it and another out, and the second
         // copy only exists to keep a shape the reader does not have.
+        // **How long the woken consumer took to come back.** Zero means nobody woke
+        // us since the last read, so there is nothing to attribute.
+        let woke = this
+            .shared
+            .woke_at_us
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if woke != 0 {
+            let waited = crate::transport::stats::epoch_us().saturating_sub(woke);
+            crate::transport::stats::PHASES
+                .rx_wake
+                .record(std::time::Duration::from_micros(waited));
+        }
         let dst = buf.initialize_unfilled();
         let lock_at = crate::transport::stats::Timing::start(crate::transport::stats::enabled());
         let (taken, ready_before, ended, open, credit_due) = this.shared.with(|conn| {

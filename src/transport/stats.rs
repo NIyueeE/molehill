@@ -105,6 +105,12 @@ pub(crate) struct Phases {
     /// One packet's whole turn: the connection lock, `poll_transmit`'s preamble
     /// and the three phases above.
     pub(crate) tx_call: Meter,
+    /// How long a woken reader took to reach `poll_read` at all.
+    ///
+    /// The half of the park that is not the carrier: from `waker.wake()` to the
+    /// consumer entering its read. Together with `rx_lock` and `io_read` it divides
+    /// the park into scheduling, contention and copying (`HANDOFF.md` §4.142).
+    pub(crate) rx_wake: Meter,
     /// What a reader pays to *reach* the connection before it can read: the time
     /// from entering `poll_read` to the connection lock being held.
     ///
@@ -158,6 +164,7 @@ impl Phases {
             tx_encode: Meter::new(),
             tx_book: Meter::new(),
             tx_call: Meter::new(),
+            rx_wake: Meter::new(),
             rx_lock: Meter::new(),
             io_read: Meter::new(),
             io_write: Meter::new(),
@@ -1201,6 +1208,8 @@ fn report_phases() {
         tx_encode_n = PHASES.tx_encode.read().1,
         tx_book_us = PHASES.tx_book.micros(),
         tx_book_n = PHASES.tx_book.read().1,
+        rx_wake_us = PHASES.rx_wake.micros(),
+        rx_wake_n = PHASES.rx_wake.read().1,
         rx_lock_us = PHASES.rx_lock.micros(),
         rx_lock_n = PHASES.rx_lock.read().1,
         io_read_us = PHASES.io_read.micros(),

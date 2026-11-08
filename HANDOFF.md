@@ -367,7 +367,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.141 Two of my three "exclusions" were never verified to fire (2026-11-08)
+### 4.142 The park is mostly the consumer coming back by itself, not a late wake (2026-11-08)
+
+The instrument §4.141 asked for: `rx_wake`, the time from `waker.wake()` to the consumer entering
+`poll_read`, recorded beside the count so a null could be told from a no-op. It fires —
+**43 677 samples against 171 394 reads** in one 60 000-request run — and that ratio is the finding.
+
+| what a reader pays | per call | how often |
+|---|---|---|
+| `waker.wake()` → **entering `poll_read`** (`rx_wake`) | **2.9 µs** | 25 % of reads |
+| entering → holding the connection lock (`rx_lock`) | 0.21 µs | every read |
+| the copy inside the lock (`io_read`) | 0.09 µs | every read |
+| the whole park (bytes ready → taken) | 13–15 µs | every parked read |
+
+**Three quarters of the reads were not woken at all.** The reader was not parked when the bytes arrived, so
+`waker.wake()` had nothing to wake, and it came back on its own schedule. The park is measured from *bytes
+becoming ready*, so it charges the carrier for however long the consumer was busy elsewhere — in the L1
+harness, finishing the previous echo.
+
+**So the carrier's read path is fully accounted for, and it is small**: apply 1.49 µs, lock 0.21, copy 0.09,
+and 2.9 µs when a wake is actually needed. Nothing in it is 10 µs, and there is no longer anywhere in the
+carrier to look for the 25 µs.
+
+**What that means for the comparison, and it is a correction of method as much as of result.** The park was
+never a carrier metric — it is "how long the consumer took to come back", and a TCP echo pays the same
+consumer latency. Comparing parks across transports measures the two harnesses' loops, not the two carriers.
+The difference that *is* real is the number of hops on the critical path: mhd has write → pump's syscall →
+dispatcher's syscall → apply → wake → copy, where TCP has write → kernel → read. Each hop is a task (or a
+syscall) of a few µs, and §4.140's arithmetic — two wakes plus the apply ≈ 12 µs against TCP's one wake ≈ 5 —
+is the only part of the 25 µs that any measurement here supports.
+
+### 4.141 Two of my three "exclusions" were never verified to fire (2026-11-08)### 4.141 Two of my three "exclusions" were never verified to fire (2026-11-08)
 
 Going back over the numbers to write the summary turned up something worse than another null result.
 
