@@ -214,6 +214,19 @@ impl std::fmt::Debug for Listener {
     }
 }
 
+/// Start the carrier's once-a-second statistics reporter.
+///
+/// The product starts it from its own runtime, so the phase and reader-park
+/// lines are invisible to a separate crate like the bench harness — which is
+/// where the receive path has to be measured (`HANDOFF.md` §4.137). The switch
+/// is the product's own: with `MOLEHILL_MHD_STATS` unset this does nothing, so
+/// an ordinary harness run is unchanged.
+///
+/// Idempotent, and safe to call before the first lane exists.
+pub fn start_stats() {
+    crate::transport::stats::spawn_reporter();
+}
+
 impl Listener {
     /// Bind the listener at `addr`.
     ///

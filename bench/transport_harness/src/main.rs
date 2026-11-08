@@ -212,6 +212,10 @@ fn init_tracing() {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    // The product's own per-second carrier lines: phases, reader parks, wake latency.
+    // Gated on `MOLEHILL_MHD_STATS` inside, so an ordinary run prints nothing
+    // (`HANDOFF.md` §4.137).
+    molehill_rathole::probe::start_stats();
     let args = parse_args()?;
     match (args.role, args.mode) {
         (Role::Server, Mode::Tcp) => serve_tcp(args.addr, args.size).await,

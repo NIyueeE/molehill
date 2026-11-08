@@ -367,7 +367,48 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.136 Inline send from the writer: built, measured, reverted — and it rules a suspect out (2026-11-08)
+### 4.137 The 25 µs is scheduling, not computation — and the carrier's own work is 1.5 µs (2026-11-08)
+
+The receive path was said to be the next target (§4.136). Before adding anything, the instrument that
+already existed was made reachable from the harness — `probe::start_stats()`, which starts the product's own
+per-second reporter, gated on the same `MOLEHILL_MHD_STATS` switch, and first landed inside `impl Listener`
+by mistake and did not compile until it was moved to module scope. Then 60 000 requests through the L1
+harness, both ends release, loopback, clean:
+
+| what | p50 | p99 | max |
+|---|---|---|---|
+| a stream's **reader waiting for bytes** (`park_p50_us`) | **14–17 µs** | 34–76 µs | 2 129 µs |
+| a stream's **first byte waiting for the wire** (`dwell_p50_us`) | 2–3 µs | 10–18 µs | 144 µs |
+
+and the cumulative phase timings, per datagram, from the same run:
+
+| stage | cost |
+|---|---|
+| `on_datagram`, entry to return (`rx_total_us` / `rx_total_n`) | **1.49 µs** |
+| ├ `decode` | 0.06 µs |
+| ├ `ack` | 0.70 µs |
+| └ `append` | 0.55 µs |
+
+**So the carrier's own work on a datagram is 1.5 µs and the reader's wait for its task to be scheduled is
+14–17 µs.** The 25 µs gap against a TCP socket is **scheduling, not computation** — and that is why the
+inline send in §4.136 was always going to fail: the sender's dwell was 2–3 µs, so there was nothing to win
+on that side.
+
+**A hypothesis this raises, which I cannot test retroactively.** §4.114's drain loop makes the dispatcher
+keep taking datagrams until the socket is empty. That fixed a 97 % loss, and it also means the dispatcher can
+hold its worker while a reader's wake waits behind it — the park went *unmeasured* before that change (the
+`mhd-stats` line existed but the harness could not start the reporter), so there is no pre-§4.114 park to
+compare against. Stating it so the next step can be designed around it rather than rediscovering it: if the
+park is the drain loop's shadow, the fix is to bound a pass by *time* (or by datagrams shared with the
+wake-ups it delays) rather than by "until empty", and the measurement is the park's p99 against the same
+build with the bound tightened.
+
+**What this rules out, and it is most of the chain**: `recvmsg`, routing, decode, the ack block and the
+payload copy together are 1.5 µs. The dispatcher's syscall count is not the problem either — 119 847
+`rx_runs` carried 9.1 MB, so the batching works. What is left is one thing: the cost of handing a datagram
+from the task that received it to the task that will read it.
+
+### 4.136 Inline send from the writer: built, measured, reverted — and it rules a suspect out (2026-11-08)### 4.136 Inline send from the writer: built, measured, reverted — and it rules a suspect out (2026-11-08)
 
 The user chose "attack the 25 µs" over restating the criterion, so the first attack was the most direct
 one: let the writer send its own packet instead of hopping to the pump's task.
