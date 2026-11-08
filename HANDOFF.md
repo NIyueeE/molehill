@@ -367,6 +367,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.113 Two of my own numbers cannot both be true (2026-11-08)
+
+The instrument §4.112 asked for is in — datagrams read per second on the cadence line — and it says the
+listener is **not** starved: one dispatcher reads **15 000–19 000 datagrams a second** in 300–340
+batches (36–61 per batch, GRO coalescing beyond `SEND_RUN`), and a second one drains about 7 000 every
+two seconds. That retired the spin theory outright.
+
+**But it contradicts the per-lane totals, and both cannot be right.** Summed over every lane in the same
+failing run:
+
+| direction | posted | received at the peer | gap |
+|---|---|---|---|
+| client → server | 449 246 | **12 909** | **−97 %** |
+| server → client | 1 227 766 | 1 225 475 | −0.19 % |
+
+So the listener reads about 20 000 datagrams a second while the four server-side lanes count about 300.
+Every silent drop between those two points is now counted and reads zero: `malformed_decode` 12,
+`unrouted` 8, `malformed_lane` 0. A routed datagram increments the lane's counter on the first line of
+`on_datagram`, so a read that reaches a lane cannot be invisible.
+
+**And the new counter has a flaw I have to name before anyone trusts it**: `READ_DATAGRAMS` is
+incremented inside `receive`, which is used by **both** the listener's dispatchers *and* every per-lane
+pump. On the client side the pumps are the ones reading the 1.2 M datagrams of the healthy direction, so
+most of that 20 000/s may be the client, not the server. The measurement cannot yet say *which reader*
+read them.
+
+**That is the next instrument, and it is one split**: two counters, one for the listener and one for the
+pump, plus a per-dispatcher "datagrams routed to a lane" count. Then either the batch arithmetic is
+wrong (and the listener is reading far less than it looks) or the lane totals are wrong (and something
+between the callback and the connection is losing them) — and those are different bugs in different
+places. I am not going to guess which, having guessed wrong three times in this chain already.
+
 ### 4.112 The listener reads thousands of batches and almost no datagrams (2026-11-08)
 
 §4.111 left the loss narrowed to "read and not routed" or "never read". Two counters settle it, and the

@@ -677,6 +677,10 @@ async fn receive(
             if crate::transport::stats::enabled() {
                 crate::transport::stats::received_run(datagrams, bytes);
             }
+            READ_DATAGRAMS.fetch_add(
+                u64::try_from(datagrams).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
@@ -1552,6 +1556,14 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
 /// measured on the *sender's* side could sit unexplained while the receiver was
 /// the one not being fed. One line a second, and the number that matters is the
 /// longest gap between batches — that is the whole of what a waiting reader pays.
+/// Datagrams the listener actually took from its sockets, since the last report.
+///
+/// Beside `batches` this is the number that separates "the reader is slow" from
+/// "the reader is awake and the socket is empty": `receive` returns `Ok(())` for
+/// both a batch and an empty `try_io`, so a batch count alone cannot say which
+/// happened (`HANDOFF.md` §4.112).
+static READ_DATAGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Datagrams the listener read and could not route, since the last report.
 ///
 /// **The last silent drop.** An id the table does not hold, on a packet that is
@@ -1592,6 +1604,7 @@ fn report_dispatch(cadence: &mut Cadence) {
         batches = cadence.batches,
         max_gap_us = u64::try_from(cadence.max_gap.as_micros()).unwrap_or(u64::MAX),
         unrouted = UNROUTED.swap(0, std::sync::atomic::Ordering::Relaxed),
+        datagrams = READ_DATAGRAMS.swap(0, std::sync::atomic::Ordering::Relaxed),
         "mhd listener cadence"
     );
     cadence.batches = 0;
