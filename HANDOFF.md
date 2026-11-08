@@ -391,6 +391,10 @@ With the fix the striped cell passed **1 of 5** runs; without it, 3 of 4 on a dr
 was checked and drained before the five runs (8 sockets on 23xx, down to 2), so this was not the
 pollution of §4.107.
 
+One more datum from the last attempt, and it is the clearest yet: the run died with
+`striped bulk echo timed out at 2 399 232/8 388 608 bytes` after 168 s — **the transfer stops a quarter
+of the way in and never resumes**, which is the livelock seen end to end rather than a slow start.
+
 So: the fix makes an invariant true that was false, and it is kept on that ground — not as the cure. The
 stall has either a second cause or a different one, and the next instrument is the one §4.107 named: the
 ACK block's `below` and the repaired numbers, on both ends, for two seconds of a failing run. That is
