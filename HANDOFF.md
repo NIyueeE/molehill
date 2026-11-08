@@ -367,6 +367,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.125 RACK reverted: both cells are structurally blind to it (2026-11-08)
+
+§4.124 landed RACK and owed it a bench judgement. Two cells, two shapes, both null:
+
+| cell | why it was chosen | `rtt_p99_ms` pre → post | A/A | `rate_per_s` |
+|---|---|---|---|---|
+| `rr-16` + `loss1` | many small requests | 246.276 → 246.171 (**−0.04 %**) | −0.10 % | +0.38 % |
+| `rr-1` + `loss1` | one stream, RTO-bound | 246.707 → 246.448 (**−0.10 %**) | −0.13 % | −0.50 % |
+
+The second ran 33 samples over 2007 s (66.9 s per arm-round) and the model's verdict was "no claim cleared
+the floors", with the A/A twin agreeing to 0.13 %. **Reverted**, per §6.4: an unproven change in the loss
+path is a liability, not a neutral — it can declare spurious losses under reordering, which is the
+retransmit storm the plan warns about.
+
+**And the interesting part is why neither cell could have shown it.** RACK needs a *later* packet's
+acknowledgement to anchor its window on:
+
+- `rr-16` keeps sixteen streams busy, so the in-flight flight per stream is **deeper than three packets** —
+  the old three-packet threshold already declares the loss, and RACK has nothing left to add.
+- `rr-1` is the opposite: one request at a time, so a lost packet is usually the **last** one in its flight
+  and no later acknowledgement exists to anchor on. `newest` is `None` and RACK cannot fire. That case is
+  what PTO (§6.2) is for, not RACK.
+
+So the model has **no cell where RACK is the only loss detector** — which needs two or three packets in
+flight per stream, sustained. That is a scenario the model does not have, and it is now named in
+`benchmarks.md`'s "cannot answer" list rather than rediscovered the hard way next time.
+
+**What this costs and what it buys.** Three attempts and about an hour of bench time to establish that a
+correct-looking change cannot be measured here; the change is gone, the repository is back to 375 tests,
+and the next phase-3 step (PTO) is exactly the one whose cell *does* exist — `rr-1` under loss is
+RTO-bound by construction, which is what PTO shortens.
+
 ### 4.124 Phase 3's first cut: RACK anchored at the acknowledged packet (2026-11-08)
 
 The plan's §6.1 asks for loss detection anchored at the **most recently acknowledged** packet rather than

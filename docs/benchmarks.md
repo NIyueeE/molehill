@@ -757,6 +757,14 @@ Stated so a reader does not ask a chart for something it never measured:
   [HANDOFF.md](../HANDOFF.md) §4.117. So a bulk cell cannot price this class of
   defect, and no cell that writes like that relay exists yet.
 
+- **A reorder-window (RACK) change.** RACK needs a *later* packet's
+  acknowledgement to anchor its window on, and no cell keeps two or three packets
+  in flight per stream: the many-stream cells go deeper than the three-packet
+  threshold, which declares the loss first, and the one-stream cell loses the last
+  packet of its flight, which has nothing after it to anchor on. Both were measured
+  null on 2026-11-08 (see [HANDOFF.md](../HANDOFF.md) §4.125) and the change was
+  reverted, so a reorder-window claim needs a cell the model does not have yet.
+
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
   two runs on one machine whose probes drifted beyond tolerance are refused
