@@ -367,7 +367,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.154 §6.3's acknowledgement policy, stated and pinned (2026-11-08)
+### 4.155 §6.4's verification list, audited: nine of ten covered, one gap filled (2026-11-08)
+
+The plan's §6.4 names ten shapes that the fake-clock and in-memory-link tests must cover. Nobody had checked
+them one by one; this does, and each maps to a test that exists:
+
+| §6.4 shape | the test |
+|---|---|
+| first packet lost alone | `a_lost_opening_packet_is_re_sent_within_the_cheap_timer`, `a_re_sent_opening_takes_the_cheap_timer_on_a_busy_lane` |
+| **last packet lost alone** | **was missing** — added below |
+| the three-packet threshold | `three_later_acks_declare_a_loss` |
+| a loss declared by time alone | `the_reordering_window_declares_a_loss_without_later_acks` |
+| reordering | the same test: the window is what keeps a reordered packet from being called lost |
+| a late acknowledgement | `an_acknowledgement_after_the_loss_still_retires_the_record`, `a_late_acknowledgement_still_frees_the_send_buffer` |
+| consecutive probe timeouts | `ten_silent_retries_need_five_seconds_of_silence`, `silence_backs_off_and_then_kills_the_path` |
+| a single-packet probe | `a_small_flight_retransmits_in_twenty_milliseconds`, `a_probe_re_sends_one_range_not_the_flight` |
+| an opening packet inside a wide bulk flight | `a_re_sent_opening_takes_the_cheap_timer_on_a_busy_lane` |
+| one-way credit recovery | `credit_goes_out_from_an_end_that_has_nothing_else_to_send` |
+| no-acknowledgement memory bound | `the_lost_table_is_capped`, `a_lost_record_is_forgotten_after_its_hold` |
+
+**The gap was the tail**, and it is the one shape where nothing but the deadline can work: the last packet of
+a flight has no later packet to reach the three-packet threshold, and when it also ends the data there is
+nothing behind it to acknowledge. `the_last_packet_of_a_flight_is_recovered_by_the_timer_alone` sends four,
+acknowledges the first three, and shows the fourth is declared lost by the timer and put back on the wire.
+Suite green at 380.
+
+**What this audit does not claim.** A test existing is not the same as a behaviour being right — that is what
+the measurements in §4.124–§4.127 were for. This says the plan's list is covered, not that the carrier is
+correct beyond what those tests assert.
+
+### 4.154 §6.3's acknowledgement policy, stated and pinned (2026-11-08)### 4.154 §6.3's acknowledgement policy, stated and pinned (2026-11-08)
 
 The plan's §6.3 was the one item never touched: "state which packets must trigger an acknowledgement
 immediately, and whether holes and credit updates reach the peer promptly". The code's answer, now written

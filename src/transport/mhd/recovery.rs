@@ -1183,6 +1183,49 @@ mod tests {
 
     /// Three later acknowledgements are what turns a gap into a loss; two are
     /// reordering and must not.
+    /// The **last** packet of a flight is recovered, and only the timer can do it.
+    ///
+    /// §6.4's list asks for "the first and the last packet lost alone". The first is
+    /// `Connection::a_lost_opening_packet_is_re_sent_within_the_cheap_timer`; the last
+    /// had nothing: it has no later packet to reach the three-packet threshold, and
+    /// when it is also the end of the data there is nothing behind it to ack, so the
+    /// loss deadline is the only thing that can name it (`HANDOFF.md` §4.155).
+    #[test]
+    fn the_last_packet_of_a_flight_is_recovered_by_the_timer_alone() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let mut sent = Vec::new();
+        for step in 0..4u64 {
+            sent.push(send_one(&mut recovery, start, step * 100));
+        }
+
+        // The first three arrive; the fourth is lost and nothing follows it.
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(10),
+            Ack {
+                largest: sent[2],
+                below: 0,
+                bits: 0b111,
+                ..Ack::default()
+            },
+        );
+        assert!(
+            acked.lost.is_empty(),
+            "one behind is reordering, not the three-packet threshold"
+        );
+
+        // No packet can ever name it, so the deadline is all that is left.
+        let (expiry, resent) = recovery.on_timeout(start + Duration::from_millis(500));
+        assert!(
+            matches!(expiry, Expiry::Loss),
+            "a lost tail is a loss, not a probe of a silent path"
+        );
+        assert!(
+            resent.iter().any(|packet| packet.number == sent[3]),
+            "and it is the tail that goes back on the wire"
+        );
+    }
+
     #[test]
     fn three_later_acks_declare_a_loss() {
         let start = Instant::now();
