@@ -367,7 +367,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.148 The closing record: three user-visible fixes and one refused comparison, written down (2026-11-08)
+### 4.149 The acceptance gates, run rather than assumed (2026-11-08)
+
+The criteria name four gates that had never been run in this session — `just check`, `just interop`,
+`just l3-accept` and both carriers' integrations. All four are green:
+
+| gate | result |
+|---|---|
+| `just check` (the whole chain: fmt, clippy ×2, machete, audit, deny, outdated, docs, bench self-check, tests) | **exit 0**, "pre-push checks passed" |
+| `just interop` | **3 passed, 0 failed** — a new server refuses an old client and keeps serving; an old server refuses a new client and says so; an old server rejects an unknown dialect and survives |
+| `just l3-accept` | **16 PASS**, none failed — including 200 KB in 65 KB chunks with no MTU black hole, 2 000 small round trips byte-exact, 16 concurrent flows byte-exact, the policy refusal before the device is touched, and a lane lent between claims byte-exactly |
+| integrations, default carrier (= mhd) | **430 passed, 0 failed** across 13 test binaries |
+| integrations, `MOLEHILL_DATA_CARRIER=tcp` | **430 passed, 0 failed**, same count |
+
+**The two carriers agree on the count**, which is the shape the criterion asks for: the suite exercises the
+same behaviour whichever carrier the data plane would use, and the TCP pin does not quietly skip the carrier
+paths (it disables carrier *moves*, not the data channels).
+
+**What is left unmet, and it is not a gate.** `"no worse than same-round TCP and peers"` — closed as
+declined (§4.145), not pending. And `timeline[clean]` at `--scale 1.0` is the release sweep's 15.9-hour
+measurement (§4.143), with the scale-0.05 reading (p99 24.87 / 14.34 ms, zero errors) standing as the
+indication until the ritual runs.
+
+### 4.148 The closing record: three user-visible fixes and one refused comparison, written down (2026-11-08)### 4.148 The closing record: three user-visible fixes and one refused comparison, written down (2026-11-08)
 
 The changelog and the user-facing benchmark page had fallen behind the work, and both are pages a reader
 takes at face value.
