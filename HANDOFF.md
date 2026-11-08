@@ -367,7 +367,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.152 The poll-interval trade is a curve with a knee, not a binary (2026-11-08)
+### 4.153 The poll interval stays at 1 ms, decided with the curve in hand (2026-11-08)
+
+§4.152 put three points on the table and the human's answer was to **keep 1 ms**, the shipped value. No code
+change: the constant was restored before the measurement and `git diff` is empty, so this entry records a
+decision rather than a change.
+
+**What the decision was made against**, which is the point of having measured the curve:
+
+| `READ_POLL` | idle CPU per lane | worst fresh-stream open |
+|---|---|---|
+| **1 ms — kept** | **2.2 % of a core** | **2.6 ms** |
+| 5 ms | 0.9 % | 6.5 ms |
+| 20 ms | 0.2 % | 21.5 ms |
+
+The 20 ms row is the state before §4.101; choosing 1 ms means paying 2.2 % of a core per idle live lane — about
+9 % for a pool of four — to hold the worst fresh-stream open at 2.6 ms instead of 21.5. A 5 ms middle point was
+available at a third of the CPU and was not taken, so the latency precedence in the plan's constraints
+(延迟 > 吞吐 > CPU) is what the decision followed, stated in numbers rather than in principle.
+
+**And one thing the curve changed about how this is judged.** p99 reads 78–101 µs at all three points, flat
+inside noise; the trade lives entirely in the max, where the 21.5 ms event is rarer than one request in a
+thousand. So a p99 SLO cannot express this trade, and an acceptance written only in p99 would have let the
+20 ms setting look identical to the 1 ms one. If a future round wants a guard on this, it has to be a max or a
+"worst N seconds" metric, not a percentile.
+
+**That closes the last open product call in the objective.** What remains outside this loop's authority is
+`timeline[clean]` at `--scale 1.0` — the release sweep's 15.9-hour measurement (§4.143) — and the peers
+criterion, closed as declined (§4.145).
+
+### 4.152 The poll-interval trade is a curve with a knee, not a binary (2026-11-08)### 4.152 The poll-interval trade is a curve with a knee, not a binary (2026-11-08)
 
 §4.151 left a product decision with two ends: 2.2 % of a core for a 1 ms poll, or the 21 ms tail §4.101
 fixed. Three points make it a curve, and the middle one matters.
