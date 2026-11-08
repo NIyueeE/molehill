@@ -380,7 +380,7 @@ moves anything.
 | 2 | a duplicate open does not accept twice | **pinned now** — see below |
 | 3 | a late packet does not resurrect a retired stream | **pinned, and the audit found a real defect here** — see below |
 | 4 | credit advances with no data | **pinned now** — see below |
-| 5 | FIN over a hole; reset against unsent data | **partial**: `the_finishing_range_carries_the_fin` and `a_hole_stops_the_prefix_and_reports_itself` pin FIN *in* a range and holes; FIN *across* a hole and reset-vs-unacknowledged are not pinned |
+| 5 | FIN over a hole; reset against unsent data | **partial**: FIN *across* a hole is pinned now (`a_finish_behind_a_hole_does_not_end_the_stream`); reset against unsent or unacknowledged data is still not |
 | 6 | close releases pump, dispatcher, socket, receive | **partial, three of four now**: `a_closed_lane_lets_its_pump_go` asserts the pump ends within two seconds **and** drops its handle on the socket. The listener's dispatcher is still uncovered |
 | 7 | sustained loss keeps tasks, memory and the table bounded | **partial**: the table cap, the dead path and an abandoned stream's buffer are pinned; task and memory bounds are not measured |
 | 8 | `LOST_HOLD` leaves no unrecoverable frontier | **pinned** |
@@ -428,6 +428,15 @@ disable without breaking compilation still left it green, because the pump has t
 That redundancy is good news for the carrier and bad news for attribution — the test pins that the lane
 releases, not which line does it. (I also caught myself about to report "all exits disabled and it still
 passed" as evidence: that variant did not compile, `Wake::Closed` left uncovered.)
+
+**#5's first half, and the rule it pins.** `RecvBuf::is_complete()` is
+`fin_at == read && pieces.is_empty()`, and `Conn::peer_finished` asks for `peer_fin && is_complete()` — so a
+finish that arrives ahead of a hole cannot end the stream. That is the correct rule and it was unpinned;
+`a_finish_behind_a_hole_does_not_end_the_stream` delivers the peer's last range first, then the finish, and
+asserts the stream is not complete and the frontier stops at 100. **Replacing `is_complete` with
+`fin_at.is_some()` fails it** with "the bytes before 300 have not all arrived, so the stream cannot be
+over" — the truncation it exists to prevent. What is still open is the other half of #5: a reset
+interleaved with unsent or unacknowledged data.
 
 **What phase 3 must pin before it moves.** It changes retire, liveness and the hold, which are #3, #6 and
 #8. #8 is already pinned; **#3 and #6 are not**, so they come first. #4 is a free pin and #1 is the one

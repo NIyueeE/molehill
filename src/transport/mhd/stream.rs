@@ -1241,6 +1241,43 @@ mod tests {
 
     /// The received prefix stops at the first hole and grows past it once the
     /// hole is filled — that is what makes it safe to send as an acknowledgement.
+    /// A finish that overtook a hole must not end the stream.
+    ///
+    /// The fifth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+    /// "FIN across a hole does not truncate". The peer's last range can arrive
+    /// before the range beneath it — reordering, or a loss with the repair still in
+    /// flight — and reporting the stream finished then would hand the visitor a body
+    /// whose middle never arrived, with no error on either end.
+    ///
+    /// `Conn::peer_finished` is the caller: it asks `peer_fin && is_complete()` for
+    /// exactly this reason, so this pins the rule it leans on.
+    #[test]
+    fn a_finish_behind_a_hole_does_not_end_the_stream() {
+        let mut recv = RecvBuf::default();
+        let mut blocks = Blocks::default();
+        recv.insert(&mut blocks, 0, &[1u8; 100]);
+        // The peer's last range arrives first, and it carries the finish.
+        recv.insert(&mut blocks, 200, &[2u8; 100]);
+        recv.finish(300);
+        assert!(
+            !recv.is_complete(),
+            "the bytes before 300 have not all arrived, so the stream cannot be over"
+        );
+        assert_eq!(
+            recv.arrived(),
+            100,
+            "and the frontier stops at the hole, so the finish cannot be acknowledged as reached"
+        );
+
+        // The hole fills; only now is the stream over.
+        recv.insert(&mut blocks, 100, &[3u8; 100]);
+        assert_eq!(recv.arrived(), 300);
+        let mut out = vec![0u8; 300];
+        let taken = recv.read_into(&mut blocks, &mut out);
+        assert_eq!(taken, 300, "every byte, in order, exactly once");
+        assert!(recv.is_complete(), "read up to the finish is complete");
+    }
+
     #[test]
     fn the_arrived_prefix_stops_at_the_first_hole() {
         let mut recv = RecvBuf::default();
