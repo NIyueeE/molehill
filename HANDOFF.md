@@ -367,6 +367,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.114 The listener took one datagram per wake-up, and that was the stall (2026-11-08)
+
+§4.113 split the counters and the contradiction dissolved: `listener_read` 63 562 with `routed` 63 534 on
+the same run — **the listener routes 99.96 % of what it reads** — and `pump_read` 466 131, which is where
+the "20 000 a second" I had been reading actually came from. The listener's own rate was about **650
+datagrams a second, at 0.9 per batch**, while the client posted ten times that.
+
+**Why one per batch**: `RecvBatch::recv` performs exactly **one `recvmsg`**. The batch's capacity (16 for
+the listener, 44 for a pump) bounds a GRO run, not the number of separate datagrams one call can take. So
+`receive` returned after one datagram however many the socket held, and the dispatcher called it once per
+wake-up: **the listener's ceiling was its own loop rate (~690/s), not the socket's**. The kernel dropped
+everything above that, which is the 97 %.
+
+**The fix is the sentence this file has been writing since §4.101 and never applying to this reader**:
+drain until the socket is empty. One wake-up now loops `try_io` until `WouldBlock` (or a zero-length
+read), so a burst is taken in one pass, and the `WouldBlock` still clears the cached readiness so the
+next wait is a real edge.
+
+**Measured**: `striped_data_channels` **6 of 6 pass, every one in 3.0–3.9 s**. Before the change the
+same cell failed about one run in four, and its failures took 40–70 s. Ten rounds of instrumenting a
+stall ended at a receive loop that took one packet per syscall.
+
 ### 4.113 Two of my own numbers cannot both be true (2026-11-08)
 
 The instrument §4.112 asked for is in — datagrams read per second on the cadence line — and it says the

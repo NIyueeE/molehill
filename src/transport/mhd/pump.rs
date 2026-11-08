@@ -654,37 +654,51 @@ fn drain_ready(socket: &UdpSocket, _batch: &mut (), shared: &Arc<Shared>, peer: 
     }
 }
 
-/// The receive side: one batched read, split back into the datagrams it
-/// carried.
+/// The receive side: **drain the socket**, one batched read at a time.
+///
+/// `batch.recv` performs exactly one `recvmsg`, so a single call takes one
+/// datagram — or one GRO run — however many the socket is holding. Calling it
+/// once per wake-up therefore caps a reader at its own loop rate, and that cap was
+/// the striped stall: the listener was woken about 690 times a second, took one
+/// datagram each time, and the kernel dropped 97 % of a direction that arrived at
+/// ten times that rate (`HANDOFF.md` §4.114).
+///
+/// So one wake-up reads until the socket is empty. A `WouldBlock` ends the drain
+/// and — because it comes out of `try_io` — clears the cached readiness, which is
+/// what makes the next `readable()` wait for a real edge instead of spinning.
 #[cfg(target_os = "linux")]
 async fn receive(
     socket: &UdpSocket,
     batch: &mut crate::transport::udp_batch::RecvBatch,
+    reads: &std::sync::atomic::AtomicU64,
     mut on_datagram: impl FnMut(std::net::SocketAddr, &[u8]),
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
     socket.readable().await?;
-    match socket.try_io(Interest::READABLE, || batch.recv(socket.as_raw_fd())) {
-        Ok(_) => {
-            let mut datagrams = 0usize;
-            let mut bytes = 0usize;
-            for (from, data) in batch.iter() {
-                datagrams += 1;
-                bytes += data.len();
-                on_datagram(from, data);
+    loop {
+        match socket.try_io(Interest::READABLE, || batch.recv(socket.as_raw_fd())) {
+            // A read that carried nothing is not progress: stop draining.
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                let mut datagrams = 0usize;
+                let mut bytes = 0usize;
+                for (from, data) in batch.iter() {
+                    datagrams += 1;
+                    bytes += data.len();
+                    on_datagram(from, data);
+                }
+                if crate::transport::stats::enabled() {
+                    crate::transport::stats::received_run(datagrams, bytes);
+                }
+                reads.fetch_add(
+                    u64::try_from(datagrams).unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
-            if crate::transport::stats::enabled() {
-                crate::transport::stats::received_run(datagrams, bytes);
-            }
-            READ_DATAGRAMS.fetch_add(
-                u64::try_from(datagrams).unwrap_or(u64::MAX),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            Ok(())
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => return Err(e),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-        Err(e) => Err(e),
     }
 }
 
@@ -814,7 +828,7 @@ pub(crate) fn spawn(
             }
             let arriving = Arc::clone(&shared);
             tokio::select! {
-                result = receive(&socket, &mut batch, |from, data| {
+                result = receive(&socket, &mut batch, &PUMP_READ, |from, data| {
                     if from != peer {
                         return;
                     }
@@ -1556,13 +1570,24 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
 /// measured on the *sender's* side could sit unexplained while the receiver was
 /// the one not being fed. One line a second, and the number that matters is the
 /// longest gap between batches — that is the whole of what a waiting reader pays.
-/// Datagrams the listener actually took from its sockets, since the last report.
+/// Datagrams taken from the **listener's** sockets, since the last report.
 ///
-/// Beside `batches` this is the number that separates "the reader is slow" from
-/// "the reader is awake and the socket is empty": `receive` returns `Ok(())` for
-/// both a batch and an empty `try_io`, so a batch count alone cannot say which
-/// happened (`HANDOFF.md` §4.112).
-static READ_DATAGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Split from the pump's count because one `receive` serves both readers: summing
+/// them together made a listener that read 20 000 a second indistinguishable from
+/// a pump that did, and those are different defects in different places
+/// (`HANDOFF.md` §4.113).
+static LISTENER_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Datagrams taken from a **dialing lane's** own socket, since the last report.
+static PUMP_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Datagrams the listener read and **handed to a lane it already knew**.
+///
+/// The last number between "read" and "counted by a connection": if it is large
+/// while the lanes' own totals are small, the loss is inside the callback; if it
+/// is small while `batches` and the reads are large, the reads are not finding
+/// the lanes at all.
+static ROUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Datagrams the listener read and could not route, since the last report.
 ///
@@ -1604,7 +1629,9 @@ fn report_dispatch(cadence: &mut Cadence) {
         batches = cadence.batches,
         max_gap_us = u64::try_from(cadence.max_gap.as_micros()).unwrap_or(u64::MAX),
         unrouted = UNROUTED.swap(0, std::sync::atomic::Ordering::Relaxed),
-        datagrams = READ_DATAGRAMS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        datagrams = LISTENER_READ.swap(0, std::sync::atomic::Ordering::Relaxed),
+        pump_read = PUMP_READ.swap(0, std::sync::atomic::Ordering::Relaxed),
+        routed = ROUTED.swap(0, std::sync::atomic::Ordering::Relaxed),
         "mhd listener cadence"
     );
     cadence.batches = 0;
@@ -1720,7 +1747,7 @@ fn spawn_dispatcher(
                     let _ = changed;
                     return;
                 }
-                read = receive(&socket, &mut batch, |from, datagram| {
+                read = receive(&socket, &mut batch, &LISTENER_READ, |from, datagram| {
                     let Ok(packet) = crate::transport::mhd::wire::decode(datagram) else {
                         // **Counted, not silent.** This path used to `return` with
                         // nothing recorded, so a listener that rejected every
@@ -1754,6 +1781,7 @@ fn spawn_dispatcher(
                     {
                         let existing = registry.lock().get(&packet.id).cloned();
                         if let Some(shared) = existing {
+                            ROUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if let Err(reason) = shared.with(|conn| conn.on_datagram(now, datagram))
                             {
                                 tracing::debug!("mhd listener dropped a datagram: {reason:?}");
