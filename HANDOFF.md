@@ -367,7 +367,72 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.131 mhd is *worse* than rathole on the interactive cell, and that is the acceptance line (2026-11-08)
+### 4.133 The bare carrier is 45 µs now, so the proxy is the bigger term — §4.132 corrected (2026-11-08)
+
+§4.132 concluded that the interactive gap sat in the carrier, using §4.101's bare round-trip figure of
+64–80 µs. **That figure is stale** — it predates §4.114's drain loop — so it was re-measured before building
+anything on it. The L1 harness, release build, 20 000 requests over one reused stream, 64-byte payload,
+loopback, clean:
+
+| metric | p50 | p90 | p99 |
+|---|---|---|---|
+| `complete_us` (bare round trip) | **45.0** | 55.0 | 65.0 |
+| `first_us` | 44.0 | 54.0 | 64.0 |
+| server `read_us` (request in hand) | **41.0** | — | 64.0 |
+| server `write_us` (echo written) | 0.0 | — | 1.0 |
+
+20 000 attempts, `failed: 0`. So the carrier's round trip is **45 µs**, not 64–80, and §4.132's arithmetic
+changes sign: `rr-1` measures 113 µs proxied, so the **proxy adds 68 µs on top of a 45 µs carrier**. The
+proxy hop is the larger term, not the smaller one.
+
+**And the round trip is almost all outbound.** The server has the request in hand after 41 µs of the 45;
+its own reply costs 0–1 µs. So whatever is slow is on the **client's write → wire → server's read** leg: the
+post, the pump's wake, the `sendmmsg`, the peer's `recvmsg`, the dispatcher and the apply. That is a much
+smaller search space than "the proxy path", and it is where the next instrument goes.
+
+**What this costs §4.132.** Its measurement stands — mhd is 85 % behind rathole on `rr-1` — and its
+conclusion does not: the gap is not "the carrier's own round trip exceeds rathole's whole request", it is
+that the proxied path pays 68 µs over a 45 µs carrier while rathole pays 61 µs in total. The lesson is the
+one this file keeps re-learning: a figure from ten rounds ago is a hypothesis, and this one was 50 % off.
+
+**Next, and it is §8's list applied to a steady-state request rather than a first echo**: bracket the
+outbound leg — `post_at` → pump wake → `sendmmsg` → peer `recvmsg` → dispatch → apply → reader wake — inside
+the product, on this cell, before touching anything. The harness already emits `post_at` on its side; the
+carrier needs the matching stamps on its own.
+
+### 4.132 The gap is per-request and it is in the carrier, not the proxy (2026-11-08)### 4.132 The gap is per-request and it is in the carrier, not the proxy (2026-11-08)
+
+§4.131 showed mhd 25 % behind rathole with sixteen streams. The single-stream cell says more, because it
+removes concurrency as an explanation:
+
+`rr-1[clean]`, four arms, six measured rounds each, 47.1 s, 28 samples:
+
+| arm | `rtt_p50_ms` | `rtt_p99_ms` | `rate_per_s` |
+|---|---|---|---|
+| `l4-plain` (mhd) | 0.113 | **0.152** | 7 987 |
+| `l4-plain` A/A twin | 0.114 | 0.153 | 7 908 |
+| `frp` | 0.136 | 0.178 | 6 769 |
+| **`rathole`** | **0.061** | **0.082** | **13 788** |
+
+Against rathole: **p50 and p99 both +85 %**, rate **−42 %**. Against frp mhd *wins* (0.113 against 0.136), so
+this is not "UDP is slow" or "the proxy is slow" — it is specific to the comparison with rathole.
+
+**And the absolute numbers put the cost in the carrier.** §4.101 measured a **bare mhd round trip** on the
+L1 harness at p50 **64–80 µs**. rathole's *entire proxied request* — visitor socket, framing, tunnel, backend
+dial, response, all of it — is **61 µs**. So a round trip over the mhd carrier alone costs more than
+rathole's whole path, and the proxy logic on top of it adds only ~40 µs (113 − 64…80).
+
+That reframes the remaining work. The interactive path is not paying for mhd's stream layer, its open
+handshake, its scheduler or its forwarding loops — those are inside that ~40 µs. It is paying for what one
+datagram round trip costs: the pump's wake, its lock, and the syscalls on both ends.
+
+**This is a hypothesis about where to look, not a diagnosis**, and it is stated as the next thing to test:
+instrument one steady-state request inside the carrier — post → pump wake → `sendmmsg` → peer `recvmsg` →
+dispatch → apply → reader wake — and see which bracket holds the 60 µs. If the bare L1 number has moved since
+§4.101 (it was measured before §4.114's drain loop), that measurement comes first, because everything above
+assumes it still reads 64–80 µs.
+
+### 4.131 mhd is *worse* than rathole on the interactive cell, and that is the acceptance line (2026-11-08)### 4.131 mhd is *worse* than rathole on the interactive cell, and that is the acceptance line (2026-11-08)
 
 The acceptance says "p50/p90/p99 no worse than same-round TCP and peers". Two things had to be established
 before it could even be asked, and one of them is an answer nobody wants.
