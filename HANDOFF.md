@@ -4819,13 +4819,14 @@ is now recorded with a stored baseline to compare against next time.
 > deleted. When a phase lands, write its result in §4 and update the plan file in
 > place.
 
-**Where the plan stands (2026-11-07).**
+**Where the plan stands (2026-11-08).**
 
 | phase | state |
 |---|---|
-| 0 — measurement apparatus | **landed**: `src/probe.rs` (pool-less lane seam), `bench/transport_harness` (L1/L2), the gate wiring that makes a compiled bench member un-skippable, and the first two findings (§4.99, §4.100) |
-| 1 — recovery accounting and lifecycle | not started |
-| 2 — no duplicate open ack | not started; screening is L3, not L2 (§3.6 of the plan) |
+| 0 — measurement apparatus | **landed**: `src/probe.rs` (pool-less lane seam), `bench/transport_harness` (L1/L2), the gate wiring that makes a compiled bench member un-skippable, and three findings (§4.99, §4.100, §4.101) |
+| 1 — recovery accounting and lifecycle | **closed** (§4.102): the counters were right; two invariants are now tests. The eight lifecycle items are handed to phase 3 as a checklist, not as proven |
+| 1b — window and admission policy | **closed, no fourth buffer size** (§4.43, §4.103, §4.104): three settings, three failures |
+| 2 — no duplicate open ack | **next**; the screen is L3, not L2 (§3.6 of the plan) |
 | 3 — RACK / PTO / liveness | not started |
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
@@ -4858,10 +4859,9 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step again** (revision 9): it names §4.103's result and the third
-attempt's pre-registered criterion — and §4.104 then settled that attempt, so the objective is one
-settlement behind. A goal edit needs a direct human turn, which is why the three copies are kept in
-this order.
+**The session objective is in step** (revision 10): it names §4.104's closure, the phase-2 next step and
+the measurement precondition. A goal edit needs a direct human turn, which is why the three copies are
+kept in this order.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
