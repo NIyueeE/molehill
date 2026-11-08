@@ -367,6 +367,67 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.128 Phase 3 costs nothing on bulk, and the 85 % criterion has no baseline yet (2026-11-08)
+
+The first acceptance guardrail, because phase 3 changed the loss and retransmission path: `bulk-n[P8]` on
+`l4-plain`, three arms (pre-phase-3 `f975207`, current, A/A twin), six rounds, 21 samples, 167.9 s.
+
+| metric | pre-phase-3 | current | change | A/A |
+|---|---|---|---|---|
+| `throughput_gbps` | 15.840 | 15.740 | **−0.63 %** | −0.93 % |
+| `offered_gbps` | 15.061 | 14.961 | −0.67 % | −0.82 % |
+| `cpu_cores` | 10.559 | 10.460 | −0.93 % | −0.74 % |
+| `cpu_s_per_gbit` | 0.700 | 0.701 | +0.19 % | +0.21 % |
+| `wire_per_visitor_byte` | 1.039 | 1.039 | −0.01 % | −0.03 % |
+| `rss_peak_mib` | 158.85 | 162.55 | +2.33 % | +7.49 % |
+
+**The throughput change is smaller than the twin's own difference** (−0.63 % against −0.93 %), so phase 3
+costs nothing measurable on bulk. Guardrail passes.
+
+**But the criterion itself cannot be judged yet, and the reason matters.** "`bulk-n` at ≥85 % of a valid
+baseline" needs a baseline measured with the arm that ships. The published records
+(`benches/records/results-bench-v0.11.2.json`) are a `sweep` with arms `molehill`/`l3`/`frp`/`rathole` and
+**no `bulk-n` cell at all** — the sweep is timeline and capacity only. And the arm they do carry is not the
+product default: `"molehill"` inherits `noise_data = True`, so every stream in every published sweep paid a
+Noise handshake, while the product's default is `data_enable = false` (§4.105). The catalog comment called
+that arm "the product in its default configuration", which was simply false, and is corrected.
+
+So the 85 % line can only be judged after a baseline is recorded with `l4-plain` on this host — a `dev` run
+kept as a record, or the release sweep once its arms include the plain plane. Until then the honest answer
+to "is `bulk-n` within 85 %" is **not knowable**, and the −0.63 % above is a *build-to-build* guardrail, not
+the criterion.
+
+### 4.127 The "independent probe deadline" is a no-op here, and liveness already resets (2026-11-08)
+
+§6.2 had two bullets left. Neither needed the code I was about to write, and saying so with a test is better
+than shipping a second timer that changes nothing.
+
+**The probe deadline cannot be earlier than the timer that exists.** §6.2 asks for it to be computed
+"independently from the latest still-outstanding packet". `arm` anchors the one timer on the **oldest**
+data-bearing packet with the same `rto` a probe would use — and `oldest ≤ latest`, so `oldest + rto ≤
+latest + rto` always. A second deadline taking `min` of the two could only ever pick the one that exists.
+What §6.2 actually wants is that the timer is a **backstop** while loss is decided by evidence, and that is
+what `on_timeout` already does: it declares whatever is past the reorder window, and probes only when
+nothing is. Changing the anchor to the newest would be the bug, not the fix — it delays every repair by a
+send interval, and `the_timer_is_never_later_than_a_latest_anchored_probe_would_be` fails on it (the two
+instants differ by exactly the 20 ms small-flight timeout).
+
+**Liveness already separates.** `Expiry::Dead` needs `DEAD_LINK` unanswered retransmissions **and**
+`DEAD_FLOOR` of silence, and `heard()` clears both — `ten_silent_retries_need_five_seconds_of_silence`
+already pinned the count and the floor; what was missing was the **reset**, which is the half that makes
+"cheap PTO counts cannot kill a path" true.
+`a_real_receipt_resets_the_silence_that_would_have_killed_the_path` sets the exact state that kills, calls
+`heard()`, and asserts the next timeout is not dead. Making `heard()` stop clearing fails it at "a receipt
+clears the unanswered count".
+
+**A note on my own first attempt at that test**: it drove forty probes and asserted no death, and it passed
+**with `heard()` removed** — because after a probe takes the only record the table is empty, `on_timeout`
+returns `Expiry::Loss` on `live == 0` before ever reaching the dead branch. It was asserting nothing. The
+rewritten one sets the state directly and fails when the reset goes.
+
+So §6.2 closes with: one range per probe (§4.126, measured), the timer as a backstop (pinned by ordering),
+and liveness reset by real receipt (pinned). Suite green at 378.
+
 ### 4.126 Phase 3's second cut: a probe re-sends one range, not the flight (2026-11-08)
 
 §6.2's most concrete item, and the one whose shape §4.107 predicted: a probe timeout re-sent **every**
