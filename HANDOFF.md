@@ -367,6 +367,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.117 The drain fix does nothing for bulk, and that is the useful part (2026-11-08)
+
+§4.116 could not score the drain fix on four rounds. Six rounds of the cheapest cell can, and the answer
+is **no effect** — measured, not assumed:
+
+| arm | `throughput_gbps` | `cpu_cores` | `rss_peak_mib` | `wire_per_visitor_byte` |
+|---|---|---|---|---|
+| pre-drain `6dd505fd` | 15.064 | 10.361 | 155.7 | 1.039 |
+| drain `08285417` | **15.002** | 10.331 | 153.7 | 1.039 |
+| A/A twin (pre-drain again) | 14.994 | 10.355 | 160.3 | 1.039 |
+
+`bulk-n[P8]`, 6 rounds, 3 arms, 168.3 s, 21 samples, 9.35 s per arm-round. Throughput moves **−0.4 %**
+against an A/A difference of **0.46 %** and an A/A scatter of **4.92 %** — the same number. `cpu_cores`
+−0.3 %, `wire_per_visitor_byte` identical to three decimals.
+
+**Which is the interesting part.** The one-datagram-per-wake-up limit only binds when a wake-up carries one
+datagram, and on the bench's bulk cells it never does: GSO/GRO hands the kernel coalesced runs, so one
+`recvmsg` returns a whole run and the listener was never the constraint there. The striped test's traffic
+has no coalescing — 1 349-byte datagrams from a TCP relay, one per packet — so the same code path there
+was capped at ~690 a second and dropped 97 %.
+
+So the drain fix is a **many-small-datagrams** fix, not a throughput one, and the bench's bulk cells are
+structurally unable to see this class of defect. That is why ten rounds of benchmark numbers never showed
+a direction losing 97 % of its traffic: the cells were measuring a shape the bug does not touch. A cell
+that writes like the striped relay — one small datagram per packet, no GSO — is the gap, and it belongs on
+the list of things the model cannot currently answer.
+
 ### 4.116 The drain fix's bench effect is unmeasured, and the model said so first (2026-11-08)
 
 The drain fix is a change to the receive path, so every earlier benchmark number describes code whose
