@@ -367,7 +367,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.155 §6.4's verification list, audited: nine of ten covered, one gap filled (2026-11-08)
+### 4.156 The carrier's recovery policy now has a home in internals.md (2026-11-08)
+
+`docs/internals.md` was not *wrong* about the carrier — it says an `mhd` lane is a UDP connection with its
+own packet numbers, acknowledgements and streams — but it was **silent** on how that recovery actually
+behaves, and five of this session's changes live there. A contributor reading the page learned the shape and
+nothing about the policy.
+
+One paragraph now states it where that audience looks: an acknowledgement is scheduled by every data-carrying
+packet and every credit change, with no delayed-ack timer and no packet number on an ack-only packet; loss
+comes from the three-packet threshold or a reorder window from the peer's frontier; a probe re-sends **one**
+oldest range rather than the flight; the pump wakes at most a millisecond apart while a stream is live —
+2.6 ms worst fresh-stream open against 21.5, for about 2 % of a core per idle lane — and sleeps on a timer
+when every stream has ended; and stream ids are monotonic in both directions, the minter skipping an id a
+live stream holds and a late packet for a retired stream dropped with its window returned.
+
+**Why there and not here.** AGENTS.md's "one topic, one home" puts the design and its trade-offs on the
+contributor page and the measurement record on this one. The numbers travel with the policy because a
+contributor choosing a poll interval needs them; the experiments behind them stay in §4.101 and §4.152.
+
+**What it does not say.** No history — not that RACK was tried and reverted, not that the page was silent
+before. A user-facing or contributor page states what is true now; the story belongs here, and this is it.
+
+### 4.155 §6.4's verification list, audited: nine of ten covered, one gap filled (2026-11-08)### 4.155 §6.4's verification list, audited: nine of ten covered, one gap filled (2026-11-08)
 
 The plan's §6.4 names ten shapes that the fake-clock and in-memory-link tests must cover. Nobody had checked
 them one by one; this does, and each maps to a test that exists:
