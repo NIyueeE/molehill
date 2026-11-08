@@ -367,7 +367,67 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.138 Bounding the drain pass did not help, so the drain loop is not the reader's shadow (2026-11-08)
+### 4.140 The reader is not blocked by the carrier: 0.18 µs to reach the lock (2026-11-08)
+
+§4.139 left two candidates for the 8–10 µs of the park that is not the wake: the consumer's own turnaround,
+or the reader waiting on the same per-connection mutex the dispatcher takes per datagram. A meter separates
+them — `rx_lock`, the time from entering `poll_read` to holding the lock, beside the existing `io_read`,
+which is the copy inside it.
+
+One L1 run, 60 000 requests, and per call:
+
+| what the reader pays | per call |
+|---|---|
+| entering `poll_read` → **holding the connection lock** (`rx_lock`) | **0.18 µs** |
+| the copy inside the lock (`io_read`) | 0.08 µs |
+| the whole park, waiting for bytes | 12–15 µs |
+
+**The reader is not blocked by the carrier.** 0.18 µs against a 13 µs park is not a contention story: the
+dispatcher takes that mutex 175 000 times in a run and the reader waits a fifth of a microsecond for it.
+
+**So the carrier's entire bookkeeping on a datagram is 1.8 µs** — apply 1.49, lock 0.18, copy 0.08 — and the
+13 µs park is *the consumer's own scheduling*: after `waker.wake()` the echo task does not run for ~13 µs,
+where the pump's own wake-to-run is 5 µs in the same run (`n≈29 000/s`).
+
+**That is the honest shape of the 25 µs, and it is not a defect in the carrier's code.** Three tasks touch a
+datagram in one process — the pump sends, the dispatcher receives and applies, the consumer reads — and the
+consumer's wake lands behind the other two on the same runtime. The pump's 5 µs is the floor; the reader's 13
+is what it costs when two carrier tasks are already busy on the same workers.
+
+**What would move it, stated so nobody looks for it in the wrong place**: fewer tasks per datagram — the
+dispatcher applying *and* the consumer reading in one task for a lane — or a runtime where a lane's tasks do
+not share workers with the listener's dispatcher. Both are architecture changes with their own risks, and
+neither is a tuning constant. That is where this line of work now stands.
+
+### 4.139 Only 5 µs of the reader's park is the wake — §4.137's phrasing corrected (2026-11-08)### 4.139 Only 5 µs of the reader's park is the wake — §4.137's phrasing corrected (2026-11-08)
+
+§4.137 said the reader's 13–15 µs park was "the reader's wait for its task to be scheduled". The same run
+carries the number that tests that claim, and I had not read it: the pump's own wake latency lives on its own
+line.
+
+| measurement | p50 | p99 | max |
+|---|---|---|---|
+| **a parked pump waiting after its wake** (`n≈29 000/s`) | **5 µs** | 9–35 µs | 138 µs |
+| a stream's reader waiting for bytes (`park_*`) | **13–15 µs** | 30–35 µs | 2 129 µs |
+
+**So at most 5 µs of the park is the wake.** A task woken in this runtime starts running in 5 µs, measured
+29 000 times a second on the same process in the same run; the reader takes three times that. The other
+8–10 µs is **not** the wake, and §4.137's phrasing — "the reader's wait for its task to be scheduled" — was
+too narrow. The park is measured from *bytes becoming ready* to *the reader taking them*, so it also carries
+whatever the consumer was doing, and whatever it had to wait for before it could ask again.
+
+**What that leaves, and it is a shorter list than before.** Between the wake and the read there are two
+candidates, and they are separable: the consumer's own turnaround (in the L1 harness the echo loop, which
+must write the previous reply before it reads again), and contention with the carrier's own tasks — the
+reader's `poll_read` takes the same per-connection mutex the dispatcher holds while applying, and §4.114's
+drain means it takes it thousands of times a second.
+
+**The instrument that would separate them** is not the park: it needs the reader's *entry* stamped as it
+enters `poll_read` and the lock wait timed inside it, so "the consumer was late" and "the consumer was
+blocked on the carrier's lock" become different numbers. That is the next probe, and the pump's 5 µs is the
+floor any design has to beat.
+
+### 4.138 Bounding the drain pass did not help, so the drain loop is not the reader's shadow (2026-11-08)### 4.138 Bounding the drain pass did not help, so the drain loop is not the reader's shadow (2026-11-08)
 
 §4.137 raised one hypothesis it could not test: that §4.114's unbounded drain lets the dispatcher hold its
 worker while a reader's wake waits behind it. This tests it by bounding the pass at **64 datagrams per

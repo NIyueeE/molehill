@@ -410,7 +410,9 @@ impl AsyncRead for StreamIo {
         // would be one copy per byte into it and another out, and the second
         // copy only exists to keep a shape the reader does not have.
         let dst = buf.initialize_unfilled();
+        let lock_at = crate::transport::stats::Timing::start(crate::transport::stats::enabled());
         let (taken, ready_before, ended, open, credit_due) = this.shared.with(|conn| {
+            lock_at.stop(&crate::transport::stats::PHASES.rx_lock);
             // Read *before* the read: taking the bytes clears the stamp.
             let ready_before = conn.ready_for(stream, std::time::Instant::now());
             let taken = crate::transport::stats::around(

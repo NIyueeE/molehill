@@ -105,6 +105,14 @@ pub(crate) struct Phases {
     /// One packet's whole turn: the connection lock, `poll_transmit`'s preamble
     /// and the three phases above.
     pub(crate) tx_call: Meter,
+    /// What a reader pays to *reach* the connection before it can read: the time
+    /// from entering `poll_read` to the connection lock being held.
+    ///
+    /// Beside `io_read` (the copy inside the lock) this separates "the consumer
+    /// was late" from "the consumer was blocked behind the carrier's own work":
+    /// the dispatcher takes the same mutex once per datagram, thousands of times a
+    /// second (`HANDOFF.md` §4.139).
+    pub(crate) rx_lock: Meter,
     /// A stream handle's read: the copy out of the receive buffer into the
     /// caller's slice.
     pub(crate) io_read: Meter,
@@ -150,6 +158,7 @@ impl Phases {
             tx_encode: Meter::new(),
             tx_book: Meter::new(),
             tx_call: Meter::new(),
+            rx_lock: Meter::new(),
             io_read: Meter::new(),
             io_write: Meter::new(),
             write_park: Meter::new(),
@@ -1192,6 +1201,8 @@ fn report_phases() {
         tx_encode_n = PHASES.tx_encode.read().1,
         tx_book_us = PHASES.tx_book.micros(),
         tx_book_n = PHASES.tx_book.read().1,
+        rx_lock_us = PHASES.rx_lock.micros(),
+        rx_lock_n = PHASES.rx_lock.read().1,
         io_read_us = PHASES.io_read.micros(),
         io_read_n = PHASES.io_read.read().1,
         io_write_us = PHASES.io_write.micros(),
