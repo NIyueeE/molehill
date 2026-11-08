@@ -5500,20 +5500,27 @@ is now recorded with a stored baseline to compare against next time.
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: 2b — the striped forwarder's window livelock.** §4.107: `striped_data_channels` fails
-about half the time, the flight sits at 32 796 against a `cwnd` of 13 490–14 839 on both ends, each
-end's writer is refused, so neither end sends and neither end's acknowledgements leave. That is a real
-forwarding deadlock, and it is ahead of everything else because nothing can be landed while the gate
-that guards every push is red — four attempts failed on it, one of them with nothing else running.
+**Next step: phase 3's second piece — PTO and liveness separated.** The blocker is gone (§4.114: the
+listener took one datagram per wake-up, the cell now passes 10 of 10 in 2.96–3.90 s) and RACK is gone too
+(§4.125, two cells, both null, reverted). What phase 3 has left:
 
-It also narrows phase 1: I closed it on "a re-sent range is counted once" and "a finished exchange
-leaves nothing counted", and **neither is `flight ≤ cwnd`** — the invariant `write` actually depends on.
+- **PTO's cell exists and has already been measured**: `rr-1` under `--condition loss1` is RTO-bound —
+  39.85 req/s, p99 246.4 ms, p50 20.6 ms over 10 rounds. That is precisely what a probe timeout shortens,
+  and precisely why RACK could not help: one request in flight means the lost packet is usually the
+  **last** one, so there is no later acknowledgement to anchor a reorder window on.
+- The work itself is §6.2's first item: one timer currently covers both "declare a loss and repair" and
+  "probe a silent path" (`Recovery::on_timeout` produces both `Expiry::Loss` and `Expiry::Dead`). Separate
+  the probe deadline, and make a PTO re-send **at most one** oldest unacknowledged range — never the whole
+  flight.
+- Keep `DEAD_FLOOR`, `DEAD_AFTER` and the keepalive; liveness stays decided by real receive and silence,
+  so cheap probe timeouts alone cannot kill a path.
+- Criterion first, run second: `rr-1`+`loss1` `rtt_p99_ms` or `rtt_max_ms` beyond the same run's A/A, or it
+  is reverted the way RACK was.
 
-The first task is not a code change. One failing run has to answer which of two things is true, since
-they have different fixes: the client's acknowledgements are sent and not applied, or they are never
-sent because its own writer is blocked. The instrument is the ACK block itself — `below` and the
-repaired number range, on both ends, for two seconds. Guessing now would be the fourth blind attempt
-in this file's recent history.
+**Two things already judged, and not to be reopened.** Phase 2's latency is judged on `rr-16[l4-plain]`
+(1.19–1.48 % resolution, 81 s) and moved nothing — it is a per-open saving, so only a churn cell can price
+it (§4.119). And the eight lifecycle invariants are audited: six fully pinned, two partial, with two real
+defects found and fixed on the way (#3's phantom accept, #1's live-id overwrite).
 
 **And nothing about the clean cell may be claimed again until a measurement can resolve it.**
 
@@ -5530,17 +5537,14 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is one finding behind** (revision 11): it still names §4.107/§4.108 as the
-blocker, and §4.114 fixed it — ten of ten striped runs pass and sixteen commits landed. A goal edit needs
-a direct human turn, so it stays as written until one comes; this section and the plan's §0 are the
-current ones for the two items it has not caught up with:
+**The session objective is in step** (revision 12): the striped blocker is recorded as closed (§4.114),
+phase 2 as a per-open saving (§4.119), the lifecycle audit as six pinned and two partial with two defects
+fixed (§4.120–§4.123), and RACK as reverted with the cell it would need (§4.125). Its next step is PTO and
+liveness separation, judged on `rr-1` + `loss1`.
 
-- the blocker is closed (§4.114, the drain loop), and
-- the drain fix is measured as a **no-op for bulk** (§4.117), so it is a many-small-datagrams fix and the
-  bench's bulk cells cannot price that class — now stated on both `benchmarks` pages.
-
-What survives from revision 11 and still binds: phase 2's latency is judged on `timeline` + `l4-plain`
-with `rtt_worst_1s_ms` / `rtt_max_ms` pre-registered rather than p99, and phase 3 comes after that.
+None of the three copies may drift between turns: this section, the plan's §0 and the objective say the
+same thing, or one of them is wrong. When they disagree the plan's original wins — it is the approved
+document, and the other two summarise it.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
