@@ -748,6 +748,15 @@ Stated so a reader does not ask a chart for something it never measured:
   runs the default; it is one knob apart from `l4`, so the pair also prices the
   encryption. No comparison against it has been published yet.
 
+- **A receiver that is slow at *many small datagrams*.** Every bulk cell sends
+  coalesced runs, so one `recvmsg` returns a whole run and the cost of taking one
+  datagram per call never appears. A path that writes 1 349-byte datagrams one at
+  a time has no coalescing, and on 2026-11-08 that shape lost 97 % of one
+  direction while `bulk-n` read 15.0 Gbit/s before *and* after the fix
+  (throughput −0.4 % against a 4.9 % A/A scatter) — see
+  [HANDOFF.md](../HANDOFF.md) §4.117. So a bulk cell cannot price this class of
+  defect, and no cell that writes like that relay exists yet.
+
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
   two runs on one machine whose probes drifted beyond tolerance are refused
