@@ -367,7 +367,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.144 The 25 µs is one extra task-hop per direction, and removing it costs a port per lane (2026-11-08)
+### 4.145 The 25 µs stops here: one port per lane is too much configuration surface (2026-11-08)
+
+§4.144 priced the only path that removes the extra task hop — one UDP socket per lane — and the human's
+answer was that it is too large a change to the configuration surface. **So it is not done**, and this entry
+records the decision rather than leaving the thread dangling.
+
+**What that settles.** The carrier keeps one server port and one demultiplexing dispatcher, and therefore
+keeps the extra task hop on the receive path. The consequence is arithmetic that is now fixed rather than
+open: a bare loopback round trip stays around 45 µs against 20 for a TCP socket, and a proxied request stays
+around 113 µs against rathole's 61. **The acceptance line "p50/p90/p99 no worse than same-round TCP and
+peers" is not met on the clean loopback cells, and cannot be met without that change** — which the product
+has declined.
+
+**What is not implicated.** Nothing in the attribution work changes: the carrier's own read path is 1.8 µs,
+apply 1.49, lock 0.21, copy 0.09, wake 5.0, consumer entry 2.9 — all direct meters — and no measurement here
+found a defect in the carrier's code. The gap is the cost of leaving the kernel, which is what the design is:
+a userspace datagram carrier against a kernel-to-kernel TCP path on the same host.
+
+**Where the carrier can still win, stated so the record is not one-sided.** Every one of those numbers is a
+*loopback* number, where TCP pays nothing for arriving in the kernel. On a real path the kernel advantage
+disappears and per-stream recovery, no head-of-line blocking across the pool's streams, and the option of
+`datagram` semantics are what the design buys. **No cell in the model measures any of those** (§4.125: the
+lossy cell ties because the shaper dominates; the reorder-window cell does not exist). So the carrier's case
+rests on an argument the bench cannot currently test, and that is the honest position to leave it in.
+
+**Consequence for the plan.** The "no worse than peers" criterion stays **unmet and closed as declined**,
+rather than unmet and pending. The remaining phase-5 work — throughput and resources, `bulk-n` against
+13.35 Gbit/s, the capacity ramp — is unaffected and is where the remaining measurable value is.
+
+### 4.144 The 25 µs is one extra task-hop per direction, and removing it costs a port per lane (2026-11-08)### 4.144 The 25 µs is one extra task-hop per direction, and removing it costs a port per lane (2026-11-08)
 
 §4.142 closed the read path: the carrier's own work is 1.8 µs and 2.9 µs more when a wake is needed. Every
 remaining number is a task hop, so they can simply be added:
@@ -6182,11 +6211,18 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step** (revision 13): phases 0–3 closed, the acceptance state as measured
-(capacity 8/8 and the clean thresholds passed at a fifth of the scale; the peers comparison failed
-structurally; `bulk-n`'s 85 % line unjudgeable without a baseline), and the human's decision — attack the
-25 µs, do not restate the criterion. Its next step is the server's receive path, instrumented before it is
-changed.
+**The session objective is one decision behind** (revision 13). It still says "the human has decided to
+attack the 25 µs", and that thread is now **closed as declined**: §4.144 priced the only path that removes
+the extra task hop — one UDP socket per lane — and the human's answer was that it is too large a change to
+the configuration surface (§4.145). So the objective's next step (instrument the receive path, then change
+it) is done and its conclusion is "no change", which the objective cannot say yet.
+
+A goal edit needs a **top-level human turn**; the answer came through a question tool, so the edit was
+refused and the objective stands as written. Everything the objective says about the *state* is still true —
+phases 0–3 closed, capacity 8/8, clean inside 50 ms at a fifth of the scale, `bulk-n` judged against
+13.35 Gbit/s from §4.143 — and only the "attack the 25 µs" sentence is superseded. When a direct message
+comes, the objective should say: the 25 µs is closed as declined, the peers criterion is unmet by decision,
+and the next step is phase 5's remaining measurements plus the closing record.
 
 None of the three copies may drift between turns: this section, the plan's §0 and the objective say the
 same thing, or one of them is wrong. When they disagree the plan's original wins — it is the approved
