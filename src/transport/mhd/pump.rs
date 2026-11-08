@@ -413,6 +413,47 @@ fn note_run_posted(sampled: bool, sent: usize) {
     }
 }
 
+/// One line when a pass finds a stream that has been holding the wire back.
+///
+/// Its own function because `flush` is at the lint's line budget, and because the
+/// fields answer one question rather than describing a step of the pass: which
+/// stream, why, and — since `HANDOFF.md` §4.107 — whether the numbers this end
+/// waits for can still be named by the peer's acknowledgement block at all.
+fn log_stall(shared: &Arc<Shared>) {
+    let Some(stall) = shared.with(|conn| conn.stall_report(Instant::now())) else {
+        return;
+    };
+    let credit_blocked = shared.with(|conn| conn.credit_blocked());
+    tracing::debug!(
+        unsent_ms = stall.unsent_ms,
+        unacked_ms = stall.unacked_ms,
+        credit_blocked,
+        backlog_streams = stall.backlog.streams,
+        backlog_worst_stream = stall.backlog.worst.map_or(0, |(id, _)| id),
+        backlog_worst_bytes = stall.backlog.worst.map_or(0, |(_, held)| held),
+        backlog_bytes = stall.backlog.total,
+        worst_stream = stall.worst.map_or(0, |w| w.id),
+        worst_stream_unsent = stall.worst.map_or(0, |w| w.unsent),
+        worst_stream_retransmits = stall.worst.map_or(0, |w| w.retransmits),
+        worst_stream_next = stall.worst.map_or(0, |w| w.next),
+        worst_stream_written = stall.worst.map_or(0, |w| w.written),
+        worst_stream_reset = stall.worst.is_some_and(|w| w.reset),
+        worst_repair_at = stall.worst.and_then(|w| w.repair).map_or(0, |(at, _)| at),
+        worst_repair_len = stall.worst.and_then(|w| w.repair).map_or(0, |(_, len)| len),
+        // The two ends' frontiers side by side: what this end tells the peer,
+        // and the numbers this end is still waiting for. A flight number more
+        // than 64 below the peer's `largest` can never be named again, which is
+        // the difference between "not acknowledged yet" and "cannot be
+        // acknowledged" (`HANDOFF.md` §4.107).
+        recv_below = stall.recv_below,
+        recv_largest = stall.recv_largest,
+        recv_prefix = stall.recv_prefix,
+        flight_oldest = stall.flight_numbers.map_or(0, |(a, _)| a),
+        flight_newest = stall.flight_numbers.map_or(0, |(_, b)| b),
+        "mhd stalled: bytes waiting"
+    );
+}
+
 async fn flush(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -515,27 +556,7 @@ async fn flush(
     posting.stop(&crate::transport::stats::PHASES.tx_send);
     crate::transport::stats::sent_run(sent, run.len());
     report_window(shared);
-    if let Some(stall) = shared.with(|conn| conn.stall_report(Instant::now())) {
-        let credit_blocked = shared.with(|conn| conn.credit_blocked());
-        tracing::debug!(
-            unsent_ms = stall.unsent_ms,
-            unacked_ms = stall.unacked_ms,
-            credit_blocked,
-            backlog_streams = stall.backlog.streams,
-            backlog_worst_stream = stall.backlog.worst.map_or(0, |(id, _)| id),
-            backlog_worst_bytes = stall.backlog.worst.map_or(0, |(_, held)| held),
-            backlog_bytes = stall.backlog.total,
-            worst_stream = stall.worst.map_or(0, |w| w.id),
-            worst_stream_unsent = stall.worst.map_or(0, |w| w.unsent),
-            worst_stream_retransmits = stall.worst.map_or(0, |w| w.retransmits),
-            worst_stream_next = stall.worst.map_or(0, |w| w.next),
-            worst_stream_written = stall.worst.map_or(0, |w| w.written),
-            worst_stream_reset = stall.worst.is_some_and(|w| w.reset),
-            worst_repair_at = stall.worst.and_then(|w| w.repair).map_or(0, |(at, _)| at),
-            worst_repair_len = stall.worst.and_then(|w| w.repair).map_or(0, |(_, len)| len),
-            "mhd stalled: bytes waiting"
-        );
-    }
+    log_stall(shared);
     for _ in 0..sent {
         shared.note_sent();
     }

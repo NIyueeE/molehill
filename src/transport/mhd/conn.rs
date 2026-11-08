@@ -422,6 +422,20 @@ pub(crate) struct Stall {
     /// (retransmits), bytes the writer never produced, or a stream the scheduler
     /// skips because it was reset.
     pub(crate) worst: Option<WorstStream>,
+    /// What this end will **tell the peer** on its next packet: its cumulative
+    /// receive frontier and the largest number it has seen.
+    ///
+    /// Beside the flight's own range this answers the question a stall cannot: a
+    /// sender stuck waiting for numbers the block can no longer name — anything
+    /// more than 64 behind `largest` — is a different defect from one whose
+    /// numbers are inside the window and simply not acknowledged
+    /// (`HANDOFF.md` §4.107).
+    pub(crate) recv_below: u32,
+    pub(crate) recv_largest: u32,
+    /// The contiguous byte frontier this end reports for the stream it last took.
+    pub(crate) recv_prefix: u64,
+    /// The lowest and highest packet numbers still in flight here.
+    pub(crate) flight_numbers: Option<(u32, u32)>,
 }
 
 /// The one stream whose owed bytes are holding a lane back.
@@ -2521,6 +2535,10 @@ impl Conn {
             unacked_ms: unacked.map_or(0, |d| d.as_millis()),
             backlog,
             worst: self.worst_stream(),
+            recv_below: self.acks.below(),
+            recv_largest: self.acks.largest().unwrap_or(0),
+            recv_prefix: self.arrived_prefix,
+            flight_numbers: self.recovery.number_range(),
         })
     }
 

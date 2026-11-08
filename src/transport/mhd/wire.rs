@@ -273,6 +273,19 @@ impl AckSet {
         fresh
     }
 
+    /// Every number below this has arrived.
+    ///
+    /// Read by the stall line, which needs to know what this end is *telling* the
+    /// peer rather than what it has received (`HANDOFF.md` §4.107).
+    pub(crate) const fn below(&self) -> u32 {
+        self.below
+    }
+
+    /// The largest number seen, or `None` before anything has.
+    pub(crate) const fn largest(&self) -> Option<u32> {
+        self.largest
+    }
+
     /// The block to put on the wire, or None before anything has arrived.
     pub(crate) const fn packet(&self) -> Option<Ack> {
         match self.largest {

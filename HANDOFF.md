@@ -367,6 +367,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.109 The two ends disagree about who is not receiving (2026-11-08)
+
+§4.107 pre-registered one instrument: the ACK block's frontier beside the flight's own numbers, on both
+ends, during a stall. It is now on the `mhd stalled` line (`recv_below`, `recv_largest`, `recv_prefix`,
+`flight_oldest`, `flight_newest`) and it answered at once — with neither of the two options I wrote down.
+
+| end | its own receive frontier | numbers it is waiting for |
+|---|---|---|
+| A | `recv_below=0`, `recv_largest=25 516`, `recv_prefix=108 800` | `196 534 … 196 562` |
+| B | `recv_below=343 069`, `recv_largest=343 068`, `recv_prefix=1 115 140` | `37 788 … 37 813` |
+
+**A's cumulative frontier is 0 while B has issued 343 068 numbers**, so A is not receiving B's traffic at
+all — and therefore never sees the acknowledgement that would retire its own stuck flight, which B's
+frontier (`below=343 069`) already covers: A waits for 196 534…196 562, which is 147 000 numbers *below*
+what B says it has. The stall is a **one-directional delivery failure**, not an accounting defect, and
+the accounting only makes it permanent.
+
+**And the accounting has a structural flaw that this exposed, worth fixing on its own.** `AckSet::below`
+advances only while numbers arrive **contiguously from zero**, and a retransmission takes a *new*
+number — so a single lost packet pins the frontier for the connection's whole life. `Recovery::on_ack`
+begins with "everything the frontier names is delivered, however far back it is… that is the step that
+retires a wide flight", and after the first loss that step is dead code: on a lossy lane the only
+retirement left is the 64-number bitmap, so any record older than 64 behind the largest falls out of
+reach and is repaired until the connection dies. That is the mechanism behind `worst_stream_retransmits`
+188 766 → 190 491 on the line above.
+
+**Two things follow, in this order.**
+
+1. **Why A stops receiving.** That is now the primary question: A's `recv_largest` froze at 25 516 while
+   B kept broadcasting. Candidates: A's pump not reading (the §4.101 readiness bug in a shape the 1 ms
+   bound does not cover), A's socket buffer full because its reader is blocked, or B sending to the wrong
+   peer address. The instrument for it is already there — `received_datagrams_per_s` on A's window line
+   against `posted_mbit_per_s` on B's — so this is a measurement, not a change.
+2. **Then the frontier.** Whether `below` should skip holes (a ranged acknowledgement, a wire change in
+   6.0) or the byte prefix should carry per-stream progress for more than the one stream it names. Both
+   are real; neither can be judged while one direction of the path delivers nothing.
+
 ### 4.108 The prefix now retires the flight — correct, and not enough (2026-11-08)
 
 §4.107 named the shape: a packet number lost for good stops the peer's cumulative frontier, the

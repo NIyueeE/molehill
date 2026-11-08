@@ -424,6 +424,18 @@ impl Recovery {
         )
     }
 
+    /// The lowest and highest packet numbers still in the table.
+    ///
+    /// For the stall line, and for the question it exists to answer: whether the
+    /// numbers a sender is waiting for are ones the peer's acknowledgement block
+    /// can still name at all (`HANDOFF.md` §4.107).
+    pub(crate) fn number_range(&self) -> Option<(u32, u32)> {
+        Some((
+            *self.in_flight.keys().next()?,
+            *self.in_flight.keys().next_back()?,
+        ))
+    }
+
     pub(crate) fn flight_bytes(&self) -> u64 {
         self.flight_bytes
     }
