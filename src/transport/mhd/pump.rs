@@ -424,7 +424,13 @@ fn log_stall(shared: &Arc<Shared>) {
         return;
     };
     let credit_blocked = shared.with(|conn| conn.credit_blocked());
+    // **The lane, because a stall line without one cannot be paired with the other
+    // end.** Reading these fields beside a window line from a *different* lane is
+    // exactly the mistake that made "this end receives nothing" look true for a
+    // minute (`HANDOFF.md` §4.109).
+    let lane = shared.with(|conn| conn.wire_id());
     tracing::debug!(
+        lane,
         unsent_ms = stall.unsent_ms,
         unacked_ms = stall.unacked_ms,
         credit_blocked,

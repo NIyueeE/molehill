@@ -393,6 +393,13 @@ retirement left is the 64-number bitmap, so any record older than 64 behind the 
 reach and is repaired until the connection dies. That is the mechanism behind `worst_stream_retransmits`
 188 766 → 190 491 on the line above.
 
+**And a correction to how I read it.** My first pass compared a stall line with a window line from a
+*different* lane — the stall line carried no `lane=` field — and concluded "A receives nothing".
+That was wrong: grouped by lane, both ends of the stalled lane report `flight=32 796` while both keep
+receiving (5 321 and 1 439 datagrams/s) and building. The `lane` field is on the stall line now. What
+survives the correction is the pair of frontiers from the two stall lines above, and the `below=0`
+observation on one of them.
+
 **Two things follow, in this order.**
 
 1. **Why A stops receiving.** That is now the primary question: A's `recv_largest` froze at 25 516 while
