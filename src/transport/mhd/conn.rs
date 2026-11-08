@@ -3945,6 +3945,69 @@ mod tests {
         );
     }
 
+    /// The flight never outgrows the window it is admitted against.
+    ///
+    /// **The invariant phase 1 did not pin, and the one `write` actually depends
+    /// on.** It closed on "a re-sent range is counted once" and "a finished
+    /// exchange leaves nothing counted", both true, and neither of them is this:
+    /// a repair is exempt from the window by design — a loss could never be
+    /// repaired otherwise — so the flight *can* rise past `cwnd`, and until
+    /// §4.108 nothing brought it back. Measured then as 32 796 in flight against a
+    /// 13 490 window on a live lane, with every writer refused and both ends idle.
+    ///
+    /// **This is a guard, not a reproduction, and the difference is worth stating.**
+    /// It passes on the current code *and* with §4.108's prefix retirement disabled,
+    /// so in this in-process harness the cumulative frontier already keeps the table
+    /// honest: the live failure needed a listener dropping 97 % of a direction, which
+    /// this `Link` cannot produce. What it protects is the invariant itself, so that
+    /// a future path adding bytes to the flight without retiring them fails here
+    /// rather than on a live lane ten rounds later.
+    #[test]
+    fn the_flight_never_outgrows_the_window() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let stream = link.a.open();
+        let bytes = payload(256 * 1024);
+
+        // A transfer that keeps the window full and keeps losing datagrams: the
+        // repair of a loss and the acknowledgement of new data are both in the
+        // table at once, which is the state `flight > cwnd` was measured in.
+        let mut clock = now;
+        let mut written = 0usize;
+        let mut accepted: Option<u32> = None;
+        let mut dropped = 0usize;
+        for step in 0..120 {
+            clock += Duration::from_millis(5);
+            if step % 4 == 1 {
+                link.pump_dropping_one(clock);
+                dropped += 1;
+            } else {
+                link.pump(clock);
+            }
+            if accepted.is_none() {
+                accepted = link.b.accept().map(|stream| stream.id);
+            }
+            if let Some(id) = accepted {
+                let _ = take(&mut link.b, id);
+            }
+            if written < bytes.len() {
+                written += link.a.write(stream.id, &bytes[written..]);
+            }
+            let (cwnd, flight, _, _) = link.a.window_state();
+            assert!(
+                flight <= cwnd,
+                "step {step} ({dropped} dropped): the flight {flight} outgrew the window \
+                 {cwnd}. write() admits against cwnd - flight, so this is the deadlock of \
+                 §4.107 with every writer refused and nothing draining the table"
+            );
+        }
+        assert!(
+            written > 0 && dropped > 10,
+            "the transfer has to run: {written}"
+        );
+    }
+
     /// A byte prefix frees the buffer with no packet record at all.
     ///
     /// This is the property the whole block exists for: the peer's cumulative

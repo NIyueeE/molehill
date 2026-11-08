@@ -367,6 +367,20 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.115 Phase 1's missing invariant is now a guard, and it is not a reproduction (2026-11-08)
+
+`the_flight_never_outgrows_the_window` closes the gap §4.107 named: phase 1 was closed on "a re-sent range
+is counted once" and "a finished exchange leaves nothing counted", and neither of those is `flight ≤ cwnd`,
+which is what `write` admits against. The test runs a 256 KiB transfer that keeps the window full and drops
+every fourth pass, and asserts the invariant after every pass.
+
+**It passes on the current code, and it also passes with §4.108's prefix retirement disabled** — I checked,
+because a test that cannot fail is theatre. In the in-process `Link` harness the cumulative frontier already
+keeps the table honest; the live failure needed the listener dropping 97 % of a direction, which this
+harness cannot produce. So it is recorded as a **guard on the invariant** — a future path that adds bytes to
+the flight without retiring them fails here in milliseconds instead of on a live lane ten rounds later —
+and not as a reproduction of §4.107. The reproduction is that section's counter snapshot.
+
 ### 4.114 The listener took one datagram per wake-up, and that was the stall (2026-11-08)
 
 §4.113 split the counters and the contradiction dissolved: `listener_read` 63 562 with `routed` 63 534 on
