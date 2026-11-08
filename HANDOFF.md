@@ -5555,22 +5555,21 @@ is now recorded with a stored baseline to compare against next time.
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: phase 3's second piece — PTO and liveness separated.** The blocker is gone (§4.114: the
-listener took one datagram per wake-up, the cell now passes 10 of 10 in 2.96–3.90 s) and RACK is gone too
-(§4.125, two cells, both null, reverted). What phase 3 has left:
+**Next step: phase 3 is closed (§4.124–§4.127); the acceptance measurements come first.** All four
+phase-3 items are settled: RACK built and reverted (§4.125), PTO reduced to one range per probe (§4.126),
+the "independent probe deadline" shown to be a no-op here (§4.127), liveness reset by a real receipt
+(§4.127).
 
-- **PTO's cell exists and has already been measured**: `rr-1` under `--condition loss1` is RTO-bound —
-  39.85 req/s, p99 246.4 ms, p50 20.6 ms over 10 rounds. That is precisely what a probe timeout shortens,
-  and precisely why RACK could not help: one request in flight means the lost packet is usually the
-  **last** one, so there is no later acknowledgement to anchor a reorder window on.
-- The work itself is §6.2's first item: one timer currently covers both "declare a loss and repair" and
-  "probe a silent path" (`Recovery::on_timeout` produces both `Expiry::Loss` and `Expiry::Dead`). Separate
-  the probe deadline, and make a PTO re-send **at most one** oldest unacknowledged range — never the whole
-  flight.
-- Keep `DEAD_FLOOR`, `DEAD_AFTER` and the keepalive; liveness stays decided by real receive and silence,
-  so cheap probe timeouts alone cannot kill a path.
-- Criterion first, run second: `rr-1`+`loss1` `rtt_p99_ms` or `rtt_max_ms` beyond the same run's A/A, or it
-  is reverted the way RACK was.
+**And the acceptance numbers have not been re-measured since §4.114**, which is why they come before any
+new work — phase 3 changed the loss and retransmission path:
+
+- `bulk-n` at **≥85 %** of a valid baseline (§9),
+- `timeline[clean]` **p99 ≤ 50 ms** and error rate ≤ 0.5 %, judged on the release sweep at `--scale 1.0`,
+- `capacity` **8/8**.
+
+Then phase 4 follows §7's default flow — unit test and deterministic injection, a short L1/L2 A/A+A/B
+screen, and a targeted L3 only when the effect clears the run's own noise with the guardrails intact, one
+pre-registered primary metric per round.
 
 **Two things already judged, and not to be reopened.** Phase 2's latency is judged on `rr-16[l4-plain]`
 (1.19–1.48 % resolution, 81 s) and moved nothing — it is a per-open saving, so only a churn cell can price
