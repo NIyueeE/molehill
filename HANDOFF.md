@@ -367,7 +367,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.142 The park is mostly the consumer coming back by itself, not a late wake (2026-11-08)
+### 4.143 The 85 % line has a baseline now, and the release cell has a price (2026-11-08)
+
+Two criterion gaps were left open. One closes here; the other turns out to be a cost question rather than a
+forgotten task.
+
+**A baseline for `bulk-n` on the arm that ships.** The published records cannot serve (§4.128: a `sweep` with
+no `bulk-n` cell, and a `mohill` row that runs the encrypted plane under a default-sounding name). So the
+baseline is recorded here, with the method that produced it, and the rule becomes arithmetic:
+
+```
+just bench run --profile dev --arms l4-plain --scenarios bulk-n --rounds 6 --aa
+fingerprint 6e70327078ce7037   engine 0967cd826c743b04   elapsed 167.9 s
+```
+
+| arm | n | median `throughput_gbps` | min | max |
+|---|---|---|---|---|
+| `l4-plain` (the shipped code) | 6 | **15.840** | 15.595 | 15.931 |
+| `l4-plain~b` (same code, second build) | 6 | 15.740 | 10.785 | 15.776 |
+| `l4-plain~aa` (same binary twice) | 6 | 15.693 | 13.978 | 15.867 |
+
+**85 % of 15.70 Gbit/s is 13.35 Gbit/s**, so that is the number a future run is judged against — on this host,
+with this profile, on this arm. It is not a release record and does not pretend to be one: `benches/records/`
+holds release artifacts, and there is no version here to name one after.
+
+**The release cell's price, so nobody plans around it by mistake.** `timeline` at `--scale 1.0` costs
+**119 minutes per arm-round** — measured 358 s at `--scale 0.05` (§4.130) and scaled linearly. The acceptance
+asks for it over four arms and two rounds: **15.9 hours**. Even one arm and one round is two hours.
+
+So `timeline[clean]` at scale 1.0 is not a task this loop can run; it is the release sweep, which is what
+the plan's wording says and why it says it. What has been done at a fifth of the scale (§4.130) stands as an
+indication — p99 24.87 ms and 14.34 ms with zero errors — and the judgement waits for the ritual.
+
+### 4.142 The park is mostly the consumer coming back by itself, not a late wake (2026-11-08)### 4.142 The park is mostly the consumer coming back by itself, not a late wake (2026-11-08)
 
 The instrument §4.141 asked for: `rx_wake`, the time from `waker.wake()` to the consumer entering
 `poll_read`, recorded beside the count so a null could be told from a no-op. It fires —
