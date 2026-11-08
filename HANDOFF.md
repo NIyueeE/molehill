@@ -389,10 +389,22 @@ anchor 20 ms later, the packet one behind is lost — and the three-packet thres
 loss). Disabling the block fails the first with "the packet one behind the anchor is lost once the window
 has run", and the whole suite is green at 377.
 
-**What this is not, yet.** The plan requires loss1/loss5/jitter in the same round, plus clean and `bulk-n`
-as regression guards, and a p99 or worst-1s gain beyond noise before the change stays. So this is the
-code and its unit evidence; the bench judgement is still owed, and the revert rule stands if the lossy
-cells do not improve.
+**What this is not, yet — and the first attempt at it failed to produce a verdict.** The plan requires
+loss1/loss5/jitter in the same round, plus clean and `bulk-n` as regression guards. The `rr-16` run under
+`--condition loss1` (three arms, 8 rounds asked) **hit the dev profile's 150 s budget** and stopped after
+21 samples — one warmup plus six measured rounds per arm — so the model never printed a verdict
+(`finished` is empty, `elapsed_s` 0.0). A run the model refuses to score is not a null result and is not
+promoted here.
+
+What the six rounds say, for the next attempt to check against: `rtt_p99_ms` 246.276 pre-RACK against
+246.171 with it (**−0.04 %**), the A/A twin differing by **−0.10 %**; `rtt_p50_ms` identical; `rate_per_s`
++0.38 % (A/A +1.36 %); `retrans_segments` +0.32 % (A/A −1.77 %). **Nothing moves.** Note what the cell
+looks like under loss1: p99 is 246 ms against 1.6 ms clean, and the rate falls from 24 000 to 610 — the
+shaper dominates, so this cell may simply be unable to see a reorder-window change.
+
+**So the next round runs loss1 again with a budget that can finish, plus loss5 and jitter, and `clean` and
+`bulk-n` as the regression guards. If none of the lossy cells improves beyond their A/A, the change is
+reverted** — that is what §6.4 says and this entry is not going to argue with it.
 
 ### 4.120 The eight lifecycle invariants, audited one by one (2026-11-08)
 
