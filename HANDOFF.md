@@ -367,7 +367,53 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.140 The reader is not blocked by the carrier: 0.18 µs to reach the lock (2026-11-08)
+### 4.141 Two of my three "exclusions" were never verified to fire (2026-11-08)
+
+Going back over the numbers to write the summary turned up something worse than another null result.
+
+**§4.138's bound never fired.** The pass was capped at 64 datagrams from the *listener* to test whether the
+dispatcher holds its worker while a reader's wake waits. The listener's own cadence line says how many
+datagrams a batch carries:
+
+```
+listener cadence batches=34424 datagrams=34535
+```
+
+**1.003 datagrams per batch.** Sixty-four was never reached, so the cap changed nothing and the experiment
+tested nothing. What the same line *does* show is that a pass holds the worker for one datagram's apply —
+about 1.5 µs (§4.137) — so a long hold was never plausible; but "not plausible" is not "measured", and
+§4.138's conclusion is withdrawn as established. It is now: the hypothesis is unsupported by the occupancy
+data, and untested by experiment.
+
+**§4.136's inline send was never verified to fire either.** It asserted no counter, no log line, nothing that
+would distinguish "the writer sent it" from "the writer did not, and the pump did as usual". The p50 did not
+move, which is consistent with the change firing and being worthless *and* with the change never firing. I
+reported it as the former.
+
+**Only §4.140 stands on a direct meter**: `rx_lock` measures the reader's wait for the connection mutex at
+0.18 µs, with no gating condition to satisfy. That one is a measurement; the other two were attempts.
+
+**The rule this earns, and it goes into the plan's evidence discipline**: a change whose *effect* is being
+measured must first be shown to *take effect* — a counter, a line, a histogram shift — in the same run that
+reports the effect. Otherwise a null result is indistinguishable from a no-op, and a null result that cannot
+be distinguished from a no-op is not evidence about anything.
+
+**What the numbers that do hold say about the 25 µs**, for whoever picks this up:
+
+| stage | cost | how solid |
+|---|---|---|
+| apply, decode + ack + append | 1.49 µs | direct meter |
+| reader's wait for the connection lock | 0.18 µs | direct meter |
+| the reader's copy | 0.08 µs | direct meter |
+| a parked pump's wake → run | 5 µs | direct meter, 29 000/s |
+| the reader's park (bytes ready → taken) | 13–15 µs | direct meter |
+
+Two wakes (dispatcher, then consumer) plus the apply is about 12 µs, which is the park. A TCP socket pays
+**one** wake for the same work, which is the 5 µs line. That accounts for roughly 7 µs of the 25 µs gap; the
+other ~18 µs is not in any instrument in this file yet, and the two attempts to find it in the carrier's own
+code were both no-ops.
+
+### 4.140 The reader is not blocked by the carrier: 0.18 µs to reach the lock (2026-11-08)### 4.140 The reader is not blocked by the carrier: 0.18 µs to reach the lock (2026-11-08)
 
 §4.139 left two candidates for the 8–10 µs of the park that is not the wake: the consumer's own turnaround,
 or the reader waiting on the same per-connection mutex the dispatcher takes per datagram. A meter separates
