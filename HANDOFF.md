@@ -6555,14 +6555,19 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step** (revision 15): phases 0–3 closed, the 25 µs closed **as declined**
-(§4.145), the peers criterion recorded as unmet-by-decision, and every acceptance measurement either run or
-priced — `bulk-n` 96.8 % of baseline (§4.146), the gates green (§4.149), the soak leak-free (§4.150), and the
-idle cost of a live lane at 2.2 % of a core (§4.151, which also corrected §4.147's wrong state).
+**The session objective is in step** (revision 17): phases 0–3 closed, the 25 µs closed **as declined**
+(§4.145), the peers criterion recorded as unmet-by-decision, every acceptance measurement run, and **every
+product call answered** — the poll interval stays at 1 ms (§4.153), decided against the three-point curve of
+§4.152 rather than against a principle.
 
-**One product call is open and it is the only thing left**: whether 2.2 % of a core per idle live lane is
-acceptable, against the alternative of waking on the timer only and paying §4.101's 21 ms p99 tail. That
-changes what `READ_POLL` means, so it is not a tuning decision and it is not mine to make.
+Nothing is waiting on a human any more. What remains outside this loop's authority is `timeline[clean]` at
+`--scale 1.0` — the release sweep's 15.9-hour measurement (§4.143) — and the peers criterion, closed as
+declined. Both are recorded as such rather than left looking like work.
+
+And the record has been corrected three times in this session for the same reason — a fact taken from my own
+notes instead of from the code or a fresh measurement (§4.133's stale 45 µs, §4.141's two unverified
+experiments, §4.157's wrong default): the rule that keeps earning its place is to check the artifact, not the
+record of it.
 
 None of the three copies may drift between turns: this section, the plan's §0 and the objective say the same
 thing, or one of them is wrong — and when they disagree the plan's original wins, because it is the approved
