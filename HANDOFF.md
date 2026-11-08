@@ -385,9 +385,14 @@ drain until the socket is empty. One wake-up now loops `try_io` until `WouldBloc
 read), so a burst is taken in one pass, and the `WouldBlock` still clears the cached readiness so the
 next wait is a real edge.
 
-**Measured**: `striped_data_channels` **6 of 6 pass, every one in 3.0–3.9 s**. Before the change the
-same cell failed about one run in four, and its failures took 40–70 s. Ten rounds of instrumenting a
+**Measured**: `striped_data_channels` **10 of 10 pass, every one in 2.96–3.90 s**. Before the change
+the same cell failed about one run in four, and its failures took 40–70 s. Ten rounds of instrumenting a
 stall ended at a receive loop that took one packet per syscall.
+
+**And it unblocked the branch**: the push that had failed eight times ran the whole suite green and
+landed sixteen commits (`74d96e4..a7a805f`). The forwarder's deadlock was never in the recovery table,
+the acknowledgement window, the buffer policy or the pump; it was a reader that took one datagram per
+wake-up while ten times that arrived.
 
 ### 4.113 Two of my own numbers cannot both be true (2026-11-08)
 
