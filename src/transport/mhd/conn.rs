@@ -3945,6 +3945,49 @@ mod tests {
         );
     }
 
+    /// A second opening frame for a stream the peer already has is not a second
+    /// stream.
+    ///
+    /// `apply_datagram` guards this with `if !known`, and *nothing pinned it*
+    /// (`HANDOFF.md` §4.120). It is reachable without any pathological peer: an
+    /// acknowledgement lost on the way back makes the sender re-send the opening
+    /// packet, and a duplicate open that queued a second accept would hand the
+    /// visitor's reader a stream the peer never opened — the failure the seam is
+    /// supposed to make impossible.
+    #[test]
+    fn a_second_open_for_a_known_stream_is_not_accepted_twice() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        assert_eq!(link.a.write(stream.id, b"hello"), 5);
+
+        // Take A's datagrams without pumping them, so the same bytes can be
+        // delivered twice — which is what a lost acknowledgement produces.
+        let mut buf = Vec::new();
+        let mut sent = Vec::new();
+        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+            sent.push(buf[buf.len() - len..].to_vec());
+        }
+        assert!(!sent.is_empty(), "the opening frame has to reach the wire");
+        for datagram in &sent {
+            link.b.on_datagram(now, datagram).unwrap();
+        }
+        let Some(first) = link.b.accept() else {
+            unreachable!("the opening frame names the stream")
+        };
+        assert_eq!(first.id, stream.id);
+
+        // The identical bytes again.
+        for datagram in &sent {
+            link.b.on_datagram(now, datagram).unwrap();
+        }
+        assert!(
+            link.b.accept().is_none(),
+            "a repeated opening frame must not queue a second accept for stream {}",
+            stream.id
+        );
+    }
+
     /// The flight never outgrows the window it is admitted against.
     ///
     /// **The invariant phase 1 did not pin, and the one `write` actually depends

@@ -367,6 +367,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.120 The eight lifecycle invariants, audited one by one (2026-11-08)
+
+Phase 3 touches the retire/repair path, liveness and the hold, so the plan's eight lifecycle invariants
+were due an audit rather than the "checklist" status they carried out of phase 1. Result: **two pinned,
+three partial, three not pinned** — and the table lives in the plan's §4.2 so phase 3 reads it before it
+moves anything.
+
+| # | invariant | state |
+|---|---|---|
+| 1 | packet/stream id wraparound | **nothing.** Worse, `open_at` wraps `next_stream` by two and `streams.insert` would *overwrite* a live stream that still holds the wrapped id — untested |
+| 2 | a duplicate open does not accept twice | **pinned now** — see below |
+| 3 | a late packet does not resurrect a retired stream | implemented (`retired` branch: drop, then `advance_read` to give the window back), **unpinned** — and it only covers the end's own parity, so a late packet for an *accepted* stream that was later retired would re-create it |
+| 4 | credit advances with no data | implemented — `credit_due()` is the first check in `build_packet`, independent of whether any stream has bytes — **unpinned**, and a single test would do it |
+| 5 | FIN over a hole; reset against unsent data | **partial**: `the_finishing_range_carries_the_fin` and `a_hole_stops_the_prefix_and_reports_itself` pin FIN *in* a range and holes; FIN *across* a hole and reset-vs-unacknowledged are not pinned |
+| 6 | close releases pump, dispatcher, socket, receive | **partial**: §4.114's drain loop now guarantees `receive` returns when closed, but not one of the four releases is asserted |
+| 7 | sustained loss keeps tasks, memory and the table bounded | **partial**: the table cap, the dead path and an abandoned stream's buffer are pinned; task and memory bounds are not measured |
+| 8 | `LOST_HOLD` leaves no unrecoverable frontier | **pinned** |
+
+**One of the eight got pinned here**, because it is the one loss makes reachable: a lost acknowledgement
+makes the sender re-send the opening packet, so a duplicate open is ordinary traffic, not a hostile peer.
+`a_second_open_for_a_known_stream_is_not_accepted_twice` delivers the same opening datagram twice and
+asserts the second one queues no accept. **It is load-bearing**: removing `apply_datagram`'s `if !known`
+guard fails it with "a repeated opening frame must not queue a second accept for stream 1".
+
+That is the standard the other seven are now measured against — a test that fails when its guard is
+removed, not one that merely passes.
+
+**What phase 3 must pin before it moves.** It changes retire, liveness and the hold, which are #3, #6 and
+#8. #8 is already pinned; **#3 and #6 are not**, so they come first. #4 is a free pin and #1 is the one
+open hazard with a plausible failure mode (`streams.insert` over a live stream) that no test would catch
+today.
+
 ### 4.119 Phase 2 buys a per-open saving and costs nothing steady-state (2026-11-08)
 
 §4.106 kept phase 2 against its own revert rule — p99 −11.4 % on `churn-16`, under the 15 % floor — with
