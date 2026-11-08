@@ -367,6 +367,68 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.103 Attempt B, second time: the clean cell finally meets ①, and the shaped cells pay for it (2026-11-07)
+
+§4.102 left one policy question, and §4.101 had just removed the mechanism that made attempt B fail
+the first time. So B was re-applied — `held = 2 × max(cwnd, WINDOW_FLOOR) − buffered`, capped at
+`MAX_BUFFERED` — and run against the current tree on the staged timeline.
+
+Method: `timeline`, `--scale 0.15`, two arms (`molehill` = current tree, `molehill~b` = with B), two
+rounds each, **no A/A**, fingerprint `b88da0128d18fb5b`, 1 585.7 s. Both binaries release builds,
+`32423b9d` and `9c73f7a7`. This is a *scaled* cell, not the release sweep: the clean stage held a few
+seconds, so its p99 rests on 427 (baseline) and 480 (B) interactive samples — enough for a 13-fold
+gap, not enough for a 20 % one.
+
+**The win, and it is the first time condition ① has been met by any build in this file.**
+
+| `timeline` stage | metric | baseline | attempt B |
+|---|---|---|---|
+| `clean` | p50 | 20.589 ms | **2.914** |
+| `clean` | p99 | 167.956 ms | **12.674** |
+| `clean` | worst-1s | 311.170 ms | **4.991** |
+| `clean` | `slo_broken` | 1 | **0** |
+| `clean#2` | p99 | 64.823 ms | **4.683** |
+| `clean#2` | worst-1s | 363.754 ms | **4.411** |
+| `clean#2` | `slo_broken` | 0.5 | **0** |
+| `jitter` | p99 | 170.883 ms | **110.812** |
+
+Per round, `clean` p99 reads 105.954 / 229.958 against 15.713 / 9.636, and `rtt_p99_ms ≤ 50` with a
+zero error rate in both B rounds. **The clean-cell tail was the admitted-but-unpacketised buffer**,
+exactly as §4.42 argued and §4.43 predicted: bound it by the window and the 100 ms tail goes with it.
+
+**And the rollback fired anyway, on three shaped cells.** Same rounds, both arms:
+
+| stage | metric | baseline rounds | B rounds | verdict |
+|---|---|---|---|---|
+| `rtt100` | throughput | 3.242 / 3.371 Gbit/s | **0.855 / 0.855** | **−74 %, identical twice** |
+| `loss1` | throughput | 5.323 / 5.190 | 4.261 / 4.874 | −13 %, ranges do not overlap |
+| `rate100` | p99 | 209.939 / 204.850 ms | 243.687 / 244.784 | +18 %, ranges do not overlap |
+
+`rate20` and `loss5` are inside their own scatter and are claims neither way; `clean` and `clean#2`
+throughput overlap too, so B is not a throughput win even where it wins latency.
+
+**The `rtt100` number is the one that decides it, and its shape is the finding**: 0.855 Gbit/s in
+*both* B rounds to three decimals is a bound, not a measurement. On a 100 ms path the sender becomes
+app-limited between acknowledgements — the buffer can no longer hold a round trip's worth of slack —
+and every refill costs a wake. That is the same mechanism §4.45 named for attempt B the first time,
+now visible as a hard ceiling instead of a median.
+
+**Reverted whole** (§4.44's own rollback clause: any shaped-cell regression). Evidence kept:
+`~/tmp/b-attemptb-1.json`, the raw arm logs under `~/tmp/bench-20261107-165344/`, and the two
+binaries in `~/tmp/bin/`.
+
+**Next experiment, pre-registered.** The ceiling must never fall below what a *long* path needs, and
+`2 × max(cwnd, WINDOW_FLOOR)` does not express that: on `rtt100` `cwnd` is large yet the writer still
+stalls, because what runs out is slack between acknowledgements, not window. Candidate, one line:
+give the ceiling a floor of `cwnd + SEND_RUN × MAX_DATAGRAM` per live stream — a pump's worth of work
+so a refill never waits — while keeping the `2 × cwnd` growth rule that produced the clean win.
+
+- **Pass**: `clean` p99 ≤ 50 ms with `slo_broken` = 0, **and** `rtt100` throughput inside the
+  same-round A/A of 3.2–3.4 Gbit/s, **and** `loss1` throughput and `rate100` p99 inside it too.
+- **Guard**: the same run must carry an A/A twin this time — two rounds without one cannot separate a
+  20 % difference, which is exactly the width of two of the three regressions above.
+- **Rollback**: any of the four shaped cells outside its A/A.
+
 ### 4.102 Phase 1 closes: the accounting was right, and it is now pinned (2026-11-07)
 
 The plan's phase 1 asked for the recovery `flight`/`buffer` accounting to be corrected before any
@@ -4703,18 +4765,19 @@ is now recorded with a stored baseline to compare against next time.
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: re-apply attempt B on top of the 1 ms bound, judged on §4.44's own numbers.** Phase 1 is
-closed (§4.102): the accounting was right, so there is nothing to correct before building on it. What
-is left from that chain is a *policy* question with two measured answers — and one of them may now be
-viable. Attempt B sized the send buffer by the window, kept the throughput (8.99 Gbit/s) and the p99,
-and failed only on the median (6 ms in 3 of 4 rounds) because a shallow queue leaves the pump idle and
-a small packet then waits for a wake. That wait is what §4.101's bound now caps at 1 ms.
+**Next step: attempt B a third time, with a floor that cannot starve a long path.** Attempt B was run
+(§4.103) and **reverted**: on the scaled `timeline` cell it took `clean` p99 from 167.96 to **12.674
+ms** and `clean#2` from 64.823 to **4.683 ms**, with `slo_broken` reading 0 on both — the first build
+in this file to meet condition ①. But `rtt100` throughput fell 3.31 → **0.855 Gbit/s, identically in
+both rounds**, and that is a bound rather than a measurement: on a 100 ms path the sender runs out of
+slack between acknowledgements and pays a wake per refill, which is the same mechanism §4.45 named the
+first time attempt B failed.
 
-The harness cannot test it — its request/response shape never leaves an idle write queued, and the
-`idle write waited for the pump` line fired zero times with the bound on *and* off (§4.102). So this is
-a `timeline` campaign, judged on: slow-second share ≤ 5 % (baseline 29 %, attempt B alone 70 %),
-throughput ≥ 7.5 Gbit/s, `rr-1`/`rr-16` and `bulk-1`/`bulk-pair` inside the same-round A/A, and no
-shaped-cell regression.
+So the third attempt gives the ceiling a floor of one pump's work — `cwnd + SEND_RUN × MAX_DATAGRAM`
+per live stream — while keeping the `2 × cwnd` growth rule that produced the clean win. Pass:
+`clean` p99 ≤ 50 ms with `slo_broken` = 0 **and** `rtt100` throughput, `loss1` throughput and
+`rate100` p99 all inside the same-round A/A. **This run must carry an A/A twin**: two rounds without
+one cannot separate 20 %, which is the width of two of the three regressions.
 
 Three things stay open, deliberately and with their evidence:
 
