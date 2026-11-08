@@ -367,6 +367,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.119 Phase 2 buys a per-open saving and costs nothing steady-state (2026-11-08)
+
+§4.106 kept phase 2 against its own revert rule — p99 −11.4 % on `churn-16`, under the 15 % floor — with
+the departure stated as a judgement. The new instrument (§4.118) turns that judgement into a measurement,
+and it explains the whole thing.
+
+`rr-16[l4-plain]`, 8 rounds, 3 arms, pre-registered `rtt_p99_ms`, resolution **1.48 %**:
+
+| metric | pre-phase-2 `74d96e4` | phase 2 `df43d57` | change | floor |
+|---|---|---|---|---|
+| `rtt_p99_ms` | 1.613 | 1.623 | **+0.62 %** | 1.48 % |
+| `rtt_p50_ms` | 0.598 | 0.594 | −0.67 % | 0.67 % |
+| `rate_per_s` | 23 850 | 23 898 | +0.20 % | 0.47 % |
+| `cpu_cores` | 5.690 | 5.705 | +0.25 % | 1.28 % |
+| `wire_per_visitor_byte` | **3.701** | **3.699** | **−0.06 %** | 0.05 % |
+
+**Nothing moves**, and the near-zero `wire` figure is the finding rather than a null result: on `churn-16`
+the same change took `wire_per_visitor_byte` **3.5646 → 2.8921** and `cpu_cores` **3.2065 → 2.7115**.
+
+**The difference is opens.** `rr-16` opens sixteen streams at the start and then serves 24 000 requests a
+second over them, so an acknowledgement saved *per stream* is rounded away; `churn-16` opens a connection
+per request, so the same saving is paid 24 000 times. Phase 2 removes a round trip at stream open — it is
+a **per-open** saving, and only a churn workload can price it.
+
+**So the departure in §4.106 was right for a reason I could not then state**: the change buys a real
+per-open saving, and this run shows it costs nothing in steady state — every steady-state metric sits
+inside its floor, including `wire` at 0.05 %. That is the trade a carrier wants: pay nothing when
+idle-steady, save a round trip when connections are frequent.
+
 ### 4.118 The drain fix is a no-op on `rr-16` too, and `rr-16` is the latency instrument (2026-11-08)
 
 §4.117 left the drain fix unpriced on the one shape it was supposed to help — many small datagrams — so
