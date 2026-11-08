@@ -367,7 +367,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.149 The acceptance gates, run rather than assumed (2026-11-08)
+### 4.150 The soak: no wedge, and a drift fifteen times below the project's own floor (2026-11-08)
+
+The last resource property never measured: what a long run does to memory, file descriptors and threads.
+`--profile soak --arms l4-plain`, one round, 952 s (15.9 min), the staged timeline walking clean, loss1,
+rtt100, loss5 and clean again.
+
+| metric | value | the project's floor |
+|---|---|---|
+| `drift_rss_mib_per_min` | **+3.2949** | 50 MiB/min |
+| `drift_fds_per_min` | **+0.1848** | — |
+| `drift_threads_per_min` | **−0.0079** | — |
+| `wedge_count` (silences over 10 s) | **0** | 1 |
+| `wedge_max_s` (longest interactive silence) | 5.005 | 1.0 |
+| `rss_peak_mib` / `fds_peak` / `threads_peak` | 177–233 / 56–60 / 20–22 | — |
+
+**Nothing leaks at the standard this project sets.** The RSS slope is a least-squares fit over the whole run,
+not a first-to-last difference, so a warm-up ramp would still show — and it reads 3.29 MiB/min against a
+materiality of 50. Descriptors grow 0.18 a minute (about eleven an hour) and threads are flat. **No silence
+crossed ten seconds**, which is what `wedge_count` counts; the longest was 5.0 s, on a shaped stage.
+
+**Per stage**, and consistent with everything before it: clean p99 **7.05 ms** and clean#2 **6.27 ms** with
+zero errors; rtt100 p99 401 ms, i.e. the 200 ms shaper each way; loss1 p99 1 065 ms and loss5 2 090 ms with
+a 0.33 % error rate — the shaped cells are the shaper plus the carrier's retransmission, which is what §4.135
+found when four tools tied on the same condition.
+
+**What this is not.** One arm, no A/A twin, so the model produced no verdict — "no claim cleared the floors"
+with zero comparisons. These are absolute readings against published floors, which is the only thing a
+single-arm soak can say, and the drift number is context rather than a claim.
+
+### 4.149 The acceptance gates, run rather than assumed (2026-11-08)### 4.149 The acceptance gates, run rather than assumed (2026-11-08)
 
 The criteria name four gates that had never been run in this session — `just check`, `just interop`,
 `just l3-accept` and both carriers' integrations. All four are green:
