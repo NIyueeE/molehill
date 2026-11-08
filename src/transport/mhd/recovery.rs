@@ -769,30 +769,40 @@ impl Recovery {
             .map(|(number, _)| *number)
             .collect();
         if stale.is_empty() {
-            // Nothing is past the reordering window yet: the timer fired early,
-            // so this is a probe of a silent path and every outstanding packet is
-            // re-sent, oldest first.
+            // Nothing is past the reordering window yet: the timer fired early, so
+            // this is a probe of a silent path.
             //
-            // The probed packets leave the table, because they are re-sent as
-            // *new* numbers and will be tracked there. Keeping both copies would
-            // count the same bytes twice in the flight: the congestion window then
-            // closes on a path that merely lost one packet, and every write stalls
-            // until the retransmission timer drains the duplicate. That is a window
-            // that leaks on loss, not a probe. A record already declared lost is
-            // not probed: its retransmission is already queued, and its record
-            // stays so a late acknowledgement of the original still lands.
+            // **One range, not the flight** (`HANDOFF.md` §4.126). A probe exists to
+            // elicit an acknowledgement, and one new number does that: the peer's
+            // block answers it, the frontier moves, and the rest of the flight is
+            // still in the table to be retired by it. Re-sending every outstanding
+            // packet instead multiplies the flight by the number of probes — the
+            // congestion window closes on a path that lost nothing, and each pass
+            // re-sends more than the last. The oldest live range is the one whose
+            // acknowledgement unblocks the most, and the one a repair queue would
+            // have taken first.
+            //
+            // The probed record leaves the table, because it returns as a *new*
+            // number and is tracked there; keeping both copies would count the same
+            // bytes twice. A record already declared lost is not probed: its
+            // retransmission is already queued, and its record stays so a late
+            // acknowledgement of the original still lands.
             self.backoff = self.backoff.saturating_add(1);
-            let all: Vec<Sent> = self
+            let oldest = self
                 .in_flight
                 .values()
                 .filter(|sent| sent.lost_at.is_none())
-                .copied()
-                .collect();
-            for sent in &all {
-                let _ = self.take(sent.number);
-            }
+                .min_by_key(|sent| (sent.time, sent.number))
+                .copied();
+            let probed = match oldest {
+                Some(sent) => {
+                    let _ = self.take(sent.number);
+                    vec![sent]
+                }
+                None => Vec::new(),
+            };
             self.arm(now, false);
-            return (Expiry::Timeout, all);
+            return (Expiry::Timeout, probed);
         }
         let mut lost = Vec::new();
         let mut opening_lost = false;
@@ -1242,6 +1252,43 @@ mod tests {
 
     /// The contrast: a burst packet on the same lane keeps the wide floor, which
     /// is the rule that survived every bulk A/B.
+    /// A probe re-sends **one** range, not the whole flight.
+    ///
+    /// §6.2 of the plan (`HANDOFF.md` §4.126): a probe timeout exists to elicit an
+    /// acknowledgement, and one new number does that. Re-sending every outstanding
+    /// packet instead multiplies the flight by the number of probes — the window
+    /// closes on a path that lost nothing, and each pass re-sends more than the
+    /// last, which is the shape §4.107 measured.
+    #[test]
+    fn a_probe_re_sends_one_range_not_the_flight() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let first = send_one(&mut recovery, start, 0);
+        for step in 1u64..3 {
+            send_one(&mut recovery, start, step * 100);
+        }
+        assert_eq!(recovery.in_flight(), 3);
+
+        // Fired before anything is past the reordering window: a probe, not a loss.
+        let (expiry, probed) = recovery.on_timeout(start + Duration::from_millis(1));
+        assert!(
+            matches!(expiry, Expiry::Timeout),
+            "an early timer is a probe"
+        );
+        assert_eq!(
+            probed.len(),
+            1,
+            "a probe re-sends one range; it offered {}",
+            probed.len()
+        );
+        assert_eq!(probed[0].number, first, "and it is the oldest");
+        assert_eq!(
+            recovery.in_flight(),
+            2,
+            "the other two stay tracked, to be retired by the answer to the probe"
+        );
+    }
+
     #[test]
     fn a_re_sent_burst_packet_keeps_the_wide_timer() {
         let start = Instant::now();

@@ -367,6 +367,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.126 Phase 3's second cut: a probe re-sends one range, not the flight (2026-11-08)
+
+§6.2's most concrete item, and the one whose shape §4.107 predicted: a probe timeout re-sent **every**
+outstanding packet. `Recovery::on_timeout`'s early branch collected the whole live table, `take`-ed each
+record and handed them all back to be repaired as new numbers — so every probe multiplied the flight, and
+each pass re-sent more than the last. That is the "retransmission of everything in flight on each write"
+the file's own comment calls a storm.
+
+It now probes with **one** range: the oldest live record, by `(time, number)`. A probe exists to elicit an
+acknowledgement, and one new number does that — the peer's block answers it, the frontier moves, and the
+rest of the flight is retired by that answer rather than duplicated before it arrives.
+
+`a_probe_re_sends_one_range_not_the_flight` pins it: three packets, a timer that fires before anything is
+past the reordering window, and the answer is one `Sent` — the oldest — with two records still tracked.
+Restoring the old branch fails it with "a probe re-sends one range; it offered 3". Suite green at 376.
+
+**What is not done, and it is the harder half of §6.2.** The probe deadline is still not independent: `arm`
+anchors the single timer on the **oldest packet carrying stream data**, which is the right anchor for
+*declaring a loss* (an old hole must expire) and the wrong one for *probing a silent path* (a PTO runs from
+the latest outstanding packet, because that one has had the least time to be acknowledged). One timer
+serving both is why the probe branch only runs when the timer fires early — small flights and short
+arms — and never on a busy lane. Splitting them needs a second deadline and a pump that waits on the
+earlier of the two, which is a change of its own.
+
+**The criterion, written before the run.** `rr-1` + `--condition loss1`, `rtt_p99_ms` and `rtt_max_ms`
+against the same run's A/A; kept only if one of them clears the floors. The baseline is §4.125's
+39.85 req/s, p99 246.4 ms, p50 20.6 ms.
+
 ### 4.125 RACK reverted: both cells are structurally blind to it (2026-11-08)
 
 §4.124 landed RACK and owed it a bench judgement. Two cells, two shapes, both null:
