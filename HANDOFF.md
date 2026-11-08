@@ -367,7 +367,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.158 "Green" now means a stated repeat policy, not one lucky run (2026-11-08)
+### 4.159 The next release is a re-baseline release, and it is recorded before the ritual (2026-11-08)
+
+Checking whether the release path is healthy turned up one fact worth having early, and one false alarm of my
+own.
+
+**The fact.** The benchmark's engine hash changed in this session, and the metric registry did not:
+
+| | `engine_hash` | `metrics_hash` |
+|---|---|---|
+| `benches/records/results-bench-v0.11.2.json` | `deec5d29798c5a68` | `e240acbf6d8515a0` |
+| current runs (`bulk-n`, `soak`) | **`031034b4b187aeae`** | `e240acbf6d8515a0` |
+
+The engine covers the method modules, adapters and probes — `model.py` gained `l4-plain` and `Arm.noise_data`
+— so `docs/release.md`'s rule applies: **"a method-changing release is a re-baseline release"**. The gate
+runs without `--baseline`, and the record it produces becomes the next baseline. That is now written into
+`CHANGELOG.md`'s `[Unreleased]` under *Changed*, where the rule asks for it, instead of being discovered on
+the day. The metric meanings, directions and floors did not move — only the instrument.
+
+**The false alarm.** The changelog also claims, from an earlier session, that "mhd wins on a lossy path and
+TCP wins on a clean one, and the crossover is between 1 % and 5 % loss". §4.135 measured **1 %** and found all
+four arms tied at p99 ≈ 246 ms — which is *consistent* with a crossover between 1 % and 5 %, so the claim
+stands and I did not touch it. Then I checked its link and reported the anchor dead, because I grepped for
+`^## ` and the section is a `###`: `### Where mhd wins, and where it loses (2026-11-07)` at line 1025 slugs
+to exactly what the changelog links to. **Two minutes, one correct claim and one wrong accusation** — the
+same lesson in miniature, applied to a link instead of a number.
+
+### 4.158 "Green" now means a stated repeat policy, not one lucky run (2026-11-08)### 4.158 "Green" now means a stated repeat policy, not one lucky run (2026-11-08)
 
 The acceptance asks for both integration suites green, and this session's own record says that was not enough
 to mean anything: before §4.114 the striped cell failed about one run in four, and §4.107 quoted a day of
