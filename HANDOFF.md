@@ -369,10 +369,19 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 
 ### 4.107 The striped stall is a window livelock, and it blocks every push (2026-11-08)
 
-`striped_data_channels` fails about **half** the time (14 runs across this round and the last: 8
-failures),
-which makes it not a slow-test problem but the thing standing between any verified commit and the
-remote — four push attempts failed on it, one of them with nothing else running.
+`striped_data_channels` fails often enough that it stops every push — five attempts in this round, one
+of them with nothing else running. **Two things contribute, and they are worth keeping apart.**
+
+*The product stall is real.* Captured below: the flight sits at twice the congestion window on both
+ends and no acknowledgement retires it.
+
+*The harness amplifies it.* The integration fixtures bind **fixed ports** (2333, 2339, …) and the suite
+runs its test binaries one after another, so each binary inherits the previous ones' `TIME_WAIT`
+sockets: after a few hours of runs, `ss` showed **155 sockets on 23xx**. Measured rates: one test run
+alone on a drained port table **passed 3 of 4**; on a polluted table 2 of 4; the full suite, which
+pollutes itself before `integration_test` even starts, fails most runs. So the ~50 % I first quoted was
+partly self-inflicted by the runs I was using to measure it, and the honest figure for the defect
+alone is nearer **one run in four**.
 
 **It is not a tight deadline.** A passing run finishes in 3–9 s; a failing one blocks 30 s on a single
 `read` and dies at 43–150 s. The visitor's echo simply stops.
