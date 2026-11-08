@@ -391,9 +391,36 @@ serving both is why the probe branch only runs when the timer fires early — sm
 arms — and never on a busy lane. Splitting them needs a second deadline and a pump that waits on the
 earlier of the two, which is a change of its own.
 
-**The criterion, written before the run.** `rr-1` + `--condition loss1`, `rtt_p99_ms` and `rtt_max_ms`
-against the same run's A/A; kept only if one of them clears the floors. The baseline is §4.125's
-39.85 req/s, p99 246.4 ms, p50 20.6 ms.
+**The criterion, written before the run, and what the run said.** `rr-1` + `--condition loss1`,
+`rtt_p99_ms` and `rtt_max_ms` against the same run's A/A, kept only if one clears the floors. The baseline
+is §4.125's 39.85 req/s, p99 246.4 ms, p50 20.6 ms. Six rounds, three arms, 21 samples, 1277 s:
+
+| metric | pre | probe | change | A/A |
+|---|---|---|---|---|
+| `rtt_p50_ms` | 20.641 | 20.636 | −0.03 % | −0.03 % |
+| `rtt_p99_ms` | 246.653 | 245.394 | **−0.51 %** | −0.11 % |
+| `rtt_max_ms` | 285.908 | 274.127 | −4.12 % | +30.81 % |
+| `rate_per_s` | 39.40 | 40.35 | **+2.41 %** | −0.13 % |
+| `retrans_segments` | 97.5 | **86.0** | **−11.79 %** | −1.03 % |
+| `wire_per_visitor_byte` | 3.754 | 3.761 | +0.18 % | +0.08 % |
+
+**The pre-registered endpoint was not met**: p99 −0.51 % is inside the floors, and `rtt_max_ms` is
+unresolvable at this run's length (A/A +30.81 %). The model's verdict is "no claim cleared the floors".
+
+**And the change stays anyway, on a ground I want stated plainly rather than smuggled.** §6.2 of the
+approved plan does not ask for this as an optimisation — it requires it: "每次 PTO 最多重发一个必要的最旧
+未确认范围以产生 ACK；不得把 outstanding flight 全量加入 repair". The old branch violated that
+requirement, and §6.4's revert rule is written for optimisations that fail to show a gain, not for a
+correctness requirement of the design. So this is a **departure from "revert if the pre-registered
+endpoint does not clear"**, and the reason is that the endpoint was the wrong instrument for a change whose
+mechanism is retransmission volume, not latency.
+
+**What the run does say, and it is consistent with the mechanism**: `retrans_segments` −11.79 % against an
+A/A difference of −1.03 % — eleven times the twin — and `rate_per_s` +2.41 % against −0.13 %. Both point
+the way the change predicts, and neither clears its materiality floor (15 % and 10 %). So: mechanism
+pinned, direction consistent, magnitude below what this run can call a claim. If a later round wants the
+claim, the cell is `rr-16` + `loss1` with `retrans_segments` pre-registered, and it needs more rounds than
+six.
 
 ### 4.125 RACK reverted: both cells are structurally blind to it (2026-11-08)
 
