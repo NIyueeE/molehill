@@ -378,7 +378,7 @@ moves anything.
 |---|---|---|
 | 1 | packet/stream id wraparound | **nothing.** Worse, `open_at` wraps `next_stream` by two and `streams.insert` would *overwrite* a live stream that still holds the wrapped id — untested |
 | 2 | a duplicate open does not accept twice | **pinned now** — see below |
-| 3 | a late packet does not resurrect a retired stream | implemented (`retired` branch: drop, then `advance_read` to give the window back), **unpinned** — and it only covers the end's own parity, so a late packet for an *accepted* stream that was later retired would re-create it |
+| 3 | a late packet does not resurrect a retired stream | **pinned, and the audit found a real defect here** — see below |
 | 4 | credit advances with no data | **pinned now** — see below |
 | 5 | FIN over a hole; reset against unsent data | **partial**: `the_finishing_range_carries_the_fin` and `a_hole_stops_the_prefix_and_reports_itself` pin FIN *in* a range and holes; FIN *across* a hole and reset-vs-unacknowledged are not pinned |
 | 6 | close releases pump, dispatcher, socket, receive | **partial**: §4.114's drain loop now guarantees `receive` returns when closed, but not one of the four releases is asserted |
@@ -398,8 +398,20 @@ that through a `Link` would take thousands of passes to assert one ordering. It 
 end advertises its whole window, an end that has drained past `WINDOW / 4` owes more, and paying it
 settles the debt. Removing `build_packet`'s `credit_due()` branch fails it at the first packet.
 
-That is the standard the other six are now measured against — a test that fails when its guard is
+That is the standard the other five are now measured against — a test that fails when its guard is
 removed, not one that merely passes.
+
+**The audit paid for itself on #3.** The rule that dropped late packets covered only
+*our own* parity — an id in the peer's space that the connection did not hold was assumed to be a stream
+being opened. So a late packet for a stream this end had **accepted and then retired** created a new
+stream and queued a phantom accept: `a_late_packet_for_an_accepted_stream_does_not_open_a_new_one` was
+written first and **failed against the code as it stood**, with a visitor whose connection had already
+closed still being able to make the server open a channel for it.
+
+The rule is now `Conn::is_retired_stream`: an id in our own space that we do not hold is retired; an id
+in the peer's space is new only if it sits at or above the highest one this end has accepted, because
+stream ids are monotonic. Both halves are pinned, and the dialer half was verified to fail when the
+branch is disabled.
 
 **What phase 3 must pin before it moves.** It changes retire, liveness and the hold, which are #3, #6 and
 #8. #8 is already pinned; **#3 and #6 are not**, so they come first. #4 is a free pin and #1 is the one

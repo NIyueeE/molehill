@@ -609,6 +609,14 @@ pub(crate) struct Conn {
     send_credit: u64,
     /// Bytes this end allows the peer, absolute.
     recv_credit: u64,
+    /// The highest stream id this end has accepted from the peer.
+    ///
+    /// Stream ids are monotonic, so this is what separates "a stream the peer is
+    /// opening" from "a packet for a stream this end already retired": an unknown
+    /// id in the peer's space that is **below** this one cannot be new, and taking
+    /// it would open a phantom stream and a phantom accept for a visitor whose
+    /// connection had already closed (`HANDOFF.md` §4.120).
+    highest_inbound: Option<u32>,
     /// The last cumulative prefix the peer reported, kept only for reporting: at a
     /// stall the question is whether the sender retired past the peer's word (it
     /// believes bytes delivered that the peer never had) or the peer's word is
@@ -918,6 +926,7 @@ impl Conn {
             ack_pending: false,
             send_credit: WINDOW / 2,
             recv_credit: WINDOW,
+            highest_inbound: None,
             last_ack_prefix: 0,
             last_ack_below: 0,
             last_ack_bits: 0,
@@ -1615,6 +1624,25 @@ impl Conn {
     /// Its own function because `apply_datagram` is at the line budget, and because the
     /// two things it does are the two things a datagram service depends on: count what
     /// arrived, and drop the *oldest* queued one when the queue is full.
+    /// Whether an id this end does not hold names a stream it has already retired.
+    ///
+    /// Two rules, and they answer different halves of the same question
+    /// (`HANDOFF.md` §4.120). An id in *our* space that we do not hold is one of our
+    /// own streams, retired. An id in the *peer's* space is normally a stream it is
+    /// opening — unless it sits below one this end already accepted, in which case
+    /// stream ids being monotonic means the peer cannot be opening it, so the packet
+    /// is late. Without the second rule a late packet for an accepted-then-retired
+    /// stream opened a **new** stream and a phantom accept.
+    fn is_retired_stream(&self, id: u32, known: bool) -> bool {
+        if known {
+            return false;
+        }
+        if id % 2 == u32::from(self.dialer) {
+            return true;
+        }
+        self.highest_inbound.is_some_and(|highest| id < highest)
+    }
+
     fn accept_datagram(&mut self, id: u32, data: &[u8]) {
         self.datagrams_in = self.datagrams_in.saturating_add(1);
         if self.in_datagrams.len() >= DATAGRAM_QUEUE {
@@ -2879,7 +2907,7 @@ impl Conn {
                 // unanswered retransmissions and declares the whole lane dead. That
                 // is how one short-lived visitor connection was killing the lane
                 // every other visitor shared.
-                let retired = !known && id % 2 == u32::from(self.dialer);
+                let retired = self.is_retired_stream(id, known);
                 if retired {
                     tracing::debug!(stream = id, "mhd dropped data for a retired stream");
                     // The bytes are gone and nobody will read them, but the peer
@@ -2905,6 +2933,7 @@ impl Conn {
                         self.inbound.push_back(id);
                         self.inbound_at.insert(id, now);
                         self.stream_opened.insert(id, now);
+                        self.highest_inbound = Some(self.highest_inbound.map_or(id, |h| h.max(id)));
                     }
                     let blocks = &mut self.blocks;
                     let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
@@ -3942,6 +3971,108 @@ mod tests {
             link.a.flight_and_buffered().2,
             0,
             "past its hold the last record goes too"
+        );
+    }
+
+    /// A packet that arrives after this end retired a stream must not bring it
+    /// back.
+    ///
+    /// The third of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120). A
+    /// visitor connection that closes leaves bytes on the wire in both directions;
+    /// if the peer's late data re-created the stream, the connection would hold a
+    /// half-open stream that nothing will ever read, and the window those bytes
+    /// spent would stay spent — one dead visitor at a time, until the lane carried
+    /// nothing.
+    #[test]
+    fn a_late_packet_does_not_resurrect_a_retired_stream() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let stream = link.a.open();
+        assert!(link.a.write(stream.id, b"hello") > 0);
+        link.pump(now);
+        let Some(accepted) = link.b.accept() else {
+            unreachable!("the stream is named on arrival")
+        };
+        assert_eq!(accepted.id, stream.id);
+
+        // A gives up on the stream: nothing will ever read it again.
+        link.a.close_stream(stream.id);
+        let later = now + ABANDON_HOLD + Duration::from_millis(1);
+        let _ = link.a.on_timeout(later);
+        assert!(
+            !link.a.streams.contains_key(&stream.id),
+            "past its hold the retired stream is gone"
+        );
+
+        // B still has bytes for it on the wire.
+        assert!(link.b.write(accepted.id, b"world") > 0);
+        let credit_before = link.a.recv_credit;
+        link.pump(later);
+
+        assert!(
+            !link.a.streams.contains_key(&stream.id),
+            "a late packet must not recreate a stream this end retired"
+        );
+        assert!(
+            link.a.recv_credit > credit_before,
+            "and the window those bytes spent has to come back: {credit_before} -> {}",
+            link.a.recv_credit
+        );
+    }
+
+    /// The same, for a stream this end **accepted** and then retired.
+    ///
+    /// The dialer's own ids are protected by the parity test in `apply_datagram`;
+    /// the peer's are not, so the code as it stood would take a late packet for a
+    /// retired accepted stream and open a *new* one with the same id — a phantom
+    /// stream and a phantom accept, for a visitor whose connection had already
+    /// closed. Stream ids are monotonic, so an unknown id in the peer's space that
+    /// is *below* the highest accepted one cannot be new.
+    #[test]
+    fn a_late_packet_for_an_accepted_stream_does_not_open_a_new_one() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let first = link.a.open();
+        let second = link.a.open();
+        assert!(link.a.write(first.id, b"one") > 0);
+        assert!(link.a.write(second.id, b"two") > 0);
+        link.pump(now);
+        let mut accepted = Vec::new();
+        while let Some(stream) = link.b.accept() {
+            accepted.push(stream.id);
+        }
+        assert_eq!(accepted, vec![first.id, second.id]);
+
+        // B retires the first one — the visitor's channel closed.
+        link.b.close_stream(first.id);
+        let later = now + ABANDON_HOLD + Duration::from_millis(1);
+        let _ = link.b.on_timeout(later);
+        assert!(!link.b.streams.contains_key(&first.id), "it is retired");
+
+        // A has not seen the reset yet and has more bytes for it. Hand B only that
+        // datagram, so the test is about a late packet and not about the reset.
+        assert!(link.a.write(first.id, b"more") > 0);
+        let mut out = Vec::new();
+        let mut delivered = false;
+        while let Some(len) = link.a.poll_transmit(later, &mut out) {
+            let datagram = out[out.len() - len..].to_vec();
+            if let Ok(packet) = super::wire::decode(&datagram)
+                && matches!(packet.frame, super::wire::Frame::Stream { id, .. } if id == first.id)
+            {
+                link.b.on_datagram(later, &datagram).unwrap();
+                delivered = true;
+            }
+        }
+        assert!(delivered, "the late packet has to reach B");
+        assert!(
+            link.b.accept().is_none(),
+            "a late packet for a retired accepted stream must not open a new one"
+        );
+        assert!(
+            !link.b.streams.contains_key(&first.id),
+            "and it must not re-create the stream either"
         );
     }
 
