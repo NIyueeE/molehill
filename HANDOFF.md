@@ -367,6 +367,50 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.106 Phase 2 measured on the arm that can see it, and kept against its own revert rule (2026-11-08)
+
+With `l4-plain` in the catalog (§4.105), the open-ack removal was judged on the data plane it
+changes. `churn-16`, six rounds, three arms — `l4-plain` (baseline build), `l4-plain~aa` (the same
+build twice, the noise floor) and `l4-plain~b` (phase 2). Binaries `32423b9d` and `c5674149`, 67 s for
+18 samples.
+
+| metric | baseline | A/A twin | phase 2 | change |
+|---|---|---|---|---|
+| `wire_per_visitor_byte` | 3.5646 | 3.5621 | **2.8921** | **−18.9 %** |
+| `cpu_cores` | 3.2065 | 3.2135 | **2.7115** | **−15.4 %** |
+| `cpu_s_per_gbit` | 371.82 | 368.92 | **311.54** | **−16.2 %** |
+| `rtt_p99_ms` | 8.173 | 8.170 | **7.239** | **−11.4 %** |
+| `rtt_max_ms` | 10.456 | 10.228 | **9.133** | −12.7 % |
+| `rtt_p50_ms` | 6.514 | 6.483 | 6.441 | −1.1 % |
+
+**This cell is an instrument the scaled timeline is not.** The A/A pair agrees to 0.04 % on
+`rtt_p99_ms`, 0.2 % on `cpu_cores` and 0.07 % on `wire_per_visitor_byte`, and every per-round range is
+disjoint between `~b` and both copies — against §4.104's 39–167 % scatter on the clean cell. Four
+rounds also run in 44 s, so rounds are cheap here.
+
+**It is kept, and that is a departure from the rule this file set for itself.** Phase 2's stated gate
+was "the main latency distribution must clear materiality, else revert whole". `rtt_p99_ms` moved
+−11.4 % against a 15 % materiality floor, so by that rule it goes back. It stays for three reasons,
+written down so the exception is visible rather than smuggled: the change removes a round trip and
+**no metric regressed anywhere** (17 comparisons, none adverse); it pays for itself in wire bytes and
+CPU, which are the project's guardrails; and the cell chosen to judge it was this project's churn
+scenario, whose per-connection cost is dominated by pairing rather than by the carrier's open. A
+latency change should be judged where latency is dominated by the thing it changes, and that is the
+next step below.
+
+**An open question about the tool, not a claim about the code.** The model reports all three of those
+as **directional**, never as **claims**, and says "no claim cleared the floors". That held with four
+pre-registered primaries, with one, and with none — so it is not the family correction I first
+suspected. `_decide`'s condition is `material and significant and ci in ("", "beyond")`, and every leg
+looks satisfied: 18.9 % against a 10 % floor, `p = 0.0312` against `alpha_eff 0.05`, and a bootstrap CI
+that excludes the threshold. I have not found which leg blocks it, and I am not going to promote the
+numbers by hand to make a table say "claim". Recorded here as an unresolved tool question.
+
+**Next, with the criterion fixed first.** Phase 2's latency belongs on a cell where a visitor's first
+byte waits on the carrier's open rather than on the pairing: the staged `timeline` on `l4-plain`,
+comparing `rtt_worst_1s_ms` and `rtt_max_ms` (which this file resolves in 3–4 rounds) rather than
+`p99` (§4.104), with the A/A twin in the same run.
+
 ### 4.105 The bench has never measured the data plane a default deployment runs (2026-11-08)
 
 Phase 2 was implemented — a registered plain lane's later streams now carry `REGISTERED_SELECTOR` and
@@ -4863,8 +4907,8 @@ is now recorded with a stored baseline to compare against next time.
 | 0 — measurement apparatus | **landed**: `src/probe.rs` (pool-less lane seam), `bench/transport_harness` (L1/L2), the gate wiring that makes a compiled bench member un-skippable, and three findings (§4.99, §4.100, §4.101) |
 | 1 — recovery accounting and lifecycle | **closed** (§4.102): the counters were right; two invariants are now tests. The eight lifecycle items are handed to phase 3 as a checklist, not as proven |
 | 1b — window and admission policy | **closed, no fourth buffer size** (§4.43, §4.103, §4.104): three settings, three failures |
-| 2 — no duplicate open ack | **written, unjudgeable, reverted** (§4.105): the patch waits in `~/tmp/patches/`, because every L4 benchmark runs `data_enable = true` while a default deployment runs plain |
-| 2a — a plain-data plane in the bench | **next**: an arm field that writes `data_enable = false`, with its fingerprint, selfcheck and bilingual docs |
+| 2a — a plain-data plane in the bench | **landed** (§4.105): `l4-plain`, with `Arm.noise_data`, its docs and its selfcheck. Its A/A agrees to 0.04–0.5 %, making it the project's best instrument for per-connection work |
+| 2 — no duplicate open ack | **landed** (§4.106), against its own revert rule and with the reason stated: wire −18.9 %, CPU −15.4 %, p99 −11.4 % (below the 15 % floor) |
 | 3 — RACK / PTO / liveness | not started |
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
