@@ -367,6 +367,68 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.107 The striped stall is a window livelock, and it blocks every push (2026-11-08)
+
+`striped_data_channels` fails about **half** the time (14 runs across this round and the last: 8
+failures),
+which makes it not a slow-test problem but the thing standing between any verified commit and the
+remote — four push attempts failed on it, one of them with nothing else running.
+
+**It is not a tight deadline.** A passing run finishes in 3–9 s; a failing one blocks 30 s on a single
+`read` and dies at 43–150 s. The visitor's echo simply stops.
+
+**What the two ends say at the moment of the stall** (`RUST_LOG=…mhd=debug MOLEHILL_MHD_STATS=1`, one
+failing run kept at `~/tmp/mhdonly-1.log`):
+
+```
+mhd stalled: unsent_ms=0 unacked_ms=211 credit_blocked=false
+  worst_stream=5 worst_stream_unsent=32796 worst_stream_retransmits=93982
+  worst_stream_next=1016752 worst_stream_written=1016752
+mhd write refused: what the recovery table holds stream=5 flight_packets=27 oldest_data_ms=202
+```
+
+| | server lane | client lane |
+|---|---|---|
+| `cwnd` | 14 839 | 13 490 |
+| **`flight`** | **32 796** | **32 796** |
+| `flight_packets` | 29 | 26 |
+| `numbers_seen` / `numbers_acked` | 8 474 / 8 474 | 174 097 / 174 097 |
+| `acks_applied_per_s` | **69** | 3 731 |
+| `acks_attached_per_s` | 5 043 | 6 543 |
+
+**The flight is more than twice the congestion window on both ends**, and it stays there while
+`worst_stream_retransmits` climbs 93 982 → 178 213 in twenty-one seconds. That is the defect:
+`write` admits on `window = cwnd − flight`, `flight > cwnd` makes that zero or negative, and the
+**age gate** then refuses too (`oldest_data_ms=202` against an RTO of ~200 ms). Neither end's writer
+may proceed, so neither end sends data, so neither end's acknowledgements leave — the server applies
+**69 acks a second against 4 100 packets built** — and the flight never drains. Every record looks
+healthy from inside: zero datagrams refused, `numbers_seen == numbers_acked`, `credit_blocked=false`,
+`backlog_streams=0`.
+
+**This is the one invariant phase 1 did not pin, and closing phase 1 on two tests was too narrow.** I
+pinned "a re-sent range is counted once" and "a finished exchange leaves nothing counted"; neither
+covers **`flight ≤ cwnd`**, which is the invariant `write` actually depends on. Repairs are exempt from
+the window by design (a repair must be able to leave when the window is full, or a loss could never be
+repaired), so the flight can rise past `cwnd` — and nothing brings it back down when the peer's acks
+stop arriving.
+
+**What the next round does first, and it is not a code change.** Get one failing run to answer which
+of two things is true, because they have different fixes:
+
+- the client's acks are *sent* and not applied by the server (`below`/bitmap in the ACK block never
+  covering the repaired numbers), or
+- the client's acks are *never sent* because its own writer is refused and bare acknowledgements are
+  not being emitted promptly enough.
+
+The instrument is the ACK block itself: log `below` and the repaired numbers' range for one stream on
+both ends for two seconds. That is a handful of lines and it decides the fix; guessing now would be the
+fourth blind attempt in this file's recent history.
+
+**Consequence for the plan.** Condition ⑥ needs both integration suites green, and a cell that fails
+half the time cannot be called green by any number of runs. So this defect is now ahead of phase 3:
+**nothing else can be landed until the forwarder stops deadlocking**, which also means the work is
+where the project's own gate says it is.
+
 ### 4.106 Phase 2 measured on the arm that can see it, and kept against its own revert rule (2026-11-08)
 
 With `l4-plain` in the catalog (§4.105), the open-ack removal was judged on the data plane it
@@ -4917,27 +4979,27 @@ is now recorded with a stored baseline to compare against next time.
 | 1b — window and admission policy | **closed, no fourth buffer size** (§4.43, §4.103, §4.104): three settings, three failures |
 | 2a — a plain-data plane in the bench | **landed** (§4.105): `l4-plain`, with `Arm.noise_data`, its docs and its selfcheck. Its A/A agrees to 0.04–0.5 %, making it the project's best instrument for per-connection work |
 | 2 — no duplicate open ack | **landed** (§4.106), against its own revert rule and with the reason stated: wire −18.9 %, CPU −15.4 %, p99 −11.4 % (below the 15 % floor) |
+| 2b — the striped window livelock | **blocking everything** (§4.107): the cell fails ~half of runs, `flight` sits at twice `cwnd` on both ends and neither writer may proceed |
 | 3 — RACK / PTO / liveness | not started |
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: 2a — let the bench run the data plane a default deployment runs.** Phase 2 is written and
-reverted (§4.105): the patch is sound and the integration fixtures exercise it, but the A/B that should
-have judged it was blind by construction, because every L4 arm sets `data_enable = true` while a
-default deployment runs the plain data plane. So the instrument comes first — an arm field that writes
-`data_enable = false`, with its method fingerprint, selfcheck and bilingual docs — and phase 2 is
-re-judged on that arm against a baseline measured the same way.
+**Next step: 2b — the striped forwarder's window livelock.** §4.107: `striped_data_channels` fails
+about half the time, the flight sits at 32 796 against a `cwnd` of 13 490–14 839 on both ends, each
+end's writer is refused, so neither end sends and neither end's acknowledgements leave. That is a real
+forwarding deadlock, and it is ahead of everything else because nothing can be landed while the gate
+that guards every push is red — four attempts failed on it, one of them with nothing else running.
 
-That is not bookkeeping. **Every number this file quotes was measured on a configuration a default user
-does not run**, and the acceptance conditions are stated over those numbers. Until an arm can run the
-plain plane, "does mhd meet ①" has only been asked of one of mhd's two data planes.
+It also narrows phase 1: I closed it on "a re-sent range is counted once" and "a finished exchange
+leaves nothing counted", and **neither is `flight ≤ cwnd`** — the invariant `write` actually depends on.
 
-**And nothing about the clean cell may be claimed again until a measurement can resolve it.** §4.104's
-twin reads a 39–167 % spread between two copies of **the same binary** on that cell at this scale, while
-the model itself computes ~131 rounds for `clean` p99 there and calls `clean#2` "too noisy for rounds to
-fix". The next claim about that cell uses a longer clean stage at `--scale 1.0`, or registers
-`rtt_worst_1s_ms` / `rtt_max_ms` — which the run resolves in 3–4 rounds — as the endpoint instead of
-p99.
+The first task is not a code change. One failing run has to answer which of two things is true, since
+they have different fixes: the client's acknowledgements are sent and not applied, or they are never
+sent because its own writer is blocked. The instrument is the ACK block itself — `below` and the
+repaired number range, on both ends, for two seconds. Guessing now would be the fourth blind attempt
+in this file's recent history.
+
+**And nothing about the clean cell may be claimed again until a measurement can resolve it.**
 
 Three things stay open, deliberately and with their evidence:
 
