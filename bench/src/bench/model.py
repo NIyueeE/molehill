@@ -1034,11 +1034,13 @@ ARM_CATALOG: dict = {
     "l4": Arm("l4", "l4"),
     "l4-mux2": Arm("l4-mux2", "l4", pool_cap=2),
     "l4-mux8": Arm("l4-mux8", "l4", pool_cap=8),
-    # **The data plane a default deployment runs.** Every other L4 arm writes
-    # `data_enable = true`, so its data channels pay a Noise handshake each; the
-    # product's default is plain (`HANDOFF.md` §4.105). One knob apart from `l4`,
-    # which is what makes the pair a measurement of the encryption's cost *and*
-    # of the opening shape that goes with it — see `Arm.noise_data`.
+    # **The plain data plane.** Every other L4 arm writes `data_enable = true`,
+    # which is the *client default* for a forwarding service (unset resolves to
+    # `true` in `src/core/client.rs`); the plane that is plain by default is a
+    # transparent claim's (`[transparent.noise].data_enable` defaults to `false`).
+    # One knob apart from `l4`, which makes the pair a measurement of the
+    # encryption's cost and of the opening shape that goes with it — see
+    # `Arm.noise_data` and `HANDOFF.md` §4.157.
     "l4-plain": Arm("l4-plain", "l4", noise_data=False),
     # `pool_cap` writes `[client.data].tunnels`, so these arms are the pool
     # *pinned* at 2 / 8 connections — the arm's width, not a cap it may grow to.

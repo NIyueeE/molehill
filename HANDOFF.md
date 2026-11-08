@@ -367,7 +367,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.156 The carrier's recovery policy now has a home in internals.md (2026-11-08)
+### 4.157 §4.105 was wrong about which default the bench was measuring (2026-11-08)
+
+Following a user-facing claim to its source turned up a mistake of mine, ten rounds old and published on both
+`benchmarks` pages.
+
+**The claim.** §4.105 said "the product's default is `false`" about `data_enable`, concluded that every L4 arm
+— all of which write `data_enable = true` — had never measured the plane a default deployment runs, and put
+that sentence on the benchmarks pages as a limitation.
+
+**What the code says**, and I should have checked it then:
+
+| where | default |
+|---|---|
+| `[client.noise].data_enable`, unset | **`true`** — `src/core/client.rs:322`, `unwrap_or(true)` |
+| `[transparent.noise].data_enable` | **`false`** — `src/config/transparent.rs:54` |
+
+So the default is **plain for a transparent claim and encrypted for a forwarding service**. The L4 arms'
+`data_enable = true` **is** the L4 default; the benches were measuring exactly the plane an L4 deployment
+runs. The `false` I quoted belongs to the L3 claim's config, and the migration note it came from
+(`parsing.rs:961`) is a `transparent.transport` entry.
+
+**What that changes.** Not one number: every measurement stands, including `l4-plain`'s, which is still one
+knob apart from `l4` and still prices the encryption and its opening shape. What changes is the **claim about
+coverage**, and it was the wrong way round — the pages told a reader that their L4 tables described a
+non-default plane, when those tables *are* the default plane and it is the transparent claim whose plane was
+never measured here. `docs/transport.md` said "`true` (the client default)" all along, and it was right; I
+took the other reading from a migration note without opening the resolver.
+
+**Fixed in three places**, because all three carried it: the English bullet, its Chinese mirror, and the
+`l4-plain` comment in `bench/bench/model.py`, which called it "the data plane a default deployment runs". Each
+now states which plane is whose default and cites the resolver.
+
+**This is the third time this session that a figure or fact taken from my own notes, rather than from the code
+or a fresh measurement, was wrong** — §4.133's 45 µs against a stale 64–80, §4.141's two unverified
+experiments, and now this. The rule that keeps emerging is the one already written down: check the artifact,
+not the record of it.
+
+### 4.156 The carrier's recovery policy now has a home in internals.md (2026-11-08)### 4.156 The carrier's recovery policy now has a home in internals.md (2026-11-08)
 
 `docs/internals.md` was not *wrong* about the carrier — it says an `mhd` lane is a UDP connection with its
 own packet numbers, acknowledgements and streams — but it was **silent** on how that recovery actually
@@ -1965,6 +2002,10 @@ comparing `rtt_worst_1s_ms` and `rtt_max_ms` (which this file resolves in 3–4 
 `p99` (§4.104), with the A/A twin in the same run.
 
 ### 4.105 The bench has never measured the data plane a default deployment runs (2026-11-08)
+
+> **Corrected by §4.157.** The "product default is `false`" below is true of a transparent claim and
+> false of a forwarding service, whose unset `data_enable` resolves to `true` — so the L4 arms were
+> already measuring the L4 default plane. The measurements stand; the coverage claim was backwards.
 
 Phase 2 was implemented — a registered plain lane's later streams now carry `REGISTERED_SELECTOR` and
 the server owes them no acknowledgement — and it was **reverted unmeasured**, because the measurement

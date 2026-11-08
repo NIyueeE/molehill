@@ -739,14 +739,16 @@ Stated so a reader does not ask a chart for something it never measured:
   number measured before that fix stays unquoted, and the degenerate cells
   above are instrument artefacts, not architecture findings.)*
 
-- **Anything about the plain data plane, before 2026-11-08.** Every L4 arm
-  wrote `data_enable = true`, so every number on this page — the timeline, the
-  churn cell, `bulk-n`, the capacity ramp, the whole sweep — describes data
-  channels that each pay a Noise handshake. The product's default is `false`: one
-  Noise handshake per control session and none per data stream. Those are two
-  different data planes, and only the first had been measured. The `l4-plain` arm
-  runs the default; it is one knob apart from `l4`, so the pair also prices the
-  encryption. No comparison against it has been published yet.
+- **How much the encryption costs, before 2026-11-08.** Every L4 arm writes
+  `data_enable = true`, which **is** the client default for a forwarding service:
+  unset resolves to `true` (`src/core/client.rs`), and each data channel then pays
+  a Noise handshake. The other data plane — one Noise handshake per control
+  session and none per data stream — is what a **transparent claim** runs by
+  default (`[transparent.noise].data_enable` defaults to `false`), so the L4
+  tables here describe the plane an L4 deployment actually runs and say nothing
+  about a claim's. `l4-plain` is one knob apart from `l4`, so the pair prices the
+  encryption and the opening shape that comes with it; no comparison against it
+  has been published yet.
 
 - **A receiver that is slow at *many small datagrams*.** Every bulk cell sends
   coalesced runs, so one `recvmsg` returns a whole run and the cost of taking one
