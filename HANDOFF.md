@@ -367,7 +367,60 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.128 Phase 3 costs nothing on bulk, and the 85 % criterion has no baseline yet (2026-11-08)
+### 4.130 The clean cell's absolute thresholds pass, at a fifth of the required scale (2026-11-08)
+
+The acceptance's headline criterion is `timeline[clean]` and `clean#2` at **p99 ≤ 50 ms** and error rate
+**≤ 0.5 %**, judged on the release sweep at `--scale 1.0`. A full-scale timeline is forty-odd minutes per
+arm-round, so this run is `--scale 0.05` — two rounds, three arms, 54 samples, 1432 s (358 s per
+arm-round) — and that difference is stated rather than smoothed over.
+
+| cell | arm | `rtt_p50_ms` | **`rtt_p99_ms`** | `rtt_max_ms` | error rate |
+|---|---|---|---|---|---|
+| `clean` | `l4-plain` | 2.06 | **24.87** | 62.51 | **0.00 %** |
+| `clean` | A/A twin | 1.92 | 15.19 | 38.74 | 0.00 % |
+| `clean#2` | `l4-plain` | 1.61 | **14.34** | 25.95 | **0.00 %** |
+| `clean#2` | A/A twin | 1.47 | 12.01 | 14.92 | 0.00 % |
+
+**Both clean cells are inside 50 ms and both report zero errors.** Three things this run does *not*
+establish, in the order they matter:
+
+1. **The scale.** The criterion names 1.0; this is 0.05. Holds are shorter, so there are fewer samples per
+   phase and less time to accumulate a tail. It is a strong indication and not the judgement.
+2. **The comparison.** "p50/p90/p99 no worse than same-round TCP and peers" needs `tcp`-class arms and the
+   peers in the same run, and this run had `l4-plain` and its own twin only.
+3. **The cell cannot order anything anyway.** The run reports p99 resolution at **173 %** on `clean#2` —
+   two copies of one binary are 39–167 % apart on this cell (§4.104). So no A/B is claimed from it; the
+   only thing it can answer is an *absolute* threshold, which is exactly what it was asked here.
+
+`rtt_max_ms` on `clean` was 62.51 ms against the twin's 38.74 — one outlier in 439 samples, and the
+criterion is p99, so it is recorded and not acted on. The shaped cells look as expected for what they are:
+`rtt100` sits at p50 401 ms, `loss5` at p99 1 743 ms.
+
+### 4.129 Capacity passes at 8/8 with no level breaking the SLO (2026-11-08)### 4.129 Capacity passes at 8/8 with no level breaking the SLO (2026-11-08)
+
+Second acceptance guardrail. `capacity` on `l4-plain` with an A/A twin, three rounds, 72 samples, 477.7 s:
+
+| level | `slo_broken` (both arms) | interactive `rtt_p99_ms` (arm / twin) |
+|---|---|---|
+| L1 | 0 | 1.71 / 1.33 |
+| L2 | 0 | 1.67 / 5.80 |
+| L3 | 0 | 1.51 / 1.34 |
+| L4 | 0 | 1.54 / 2.67 |
+| L5 | 0 | 2.08 / 1.87 |
+| L6 | 0 | 2.48 / **22.30** |
+| L7 | 0 | 4.88 / 1.96 |
+| L8 | 0 | 2.38 / 2.29 |
+| **ramp** | — | **`capacity_streams` = 8** on both arms |
+
+**8 of 8, and not marginally**: every level's interactive stream stayed inside the SLO, and the worst single
+reading anywhere in the run (22.3 ms, on the *twin* at L6) is still less than half the 50 ms budget. The
+`capacity_headroom_pct` of 0.0 is the metric's definition, not a miss — the ramp's ceiling is 8, so
+sustaining 8 leaves no headroom above it.
+
+The per-level `rtt_p99_ms` resolutions are poor at three rounds (15–50 %, as the run itself reports), so no
+level-to-level comparison is claimed; what is claimed is the headline, which is a count and counts exactly.
+
+### 4.128 Phase 3 costs nothing on bulk, and the 85 % criterion has no baseline yet (2026-11-08)### 4.128 Phase 3 costs nothing on bulk, and the 85 % criterion has no baseline yet (2026-11-08)
 
 The first acceptance guardrail, because phase 3 changed the loss and retransmission path: `bulk-n[P8]` on
 `l4-plain`, three arms (pre-phase-3 `f975207`, current, A/A twin), six rounds, 21 samples, 167.9 s.
