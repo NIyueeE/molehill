@@ -1053,6 +1053,29 @@ impl MhdLane {
         Ok(lane)
     }
 
+    /// Whether this lane's later streams may skip the open acknowledgement.
+    ///
+    /// Three conditions, each excluding a shape that genuinely needs the old
+    /// handshake:
+    ///
+    /// - the lane must have **registered**, because that is the fact the
+    ///   acknowledgement proves and a lane whose first stream has not finished
+    ///   has nothing to skip;
+    /// - the data plane must be **plain**, because a Noise lane already rides its
+    ///   hello in the handshake's reply — it pays nothing extra for the answer and
+    ///   has no acknowledgement to remove;
+    /// - the connection must have **no root**, because a sealed stream never had
+    ///   an acknowledgement to begin with.
+    ///
+    /// The client states this on the wire (`REGISTERED_SELECTOR`) rather than
+    /// letting each end infer it, so a lane whose registration the server has
+    /// lost is refused as one stream instead of stalling both ends.
+    fn skips_open_ack(&self) -> bool {
+        self.noise.is_none()
+            && !self.shared.has_lane_root()
+            && self.registered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Open one application stream: the transport selector, the optional Noise
     /// handshake, and nothing above that.
     ///
@@ -1123,8 +1146,15 @@ impl MhdLane {
             // is the only one the compiler needs there.
             _ => {
                 let mut plain = plain;
+                // A registered plain lane says so, and the server then owes it no
+                // acknowledgement (see `skips_open_ack`).
+                let selector = if self.skips_open_ack() {
+                    crate::protocol::REGISTERED_SELECTOR
+                } else {
+                    crate::protocol::PLAIN_SELECTOR
+                };
                 plain
-                    .write_all(&[crate::protocol::PLAIN_SELECTOR])
+                    .write_all(&[selector])
                     .await
                     .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
                 plain
@@ -1338,6 +1368,12 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         let carries = self.noise.is_some()
             && self.registered.load(std::sync::atomic::Ordering::Relaxed)
             && !self.shared.has_lane_root();
+        // **The one round trip this phase removes.** Lane establishment already
+        // proved the session and reserved its slot; a later plain stream on the
+        // same lane has nothing new to prove, and `REGISTERED_SELECTOR` tells the
+        // server so. Without this, every visitor's first byte waits for an
+        // acknowledgement of something settled before the visitor existed.
+        let plain_registered = self.skips_open_ack();
         // `hs_at` is stamped **after** the channel is open and **before** the
         // hello goes out, so the two numbers below are the two waits a visitor
         // can pay and not the three they look like: `hs_us` is the handshake
@@ -1375,13 +1411,22 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
                 .flush()
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-            // Stamped before the read: it used to sit beside its own `elapsed()`
-            // and always read zero, hiding this phase entirely.
-            ack_at = Some(Instant::now());
-            let ack = crate::protocol::read_ack(&mut stream)
-                .await
-                .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
-            (id, stream, ack, hs)
+            if plain_registered {
+                // Nothing is coming back. The acknowledge this used to wait for
+                // proved the lane's registration, which the selector already said;
+                // `Ack::Ok` here is the same verdict the server would have given,
+                // produced locally because there is nothing left to ask it.
+                ack_at = None;
+                (id, stream, crate::protocol::Ack::Ok, hs)
+            } else {
+                // Stamped before the read: it used to sit beside its own `elapsed()`
+                // and always read zero, hiding this phase entirely.
+                ack_at = Some(Instant::now());
+                let ack = crate::protocol::read_ack(&mut stream)
+                    .await
+                    .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+                (id, stream, ack, hs)
+            }
         };
         self.log_slow_open(stream_id, carries, hs_us);
         // The acknowledgement's wait: from the hello going out to its answer —
@@ -1394,7 +1439,14 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         // only past five milliseconds, which is a sample of the worst (see
         // `stats::note_open_phase`).
         crate::transport::stats::note_open_phase(0, hs_us);
-        crate::transport::stats::note_open_phase(1, ack_us);
+        // Phase 1 is the *acknowledgement's* wait, so an open that never waits for
+        // one contributes nothing to it. Recording a zero there would drag the
+        // histogram's median down with opens that did no such thing, and the
+        // remaining sample is the one that means something: the opens that still
+        // pay it.
+        if ack_at.is_some() {
+            crate::transport::stats::note_open_phase(1, ack_us);
+        }
         // The server reserved this lane's slot on this open, so the next one can
         // carry its hello in the handshake's opening message and be answered in
         // the reply: one round trip instead of two.

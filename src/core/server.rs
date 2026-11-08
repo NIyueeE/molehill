@@ -2348,6 +2348,27 @@ async fn serve_mhd_lane(
 /// payload and the hello arrives as the next record, exactly as it always did.
 /// The two shapes are told apart by the payload's presence, so neither end has
 /// to agree in advance and a disagreement is a fallback rather than a deadlock.
+/// One accepted `mhd` stream, wrapped, before its hello has been read.
+///
+/// A struct rather than a tuple because it grew to five facts and the caller has
+/// to keep them apart: two of them decide whether an acknowledgement is still
+/// owed, and one of them is a claim the peer made that this end may have to
+/// refuse.
+#[cfg(feature = "mhd")]
+struct WrappedStream {
+    /// The stream, in whatever transport wraps it.
+    io: crate::transport::multiplex::CarrierStream,
+    /// How long the handshake took, in microseconds.
+    hs_us: u64,
+    /// The hello the handshake's reply carried, when it carried one.
+    carried: Option<Vec<u8>>,
+    /// Whether the acknowledgement already rode the handshake's reply.
+    ack_sent: bool,
+    /// Whether this stream claimed its lane was already registered, and therefore
+    /// owed no acknowledgement (`REGISTERED_SELECTOR`).
+    claimed_registered: bool,
+}
+
 #[cfg(feature = "mhd")]
 async fn wrap_mhd_stream(
     stream: crate::transport::mhd::lane::StreamIo,
@@ -2356,12 +2377,7 @@ async fn wrap_mhd_stream(
     deadline: Duration,
     sel_us: u64,
     opened: std::time::Instant,
-) -> Result<(
-    crate::transport::multiplex::CarrierStream,
-    u64,
-    Option<Vec<u8>>,
-    bool,
-)> {
+) -> Result<WrappedStream> {
     // Captured before the stream is consumed: it is the identity that pairs this
     // end's handshake hash with the peer's in a log.
     let stream_id = stream.stream_id();
@@ -2373,6 +2389,10 @@ async fn wrap_mhd_stream(
     // Whether the handshake's reply already carried the lane's acknowledgement,
     // which is what the one-flight shape does. The caller must not send it twice.
     let mut ack_sent = false;
+    // Whether the peer said on the wire that its lane is already registered. This
+    // end does not infer it from its own state: an inference would have each end
+    // waiting for the other when the two disagreed (`REGISTERED_SELECTOR`).
+    let mut claimed_registered = false;
     let io: crate::transport::multiplex::CarrierStream = match tokio::time::timeout(
         deadline,
         stream.read_u8(),
@@ -2385,6 +2405,13 @@ async fn wrap_mhd_stream(
         // packet with the same key, so there is no handshake and nothing carried
         // — the hello follows as the next record.
         PLAIN_SELECTOR | crate::protocol::DERIVED_SELECTOR => stream,
+        // The same shape as `PLAIN`, plus a claim: this lane registered already,
+        // so the hello it names needs no acknowledgement. The caller decides what
+        // to do with the claim — honour it, or refuse the stream.
+        crate::protocol::REGISTERED_SELECTOR => {
+            claimed_registered = true;
+            stream
+        }
         NOISE_SELECTOR => {
             #[cfg(feature = "noise")]
             {
@@ -2472,7 +2499,13 @@ async fn wrap_mhd_stream(
     let hs_us = u64::try_from(opened.elapsed().as_micros())
         .unwrap_or(u64::MAX)
         .saturating_sub(sel_us);
-    Ok((io, hs_us, carried, ack_sent))
+    Ok(WrappedStream {
+        io,
+        hs_us,
+        carried,
+        ack_sent,
+        claimed_registered,
+    })
 }
 
 /// Prepare and route one stream the peer opened.
@@ -2506,8 +2539,14 @@ async fn serve_mhd_stream(
     // the TCP accept path).
     let deadline = Duration::from_secs(HANDSHAKE_TIMEOUT * 2);
     let sel_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let (mut io, hs_us, carried, ack_sent) =
-        wrap_mhd_stream(stream, &shared, &state, deadline, sel_us, opened).await?;
+    let WrappedStream {
+        io,
+        hs_us,
+        carried,
+        ack_sent,
+        claimed_registered,
+    } = wrap_mhd_stream(stream, &shared, &state, deadline, sel_us, opened).await?;
+    let mut io = io;
     // The hello, either from the opening message or as the next record. Both
     // shapes go through the same reader, so the version check and the decode
     // cannot differ between them.
@@ -2538,6 +2577,25 @@ async fn serve_mhd_stream(
                 if existing.nonce != nonce {
                     bail!("mhd lane carried streams for two different sessions");
                 }
+            } else if claimed_registered {
+                // **The claim this end cannot honour.** The peer said on the wire
+                // that the lane is registered, so it will not wait for an
+                // acknowledgement; this end holds no registration, so it has one to
+                // give. Answering anyway would leave an acknowledgement at the head
+                // of a stream nobody reads, and answering nothing would park the
+                // visitor until the lane's dead timer.
+                //
+                // So the *stream* is refused, not the lane: the peer's pool treats
+                // it as a failed open and rebuilds, and the session keeps every
+                // other stream. Reaching this at all means the two ends disagreed
+                // about a lane that has registered, which is worth one debug line
+                // naming the nonce.
+                debug!(
+                    "Refused an mhd stream that claimed a registered lane: this lane holds no \
+                     registration for session {}",
+                    hex::encode(nonce)
+                );
+                bail!("mhd stream claimed a registered lane that this end does not hold");
             } else {
                 match reserve_tunnel(&registry, &nonce, max_tunnels).await {
                     TunnelSlot::Held(session) => {
@@ -2568,7 +2626,14 @@ async fn serve_mhd_stream(
             // one-flight shape does: the hello rode the opening message, so the
             // answer rode the reply. Writing it twice would leave a stray record
             // the client reads as its first bytes of service data.
-            if !ack_sent {
+            //
+            // **And unless the client said it was already registered.** Then the
+            // fact this acknowledgement proves was proved by the lane's first
+            // stream, and the visitor's first byte stops waiting for it. Writing it
+            // anyway is the failure this phase exists to remove: the client is not
+            // reading, so the byte becomes the head of the prologue it *is*
+            // reading, and the stream dies with a garbled service id.
+            if !ack_sent && !claimed_registered {
                 write_and_flush(&mut io, &postcard::to_stdvec(&Ack::Ok)?).await?;
             }
             let total_us = u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX);

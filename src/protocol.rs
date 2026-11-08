@@ -124,6 +124,24 @@ pub const NOISE_SELECTOR: u8 = 0x01;
 #[cfg(feature = "mhd")]
 pub const DERIVED_SELECTOR: u8 = 0x02;
 
+/// Plain **and** the lane is already registered, so no open acknowledgement follows.
+///
+/// A lane's first stream is what registers it: the server reserves its tunnel
+/// slot against the session nonce and answers `Ack::Ok`, which the client waits
+/// for. Every later stream on that lane carries the same nonce, names the same
+/// service and is admitted the same way — the acknowledgement proves a fact the
+/// previous stream already proved, and paying a round trip for it puts one
+/// connection setup in front of every visitor.
+///
+/// So the client **states its belief on the wire** instead of both ends inferring
+/// it from their own state. That matters: if the client believed "registered"
+/// while the server did not, an inferred rule would have each end wait for the
+/// other. With this byte the server can see the claim, and a claim it cannot
+/// honour is refused as that one stream rather than as a stall (`mhd` only; a
+/// build without the carrier has no reader for it).
+#[cfg(feature = "mhd")]
+pub const REGISTERED_SELECTOR: u8 = 0x03;
+
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
 /// The data-plane carrier a service's tunnels will use, as declared by the
