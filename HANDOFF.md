@@ -367,6 +367,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.105 The bench has never measured the data plane a default deployment runs (2026-11-08)
+
+Phase 2 was implemented — a registered plain lane's later streams now carry `REGISTERED_SELECTOR` and
+the server owes them no acknowledgement — and it was **reverted unmeasured**, because the measurement
+turned out to be structurally blind to it. That blindness is the finding, and it is bigger than the
+change.
+
+**The change worked, on the path the tests use and no benchmark does.** The integration fixtures carry
+no `data_enable` key, so they run its default *false*: plain data channels. `mhd_tunnel`,
+`mhd_tunnel_carries_streams` and `mhd_same_port` all exercise the registered-skip path and pass
+(21 of 22; the one failure is a separate, pre-existing flake — see below).
+
+**Every L4 benchmark sets `data_enable = true`** (`bench/src/bench/topology.py`'s `NOISE_CLIENT_BLOCK`).
+So every published number — `timeline`, `churn-16`, `bulk-n`, `capacity`, the whole sweep — describes a
+data plane that pays a per-stream Noise handshake, while **the product's default is the plain one**.
+Those are two different products, and this file has been quoting the first while a default deployment
+runs the second.
+
+**The A/B that should have judged phase 2 was therefore null by construction.** `churn-16`, three arms,
+four rounds, A/A twin: `molehill` 7.351 / `molehill~aa` 6.992 / `molehill~b` 6.978 ms at p50 — the
+change lands *on top of* the A/A copy, i.e. inside the scatter, and the run reported no claim on any
+metric. The mechanism was never engaged, and the engine's own log says so: `phase="hello_ack"` reports
+**13 samples in both arms**, because on a Noise lane the hello rides the handshake and the
+acknowledgement rides its reply, so there was no round trip to remove.
+
+**So the order changes.** Phase 2 keeps its patch (`~/tmp/patches/phase2-plain-no-open-ack.patch`,
+283 lines) and its place in the queue, but it cannot be judged before the bench can run a plain data
+plane. The next step is the instrument, not the change: an arm field that writes `data_enable = false`
+and the fingerprint/selfcheck/docs that go with it, then re-run the same A/B.
+
+**A second thing this round found, and it is not about phase 2.** `striped_data_channels` fails
+intermittently on the *current* tree: same binary, one run passes in 11 s, the next times out at 84 s
+with `striped bulk echo read timed out`, and it fails with phase 2 stashed as well. That matches the
+striped history in §4.30–§4.45 (6/6 one day, 13/24 another). It matters for the acceptance: condition
+⑥ requires both integration suites green, and a flaky cell means "green" needs a stated repeat policy
+rather than one run.
+
 ### 4.104 Three buffer sizes, three failures: this line is closed (2026-11-08)
 
 Attempt B was tried a third time with a 4 MiB floor under a window-sized ceiling, and run with the
@@ -4826,18 +4863,22 @@ is now recorded with a stored baseline to compare against next time.
 | 0 — measurement apparatus | **landed**: `src/probe.rs` (pool-less lane seam), `bench/transport_harness` (L1/L2), the gate wiring that makes a compiled bench member un-skippable, and three findings (§4.99, §4.100, §4.101) |
 | 1 — recovery accounting and lifecycle | **closed** (§4.102): the counters were right; two invariants are now tests. The eight lifecycle items are handed to phase 3 as a checklist, not as proven |
 | 1b — window and admission policy | **closed, no fourth buffer size** (§4.43, §4.103, §4.104): three settings, three failures |
-| 2 — no duplicate open ack | **next**; the screen is L3, not L2 (§3.6 of the plan) |
+| 2 — no duplicate open ack | **written, unjudgeable, reverted** (§4.105): the patch waits in `~/tmp/patches/`, because every L4 benchmark runs `data_enable = true` while a default deployment runs plain |
+| 2a — a plain-data plane in the bench | **next**: an arm field that writes `data_enable = false`, with its fingerprint, selfcheck and bilingual docs |
 | 3 — RACK / PTO / liveness | not started |
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: phase 2 — the duplicate open acknowledgement.** The buffer line is closed (§4.104): three
-settings, three failures, and the reason is structural — the send buffer is the only place the carrier
-can absorb a visitor-side path it cannot see, so shrinking it always costs a shaped cell. A fourth
-number would not end differently. So the sequence returns to the plan's own order and takes the one
-arrival-path item that is independent of the buffer: a registered lane's later streams still wait for
-an application-level `Ack::Ok` the lane's establishment has already made redundant. §3.6 of the plan
-says why the screen for it is L3 rather than the harness.
+**Next step: 2a — let the bench run the data plane a default deployment runs.** Phase 2 is written and
+reverted (§4.105): the patch is sound and the integration fixtures exercise it, but the A/B that should
+have judged it was blind by construction, because every L4 arm sets `data_enable = true` while a
+default deployment runs the plain data plane. So the instrument comes first — an arm field that writes
+`data_enable = false`, with its method fingerprint, selfcheck and bilingual docs — and phase 2 is
+re-judged on that arm against a baseline measured the same way.
+
+That is not bookkeeping. **Every number this file quotes was measured on a configuration a default user
+does not run**, and the acceptance conditions are stated over those numbers. Until an arm can run the
+plain plane, "does mhd meet ①" has only been asked of one of mhd's two data planes.
 
 **And nothing about the clean cell may be claimed again until a measurement can resolve it.** §4.104's
 twin reads a 39–167 % spread between two copies of **the same binary** on that cell at this scale, while
@@ -4859,9 +4900,10 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step** (revision 10): it names §4.104's closure, the phase-2 next step and
-the measurement precondition. A goal edit needs a direct human turn, which is why the three copies are
-kept in this order.
+**The session objective is one finding behind** (revision 10): it still names phase 2 as the next step,
+and §4.105 has since found that phase 2 cannot be judged until the bench can run a plain data plane. A
+goal edit needs a direct human turn, which is why the three copies keep a stated order — this section
+and the plan file are the current ones.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
