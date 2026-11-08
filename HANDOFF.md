@@ -367,7 +367,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.145 The 25 µs stops here: one port per lane is too much configuration surface (2026-11-08)
+### 4.146 `bulk-n` passes the 85 % line at 96.8 % of its baseline (2026-11-08)
+
+The first phase-5 measurement, against the baseline §4.143 recorded rather than against a neighbour:
+
+| arm | `throughput_gbps` | of baseline | vs 13.35 | `cpu_cores` | `rss_peak_mib` |
+|---|---|---|---|---|---|
+| `l4-plain` (HEAD) | **15.339** | **96.8 %** | **PASS** | 10.43 | 155.65 |
+| `l4-plain~aa` | 15.679 | 99.0 % | PASS | 10.57 | 153.80 |
+
+Six rounds, 14 samples, 110.7 s. **Passes with margin**: 96.8 % against a floor of 85 %, and the A/A twin
+reads 99.0 %, so the 2.2 % below baseline is inside this cell's own spread. `cpu_cores` and `rss_peak_mib`
+are indistinguishable from the twin.
+
+**What this covers.** Everything since the baseline was taken — the RACK revert (§4.125), the one-range PTO
+(§4.126) and the six instruments added while chasing the 25 µs (§4.132–§4.142) — costs nothing measurable on
+bulk. That is the regression guard the plan's §9 asks for, and it is green.
+
+**What it does not cover.** The criterion is "not below 85 % of a valid baseline"; it is met on this host,
+this profile and this arm. A release record is still not what this is, and §4.143 says why.
+
+### 4.145 The 25 µs stops here: one port per lane is too much configuration surface (2026-11-08)### 4.145 The 25 µs stops here: one port per lane is too much configuration surface (2026-11-08)
 
 §4.144 priced the only path that removes the extra task hop — one UDP socket per lane — and the human's
 answer was that it is too large a change to the configuration surface. **So it is not done**, and this entry
@@ -6211,18 +6231,14 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is one decision behind** (revision 13). It still says "the human has decided to
-attack the 25 µs", and that thread is now **closed as declined**: §4.144 priced the only path that removes
-the extra task hop — one UDP socket per lane — and the human's answer was that it is too large a change to
-the configuration surface (§4.145). So the objective's next step (instrument the receive path, then change
-it) is done and its conclusion is "no change", which the objective cannot say yet.
+**The session objective is in step** (revision 14): phases 0–3 closed, the 25 µs closed **as declined**
+(§4.145: one port per lane is too much configuration surface, so the extra task hop stays), the peers
+criterion recorded as unmet-by-decision rather than pending, `bulk-n` judged at 96.8 % of its baseline
+(§4.146), and the next step named as the last two measurements plus the closing record.
 
-A goal edit needs a **top-level human turn**; the answer came through a question tool, so the edit was
-refused and the objective stands as written. Everything the objective says about the *state* is still true —
-phases 0–3 closed, capacity 8/8, clean inside 50 ms at a fifth of the scale, `bulk-n` judged against
-13.35 Gbit/s from §4.143 — and only the "attack the 25 µs" sentence is superseded. When a direct message
-comes, the objective should say: the 25 µs is closed as declined, the peers criterion is unmet by decision,
-and the next step is phase 5's remaining measurements plus the closing record.
+None of the three copies may drift between turns: this section, the plan's §0 and the objective say the same
+thing, or one of them is wrong — and when they disagree the plan's original wins, because it is the approved
+document.
 
 None of the three copies may drift between turns: this section, the plan's §0 and the objective say the
 same thing, or one of them is wrong. When they disagree the plan's original wins — it is the approved
