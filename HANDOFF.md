@@ -367,7 +367,45 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.150 The soak: no wedge, and a drift fifteen times below the project's own floor (2026-11-08)
+### 4.151 An idle lane with a live stream costs 2.2 % of a core — §4.147 measured the wrong state (2026-11-08)
+
+§4.147 reported that an idle live connection costs 0.00 % of a core. **It measured an idle connection with no
+live streams**, and the difference is two orders of magnitude.
+
+**How it was caught.** The clamp that §4.101 added — a pump with live streams may not sleep past 1 ms — has a
+precondition, `has_live_streams()`, and §4.147 never checked it. It is on the `mhd window` line now
+(`live=`), and during that hold it reads:
+
+```
+cycle=n=1 packets=1     live=false
+```
+
+Both ends, every line. The requests finish their streams, so a plain hold is an idle *connection* with
+nothing in it: the pump sleeps on the keepalive timer, runs one or three passes a second, and spends nothing.
+That is a real measurement of a real state, and it is not the state the open item asked about.
+
+**The harness now opens a stream for the hold** (`stream_open: true` in the NDJSON), and the same
+measurement — `/proc/<pid>/stat` over five seconds, four runs — reads:
+
+| end | run 1 | run 2 | run 3 | run 4 |
+|---|---|---|---|---|
+| server | **2.20 %** of a core | 2.20 % | 2.20 % | — |
+| client | 1.60 % | 2.00 % | 2.20 % | 2.20 % |
+
+**Two percent of a core, per idle lane, on both ends.** At the default pool of four that is ~9 % of a core
+per connected client doing nothing, and it is exactly what §4.101 bought: the 21 ms tail it fixed was a
+reader waiting for a pump that had gone to sleep, and the fix was to stop it sleeping past a millisecond.
+The trade was never priced until now.
+
+**What that does not decide.** Whether ~2 % per idle lane is acceptable is a product call, and it now has a
+number to be made against instead of an assumption. The alternative — wake on the timer only, and accept the
+tail — was measured as a 21 ms p99 tail on a fresh stream (§4.101), so the trade is 2 % CPU against 21 ms.
+
+**And the discipline held this time.** §4.141 says a change whose effect is measured must first be shown to
+take effect; the precondition set that standard for a *measurement* too, and it caught a state I had assumed
+rather than checked.
+
+### 4.150 The soak: no wedge, and a drift fifteen times below the project's own floor (2026-11-08)### 4.150 The soak: no wedge, and a drift fifteen times below the project's own floor (2026-11-08)
 
 The last resource property never measured: what a long run does to memory, file descriptors and threads.
 `--profile soak --arms l4-plain`, one round, 952 s (15.9 min), the staged timeline walking clean, loss1,

@@ -199,8 +199,7 @@ fn report_window(shared: &Arc<Shared>) {
         // the first lane to report each second consumed — one lane printed 728 624
         // and another 1 937 in the same second. The question now is what *this*
         // lane's socket took, so both counts come from the connection.
-        let (built, process_posted_now) = crate::transport::stats::take_datagrams();
-        let _ = process_posted_now;
+        let (built, _) = crate::transport::stats::take_datagrams();
         let (posted_bytes, posted, posted_us) = conn.posted_rate(now);
         // This lane's own pass cycle, beside the numbers it explains: how many passes,
         // how many packets, and the microseconds of flush against the microseconds of
@@ -240,6 +239,7 @@ fn report_window(shared: &Arc<Shared>) {
         tracing::debug!(
             cycle = %cycle,
             datagrams = %format_datagrams(conn.datagram_counts()),
+            live = conn.has_live_streams(),
             datagrams_total = %format_datagrams((posted_total, received_total)),
             worst_stream = worst.map_or(0, |w| w.id),
             worst_next = worst.map_or(0, |w| w.next),

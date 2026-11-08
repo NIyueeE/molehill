@@ -539,11 +539,25 @@ async fn client_mhd(args: &Args) -> Result<()> {
         bail!("{failed} of {} requests failed", args.requests);
     }
     // Hold the lane open and idle, so its polling cost can be sampled from
-    // outside (`HANDOFF.md` §4.147).
-    if args.hold_ms > 0 {
-        emit("holding", &[("ms", args.hold_ms.to_string())]);
+    // outside (`HANDOFF.md` §4.151). **A stream has to be open for that to be the
+    // cost it claims to measure**: the requests above finish their streams, so a
+    // plain hold is an idle *connection* with no streams — measured as `live=false`
+    // on both ends, and a different (cheaper) thing.
+    let idle_stream = if args.hold_ms > 0 {
+        let held = lane.open().await.ok();
+        emit(
+            "holding",
+            &[
+                ("ms", args.hold_ms.to_string()),
+                ("stream_open", held.is_some().to_string()),
+            ],
+        );
         tokio::time::sleep(std::time::Duration::from_millis(args.hold_ms)).await;
-    }
+        held
+    } else {
+        None
+    };
+    drop(idle_stream);
     drop(lane);
     Ok(())
 }
