@@ -367,6 +367,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.111 Ninety-seven percent of one direction never reaches the reader (2026-11-08)
+
+§4.110 pre-registered one number: this end's `sent` against the peer's `received`, per lane. The window
+line already had the cumulative pair bound (`datagram_totals`) and was printing only the per-second
+delta, so it is printed now as `datagrams_total=` and the question is answered in one run:
+
+| lane | client sent | server received | gap | server sent | client received | gap |
+|---|---|---|---|---|---|---|
+| …304 | 147 069 | **3 758** | **−143 311** | 419 918 | 419 248 | −670 |
+| …305 | 140 949 | **4 475** | **−136 474** | 387 520 | 386 446 | −1 074 |
+| …306 | 145 327 | **4 331** | **−140 996** | 403 073 | 402 434 | −639 |
+| …307 | 179 | 176 | −3 | 1 547 | 1 546 | −1 |
+
+**One direction loses 97 % of its datagrams, the other loses 0.16 %** — and the 0.16 % is just what is
+still in flight. The loss is per lane, sustained, and on the client→server side only, which is the
+direction that carries the bulk of the test's 8 MiB write.
+
+That retires the rest of the queue of theories: it is not the recovery table (§4.108, §4.110), not the
+acknowledgement window (§4.107), not the buffer policy (§4.104) and not the pump's sleep (§4.101). **The
+server's reader is not taking what its socket is holding**, or the client is posting to an address the
+server never reads — and 5 000 datagrams a second is far below any throughput limit, so the failure is a
+stall rather than a rate.
+
+**The next instrument, one line.** The listener's dispatcher already reports a cadence
+(`report_dispatch`), so the next failing run answers: is the dispatcher's `receive` returning nothing
+while the socket's queue holds data (a lost readiness edge, the same shape §4.101 found on the pump), is
+it blocked on the registry lock, or is it awake and reading a different socket than the one the packets
+land on (`SO_REUSEPORT` gives the listener several, and the lane's id is what routes them).
+
 ### 4.110 The stuck flight is a contiguous block, and the peer never receives it (2026-11-08)
 
 §4.109 left one field missing — which stream the byte prefix names — and adding it (`recv_stream`) turned
