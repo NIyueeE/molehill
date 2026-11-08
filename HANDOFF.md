@@ -367,7 +367,73 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.133 The bare carrier is 45 µs now, so the proxy is the bigger term — §4.132 corrected (2026-11-08)
+### 4.135 On the lossy cell every tool ties, because the shaper is the measurement (2026-11-08)
+
+The complement to §4.134: if the clean cell is structurally unwinnable, does the *shaped* cell show the
+carrier winning? `rr-16` under `--condition loss1`, four arms, six rounds each, 28 samples, 279 s:
+
+| arm | `rtt_p50_ms` | `rtt_p99_ms` | `rate_per_s` |
+|---|---|---|---|
+| `l4-plain` (mhd) | 20.40 | 245.86 | 551 |
+| `l4-plain` A/A twin | 20.38 | 246.94 | 554 |
+| `frp` | 20.49 | 246.37 | 550 |
+| `rathole` | 20.49 | 246.24 | 566 |
+
+**Everything is the same to within 0.4 %**, and p99 ≈ 246 ms is the shaper's own arithmetic — a 1 %-loss
+path where every tool pays one 200 ms retransmission timeout per loss. The cell measures the shaper, not the
+carriers. Nothing can be ordered from it, and mhd's first place by 0.4 % is noise, not a win.
+
+**So the picture across the bench is now complete and it is not flattering:**
+
+- **clean loopback**: mhd is **25 µs behind a TCP socket** on a bare round trip and **85 % behind rathole** on
+  a proxied request, for the structural reason in §4.134 — a userspace wake the kernel path does not pay.
+- **loss1**: everyone ties, because the shaper dominates.
+- **the cells that could discriminate** — two or three packets in flight (§4.125), a reorder window, a path
+  where per-stream recovery beats a shared TCP connection — **do not exist in the model**.
+
+That is the state of the acceptance line "no worse than same-round TCP and peers": **not met, and not
+measurable as the model stands** on either of the two cells that do exist. The carrier's claimed advantage —
+per-stream recovery over an unreliable datagram, no head-of-line blocking across streams — is exactly the
+thing no cell here tests.
+
+### 4.134 The 25 µs is a userspace wake that TCP's loopback never pays (2026-11-08)### 4.134 The 25 µs is a userspace wake that TCP's loopback never pays (2026-11-08)
+
+The same harness, the same 20 000 requests, 64 bytes, one reused connection, loopback, clean — `--mode tcp`
+is a bare TCP echo, so this is transport against transport:
+
+| transport | client round trip p50 | p99 | server `read_us` p50 |
+|---|---|---|---|
+| bare TCP socket | **20.0 µs** | 34.0 | 15.0 |
+| bare mhd stream | **45.0 µs** | 65.0 | 41.0 |
+
+**The extra 25 µs is entirely in the outbound leg**: the server has the request after 41 µs on mhd and 15 µs
+on TCP, while the return legs are 4 and 5 µs. So it is not payload, not encryption (both plain), not the
+listener's routing — it is what happens between a `write` and the peer's `read`.
+
+**And the mechanism is structural, not a defect.** TCP's loopback path is kernel to kernel: `write` copies
+into the peer's socket buffer and its `read` returns, with no userspace task involved. mhd cannot do that —
+the bytes go into `SendBuf`, a stream writer must be woken, the pump must be signalled, and the pump runs a
+pass that builds a packet and issues `sendmmsg`. On the far side a dispatcher must `recvmsg`, route by lane
+id, apply, and wake the reader. **Two userspace wake-ups and one pump pass**, against zero. The pump's own
+pass cost is already on the window line: `flush_per_pass ≈ 13 µs`.
+
+**What follows, and it is not comfortable.** On a loopback, clean, single-small-request cell, **no userspace
+UDP carrier can beat a TCP socket** — the 25 µs is the price of leaving the kernel, and it is a price TCP on
+loopback simply does not pay. So the acceptance line "p50/p90/p99 no worse than same-round TCP and peers",
+*as judged on this kind of cell*, is not achievable by this design, and rathole's 61 µs whole-request figure
+is 61 µs of kernel loopback plus a thin shim.
+
+That does not make the last three rounds of measurements pointless — they locate the cost precisely, and they
+say where mhd *can* win: anywhere TCP's kernel-to-kernel path stops being cheap, which is a real network with
+loss, reordering and a shaper, and that is what the `loss1`/`loss5`/`jitter`/`rtt100` conditions exist to
+model. **But it does mean the criterion and the cell have to be brought into line**: either the comparison
+moves to a shaped path — where both tools pay for the path and the carrier's recovery is what differs — or
+the criterion says plainly that on loopback mhd is 25 µs behind by construction.
+
+Recorded here rather than decided: this one is the human's call, because it changes what the carrier is
+claiming to be good at.
+
+### 4.133 The bare carrier is 45 µs now, so the proxy is the bigger term — §4.132 corrected (2026-11-08)### 4.133 The bare carrier is 45 µs now, so the proxy is the bigger term — §4.132 corrected (2026-11-08)
 
 §4.132 concluded that the interactive gap sat in the carrier, using §4.101's bare round-trip figure of
 64–80 µs. **That figure is stale** — it predates §4.114's drain loop — so it was re-measured before building
