@@ -5057,10 +5057,11 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is one finding behind** (revision 10): it still names phase 2 as the next step,
-and §4.105 has since found that phase 2 cannot be judged until the bench can run a plain data plane. A
-goal edit needs a direct human turn, which is why the three copies keep a stated order — this section
-and the plan file are the current ones.
+**The session objective is in step** (revision 11): it names §4.107/§4.108 as the blocker, the
+pre-registered ACK-block instrument as the next step, and the eight local commits the flake is holding
+back. A goal edit needs a direct human turn, which is why the three copies keep a stated order — but
+none of them may drift between turns: this section, the plan's §0 and the objective say the same thing
+or one of them is wrong.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate
