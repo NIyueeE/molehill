@@ -739,6 +739,15 @@ Stated so a reader does not ask a chart for something it never measured:
   number measured before that fix stays unquoted, and the degenerate cells
   above are instrument artefacts, not architecture findings.)*
 
+- **Anything about the plain data plane, before 2026-11-08.** Every L4 arm
+  wrote `data_enable = true`, so every number on this page — the timeline, the
+  churn cell, `bulk-n`, the capacity ramp, the whole sweep — describes data
+  channels that each pay a Noise handshake. The product's default is `false`: one
+  Noise handshake per control session and none per data stream. Those are two
+  different data planes, and only the first had been measured. The `l4-plain` arm
+  runs the default; it is one knob apart from `l4`, so the pair also prices the
+  encryption. No comparison against it has been published yet.
+
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
   two runs on one machine whose probes drifted beyond tolerance are refused

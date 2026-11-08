@@ -90,13 +90,39 @@ public_key = "{NOISE_CLIENT_PUBLIC}"
 """
 
 #: The client half: its own private key and the server's public key. The
-#: control channel is always KK; the data planes follow data_enable.
-NOISE_CLIENT_BLOCK = f"""
+#: control channel is always KK; the data planes follow `data_enable`.
+#:
+#: **`data_enable` is an arm parameter, not a constant** (`HANDOFF.md` §4.105).
+#: The product's default is `false` — a plain data plane, one Noise handshake per
+#: *control* session and none per data stream — and every arm here used to write
+#: `true`, so the published numbers described a data plane a default deployment
+#: does not run. It stays `true` for the arms that always said so, because their
+#: numbers are already published against it; `l4-plain` is the arm that runs what
+#: a default deployment runs.
+NOISE_CLIENT_TEMPLATE = """
 [client.noise]
-public_key = "{NOISE_SERVER_PUBLIC}"
-private_key = "{NOISE_CLIENT_PRIVATE}"
-data_enable = true
+public_key = "{server_public}"
+private_key = "{client_private}"
+data_enable = {data_enable}
 """
+
+#: The arm set this file has always written, kept as a name so the many call
+#: sites below read as they did.
+NOISE_CLIENT_BLOCK = NOISE_CLIENT_TEMPLATE.format(
+    server_public=NOISE_SERVER_PUBLIC,
+    client_private=NOISE_CLIENT_PRIVATE,
+    data_enable="true",
+)
+
+
+def noise_client_block(arm) -> str:
+    """The client's Noise table for this arm's data plane."""
+    return NOISE_CLIENT_TEMPLATE.format(
+        server_public=NOISE_SERVER_PUBLIC,
+        client_private=NOISE_CLIENT_PRIVATE,
+        data_enable="true" if arm.noise_data else "false",
+    )
+
 
 #: The `/proc/net/dev` fields per interface: name, then 16 counters.
 DEV_COLUMNS = 16
@@ -823,7 +849,7 @@ default_token = "bench"
 [client.control]
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
-{NOISE_CLIENT_BLOCK}
+{noise_client_block(arm)}
 [client.data]{cap}
 
 {"".join(services)}"""
