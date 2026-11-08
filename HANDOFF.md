@@ -367,6 +367,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.116 The drain fix's bench effect is unmeasured, and the model said so first (2026-11-08)
+
+The drain fix is a change to the receive path, so every earlier benchmark number describes code whose
+listener took one datagram per wake-up. It has to be re-measured — and the first attempt **could not**,
+which is worth recording rather than hiding.
+
+Three arms in one run (pre-drain `6dd505fd`, drain `08285417`, and the A/A twin), `l4-plain`,
+`bulk-n,rr-16`, 4 rounds: 194 s, 30 samples, 16.17 s per arm-round. The verdict:
+
+```
+no claim cleared the floors: every difference this run saw is inside its own scatter
+  or below its metric's materiality
+l4-plain~aa: 29 metric comparisons against a second copy of itself, 0 claims
+l4-plain~b:  29 metric comparisons against a second copy of itself, 0 claims
+rr-16|c16 rate_per_s: resolves 33.0 % against a 10 % floor — about 42 rounds would reach it
+rr-16|c16 cpu_cores: resolves 34.3 % against a 15 % floor — about 21 rounds would reach it
+```
+
+It even printed a "+188.70 %" rate difference with a confidence interval spanning zero and `p 0.625`,
+flagged `FRAGILE: dropping any one round flips this`. **Four rounds cannot resolve these cells**, and
+the run's own A/A twin is the evidence: two copies of one binary differ by as much as the A/B does.
+
+So the honest position is that the drain fix's throughput effect is **still unknown**, and the next
+attempt is `bulk-n` only (6 rounds would resolve its `rss_peak_mib`, and it is the cheapest cell) or the
+`rr` cells at 20-plus rounds. Nothing is promoted from this run.
+
 ### 4.115 Phase 1's missing invariant is now a guard, and it is not a reproduction (2026-11-08)
 
 `the_flight_never_outgrows_the_window` closes the gap §4.107 named: phase 1 was closed on "a re-sent range
