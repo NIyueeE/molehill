@@ -167,6 +167,21 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
 - `CreateDataChannelFor` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the lane, and the stream's prologue names the service it carries.
 - On an `mhd` lane the stream is the carrier's own: byte offsets, a connection-wide acknowledgement bitmap and credit live in `src/transport/mhd/`, with no yamux and no record layer between the visitor's bytes and the lane's packet scheduler. Noise is per stream, so one stream cannot read another's bytes and a reordering never desynchronises a record counter. On a TCP lane the stream is a yamux stream over the Noise-wrapped connection, as before.
+- **A lane's recovery is its own, and it is deliberately small.** Every packet
+  that carried stream data schedules an acknowledgement, and so does every credit
+  change; there is no delayed-ack timer, so the block rides whatever packet the
+  end builds next and a packet carrying only an acknowledgement takes no packet
+  number (it can never leave a hole in the peer's number frontier). Loss is
+  declared by a three-packet threshold or by a reorder window measured from the
+  peer's frontier, whichever names it first; a probe timeout re-sends **one**
+  oldest range rather than the flight, so a probe cannot multiply what is in
+  flight. While a stream is live the pump wakes at most a millisecond apart — that
+  is what keeps the worst fresh-stream open at 2.6 ms instead of 21.5, at a cost of
+  about 2 % of a core per idle lane — and it sleeps on a timer when every stream
+  has ended. Stream ids are monotonic: the minter skips an id a live stream still
+  holds, and a packet arriving for a retired stream is dropped and gives its window
+  back rather than opening a new one.
+
 - The server feeds accepted streams into the same pool/pairing logic used for plain channels.
 - Per-stream framing is identical to the plain path (the service prologue, then the `StartForward*` command), which keeps the stream path and the connection path testable against each other.
 - The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It carries only the TCP carrier; `mhd` has its own stream engine. It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
