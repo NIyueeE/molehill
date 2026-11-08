@@ -5870,21 +5870,24 @@ is now recorded with a stored baseline to compare against next time.
 | 4 — re-attribution | not started |
 | 5 — throughput and resources | not started |
 
-**Next step: phase 3 is closed (§4.124–§4.127); the acceptance measurements come first.** All four
-phase-3 items are settled: RACK built and reverted (§4.125), PTO reduced to one range per probe (§4.126),
-the "independent probe deadline" shown to be a no-op here (§4.127), liveness reset by a real receipt
-(§4.127).
+**Next step: the server's receive path, measured before it is changed.** The human chose attacking the
+25 µs over restating the acceptance criterion, and the first attack is already spent: an inline send from
+the writer (§4.136) left p50 exactly where it was (45.0 µs) and was reverted. What that buys is the
+hypothesis it kills — the client's hop to the pump is not the cost.
 
-**And the acceptance numbers have not been re-measured since §4.114**, which is why they come before any
-new work — phase 3 changed the loss and retransmission path:
+The other end is: the server's `read_us` is **41 µs over mhd against 15 µs over TCP** (§4.133/§4.134), and
+that number is read *after* the datagram has arrived. So the 41 µs is inside `recvmsg` → route by lane id →
+`on_datagram` → `apply_datagram` → wake the reader → the reader task running again: two task switches and
+one syscall.
 
-- `bulk-n` at **≥85 %** of a valid baseline (§9),
-- `timeline[clean]` **p99 ≤ 50 ms** and error rate ≤ 0.5 %, judged on the release sweep at `--scale 1.0`,
-- `capacity` **8/8**.
+The order is instrument first: stamp that chain, read it on the L1 harness, and pre-register `complete_us`
+p50 **and** p99 against the current build's A/A in the same run. Only an effect beyond that A/A goes to L3
+(`rr-1`/`rr-16` with clean and `loss1` as guardrails), and no effect means a revert, exactly as §4.136 and
+§4.125 went.
 
-Then phase 4 follows §7's default flow — unit test and deterministic injection, a short L1/L2 A/A+A/B
-screen, and a targeted L3 only when the effect clears the run's own noise with the guardrails intact, one
-pre-registered primary metric per round.
+**Two criterion gaps stay on the list** rather than falling out of it: `timeline[clean]` at `--scale 1.0`
+with TCP and peers in the same run, and an `l4-plain` baseline record so that `bulk-n` at 85 % can be
+judged at all.
 
 **Two things already judged, and not to be reopened.** Phase 2's latency is judged on `rr-16[l4-plain]`
 (1.19–1.48 % resolution, 81 s) and moved nothing — it is a per-open saving, so only a churn cell can price
@@ -5906,10 +5909,11 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is in step** (revision 12): the striped blocker is recorded as closed (§4.114),
-phase 2 as a per-open saving (§4.119), the lifecycle audit as six pinned and two partial with two defects
-fixed (§4.120–§4.123), and RACK as reverted with the cell it would need (§4.125). Its next step is PTO and
-liveness separation, judged on `rr-1` + `loss1`.
+**The session objective is in step** (revision 13): phases 0–3 closed, the acceptance state as measured
+(capacity 8/8 and the clean thresholds passed at a fifth of the scale; the peers comparison failed
+structurally; `bulk-n`'s 85 % line unjudgeable without a baseline), and the human's decision — attack the
+25 µs, do not restate the criterion. Its next step is the server's receive path, instrumented before it is
+changed.
 
 None of the three copies may drift between turns: this section, the plan's §0 and the objective say the
 same thing, or one of them is wrong. When they disagree the plan's original wins — it is the approved
