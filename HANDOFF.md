@@ -367,7 +367,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.143 The 85 % line has a baseline now, and the release cell has a price (2026-11-08)
+### 4.144 The 25 µs is one extra task-hop per direction, and removing it costs a port per lane (2026-11-08)
+
+§4.142 closed the read path: the carrier's own work is 1.8 µs and 2.9 µs more when a wake is needed. Every
+remaining number is a task hop, so they can simply be added:
+
+| hop | cost | source |
+|---|---|---|
+| a parked task's wake → run | 5.0 µs | direct meter, 29 000/s |
+| apply the datagram | 1.49 µs | direct meter |
+| woken consumer → entering its read | 2.9 µs | direct meter, 25 % of reads |
+| **one hop on the receive path** | **9.4 µs** | |
+| **both directions** | **18.8 µs** | |
+| measured gap, mhd 45 µs against TCP 20 µs | **25 µs** | §4.134 |
+
+**Three quarters of the gap is one extra task-hop per direction.** A TCP socket's data arrives in the kernel
+and its reader is woken by the kernel: one task per direction. mhd's data is received by a *pump* or a
+*dispatcher*, applied there, and only then handed to the consumer: two tasks per direction. Remove one hop
+each way and the round trip would be about **26 µs** — within 6 µs of TCP, out of 25 today.
+
+**How to remove it, and what it costs.** The consumer would have to be the task that receives, which means
+**one UDP socket per lane** on the accepted side: the listener currently receives every lane on the same port
+and demultiplexes by lane id, which is exactly the extra hop.
+
+- *The win*: the accepting task does `recvmsg` → apply → read in one hop. Both directions would then be one
+  task, like TCP.
+- *The price*: a **port per lane**. The pool opens N lanes per client, so a client that has a pool of four
+  holds four server ports instead of one — more NAT bindings, more firewall surface, and a wire change (the
+  client must be told which port carries which lane, so it has to ride the accept path in dialect 6.0).
+- *Not on the table*: any variant that keeps one port. The demultiplexer has to be a task, and the consumer
+  has to be woken by it; §4.142 measured both halves and they are the 9.4 µs.
+
+**So the decision is a product decision, not a tuning one**: whether mhd is willing to hold one server port
+per lane to buy roughly 19 µs of loopback round trip. That is why this stops here rather than at a commit —
+it changes the carrier's network footprint, which the plan's own constraints treat as a product boundary, and
+"attack the 25 µs" was decided before this was the price.
+
+### 4.143 The 85 % line has a baseline now, and the release cell has a price (2026-11-08)### 4.143 The 85 % line has a baseline now, and the release cell has a price (2026-11-08)
 
 Two criterion gaps were left open. One closes here; the other turns out to be a cost question rather than a
 forgotten task.
