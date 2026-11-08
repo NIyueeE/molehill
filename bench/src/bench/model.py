@@ -1080,7 +1080,10 @@ ARM_CATALOG: dict = {
     "frp": Arm("frp", "peer", tool="frp", label="frp"),
     "rathole": Arm("rathole", "peer", tool="rathole", label="rathole"),
     "nps": Arm("nps", "peer", tool="nps", label="nps"),
-    # The sweep's own row name: the product in its default configuration.
+    # The sweep's own row name. **Not** the product's default data plane: it inherits
+    # `noise_data = True`, so every data stream pays a Noise handshake — which is
+    # what every published sweep measured before `l4-plain` existed, and why the
+    # label is the row name and not "default" (`HANDOFF.md` §4.128).
     "molehill": Arm("molehill", "l4", label="molehill"),
 }
 
