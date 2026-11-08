@@ -367,7 +367,46 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.130 The clean cell's absolute thresholds pass, at a fifth of the required scale (2026-11-08)
+### 4.131 mhd is *worse* than rathole on the interactive cell, and that is the acceptance line (2026-11-08)
+
+The acceptance says "p50/p90/p99 no worse than same-round TCP and peers". Two things had to be established
+before it could even be asked, and one of them is an answer nobody wants.
+
+**"TCP" is not expressible as an arm.** `refuse_carrier_arm` refuses one by design: the data plane's
+carrier is chosen at runtime (mhd, falling back to TCP) and the configuration has no field for it, so an arm
+naming a carrier would describe a setting the product does not have (§ the catalog's own comment). The
+"peers" half is expressible, so that is what was measured.
+
+`rr-16[clean]`, four arms, six measured rounds each, 40.9 s, 28 samples:
+
+| arm | `rtt_p50_ms` | `rtt_p99_ms` | `rate_per_s` |
+|---|---|---|---|
+| `l4-plain` (mhd, plain plane) | 0.59 | **1.71** | 22 562 |
+| `l4-plain` A/A twin | 0.60 | 1.72 | 22 599 |
+| `frp` | 0.59 | 1.65 | 22 890 |
+| **`rathole`** | **0.49** | **1.37** | **23 940** |
+
+**mhd loses this cell.** Against rathole: p99 **+24.8 %**, p50 **+20 %**, rate −5.8 %. Against frp: p99
++3.6 %, rate −1.4 %. The A/A twin differs by **0.6 %** on p99, so a 24.8 % gap is not noise — it is the
+answer.
+
+**Why the model said nothing about it**: it compared the A/B pair and the A/A pair and reported "0 further
+metric comparisons"; cross-tool comparisons are not scored. So this is a hand-read of six-round medians with
+the twin as the noise floor, and the numbers are stated here rather than promoted to a claim.
+
+**What this means for the objective, plainly.** "No worse than same-round TCP and peers" is an acceptance
+criterion, and on the one cell where it can be measured, the carrier is 25 % behind rathole and 4 % behind
+frp. That is not a rounding difference or a resolution problem; it is the product being slower than the tool
+it forked from, on the workload the bench resolves best. The next work on the interactive path — whatever it
+is — is measured against 1.37 ms, not against the previous mhd build.
+
+**One thing that would make the TCP half askable**, if it is ever wanted: a build-time or environment
+selection the runner can name as an arm. `MOLEHILL_DATA_CARRIER` exists as a switch; an arm cannot use it
+today, and inventing one would mean the arm describes a setting the product does not have — which is exactly
+what `refuse_carrier_arm` exists to prevent. So the honest options are: drop "TCP" from the criterion, or
+add a supported way to select the carrier and then let an arm name it.
+
+### 4.130 The clean cell's absolute thresholds pass, at a fifth of the required scale (2026-11-08)### 4.130 The clean cell's absolute thresholds pass, at a fifth of the required scale (2026-11-08)
 
 The acceptance's headline criterion is `timeline[clean]` and `clean#2` at **p99 ≤ 50 ms** and error rate
 **≤ 0.5 %**, judged on the release sweep at `--scale 1.0`. A full-scale timeline is forty-odd minutes per
