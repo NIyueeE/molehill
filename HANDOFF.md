@@ -367,7 +367,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.151 An idle lane with a live stream costs 2.2 % of a core — §4.147 measured the wrong state (2026-11-08)
+### 4.152 The poll-interval trade is a curve with a knee, not a binary (2026-11-08)
+
+§4.151 left a product decision with two ends: 2.2 % of a core for a 1 ms poll, or the 21 ms tail §4.101
+fixed. Three points make it a curve, and the middle one matters.
+
+| `READ_POLL` | idle CPU per lane (server / client) | fresh-stream `complete_us` **max** | p99 | p50 |
+|---|---|---|---|---|
+| **1 ms** (shipped) | **2.20 % / 2.20 %** | **2.6 ms** | 101 µs | 49 µs |
+| 5 ms | 0.80 % / 1.00 % | 6.5 ms | 78 µs | 52 µs |
+| 20 ms | **0.20 % / 0.20 %** | **21.5 ms** | 87 µs | 49 µs |
+
+Five thousand fresh streams per point, so every request opens a stream — the shape §4.101's tail appeared in.
+CPU scales as one over the interval (2.2 → 0.9 → 0.2 %), which is what a wake rate should do.
+
+**And the trade shows in the max, not in p99.** p99 reads 101 / 78 / 87 µs across the three — flat inside this
+sample size's noise — while the max moves 2.6 → 6.5 → **21.5 ms**, and 21.5 ms at a 20 ms poll is §4.101's
+tail reproduced to the millisecond. That is worth stating plainly, because it means **a p99 SLO would not
+see this trade at all**: the 21 ms event is rarer than one in a thousand requests, which is exactly why §4.101
+found it by looking at a tail and not at a percentile.
+
+**So the decision has three points, not two:**
+
+- 1 ms: 2.2 % of a core per idle lane, worst fresh-stream open 2.6 ms.
+- 5 ms: 0.9 %, worst 6.5 ms — a third of the CPU for a tail that is still under a millisecond-scaled budget.
+- 20 ms: 0.2 %, worst 21.5 ms — the state before §4.101.
+
+The constant is back at **1 ms**, the shipped value, with `git diff` empty: this round measured the curve and
+changed nothing.
+
+### 4.151 An idle lane with a live stream costs 2.2 % of a core — §4.147 measured the wrong state (2026-11-08)### 4.151 An idle lane with a live stream costs 2.2 % of a core — §4.147 measured the wrong state (2026-11-08)
 
 §4.147 reported that an idle live connection costs 0.00 % of a core. **It measured an idle connection with no
 live streams**, and the difference is two orders of magnitude.
