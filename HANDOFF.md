@@ -367,6 +367,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.110 The stuck flight is a contiguous block, and the peer never receives it (2026-11-08)
+
+§4.109 left one field missing — which stream the byte prefix names — and adding it (`recv_stream`) turned
+the question around. Eight consecutive stall lines from one lane, one end:
+
+| field | value |
+|---|---|
+| `worst_stream` | **0 — no stream is holding the wire back** |
+| `flight` | **85 825 … 85 851 — twenty-six consecutive numbers** |
+| `recv_below` / `recv_largest` | 251 630 / 251 629 — healthy, advancing |
+| `recv_prefix` (stream 5) | 1 246 324 → 1 279 120 — advancing |
+| `worst_stream_retransmits` | 75 926 → 82 126 in about seven seconds |
+
+**This end is fine at both ends of the wire and is re-sending the same twenty-six packets, five thousand
+times a second, to a peer that never acknowledges them.** Nothing is unsent (`worst_stream=0`), so the
+bytes left long ago; and the numbers are **consecutive**, which is what rules out the hole-and-bitmap
+theory of §4.107: a contiguous run of 26 sits well inside the 64-number bitmap, so if the peer had them
+it would have said so.
+
+So the peer does not have them. Either they never left this socket, or they leave and never arrive, or
+they arrive and the peer drops them without counting — and the peer's own counters say it drops nothing
+(`datagrams refused` is zero on every failing run). The next instrument is the same line seen from the
+other side: this end's `sent` against the peer's `received_total` for the same lane, over two seconds.
+That is one number each and it decides between "never posted" and "posted and lost", which have
+different fixes and neither of which is in the recovery table.
+
+**What this retires.** The bitmap-window theory (§4.107), my `confirm_prefix` fix as a candidate cure
+(§4.108 — still correct, still not the cause), and the "one direction receives nothing" reading (§4.109).
+Each of those was a real observation; none of them is the defect. The defect is that a short contiguous
+block of packets stops being delivered while both ends report healthy.
+
 ### 4.109 The two ends disagree about who is not receiving (2026-11-08)
 
 §4.107 pre-registered one instrument: the ACK block's frontier beside the flight's own numbers, on both

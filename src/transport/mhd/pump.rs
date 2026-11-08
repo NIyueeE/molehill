@@ -454,6 +454,7 @@ fn log_stall(shared: &Arc<Shared>) {
         recv_below = stall.recv_below,
         recv_largest = stall.recv_largest,
         recv_prefix = stall.recv_prefix,
+        recv_stream = stall.recv_stream,
         flight_oldest = stall.flight_numbers.map_or(0, |(a, _)| a),
         flight_newest = stall.flight_numbers.map_or(0, |(_, b)| b),
         "mhd stalled: bytes waiting"

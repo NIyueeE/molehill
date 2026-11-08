@@ -432,8 +432,13 @@ pub(crate) struct Stall {
     /// (`HANDOFF.md` §4.107).
     pub(crate) recv_below: u32,
     pub(crate) recv_largest: u32,
-    /// The contiguous byte frontier this end reports for the stream it last took.
+    /// The contiguous byte frontier this end reports, **and the stream it names**.
+    ///
+    /// The stream matters as much as the number: the prefix is evidence about one
+    /// stream only, so a sender stuck on a different one learns nothing from it
+    /// (`HANDOFF.md` §4.109).
     pub(crate) recv_prefix: u64,
+    pub(crate) recv_stream: u32,
     /// The lowest and highest packet numbers still in flight here.
     pub(crate) flight_numbers: Option<(u32, u32)>,
 }
@@ -2538,6 +2543,7 @@ impl Conn {
             recv_below: self.acks.below(),
             recv_largest: self.acks.largest().unwrap_or(0),
             recv_prefix: self.arrived_prefix,
+            recv_stream: self.arrived_stream,
             flight_numbers: self.recovery.number_range(),
         })
     }
