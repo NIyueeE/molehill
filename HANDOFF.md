@@ -376,12 +376,12 @@ moves anything.
 
 | # | invariant | state |
 |---|---|---|
-| 1 | packet/stream id wraparound | **nothing.** Worse, `open_at` wraps `next_stream` by two and `streams.insert` would *overwrite* a live stream that still holds the wrapped id — untested |
+| 1 | packet/stream id wraparound | **pinned, and a second real defect** — see below |
 | 2 | a duplicate open does not accept twice | **pinned now** — see below |
 | 3 | a late packet does not resurrect a retired stream | **pinned, and the audit found a real defect here** — see below |
 | 4 | credit advances with no data | **pinned now** — see below |
 | 5 | FIN over a hole; reset against unsent data | **partial**: `the_finishing_range_carries_the_fin` and `a_hole_stops_the_prefix_and_reports_itself` pin FIN *in* a range and holes; FIN *across* a hole and reset-vs-unacknowledged are not pinned |
-| 6 | close releases pump, dispatcher, socket, receive | **partial**: §4.114's drain loop now guarantees `receive` returns when closed, but not one of the four releases is asserted |
+| 6 | close releases pump, dispatcher, socket, receive | **partial, three of four now**: `a_closed_lane_lets_its_pump_go` asserts the pump ends within two seconds **and** drops its handle on the socket. The listener's dispatcher is still uncovered |
 | 7 | sustained loss keeps tasks, memory and the table bounded | **partial**: the table cap, the dead path and an abandoned stream's buffer are pinned; task and memory bounds are not measured |
 | 8 | `LOST_HOLD` leaves no unrecoverable frontier | **pinned** |
 
@@ -412,6 +412,22 @@ The rule is now `Conn::is_retired_stream`: an id in our own space that we do not
 in the peer's space is new only if it sits at or above the highest one this end has accepted, because
 stream ids are monotonic. Both halves are pinned, and the dialer half was verified to fail when the
 branch is disabled.
+
+**The audit found a second real defect, on #1.** `open_at` inserted the minted id
+unconditionally, and stream ids wrap by two — so once the space wrapped, the minter could hand out an id a
+live stream still held and `streams.insert` would replace that stream's state: ciphers, frontier, place in
+the window, with no error anywhere. `opening_a_stream_never_hands_out_an_id_a_live_stream_holds` was
+written first and failed against the code ("the minter handed out id 1 while a live stream held it"); the
+minter now probes at most `len() + 1` candidates of its parity, which by the pigeonhole always finds a free
+id because only `len()` ids are occupied in total.
+
+**And #6 is pinned as a property, not a branch.** `a_closed_lane_lets_its_pump_go` asserts the pump stops
+within two seconds and lets go of the socket on the way out. Disabling either of the two exits I could
+disable without breaking compilation still left it green, because the pump has three: the select's
+`closed()` arm, the loop's `is_closed()` check, and the wake `close()` delivers through the pump signal.
+That redundancy is good news for the carrier and bad news for attribution — the test pins that the lane
+releases, not which line does it. (I also caught myself about to report "all exits disabled and it still
+passed" as evidence: that variant did not compile, `Wake::Closed` left uncovered.)
 
 **What phase 3 must pin before it moves.** It changes retire, liveness and the hold, which are #3, #6 and
 #8. #8 is already pinned; **#3 and #6 are not**, so they come first. #4 is a free pin and #1 is the one

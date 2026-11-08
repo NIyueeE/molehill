@@ -1014,8 +1014,20 @@ impl Conn {
 
     /// Open a stream, recording when it was created.
     fn open_at(&mut self, now: Instant) -> StreamHandle {
-        let id = self.next_stream;
-        self.next_stream = self.next_stream.wrapping_add(2);
+        // **Stream ids wrap by two, so a wrapped id can name a stream still in
+        // use.** Inserting unconditionally would replace that stream's state — its
+        // ciphers, its frontier, its place in the window — with a fresh one, and
+        // the visitor reading it would never see an error (invariant 1 of
+        // `HANDOFF.md` §4.120). Probing at most `len() + 1` candidates of one parity
+        // always finds a free id: only `len()` ids are occupied in total, so by the
+        // pigeonhole one of `len() + 1` candidates is free.
+        let mut id = self.next_stream;
+        let mut probes = 0usize;
+        while self.streams.contains_key(&id) && probes <= self.streams.len() {
+            id = id.wrapping_add(2);
+            probes += 1;
+        }
+        self.next_stream = id.wrapping_add(2);
         let (send_cipher, recv_cipher) = self.stream_ciphers(id);
         let sealed = self.lane_root.is_some();
         let state = StreamState {
@@ -4018,6 +4030,37 @@ mod tests {
             link.a.recv_credit > credit_before,
             "and the window those bytes spent has to come back: {credit_before} -> {}",
             link.a.recv_credit
+        );
+    }
+
+    /// The stream-id minter must never hand out an id a live stream still holds.
+    ///
+    /// The first of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120).
+    /// Ids wrap by two, and `open_at` inserted unconditionally — so an id that
+    /// wrapped onto a stream still in use would **replace its state**, and the
+    /// visitor reading that stream would lose its frontier, its ciphers and its
+    /// place in the receive window without any error anywhere.
+    #[test]
+    fn opening_a_stream_never_hands_out_an_id_a_live_stream_holds() {
+        let mut conn = Conn::new(9, true);
+        let first = conn.open();
+        // Force the minter back onto the id that is still open, which is what a
+        // wrap does once the space is exhausted.
+        conn.next_stream = first.id;
+        let second = conn.open();
+
+        assert_ne!(
+            second.id, first.id,
+            "the minter handed out id {} while a live stream held it",
+            first.id
+        );
+        assert!(
+            conn.streams.contains_key(&first.id),
+            "and the stream that held it must still be there"
+        );
+        assert!(
+            conn.streams.contains_key(&second.id),
+            "the new stream is in the table too"
         );
     }
 

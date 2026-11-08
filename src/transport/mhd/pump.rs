@@ -2494,3 +2494,48 @@ mod lane_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "tests unwrap values they just constructed"
+    )]
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Closing a lane lets its pump go, and with it the socket.
+    ///
+    /// The sixth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+    /// "close releases pump, dispatcher, socket and receive". Nothing asserted any
+    /// of the four, and a pump that outlives its lane keeps the port bound — under
+    /// `SO_REUSEPORT` a restarted server's traffic can land on the dead one.
+    ///
+    /// The receive side is the part §4.114 changed: `receive` now drains until the
+    /// socket is empty, so it must also be a future that **completes** when the lane
+    /// closes rather than one that keeps looping. This asserts the whole chain: the
+    /// task ends, and it drops its handle on the socket on the way out.
+    #[tokio::test]
+    async fn a_closed_lane_lets_its_pump_go() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = socket.local_addr().unwrap();
+        let shared = Shared::new(
+            Conn::new(7, true),
+            crate::transport::health::SessionHealth::new(),
+        );
+        let pump = spawn(Arc::clone(&socket), peer, Arc::clone(&shared));
+        assert_eq!(Arc::strong_count(&socket), 2, "the pump holds a handle");
+
+        shared.close(ResetCode::Aborted);
+        let Ok(joined) = tokio::time::timeout(Duration::from_secs(2), pump).await else {
+            unreachable!("the pump must stop when the lane closes, and it did not")
+        };
+        joined.unwrap();
+        assert_eq!(
+            Arc::strong_count(&socket),
+            1,
+            "and it must let go of the socket, or the port stays bound"
+        );
+    }
+}
