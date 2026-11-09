@@ -3655,6 +3655,13 @@ mod tests {
         b: Conn,
         a_to_b: VecDeque<Vec<u8>>,
         b_to_a: VecDeque<Vec<u8>>,
+        /// How far past `now` the next polled datagram is stamped.
+        ///
+        /// A test that polls a batch in a loop is a sender emptying a queue in one
+        /// go; stamped with one instant it is a sender that emitted everything
+        /// simultaneously, and a rule that reasons about how long a packet has been
+        /// outstanding cannot be exercised against that (`HANDOFF.md` §4.204).
+        sent: Duration,
     }
 
     impl Link {
@@ -3664,7 +3671,24 @@ mod tests {
                 b: Conn::new(9, false),
                 a_to_b: VecDeque::new(),
                 b_to_a: VecDeque::new(),
+                sent: Duration::ZERO,
             }
+        }
+
+        /// Poll one datagram from `a`, stamped a spacing after the previous one.
+        fn next_a(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<usize> {
+            let at = now + self.sent;
+            let len = self.a.poll_transmit(at, buf)?;
+            self.sent += Self::SPACING;
+            Some(len)
+        }
+
+        /// The same for `b`.
+        fn next_b(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<usize> {
+            let at = now + self.sent;
+            let len = self.b.poll_transmit(at, buf)?;
+            self.sent += Self::SPACING;
+            Some(len)
         }
 
         /// Move everything both ends want to send and drop every `drop_every`th
@@ -3711,27 +3735,47 @@ mod tests {
 
         /// Move everything both ends want to send, then deliver it, until both
         /// are quiet. Answers how many datagrams moved.
+        /// One exchange, with **time passing between packets**.
+        ///
+        /// `pump` stamps a whole batch with one instant, which is a carrier that
+        /// sends everything at once — and no rule that reasons about time can be
+        /// exercised against it: a hole and the packets that overtake it would carry
+        /// the same send time, so "sent a reordering window earlier" is never true
+        /// (`HANDOFF.md` §4.204). Here each datagram leaves [`SPACING`] after the one
+        /// before it, and the acknowledgements arrive after the batch, which is the
+        /// shape a real pump has.
         fn pump(&mut self, now: Instant) -> usize {
+            self.pump_spaced(now, Self::SPACING)
+        }
+
+        /// How far apart this harness sends two packets, and how far apart their
+        /// acknowledgements follow.
+        const SPACING: Duration = Duration::from_millis(2);
+
+        fn pump_spaced(&mut self, now: Instant, spacing: Duration) -> usize {
             let mut moved = 0;
+            let mut at = now;
             loop {
                 let mut progress = false;
                 let mut buf = Vec::new();
-                while let Some(len) = self.a.poll_transmit(now, &mut buf) {
+                while let Some(len) = self.a.poll_transmit(at, &mut buf) {
                     self.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+                    at += spacing;
                     moved += 1;
                     progress = true;
                 }
-                while let Some(len) = self.b.poll_transmit(now, &mut buf) {
+                while let Some(len) = self.b.poll_transmit(at, &mut buf) {
                     self.b_to_a.push_back(buf[buf.len() - len..].to_vec());
+                    at += spacing;
                     moved += 1;
                     progress = true;
                 }
                 while let Some(datagram) = self.a_to_b.pop_front() {
-                    self.b.on_datagram(now, &datagram).unwrap();
+                    self.b.on_datagram(at, &datagram).unwrap();
                     progress = true;
                 }
                 while let Some(datagram) = self.b_to_a.pop_front() {
-                    self.a.on_datagram(now, &datagram).unwrap();
+                    self.a.on_datagram(at, &datagram).unwrap();
                     progress = true;
                 }
                 if !progress {
@@ -4087,7 +4131,7 @@ mod tests {
         let mut dropped = 0;
         for _ in 0..8 {
             let mut buf = Vec::new();
-            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+            let Some(len) = link.next_a(now, &mut buf) else {
                 break;
             };
             let Some(packet) = super::wire::decode(&buf[buf.len() - len..]).ok() else {
@@ -4713,7 +4757,7 @@ mod tests {
         // delivered twice — which is what a lost acknowledgement produces.
         let mut buf = Vec::new();
         let mut sent = Vec::new();
-        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+        while let Some(len) = link.next_a(now, &mut buf) {
             sent.push(buf[buf.len() - len..].to_vec());
         }
         assert!(!sent.is_empty(), "the opening frame has to reach the wire");
@@ -4893,7 +4937,7 @@ mod tests {
         // single acknowledgement declares both lost.
         let mut buf = Vec::new();
         let mut seen = 0usize;
-        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+        while let Some(len) = link.next_a(now, &mut buf) {
             seen += 1;
             if seen == 2 || seen == 4 {
                 continue;
@@ -5035,7 +5079,7 @@ mod tests {
         let mut dropped = 0;
         for _ in 0..8 {
             let mut buf = Vec::new();
-            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+            let Some(len) = link.next_a(now, &mut buf) else {
                 break;
             };
             let datagram = buf[buf.len() - len..].to_vec();
@@ -5092,7 +5136,7 @@ mod tests {
         let mut held = None;
         for _ in 0..4 {
             let mut buf = Vec::new();
-            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+            let Some(len) = link.next_a(now, &mut buf) else {
                 break;
             };
             let datagram = buf[buf.len() - len..].to_vec();
@@ -5148,7 +5192,7 @@ mod tests {
         assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
         // Send everything and deliver nothing: the records are in flight.
         let mut buf = Vec::new();
-        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+        while let Some(len) = link.next_a(now, &mut buf) {
             link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
         }
         let before = link.a.cwnd;
@@ -5199,7 +5243,7 @@ mod tests {
         let bytes = payload(2_000);
         assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
         let mut buf = Vec::new();
-        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+        while let Some(len) = link.next_a(now, &mut buf) {
             link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
         }
         // The timer gives up on both records; nothing is pumped, so nothing is
@@ -5310,7 +5354,7 @@ mod tests {
         let mut repeat = None;
         for _ in 0..8 {
             let mut buf = Vec::new();
-            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+            let Some(len) = link.next_a(now, &mut buf) else {
                 break;
             };
             let datagram = buf[buf.len() - len..].to_vec();
@@ -5616,7 +5660,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut seen = 0usize;
         let mut dropped: Option<(u64, usize)> = None;
-        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+        while let Some(len) = link.next_a(now, &mut buf) {
             let packet = &buf[buf.len() - len..];
             if let Ok(wire::Packet {
                 frame: Frame::Stream { offset, data, .. },
@@ -5644,7 +5688,7 @@ mod tests {
         }
         // The acknowledgements that read the hole as a loss.
         let mut acked = Vec::new();
-        while let Some(len) = link.b.poll_transmit(now, &mut buf) {
+        while let Some(len) = link.next_b(now, &mut buf) {
             acked.push(buf[buf.len() - len..].to_vec());
         }
         for datagram in acked {
@@ -5656,7 +5700,7 @@ mod tests {
         // byte from the hole to the tail.
         let mut resent = 0usize;
         let mut first = None;
-        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+        while let Some(len) = link.next_a(now, &mut buf) {
             if let Ok(wire::Packet {
                 frame: Frame::Stream { offset, data, .. },
                 ..
@@ -5731,7 +5775,7 @@ mod tests {
                     Expiry::Loss,
                     "a stale packet is a loss, not a probe"
                 );
-                while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+                while let Some(len) = link.next_a(now, &mut buf) {
                     link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
                 }
                 for datagram in std::mem::take(&mut link.a_to_b) {
