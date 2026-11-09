@@ -82,13 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   numbers they produce are the carrier's alone: an mhd stream opens in 3 µs
   against a TCP connect's 48, and a round trip costs 2.5× the bare socket's.
 
-- **A lossy path now has a stated cost, measured rather than argued.** On a
-  carrier path that drops 5 % of datagrams, mhd carries about a quarter of what
-  the same cell carries clean — 0.29 Gbit/s against 1.19 — as a level over six
-  rounds, not a scatter. The counters say the window is what limits it: it reaches
-  1.47 MB against a 16 MiB ceiling, which over a 200 ms round trip is 236 Mbit/s,
-  while retransmissions stay at 4.3 %, the loss rate. [Benchmarks](docs/benchmarks.md)
-  says what the model still cannot answer about it.
+- **A lossy path costs mhd most of its throughput, and that is an open defect rather
+  than a documented trade-off.** On a carrier path that drops 5 % of datagrams, mhd
+  carries about a quarter of what the same cell carries clean — 0.29 Gbit/s against
+  1.19 — as a level over six rounds, not a scatter. On a 100 Mbit queue about 11 ms
+  deep the same lane drops two orders of magnitude more than a TCP-based peer while
+  carrying 19 % less, so the loss follows the sender's own rate rather than the
+  shaper's. The cause is under measurement, not fixed: the window does grow after the
+  first loss, but a repair is admitted **outside** that window, and no counter in the
+  tree yet says what share of a lane's wire is a byte already sent once.
+  [Benchmarks](docs/benchmarks.md) says what the model still cannot answer about it.
 - **This is a re-baseline release for the benchmark.** The engine changed —
   `bench/src/bench/model.py` gained the `l4-plain` arm and `Arm.noise_data`, so
   runs can measure the plain data plane — while the metric registry did not
@@ -99,13 +102,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would refuse. See [docs/release.md](docs/release.md).
 
 - **Each carrier now has a stated path condition, measured rather than assumed.** mhd
-  wins on a lossy path and TCP wins on a clean one, and the crossover is between 1 %
-  and 5 % loss: at 5 % loss mhd carries 3.7× the throughput with a 31 % tighter tail,
-  while on an unshaped cell TCP's tail is 4× tighter (14.4 ms against 59.0 ms at p99).
+  wins on a lossy path and TCP wins on a clean one. On an unshaped cell TCP's tail is
+  4× tighter (14.4 ms against 59.0 ms at p99). A shaped 5 %-loss cell has mhd at 3.7×
+  the throughput with a 31 % tighter tail, **but that ratio is not currently
+  established**: the row was gathered with the condition on the visitor leg, and the
+  same method on the leg the carrier crosses reads the TCP side four times higher.
   The fallback keeps its meaning — it fires when a session cannot be *established*,
   which is a different question from which carrier is faster — so the documentation
   now says which path each one is for instead of leaving the comparison to the
-  reader. The table and its conditions are in
+  reader. The table, its conditions and its caveat are in
   [Benchmarks](docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-07).
 
 - **The congestion window's ceiling follows the path** rather than sitting at a flat

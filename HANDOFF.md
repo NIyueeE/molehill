@@ -154,6 +154,16 @@ phase lands, its result is written into §4/§5 here and the plan file is update
 in place rather than amended with a second story — a superseded paragraph in an
 untracked file is a paragraph nobody can date.
 
+**The plan file was replaced whole on 2026-11-09** (third version, approved that
+day). It is now the **D0–D5** plan: settle the copies, instrument the lane, choose
+the fix from the readings, then judge it — with the lossy-path penalty as the
+subject rather than a closed decision. The two earlier texts (the 2026-11-07
+phases 0–6 and the same-day §12 P1–P5) are superseded; their measurements, closed
+phases and withdrawn conclusions are **not** in the plan file any more, they are
+here — §4.99–§4.160 for phases 0–3, §4.165–§4.175 for P1–P5, §4.176–§4.179 for
+the three reversals. That is deliberate: a plan states what is being done, this
+file states what was measured, and a fact keeps one home (§3 of `AGENTS.md`).
+
 ---
 
 ## 2. Decision and invariants
@@ -366,6 +376,47 @@ before the experiment runs**; a run that changes them afterwards is not evidence
 - **Rule for next time.** Clean up by **directory type** (`bench-<date>-<time>/`,
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
+
+### 4.179 The plateau was an artifact of the stage ending, and the growth arithmetic was wrong too (2026-11-09)
+
+The plan was replaced with a D0–D5 version whose subject is this defect, not its classification. Before it could
+run, re-reading the artifact that produced §4.174 killed two claims I had written on top of it.
+
+**"`cwnd` plateaus at 1.5 MB" is not what the series says.** The `cwnd=1471759` line is at
+`04:43:27`, and it is the **last second of the bulk stream**, not the middle of it. The same lane one second later
+reads `buffered=51`, then `buffered=0` for the rest of the stage, with `acked_since_growth` frozen at `466754` —
+that is a stream that finished and a stage still running the small-packet series. So the maximum is an
+end-of-flow value. Across the flow it is not flat at all: 90 383 → 1 471 759 in **53 s**, a steady climb. The
+"plateau" was one row read as if it were a level, and the run that was supposed to explain it (one `--scale 2`
+stats run) would have explained nothing.
+
+**And my 6.7 KB/s arithmetic had a false premise.** `on_ack` grows the window once per `cwnd` worth of
+acknowledged bytes, which is one round trip *only if the acknowledged rate is `cwnd / rtt`*. On this path it is
+not: the same lane's `flight` has a median of 1.12 MB and a peak of 13.7 MB against a `cwnd` median of 992 864,
+because **a declared loss leaves the flight and its repair enters it outside the window**. So `cwnd` worth of acks
+arrives faster than one per RTT, and the measured climb is **≈28 KB/s**, four times §4.177's number. "The window is
+nearly frozen" is withdrawn with the plateau.
+
+**What survives, and what it changes.** The defect itself is unchanged and still measured on the product's own
+path: six rounds with the twin at 0.2886 / 0.3332 Gbit/s against ~1.19 clean, and `rate100_shallow` at 0.0776 with
+1 381 drops against rathole's 0.0955 with 17. What changes is where to look. The window does climb, and it climbs
+past the point where `cwnd / rtt` would explain the cell's throughput — 1.47 MB over 200 ms is 59 Mbit/s per lane,
+while the cell carries ~290 across four. **So a large share of what crosses the wire is repair traffic, not new
+data**, and the first question is no longer "why does the window stop" but "how much of the second is the lane
+sending the same bytes again". That is measurable with the counters that already exist plus the ones D1 adds, and
+it is the row in the plan's decision table that ends in "fix the accounting, not the controller".
+
+**Where the three reversals now sit.** §4.178 recorded that the penalty is a defect rather than a trade-off;
+§4.177 recorded that the cheap recovery rules are arithmetically dead; this entry records that the mechanism I
+named in §4.177 was the wrong one, and that the arithmetic behind it was off by four because of an unstated
+assumption. All three stay in the file: a wrong mechanism that was written down and then measured is worth more to
+the next reader than a clean paragraph, and the pattern in all three is the same — **I stated a mechanism from
+reading code and one aggregate row, then treated it as measured.**
+
+**The plan that follows from it.** `MHD-FINALIZATION-PLAN.md` (third version) is D0 sync → D1 per-lane
+instrumentation → D2 two attribution runs → D3 one candidate, submitted and reverted alone → D4 criteria → D5
+closing. Its decision table sends "posted bytes disagree with delivered throughput" to the accounting, and only
+"continuous data, healthy acknowledgements, a window that is genuinely the limit" to a rate-driven controller.
 
 ### 4.178 The lossy-path penalty is a defect, not a trade-off: doubling the flow does not help (2026-11-09)
 
@@ -7381,15 +7432,28 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The goal was closed and a new one opened** (2026-11-09). The objective that carried phases 0–3 was marked
-complete at revision 18 (§4.160: four of six acceptance criteria met, one met at an indication, one declined),
-and a completed goal cannot be re-armed. So the extension lives in a **new objective**
-(`goal-7b7c4139-cfb5-4c7f-8720-eb758ab9a4c2`, 120 rounds) whose text is `MHD-FINALIZATION-PLAN.md` §12's five
-stages: **P1 measurement → P2 instrument → P3 coverage → P4 controller (conditional) → P5 closing**. §4.164
-records the mapping from each finding to its stage.
+**Three objectives, and the third one is the D0–D5 plan** (2026-11-09). The objective that carried phases 0–3 was
+marked complete at revision 18 (§4.160: four of six acceptance criteria met, one met at an indication, one
+declined), and a completed goal cannot be re-armed. So the §12 extension lived in a **second objective**
+(`goal-7b7c4139-cfb5-4c7f-8720-eb758ab9a4c2`, 120 rounds) whose five stages were P1 measurement → P2 instrument →
+P3 coverage → P4 controller (conditional) → P5 closing, with §4.164 mapping each finding to its stage. That one is
+**complete too, and its subject turned out to be the wrong one**: §12 asked whether a controller was worth
+writing, and the answer to the defect it uncovered was left as "no change, mechanism named".
 
-**Read §12, not this paragraph, when the two differ** — the plan is the approved document and this is a summary
-of it. State at revision 2 of that objective:
+The **third objective** (`goal-baa3d2de-a96a-4be8-a5b3-30cd6801d18a`, 120 rounds) is the one that runs now, and
+its text is the **D0–D5** plan that replaced the plan file on the same day:
+
+| stage | what it produces |
+|---|---|
+| **D0** | the three copies agree — plan file, this file, the objective |
+| **D1** | per-lane instrumentation that can tell window, scheduler, acknowledgement, repair and counting apart |
+| **D2** | two attribution runs (`rtt100`, then tunnel-leg `loss5` at `--scale 2` with A/A) that **choose** the fix |
+| **D3** | **one** candidate, submitted and reverted alone: accounting first, scheduling second, a rate-driven window only if the counters say the window is the limit |
+| **D4** | the pre-registered criteria and guards (six cells, listed in the plan's §四) |
+| **D5** | `just fmt`/`check`/`interop`/`l3-accept`, both carriers' integration suites, capacity, soak, docs, changelog |
+
+**Read the plan file, not this paragraph, when the two differ** — it is the approved document and this is a
+summary of it. What §12 left behind, kept here because these are measurements and not a plan:
 
 - **P1 done** (§4.165–§4.170) with one correction that mattered: the first three runs shaped the **visitor**
   leg, not the carrier's, and a window line reading `srtt=1000us` under a 100 ms condition is what caught it.
@@ -7400,47 +7464,61 @@ of it. State at revision 2 of that objective:
 - **P3 done** (§4.172): the listener's dispatchers and the admission cap now have tests that observe the
   release — the task ending and the socket handle going — rather than the request for it, and both are
   load-bearing. #7's task bound stays partial, recorded as structure rather than as measurement.
-- **P4's gate is met on one shape with the sign reversed** (§4.174): `rate100`/`rate1000` say the path limits,
-  but on a 5 %-loss carrier path the counters say the window does — `cwnd` reaching only 1.47 MB against a
-  16 MiB ceiling, which at 200 ms is 236 Mbit/s against the 290 measured. The failure is that the window
-  **recovers too slowly** after the first loss, not that it never shrinks, and a multiplicative decrease would
-  make that cell worse.
+- **P4's gate looked met on one shape with the sign reversed** (§4.174): `rate100`/`rate1000` say the path limits,
+  but on a 5 %-loss carrier path the counters said the window did — `cwnd` reaching 1.47 MB against a
+  16 MiB ceiling, which at 200 ms is 236 Mbit/s against the 290 measured. **The "reaches only 1.47 MB" half is
+  withdrawn** (§4.179): that reading is the last second of the bulk stream, and across the flow the window climbs
+  steadily. What survives is that the failure is on the recovery side, not that the window never shrinks — a
+  multiplicative decrease would make that cell worse.
 - **P5 done** (§4.175): `just check`, `just interop`, `just l3-accept`, three full integration runs and twenty
   runs of the once-flaky cell, plus the TCP carrier's suite at 435 passed — all on the tree that carries the
   changes.
 - **The lossy-path penalty is an unfixed defect** (§4.178). Doubling the flow from 60 s to 120 s did not raise
-  throughput (0.2306 against 0.2886, single arm, so "not higher"), so the quarter-rate is a level rather than a
-  transient of a short window. Two earlier framings — "accept and document" and then "it is a transient" — were
-  mine and both were wrong; the cheap test that settled it should have come first.
-- **P4 still closes without a controller** (§4.176–§4.177), on a narrower basis: no controller until the smaller
-  question is answered — why `cwnd` plateaus near 1.5 MB on that path, which my reading of the growth rule does
-  not predict. One stats run at `--scale 2` answers it. The shallow-queue cell now exists and
-  shows mhd dropping two orders of magnitude more than its peers while carrying 19 % less — so loss does follow
-  its own rate. The cheap recovery rule is arithmetically dead (a clean window at 5 % loss is 0.6 % likely at a
-  hundred packets), and the growth rate is 6.7 KB/s at 200 ms, so the window is nearly frozen at whatever value
-  slow start reached. What would work is a rate-driven window — a redesign with its own guard matrix, not a fix.
+  throughput (0.2306 against 0.2886, single arm, so "not higher"). Two earlier framings — "accept and document"
+  and then "it is a transient" — were mine and both were wrong; the cheap test that settled it should have come
+  first.
+- **P4 closed without a controller, and then its stated reason was withdrawn** (§4.176–§4.177, §4.179). §4.176
+  built the shallow-queue cell (`rate100_shallow`) and it shows mhd dropping two orders of magnitude more than its
+  peers while carrying 19 % less — so loss does follow its own rate. §4.177 showed the cheap recovery rules are
+  arithmetically dead (a clean window at 5 % loss is 0.6 % likely at a hundred packets). What is **withdrawn** is
+  the mechanism it named: the window is not frozen, it climbs ≈28 KB/s, and `cwnd` worth of acknowledgements
+  arrives faster than once per round trip because **repairs ride outside the window**. So the next question is
+  how much of the wire is bytes sent twice, and that is D1/D2's first job.
 
-**So §12 is complete: P1 through P5 each have an outcome, and the one item left partial is named.** §4.172's #7
-task-count bound stays structural rather than measured, and no controller was written — recorded as "no change,
-mechanism named" rather than as a gap.
+**§12 finished with every stage having an outcome, and the outcome was a question it declined to answer.** §4.172's
+#7 task-count bound stays structural rather than measured, and no controller was written. That is exactly why the
+third plan exists: "no change, mechanism named" is an honest end to a *plan*, and an unacceptable end to a
+*defect* the product ships with.
 
-**Nothing is queued.** No measurement is outstanding, no decision is unanswered, and no row of the plan's
-progress table says "not started". The next round worth starting needs either a new instruction or a defect —
-and if the release ritual itself is wanted here, that needs the "no release-oriented sweep" constraint lifted
-first, because `timeline[clean]` at `--scale 1.0` is a 15.9-hour measurement (§4.143).
+**What is queued now, in order** (the plan's D-stages, with the evidence each one owes):
 
-And the record has been corrected three times in this session for the same reason — a fact taken from my own
+1. **D0 is done on this commit** — the plan file replaced, §4.179 recording both withdrawals, this section
+   rewritten, `docs/internals.md` no longer calling the window rule "a property of the design … not a defect",
+   and the objective restated as the D0–D5 plan.
+2. **D1, per-lane instrumentation.** The counters that exist are process-global (`stats::note_none_reason` sums
+   every lane into one line, §4.179's finding) and the ones that are per-lane do not separate new bytes from
+   repaired bytes. Nothing in the tree can currently answer "what fraction of this lane's wire was the same byte
+   sent again", which is the plan's first decision row.
+3. **D2, the two attribution runs** — `rtt100` first (does a loss-free long path grow and retire normally?), then
+   tunnel-leg `loss5` at `--scale 2` with the A/A twin, `MOLEHILL_MHD_STATS=1` and `RUST_LOG=molehill=debug`.
+4. **D3, one candidate** chosen by that table; then D4's six cells and D5's gates.
+
+**Two things this round must not repeat.** A plan that closes a defect without fixing it, and an entry that names
+a mechanism from an aggregate row instead of from a counter. Both are in this file's record now; neither is a
+reason to skip the work, and the D-stages are ordered so the second cannot happen again before the first is
+tested.
+
+And the release ritual is still not this: `timeline[clean]` at `--scale 1.0` is a 15.9-hour measurement (§4.143)
+and `just bench gate` needs a sweep-shaped run. Both stay parked until a human asks for a release.
+
+And the record has been corrected four times in this session for the same reason — a fact taken from my own
 notes instead of from the code or a fresh measurement (§4.133's stale 45 µs, §4.141's two unverified
-experiments, §4.157's wrong default): the rule that keeps earning its place is to check the artifact, not the
-record of it.
+experiments, §4.157's wrong default, §4.179's end-of-stage maximum read as a plateau): the rule that keeps
+earning its place is to check the artifact, not the record of it.
 
-None of the three copies may drift between turns: this section, the plan's §0 and the objective say the same
-thing, or one of them is wrong — and when they disagree the plan's original wins, because it is the approved
-document.
-
-None of the three copies may drift between turns: this section, the plan's §0 and the objective say the
-same thing, or one of them is wrong. When they disagree the plan's original wins — it is the approved
-document, and the other two summarise it.
+None of the three copies may drift between turns: this section, the plan file's stage table and the objective
+say the same thing, or one of them is wrong — and when they disagree the plan's original wins, because it is the
+approved document.
 
 Approved and ordered. **A is implemented and switched off** (`MOLEHILL_MHD_SEAL`,
 see §4.10 and §4.13); **B, C and D are not implemented at all.** Each is a separate

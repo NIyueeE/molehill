@@ -169,11 +169,16 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
 - On an `mhd` lane the stream is the carrier's own: byte offsets, a connection-wide acknowledgement bitmap and credit live in `src/transport/mhd/`, with no yamux and no record layer between the visitor's bytes and the lane's packet scheduler. Noise is per stream, so one stream cannot read another's bytes and a reordering never desynchronises a record counter. On a TCP lane the stream is a yamux stream over the Noise-wrapped connection, as before.
 - **A lane's window grows additively after its first loss.** Until the path drops something, every acknowledged
   byte buys a byte of window, so the flight doubles per round trip; the first loss latches slow start off **for
-  good**, and from there the window grows by one packet per window. Nothing cuts it on a loss — the loss is
-  repaired, not charged to the window. The consequence is visible on a long path: over a 200 ms round trip a
-  lane that loses 5 % of its datagrams climbs from its initial ten packets to about 1.5 MB in twenty seconds,
-  and carries roughly `window / rtt` while it climbs. That is a property of the design worth knowing before
-  reading a lossy-path number, not a defect to be fixed here.
+  good**, and from there the window grows by one packet per `cwnd` worth of acknowledged bytes. Nothing cuts it on
+  a loss — the loss is repaired, not charged to the window. Two consequences follow, and both are measured on the
+  carrier's own path. A **repair is admitted outside the window**, so a lane that is losing packets carries a
+  flight several times its `cwnd` and the window climbs faster than "one packet per round trip" would suggest —
+  ≈28 KB/s on a 200 ms path. And the lane then carries much less than the path could: a 5 %-loss tunnel leg gives
+  0.29 Gbit/s against 1.19 on a clean one, and on a 100 Mbit queue about 11 ms deep the same lane drops two orders
+  of magnitude more than its TCP peers while carrying 19 % less. **That is an open defect, not a property to
+  work around**: no counter in the tree yet says what share of a lane's wire is a byte already sent once, and
+  until one does, a controller would be guesswork. The plan and the instrumentation that closes the gap are
+  `HANDOFF.md` §4.179 and §5.
 
 - **A lane's recovery is its own, and it is deliberately small.** Every packet
   that carried stream data schedules an acknowledgement, and so does every credit

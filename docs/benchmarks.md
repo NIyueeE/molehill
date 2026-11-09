@@ -1065,11 +1065,16 @@ faster*, and those are different questions. A deployment that expects packet los
 deployment on a datacentre or a well-provisioned link should prefer TCP, and the `clean` row is the
 reason.
 
-Two things this table does **not** say. It does not compare either carrier against other tools — that
+Three things this table does **not** say. It does not compare either carrier against other tools — that
 is the sweep's job, and on the same `clean` cell the peers measured 1.02–1.09 ms at p50 against both
 molehill carriers' 2.63–2.82 (§"The carrier axis is a path condition now" above explains why the pool
-pays that). And it is loopback in a container: the loss and jitter cells are shaped, the clean one is
-not, so `clean` is a lower bound on what a real path does to both carriers.
+pays that). It does not establish the `loss5` ratio: that row was gathered with the condition on the
+**visitor** leg, which is the leg the carrier does not cross, and a later run of the same binary and
+method on the carrier's own leg read the TCP side at **1.16 Gbit/s** against the 0.30 above — a factor
+of four, so "3.7×" is one run's number rather than a ratio this model can resolve. The row stays as the
+published record it is; the carrier axis is being re-measured on the leg the carrier actually crosses
+(`--condition-leg tunnel`). And it is loopback in a container: the loss and jitter cells are shaped, the
+clean one is not, so `clean` is a lower bound on what a real path does to both carriers.
 
 ### Warm and cold
 
