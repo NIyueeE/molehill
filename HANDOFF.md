@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.197 D4 continues: the shallow-queue defect reproduces, and `rate1000` no longer reads like its record (2026-11-09)
+
+**`rate100_shallow`, `bulk-1`, against the two peers** (dev profile, two measured rounds plus the twin, 108.9 s).
+This is the second defect cell in the plan, and it has not moved:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0957 / 0.0957 | 16 / 16 |
+| frp | 0.0952 / 0.0951 | 14 / 16 |
+| molehill | 0.0688 / 0.0833 | 4 664 / 1 605 |
+| molehill~aa | 0.0743 / 0.0756 | 1 385 / 1 324 |
+
+mhd carries about **20 % less** than either peer and drops **two orders of magnitude** more, exactly as §4.176
+measured. The plan's criterion for this cell — "throughput no longer behind its peers, and its own drops down" —
+**fails**, and it fails for the same reason the lossy cell does: the carrier's own re-sending overruns a shallow
+queue.
+
+**`rate1000` on the carrier leg** (`cost`, `--scale 1`, two rounds plus the twin, 383.9 s):
+
+| arm | `throughput_gbps` | `rtt_p99_ms` | `cpu_s_per_gbit` | wire/visitor | drops |
+|---|---|---|---|---|---|
+| molehill | 0.7919 / 0.7940 | 824.6 / 876.1 | 2.092 / 2.093 | 1.224 | 0 / 0 |
+| molehill~aa | 0.8080 / 0.7936 | 781.3 / 856.5 | 2.046 / 2.129 | 1.20–1.23 | 0 / −1 |
+
+**79 % of the shaper with a tail near 0.85 s and 22 % duplicate wire, on a 2 ms path with no drops at all** — so the
+tail is the carrier stalling itself, not a queue. The P1 record for this cell (§4.168) reads 93.8 % of the shaper
+with a tail two orders of magnitude smaller, and **the two are not comparable as they stand**: different profile,
+different round count, and no fingerprint check has been done between them. So this cell is recorded as **does not
+reproduce its record**, with the reconciliation named as the next step for it rather than asserted as a regression.
+
+**What D4 has so far, out of six criteria.** `loss1` holds; `bulk-n` sits exactly on its floor and is undecided
+until a same-method baseline exists; the shallow-queue cell fails; `rate1000` does not reproduce its record and is
+unreconciled. The remaining cells — `transport`, the clean interactive numbers, and the formal 120 s `loss5` — have
+not been run in this stage.
+
 ### 4.196 D4 begins: `loss1` holds, and `bulk-n` sits exactly on its floor (2026-11-09)
 
 D4's acceptance cells, run on the tree that has no fix in it. Two of the six so far, both with the A/A twin.
