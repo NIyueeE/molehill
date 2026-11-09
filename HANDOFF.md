@@ -367,7 +367,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.162 `jitter` is resolved, and it says the carriers are equal there (2026-11-09)
+### 4.164 The plan was extended: five stages, and the controller is conditional (2026-11-09)
+
+After §4.161–§4.163 the human asked whether mhd still had anything to finish, then approved an extension
+rather than a new plan. `MHD-FINALIZATION-PLAN.md` §12 is the approved text; this entry is the record of why
+it says what it says.
+
+**What the audit found, and what each finding became.**
+
+| finding | became |
+|---|---|
+| §10.4's "the `loss5` advantage must not be erased" was never verified in one round | **P1**: `cost` + `loss5`, mhd against its A/A twin and a TCP side, `rtt_p99_ms` and `throughput_gbps` pre-registered |
+| the rate-shaped cells have never had a bulk-plus-interactive measurement at one operating point | **P1**: the same cell on `rate100`, plus a new `rate1000` for the high-bandwidth case §4.163 could not reach |
+| §3.4's four `transport_*` metrics were never registered; §10.3 leans on them | **P2**: the L1/L2 harness wired in, four declarations, calibration, and a topology that keeps the harness on the shaped path instead of loopback |
+| §4.120 #6 (listener dispatcher release) and #7 (task/memory bounds) are partial | **P3**: tests that observe the task and the socket actually going away, and bounded tables under sustained loss |
+| §4.163's window finding is real in the code and unreachable in the instrument | **P4**, explicitly conditional: no controller until P1 shows `flight ≈ cwnd` with `none_reason = window` dominating |
+
+**Two things the extension deliberately does not do.** It does not reopen the per-lane-socket 25 µs route
+(§4.145) or the `READ_POLL` decision (§4.153), and it does not schedule a controller by default — §12.1's
+entry condition for P4 is a measurement, and §12.2 says what that measurement has to look like before the
+question is even open.
+
+**One correction inside the plan itself.** §12.3 defines `transport_recovery_p99_us` as
+`max(0, complete_us − first_us)` rather than the whole round trip, because the harness already reports
+`complete_us` and re-naming the same number twice would put two metrics on one measurement — the shape that
+made §4.105's coverage claim wrong in the first place.
+
+### 4.162 `jitter` is resolved, and it says the carriers are equal there (2026-11-09)### 4.162 `jitter` is resolved, and it says the carriers are equal there (2026-11-09)
 
 §6.4 names `jitter` alongside `loss1`/`loss5`; it had never been run. `rr-1`, four arms, six rounds,
 28 samples, 1 716.9 s:
@@ -6769,10 +6795,17 @@ Three things stay open, deliberately and with their evidence:
   shock absorber for a visitor link it cannot see. It is a **closed** defect, not an open one — the
   honest description is "the buffer is load-bearing", not "the buffer is wrong".
 
-**The session objective is finished and marked complete** (revision 17, closed after §4.160). Four of the six
-acceptance criteria are met, one is met at an indication with its formal judgement assigned to the release
-ritual, and one was declined by the human. §4.160 tabulates the six and states what "finished" covers, so a
-reader can check the claim instead of taking it.
+**The goal was closed and a new one opened** (2026-11-09). The objective that carried phases 0–3 was marked
+complete at revision 18 (§4.160: four of six acceptance criteria met, one met at an indication, one declined),
+and a completed goal cannot be re-armed. So the extension lives in a **new objective**
+(`goal-7b7c4139-cfb5-4c7f-8720-eb758ab9a4c2`, 120 rounds) whose text is `MHD-FINALIZATION-PLAN.md` §12's five
+stages: **P1 measurement → P2 instrument → P3 coverage → P4 controller (conditional) → P5 closing**. §4.164
+records the mapping from each finding to its stage.
+
+**Read §12, not this paragraph, when the two differ** — the plan is the approved document and this is a summary
+of it. What the summary must not lose: P4 has an entry condition (`flight ≈ cwnd` with `none_reason = window`
+dominating, measured), and P1's judgement is pre-registered on `rtt_p99_ms` and `throughput_gbps` with a
+same-round A/A twin.
 
 **Nothing is queued.** No measurement is outstanding, no decision is unanswered, and no row of the plan's
 progress table says "not started". The next round worth starting needs either a new instruction or a defect —
