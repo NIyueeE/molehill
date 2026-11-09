@@ -3653,8 +3653,17 @@ mod tests {
     struct Link {
         a: Conn,
         b: Conn,
+        /// In flight, each with the instant it arrives. A datagram pushed straight into
+        /// `a_to_b` skips this: the test is saying it has already arrived.
+        pending_a: VecDeque<(Instant, Vec<u8>)>,
+        pending_b: VecDeque<(Instant, Vec<u8>)>,
         a_to_b: VecDeque<Vec<u8>>,
         b_to_a: VecDeque<Vec<u8>>,
+        /// The one-way delay this link imposes, a number the test chooses. A rule about how
+        /// long a packet has been outstanding must be judged against a known delay; when the
+        /// "round trip" was whatever a batch took to drain it was an artefact
+        /// (`HANDOFF.md` §4.207).
+        delay: Duration,
         /// How far past `now` the next polled datagram is stamped.
         ///
         /// A test that polls a batch in a loop is a sender emptying a queue in one
@@ -3669,8 +3678,11 @@ mod tests {
             Self {
                 a: Conn::new(9, true),
                 b: Conn::new(9, false),
+                pending_a: VecDeque::new(),
+                pending_b: VecDeque::new(),
                 a_to_b: VecDeque::new(),
                 b_to_a: VecDeque::new(),
+                delay: Self::DELAY,
                 sent: Duration::ZERO,
             }
         }
@@ -3751,24 +3763,44 @@ mod tests {
         /// How far apart this harness sends two packets, and how far apart their
         /// acknowledgements follow.
         const SPACING: Duration = Duration::from_millis(2);
+        /// The one-way delay every test on this link sees: an acknowledgement takes two of
+        /// these, and the reordering window is derived from that.
+        const DELAY: Duration = Duration::from_millis(5);
 
         fn pump_spaced(&mut self, now: Instant, spacing: Duration) -> usize {
             let mut moved = 0;
             let mut at = now;
+            let mut waited = 0u32;
             loop {
                 let mut progress = false;
                 let mut buf = Vec::new();
                 while let Some(len) = self.a.poll_transmit(at, &mut buf) {
-                    self.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+                    self.pending_a
+                        .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
                     at += spacing;
                     moved += 1;
                     progress = true;
                 }
                 while let Some(len) = self.b.poll_transmit(at, &mut buf) {
-                    self.b_to_a.push_back(buf[buf.len() - len..].to_vec());
+                    self.pending_b
+                        .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
                     at += spacing;
                     moved += 1;
                     progress = true;
+                }
+                while let Some((due, _)) = self.pending_a.front() {
+                    if *due > at {
+                        break;
+                    }
+                    let (_, datagram) = self.pending_a.pop_front().unwrap();
+                    self.a_to_b.push_back(datagram);
+                }
+                while let Some((due, _)) = self.pending_b.front() {
+                    if *due > at {
+                        break;
+                    }
+                    let (_, datagram) = self.pending_b.pop_front().unwrap();
+                    self.b_to_a.push_back(datagram);
                 }
                 while let Some(datagram) = self.a_to_b.pop_front() {
                     self.b.on_datagram(at, &datagram).unwrap();
@@ -3779,7 +3811,23 @@ mod tests {
                     progress = true;
                 }
                 if !progress {
-                    return moved;
+                    // Nothing moved. If something is still in flight, wait for its arrival
+                    // and carry on — a link with a delay is quiet only when the queue is
+                    // empty, not when this pass found nothing to send.
+                    let next = self
+                        .pending_a
+                        .front()
+                        .map(|(at, _)| *at)
+                        .into_iter()
+                        .chain(self.pending_b.front().map(|(at, _)| *at))
+                        .min();
+                    match next {
+                        Some(due) if waited < 64 => {
+                            at = at.max(due);
+                            waited += 1;
+                        }
+                        _ => return moved,
+                    }
                 }
             }
         }
@@ -3789,23 +3837,42 @@ mod tests {
             let mut moved = 0;
             let mut buf = Vec::new();
             let mut dropped = false;
-            while let Some(len) = self.a.poll_transmit(now, &mut buf) {
+            let mut at = now;
+            while let Some(len) = self.a.poll_transmit(at, &mut buf) {
+                at += Self::SPACING;
                 if !dropped {
                     dropped = true;
                     moved += 1;
                     continue;
                 }
-                self.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+                self.pending_a
+                    .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
                 moved += 1;
             }
-            while let Some(datagram) = self.a_to_b.pop_front() {
-                self.b.on_datagram(now, &datagram).unwrap();
+            while let Some((due, _)) = self.pending_a.front() {
+                if *due > at {
+                    break;
+                }
+                let (_, datagram) = self.pending_a.pop_front().unwrap();
+                self.a_to_b.push_back(datagram);
             }
-            while let Some(len) = self.b.poll_transmit(now, &mut buf) {
-                self.b_to_a.push_back(buf[buf.len() - len..].to_vec());
+            while let Some(datagram) = self.a_to_b.pop_front() {
+                self.b.on_datagram(at, &datagram).unwrap();
+            }
+            while let Some(len) = self.b.poll_transmit(at, &mut buf) {
+                at += Self::SPACING;
+                self.pending_b
+                    .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
+            }
+            while let Some((due, _)) = self.pending_b.front() {
+                if *due > at {
+                    break;
+                }
+                let (_, datagram) = self.pending_b.pop_front().unwrap();
+                self.b_to_a.push_back(datagram);
             }
             while let Some(datagram) = self.b_to_a.pop_front() {
-                self.a.on_datagram(now, &datagram).unwrap();
+                self.a.on_datagram(at, &datagram).unwrap();
             }
             moved
         }
@@ -4801,6 +4868,11 @@ mod tests {
     fn the_flight_never_outgrows_the_window() {
         let now = Instant::now();
         let mut link = Link::new();
+        // This test is about admission against the window, not about time: with the link's
+        // delay in place a repair is declared and repairs are window-exempt by design, which
+        // is a different invariant (`HANDOFF.md` §4.206). Zero delay keeps the scenario the
+        // one the assertion is about.
+        link.delay = Duration::ZERO;
         link.pump(now);
         let stream = link.a.open();
         let bytes = payload(256 * 1024);
@@ -5734,6 +5806,9 @@ mod tests {
     fn a_lost_opening_packet_is_re_sent_within_the_cheap_timer() {
         let start = Instant::now();
         let mut link = Link::new();
+        // The timer is measured against this end's clock; the link's delay would add its own
+        // two legs to every observation, and this test is about which floor was armed.
+        link.delay = Duration::ZERO;
         // A lane that has carried something: the opening below then has a
         // round-trip sample, which is the case a stream opened on a live lane
         // hits (a fresh lane pays `INITIAL_RTO` instead; see the unit test).
