@@ -191,6 +191,10 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `udp_recv_mbit` | Mbit/s | 越高越好 | 探针收到的数据报数 × 载荷 / 探针自己的测量窗口(对一次 blast 来说,该窗口包含 drain) | 探针的接收窗口 |
 | `udp_loss_pct` | % | 越低越好 | (发出的数据报 - 收到的数据报) / 发出的数据报 | 探针发出的数据报 |
 | `udp_gap_p99_ms` | ms | 越低越好 | 探针收到的各次应答之间间隔的第 99 百分位数 | 一个收到的数据报 |
+| `transport_open_p99_us` | us | 越低越好 | fresh 流开流时间的 p99：工具臂上是 mhd 流，control 臂上是 TCP connect。reuse 格子报为缺失而不是 0 | 一次开流 |
+| `transport_first_byte_p99_us` | us | 越低越好 | 从写出请求到收到首字节的 p99：carrier 自己的往返，其上没有任何代理 | 一个请求 |
+| `transport_recovery_p99_us` | us | 越低越好 | `max(0, complete_us - first_us)` 的 p99：**首字节之后**的等待，被修复或停滞的流在这里显形。不是整个往返 | 一个请求 |
+| `transport_stream_error_rate_pct` | % | 越低越好 | 失败 attempt /（成功 + 失败），由 harness 自己计数 | 一个请求 |
 | `udp_rtt_p99_ms` | ms | 越低越好 | 探针数据报 echo 往返时间的第 99 百分位数 | 一个被 echo 的数据报 |
 | `setup_p50_ms` | ms | 越低越好 | 建立一条连接所需时间的中位数,前提是工作负载每次请求都新开一条连接。它只测访客到服务端的握手:服务端在接受之后才把访客与通道配对,所以隧道侧的抵达代价要看 `rtt_*`,不在这里 | 一条连接 |
 | `cpu_s_per_gbit` | s/Gbit | 越低越好 | 工具 CPU 秒数(user+sys,两个 daemon 合计) / 访客报价的 Gbit | 访客链路出方向上的 Gbit |
@@ -237,6 +241,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `capacity` | `capacity` | 在一条全新的交互连接仍满足 SLO 的前提下,工具能承载多少 bulk 负载 | `capacity_streams` |
 | `reconnect` | `reconnect` | 访客在重启之后付出什么:从进程启动到能够应答的时间 | `startup_s` |
 | `udp-blast` | `udp` | 探针以力所能及的最快速率报价时的数据报上限 | `udp_recv_mbit` |
+| `transport` | `transport` | carrier 本身的开销，其上没有任何东西：裸 TCP socket（control 臂）与 mhd 流各跑一次请求/响应，走同一条整形路径 | `transport_first_byte_p99_us` |
 
 一个格子的**地板是这次运行的属性,不是这个格子的属性**。`bulk-n` 在同一台主机、
 同一对二进制、同样臂数下的四次运行,A/A 孪生的离散度分别是 5.4%、3.9%、14.9% 和

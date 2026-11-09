@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from bench import instruments as inst
-from bench import iperf, model, topology
+from bench import iperf, model, paths, topology
 
 HERE = Path(__file__).resolve().parent
 RR_PROBE = HERE / "probes" / "rr.py"
@@ -1825,6 +1825,157 @@ def run_reconnect(ctx: Ctx, params: dict) -> list:
     ]
 
 
+#: The protocol-level harness's binary: built by the workspace, run inside the
+#: namespaces by the `transport` workload. A cell that needs it builds it, because
+#: a harness two commits behind the tree measures code that no longer exists.
+TRANSPORT_HARNESS = "target/release/transport-harness"
+#: Its own port, so a raw carrier never collides with the tool's own listener.
+TRANSPORT_PORT = 2406
+
+
+def _transport_argv(mode: str, role: str, addr: str, extra: list) -> list:
+    return [
+        str(paths.REPO_ROOT / TRANSPORT_HARNESS),
+        "--mode",
+        mode,
+        "--role",
+        role,
+        "--addr",
+        addr,
+        *extra,
+    ]
+
+
+def _transport_cell(rows: list, mode: str, streams: str) -> Cell:
+    """One cell from the harness's own attempts: the four protocol numbers."""
+    ok = [r for r in rows if r.get("ok")]
+    failed = len(rows) - len(ok)
+    total = len(rows)
+    first = [r["first_us"] for r in ok]
+    recovery = [max(0, r["complete_us"] - r["first_us"]) for r in ok]
+    opens = [r["open_us"] if mode == "mhd" else r["connect_us"] for r in ok]
+    metrics = {
+        "transport_first_byte_p99_us": inst.pct(first, 0.99),
+        "transport_recovery_p99_us": inst.pct(recovery, 0.99),
+        "transport_stream_error_rate_pct": (
+            round(100.0 * failed / total, 4) if total else None
+        ),
+    }
+    unavailable: dict = {}
+    # A reuse cell has no open to measure: one stream can only be opened once, and
+    # reporting the reuse's zero would be a latency nobody paid.
+    if streams == "fresh":
+        metrics["transport_open_p99_us"] = inst.pct(opens, 0.99)
+    else:
+        unavailable["transport_open_p99_us"] = {
+            "reason": (
+                "a reuse cell opens one stream for the whole cell, so it has no "
+                "open distribution"
+            )
+        }
+    cell = Cell(streams, bool(rows), metrics=metrics, unavailable=unavailable)
+    cell.evidence |= {
+        "mode": mode,
+        "attempts": total,
+        "failed": failed,
+        "harness": TRANSPORT_HARNESS,
+    }
+    if not rows:
+        cell.reason = (
+            "the harness produced no attempt (its stderr is in the round's directory)"
+        )
+    return cell
+
+
+def run_transport(ctx: Ctx, params: dict) -> list:
+    """L1 against L2 on the same shaped path: raw TCP socket versus an mhd stream.
+
+    The control arm runs `--mode tcp` — that *is* L1, the tool-free baseline — and
+    a tool arm runs `--mode mhd`. Both ends sit across the leg the condition is
+    imposed on (listener in the server namespace, dialer in the visitor's), so the
+    path measured is the path the condition describes rather than loopback.
+    """
+    mode = "tcp" if ctx.arm.kind == "control" else "mhd"
+    if ctx.arm.kind not in ("control", "l4"):
+        return [
+            Cell(
+                "reuse",
+                True,
+                unavailable={
+                    m: {"reason": f"a {ctx.arm.kind} arm does not cross a socket"}
+                    for m in (
+                        "transport_open_p99_us",
+                        "transport_first_byte_p99_us",
+                        "transport_recovery_p99_us",
+                        "transport_stream_error_rate_pct",
+                    )
+                },
+                evidence={"mode": mode},
+            )
+        ]
+    addr = f"{model.TOPO_SRV_IP}:{TRANSPORT_PORT}"
+    server_log = ctx.work / f"transport-server-{ctx.arm.id}.log"
+    cells: list = []
+    server = subprocess.Popen(
+        ctx.topo.ns_argv(
+            topology.SRV_NS,
+            _transport_argv(mode, "server", addr, ["--size", str(params["size"])]),
+        ),
+        stdout=server_log.open("wb"),
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _transport_wait(server_log)
+        for streams in ("reuse", "fresh"):
+            log = ctx.work / f"transport-{ctx.arm.id}-{streams}.ndjson"
+            argv = ctx.topo.ns_argv(
+                topology.VIS_NS,
+                _transport_argv(
+                    mode,
+                    "client",
+                    addr,
+                    [
+                        "--size",
+                        str(params["size"]),
+                        "--requests",
+                        str(params["requests"]),
+                        "--stream-mode",
+                        streams,
+                    ],
+                ),
+            )
+            result, rc, _wall = _spawn_probe(argv, log, timeout=params["max_s"])
+            rows = []
+            with contextlib.suppress(OSError):
+                for line in log.read_text(errors="replace").splitlines():
+                    if line.startswith("{"):
+                        with contextlib.suppress(ValueError):
+                            row = json.loads(line)
+                            if row.get("kind") == "attempt":
+                                rows.append(row)
+            cell = _transport_cell(rows, mode, streams)
+            if not result and cell.ok:
+                cell.ok = False
+                cell.reason = f"the harness exited {rc}"
+            cells.append(cell)
+    finally:
+        with contextlib.suppress(OSError):
+            server.kill()
+        with contextlib.suppress(Exception):
+            server.wait(timeout=5)
+    return cells
+
+
+def _transport_wait(log: Path, timeout: float = 20.0) -> None:
+    """Wait until the harness's listener has announced its address."""
+    end = time.time() + timeout
+    while time.time() < end:
+        with contextlib.suppress(OSError):
+            if "listening" in log.read_text(errors="replace"):
+                return
+        time.sleep(0.1)
+
+
 RUNNERS = {
     model.Kind.BULK: run_bulk,
     model.Kind.BULK_PAIR: run_bulk_pair,
@@ -1834,6 +1985,7 @@ RUNNERS = {
     model.Kind.STAGED: run_staged,
     model.Kind.CAPACITY: run_capacity,
     model.Kind.RECONNECT: run_reconnect,
+    model.Kind.TRANSPORT: run_transport,
 }
 
 

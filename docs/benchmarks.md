@@ -234,6 +234,10 @@ the definitions are what the report and the verdict render.
 | `udp_recv_mbit` | Mbit/s | higher is better | datagrams the probe received x payload / the probe's own measured window (which for a blast includes the drain) | the probe's receive window |
 | `udp_loss_pct` | % | lower is better | (datagrams sent - datagrams received) / datagrams sent | datagrams the probe sent |
 | `udp_gap_p99_ms` | ms | lower is better | 99th percentile of the gaps between replies the probe received | one received datagram |
+| `transport_open_p99_us` | us | lower is better | 99th percentile of a fresh stream's open: an mhd stream on a tool arm, a TCP connect on the control arm. A reuse cell reports it absent, not zero | one stream open |
+| `transport_first_byte_p99_us` | us | lower is better | 99th percentile of the wait from the request being written to the first response byte: the carrier's own round trip with no proxy above it | one request |
+| `transport_recovery_p99_us` | us | lower is better | 99th percentile of `max(0, complete_us - first_us)`: the wait **after** the first response byte, where a repaired or stalled stream shows. Not the whole round trip | one request |
+| `transport_stream_error_rate_pct` | % | lower is better | failed attempts / (successful + failed), as the harness counts them | one request |
 | `udp_rtt_p99_ms` | ms | lower is better | 99th percentile of the probe's datagram echo round trips | one echoed datagram |
 | `setup_p50_ms` | ms | lower is better | median time to establish one connection, when the workload opens a fresh one per request. It measures the visitor-to-server handshake only: the server accepts before it pairs the visitor with a channel, so the tunnel's arrival cost is in `rtt_*`, not here | one connection |
 | `cpu_s_per_gbit` | s/Gbit | lower is better | tool CPU-seconds (user+sys, both daemons) / Gbit the visitor offered | Gbit on the visitor's link egress |
@@ -284,6 +288,7 @@ Two conventions the table cannot state, because they belong to the workload:
 | `capacity` | `capacity` | how much bulk load the tool carries while a fresh interactive connection still meets the SLO | `capacity_streams` |
 | `reconnect` | `reconnect` | what a visitor pays after a restart: time from process start to answering | `startup_s` |
 | `udp-blast` | `udp` | the datagram ceiling when the probe offers as fast as it can | `udp_recv_mbit` |
+| `transport` | `transport` | what the carrier itself costs with nothing above it: one request/response over a raw TCP socket (the control arm) against one over an mhd stream, on the same shaped path | `transport_first_byte_p99_us` |
 
 A cell's **floor is a property of the run, not of the cell.** Four runs of
 `bulk-n` on the same host, same binary pair, same arm count, gave A/A twin

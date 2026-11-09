@@ -1205,6 +1205,15 @@ KIND_COLUMNS: dict = {
     "rr": ("rate_per_s", "rtt_p99_ms", "setup_p50_ms", "wire_per_visitor_byte"),
     "udp": ("udp_loss_pct", "udp_recv_mbit", "udp_gap_p99_ms", "udp_rtt_p99_ms"),
     "udp-ladder": ("udp_loss_pct", "udp_recv_mbit", "cpu_s_per_gbit"),
+    # The protocol harness's four numbers, in the order a reader asks them: what a
+    # round trip costs, what an open costs, what the tail after the first byte
+    # costs, and whether any of it failed.
+    "transport": (
+        "transport_first_byte_p99_us",
+        "transport_open_p99_us",
+        "transport_recovery_p99_us",
+        "transport_stream_error_rate_pct",
+    ),
 }
 
 

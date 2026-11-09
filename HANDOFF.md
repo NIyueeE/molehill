@@ -367,6 +367,50 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.171 P2 lands: the protocol harness is a workload, and its four numbers are in the run file (2026-11-09)
+
+§10.3 leans on "L1/L2 protocol metrics reported independently" and §3.4 asked for them as declarations with
+units, denominators, materiality, selfcheck and bilingual docs. Until now the harness existed and printed
+NDJSON, but nothing in the model could produce, gate or compare its numbers. That is now wired:
+
+- **`scenario transport`** (`kind transport`, headline `transport_first_byte_p99_us`) runs the harness twice per
+  arm — a `reuse` cell and a `fresh` cell — with the listener in the **server** namespace and the dialer in the
+  **visitor's**, so the traffic crosses the leg a `--condition` shapes instead of measuring loopback. §12.3's
+  sentence had those two names the other way round; the leg logic is what matters and this is it.
+- **The control arm is L1 by construction**: it runs `--mode tcp`, i.e. a raw TCP socket with no tool, which is
+  what §3.1 calls L1. A tool arm runs `--mode mhd`, which is L2. An arm that crosses no socket (L3) reports the
+  four metrics as typed absences.
+- **Four declarations**: `transport_open_p99_us` (absent in a reuse cell, not zero), `transport_first_byte_p99_us`,
+  `transport_recovery_p99_us` (`max(0, complete_us - first_us)`, so it is not the round trip twice), and
+  `transport_stream_error_rate_pct`. Rows on both `benchmarks` pages; `just bench-selfcheck` went from 741 to
+  **770** checks, the new ones derived from the declarations rather than written by hand.
+
+**Measured, three rounds of smoke then a four-round A/A calibration:**
+
+| cell | arm | `open` | `first` | `recovery` | error % |
+|---|---|---|---|---|---|
+| reuse | control (L1, TCP) | — | 25 µs | 15 µs | 0 |
+| reuse | mhd (L2) | — | **87 µs** | 2 µs | 0 |
+| fresh | control | 48 µs | 34 µs | 17 µs | 0 |
+| fresh | mhd | **3 µs** | 70 µs | 4 µs | 0 |
+
+- **A stream open costs 3 µs on mhd against 48 µs for a TCP connect** — the carrier's open is local bookkeeping
+  and pays no handshake, which is the shape §4.106's work assumed.
+- **A round trip costs 2.5× more on mhd** (79.5 against 31.5 µs on the reuse cell, four rounds, A/A twin exactly
+  79.5). This is the same 25 µs task hop §4.134 measured on loopback, now visible from inside the model across a
+  veth pair.
+- **The floors are the point**: `open` 18.3 %, `first` 22.0 %, `recovery` 41.7 %. The first two can resolve the
+  2.5× difference; `recovery` cannot resolve anything at these magnitudes (its values are 2–17 µs, near the
+  timer's own grain) and its floor says so rather than inviting a claim.
+
+**What this changes about §4.169/§4.170.** Nothing in their numbers, but they now have an instrument that could
+have caught the leg mistake in one run instead of three: `first` on a shaped cell that is not shaped must come
+out near the clean value, and that comparison is now available inside a single campaign.
+
+**What it does not do.** It does not put L1/L2 into any release cell — `transport` is not in the `sweep`
+profile — and it does not produce a product SLO: `transport` is a diagnostic on the carrier, and §12.3's rule
+that these numbers support attribution rather than replace the product verdict stands.
+
 ### 4.170 Six rounds make the lossy-path collapse a level, not a lottery (2026-11-09)
 
 §4.169's two-round reading was 0.074–0.174 Gbit/s on a 62 % floor, which could not say whether the collapse was a

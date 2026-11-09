@@ -598,6 +598,59 @@ METRIC_SPECS: tuple[dict, ...] = (
         "materiality": ("abs", 1000.0),
         "precision": 0,
     },
+    {
+        "id": "transport_open_p99_us",
+        "unit": "us",
+        "direction": "lower",
+        "definition": (
+            "nearest-rank 99th percentile of a fresh stream's open: an mhd stream on "
+            "a tool arm, a TCP connect on the control arm. A reuse cell reuses one "
+            "stream, so it reports this as absent rather than as zero"
+        ),
+        "denominator": "one stream open",
+        "needs": ("transport",),
+        "materiality": ("rel", 15.0),
+        "precision": 1,
+    },
+    {
+        "id": "transport_first_byte_p99_us",
+        "unit": "us",
+        "direction": "lower",
+        "definition": (
+            "99th percentile of the wait from the request being written to the first "
+            "response byte: the carrier's own round trip, with no proxy above it"
+        ),
+        "denominator": "one request",
+        "needs": ("transport",),
+        "materiality": ("rel", 15.0),
+        "precision": 1,
+    },
+    {
+        "id": "transport_recovery_p99_us",
+        "unit": "us",
+        "direction": "lower",
+        "definition": (
+            "99th percentile of max(0, complete_us - first_us): the wait **after** the "
+            "first response byte, which is where a repaired or stalled stream shows. "
+            "Not the whole round trip — first-byte owns that"
+        ),
+        "denominator": "one request",
+        "needs": ("transport",),
+        "materiality": ("rel", 15.0),
+        "precision": 1,
+    },
+    {
+        "id": "transport_stream_error_rate_pct",
+        "unit": "%",
+        "direction": "lower",
+        "definition": (
+            "failed attempts / (successful + failed), as the harness counts them"
+        ),
+        "denominator": "one request",
+        "needs": ("transport",),
+        "materiality": ("abs", 0.5),
+        "precision": 4,
+    },
 )
 
 
@@ -1348,6 +1401,8 @@ def expected_cells(scenario_id: str, params: dict) -> list:
         return [*cells, "run"]
     if scenario.kind == Kind.CAPACITY:
         return [f"L{n}" for n in range(1, params["streams_max"] + 1)] + ["ramp"]
+    if scenario.kind == Kind.TRANSPORT:
+        return ["reuse", "fresh"]
     if scenario.id == "udp-ladder":
         return [f"{rate:g}M" for rate in params["rates_mbit"]]
     if named := CELL_NAMING.get(scenario.kind):
@@ -1554,6 +1609,17 @@ def scenario_catalog() -> list:
                 "max_s": 60,
             },
             headline="udp_recv_mbit",
+        ),
+        Scenario(
+            id="transport",
+            kind="transport",
+            claim=(
+                "what the carrier itself costs with nothing above it: one "
+                "request/response over a raw TCP socket (the control arm) against one "
+                "over an mhd stream, on the same shaped path"
+            ),
+            params={"requests": 4000, "size": 64, "max_s": 120},
+            headline="transport_first_byte_p99_us",
         ),
     ]
 
@@ -1788,6 +1854,7 @@ class Kind:
     STAGED: ClassVar[str] = "staged"
     CAPACITY: ClassVar[str] = "capacity"
     RECONNECT: ClassVar[str] = "reconnect"
+    TRANSPORT: ClassVar[str] = "transport"
 
     ALL: ClassVar[tuple] = (
         BULK,
@@ -1798,6 +1865,7 @@ class Kind:
         STAGED,
         CAPACITY,
         RECONNECT,
+        TRANSPORT,
     )
 
 
