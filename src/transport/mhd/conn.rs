@@ -5256,9 +5256,17 @@ mod tests {
             link.pump_lossy(start + Duration::from_millis(step), 20);
             step += 1;
         }
-        // Then a clean path, so the assertion is about delivery and not about luck.
+        // Then a clean path, so the assertion is about delivery and not about luck. The
+        // timer is driven here because a real pump drives it: without it this harness
+        // only ever repairs on the three-packet threshold, so a hole with no later
+        // packet behind it waits for a timeout that never comes — and any change in the
+        // datagram sequence is then enough to make the transfer stall short of the end.
+        // That is a harness gap, not a carrier one: the earlier pass was luck.
         for extra in 0..400 {
-            link.pump(start + Duration::from_millis(step + extra));
+            let at = start + Duration::from_millis(step + extra);
+            let _ = link.a.on_timeout(at);
+            let _ = link.b.on_timeout(at);
+            link.pump(at);
         }
         let mut got: Vec<u8> = Vec::new();
         for _ in 0..64 {

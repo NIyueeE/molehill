@@ -377,6 +377,58 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.186 The ranges frame was built, engaged, and **reverted**: the pre-registered cell could not judge it (2026-11-09)
+
+D3's candidate was implemented (`3043039`), measured against the binary at `346d5e3` in the pre-registered cell,
+and reverted (`b3e9778`). Both halves matter: the mechanism worked, and the experiment failed.
+
+**What was built.** A `Ranges` frame (`Kind::Ranges`, 13 bytes fixed plus 6 per entry, at most four entries)
+carrying `stream`, the contiguous `base` its deltas are measured from, and `(delta, len)` pairs. A receiver sets
+`RangesOwed` when a packet lands **above** a stream's contiguous frontier and emits one report at most every 10 ms.
+A sender retires every recovery record **wholly inside** a named range, samples the trip from the newest of them,
+and feeds the confirmed bytes to the same growth rule a number acknowledgement feeds. It never moves the stream's
+`base`: a range is out of order by definition, and a reader handed those bytes would read a hole as data. Five
+tests, including the one that pins "wholly inside, never overlapping".
+
+**The run.** `cost`, tunnel leg, `loss5`, arm `l4-mux8`, `--scale 1`, three rounds, `--aa` plus `--ab-arm` so the
+same run measured the candidate, a second copy of it, and the baseline: 669.1 s, 18 samples.
+
+| arm | `throughput_gbps` per round | median | dup (aggregate) | worst lane | `rng` retired |
+|---|---|---|---|---|---|
+| candidate | 0.2557 / 0.3048 / 0.2526 | **0.2557** | 22.7 % | **30.4 %** | 24.6 MB |
+| candidate twin | 0.2429 / 0.0790 / 0.3366 | 0.2429 | 23.5 % | 30.7 % | 21.0 MB |
+| baseline | 0.3799 / 0.3422 / 0.2973 | **0.3422** | 22.0 % | **73.2 %** | — |
+
+**The mechanism engaged, so the run is not void.** `rng` shows 21–25 MB retired through range reports, and the
+lane-level reading is what the change predicted: without it one lane sat at **73.2 %** duplicate share; with it,
+the worst lane in either candidate arm was **30.4 % / 30.7 %**.
+
+**And the experiment failed anyway.** The model's verdict is *no claim cleared the floors*, and the cell resolves
+`throughput_gbps` at **53 %** — about 109 rounds would be needed to see a 10 % effect. The candidate's point
+estimate was also lower than the baseline's (0.2557 against 0.3422), inside that noise but pointing the wrong way,
+and one candidate round read 0.079 (a storm). **A change that might cost throughput is not kept on a lane-level
+side effect**, so it was reverted whole; `git revert b3e9778` re-lands it unchanged when a cell can judge it.
+
+**The real finding is about the pre-registration, and it is my error.** I registered a primary metric on a cell
+whose own noise is five times the effect size, in the same document that says a claim must clear the run's own
+measured noise. The evidence that the mechanism works is a **counter** — worst-lane duplicate share, 73 % → 30 % —
+and that counter is not a model metric, so the pre-registration could not name it. Two ways out, and the next
+round picks one **before** re-landing the frame:
+
+1. **Promote the lane-level duplicate share into `model.METRICS`**, fed from the ledger lines the runner already
+   archives, so the primary is the number the mechanism actually moves and the gate can police it like any other.
+2. **Find a cell where the storm is deterministic** (a longer stage, or more lanes) so `throughput_gbps`
+   separates by more than 100 % and survives the scatter.
+
+Until one of those exists no candidate on this shape can pass, and a number that clears a floor by luck is worse
+than no number.
+
+**One thing that did survive the revert, because it is a harness fix and not the candidate**: the fake link now
+drives `on_timeout`, as a real pump does. Without it the harness only ever repaired on the three-packet
+threshold, so a hole with no later packet behind it waited for a timer that never came — which is why a change in
+the datagram sequence was enough to stall `five_percent_loss_on_a_fake_link_delivers_without_storming` short of
+the end. The earlier pass was luck.
+
 ### 4.185 The storm is reproducible, the pre-registration is written, and §4.182's contradiction dissolves (2026-11-09)
 
 **Reproduction.** `cost`, tunnel leg, `loss5`, arm `l4-mux8` (eight lanes), `--scale 1`, three rounds plus the A/A
