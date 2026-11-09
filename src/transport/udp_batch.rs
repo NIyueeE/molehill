@@ -270,8 +270,14 @@ impl SendBatch {
             n += 1;
         }
         if n < limit {
-            // The one shorter piece GSO allows, and only at the end.
-            if n + 1 != limit {
+            // GSO allows exactly one **shorter** segment, and only as the last one. A
+            // *longer* tail is not a segment this batch can carry: handing it to
+            // `UDP_SEGMENT` makes the kernel split it into pieces of `segment` bytes, and
+            // the receiver gets fragments of a packet instead of the packet. That is how a
+            // lane's first stream packet — the run is [credit, stream@0] — arrived as five
+            // 17-byte fragments and was refused by the decoder on every lane
+            // (`HANDOFF.md` §4.210). The caller falls back to one datagram per span.
+            if n + 1 != limit || spans[n].len() > segment {
                 return Ok(0);
             }
             n += 1;
@@ -357,6 +363,30 @@ mod tests {
 
     /// A GSO batch reaches the peer as the individual datagrams it was built
     /// from: the kernel cuts the buffer at the segment size, so nothing about
+    /// A run whose second datagram is *longer* than the first is not a GSO batch.
+    ///
+    /// `UDP_SEGMENT` splits the whole buffer into segments of one size, so a tail longer
+    /// than that size is chopped into fragments of it — the packet never arrives whole, and
+    /// the receiver refuses the pieces as malformed. The run that opens a lane is exactly
+    /// that shape: a 17-byte credit followed by the first stream packet.
+    #[test]
+    fn a_longer_tail_is_refused_so_the_caller_sends_it_whole() {
+        use std::os::fd::AsRawFd;
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = receiver.local_addr().unwrap();
+        let buf = Bytes::from(vec![0u8; 17 + 74]);
+        let spans = [
+            Span::Staged { off: 0, len: 17 },
+            Span::Staged { off: 17, len: 74 },
+        ];
+        let refused = SendBatch::send_gso(sender.as_raw_fd(), peer, &buf, &spans);
+        assert!(
+            matches!(refused, Ok(0)),
+            "a longer tail is not a GSO batch, the caller must send the spans itself: {refused:?}"
+        );
+    }
+
     /// the wire changes — only the number of syscalls and skbs.
     #[test]
     fn a_gso_batch_arrives_as_individual_datagrams() {
