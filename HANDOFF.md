@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.200 The storm is not loss-specific: both shaped cells storm where their records were clean (2026-11-09)
+
+`rate100` (100 Mbit shaper on the carrier leg) twice, the second after killing eight harness servers a previous run
+had leaked:
+
+| run | `throughput_gbps` | `rtt_p99_ms` | `dropped_packets` | wire/visitor |
+|---|---|---|---|---|
+| first | 0.074 (one sample; the other degenerate) | 4 138 / 70.6 | 132 857 / −19 | 13.6 / **3 762** `cpu_s_per_gbit` |
+| second | 0.0765 / 0.0681 | 3 803 / 122.3 (flipping by round) | 89 783 / 618 112 | 1.43 / **436.8** |
+
+**Against §4.168's 93.5 % of the shaper, today reads 68–77 % with a tail that flips between 122 ms and 3.8 s by
+round, and 90 000–620 000 drops.** Two rounds are enough to say the cell is not in the state its record describes.
+The same is true of `rate1000` (§4.197: 79 % of the shaper, 0.85 s tail).
+
+**And that is the finding worth more than either number: the storm is not a loss-cell phenomenon.** These cells
+configure no loss at all — the loss is the shaper's queue overflowing, which the carrier's own re-sending causes. So
+the defect reproduces wherever the carrier can build a queue, not only under `loss5`, and both shaped cells in the
+plan's acceptance table are downstream of it.
+
+**What this does not establish.** That a code change caused it. The engine is identical to the baseline binary
+(`git diff 346d5e3..HEAD -- src/` touches only `probe.rs`, the ledger and tests), so "environment" and "a regression
+older than 346d5e3" are both open, and this session has no older binary to separate them. The distinguishing run is
+named, not guessed: build the engine from the commit that produced §4.168 and run this cell on it, same method.
+
+**Two degenerate samples are also on the record** — `cpu_s_per_gbit` 3 762 and `wire_per_visitor_byte` 436.8, each
+from a round whose denominator collapsed. They are not readings; they are evidence that this cell needs its
+denominator guarded before it can be quoted at all.
+
 ### 4.199 The formal `loss5` acceptance: half the floor, with a 1.4 s tail (2026-11-09)
 
 The headline cell, run properly: `cost` + `loss5` on the tunnel leg, **`--scale 2` (120 s stages), six measured
