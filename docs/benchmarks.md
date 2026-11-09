@@ -471,6 +471,7 @@ same vocabulary without the schedule: one cell, one condition, one number.
 | `loss5` | a badly congested path | 100 ms delay, 5 % loss, 10 000-packet queue | 120 s |
 | `rate100` | a 100 Mbit uplink | 100 Mbit/s, 20 ms delay, 2000-packet queue | 120 s |
 | `rate1000` | a gigabit metro link, short enough that a window ceiling cannot hide behind a long round trip | 1 Gbit/s, 2 ms delay, 4000-packet queue | focused cell only |
+| `rate100_shallow` | a 100 Mbit uplink with an ~11 ms queue: shallow enough that a sender without a loss response overruns it, so the drops are its own rate | 100 Mbit/s, 20 ms delay, 100-packet queue | focused cell only |
 | `rate20` | a 20 Mbit/s uplink | 20 Mbit/s, 40 ms delay, 2000-packet queue | 120 s |
 | `loss1_rate100` | a 100 Mbit uplink that also loses packets — the lossy WAN the carriers are chosen for | 100 Mbit/s, 20 ms delay, 1 % loss | focused cell only |
 | `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms, 10 000-packet queue | 120 s |

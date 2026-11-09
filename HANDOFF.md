@@ -367,6 +367,42 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.176 The cell that makes loss depend on the sender's rate — and what it says (2026-11-09)
+
+§4.174's conclusion was that the lossy-path cost is the window recovering too slowly, and that any change to the
+recovery rule needs a cell where **loss depends on the offered rate** — otherwise "back off on loss" and "grow
+faster after loss" are both unfalsifiable. That cell now exists.
+
+**`rate100_shallow`**: 100 Mbit, 20 ms each way, and a **100-packet** queue — about 11 ms of buffering at that
+rate, against the 2 000 the other rate cells carry. A sender that keeps a 1 MB window flowing overruns it; a
+sender with a loss response backs off. Measured on `bulk-1`, four arms, six rounds, 257.7 s:
+
+| arm | `throughput_gbps` | `dropped_packets` | `retrans_segments` | `cpu_s_per_gbit` |
+|---|---|---|---|---|
+| `rathole` | **0.0955** | **17** | 3.0 | **0.72** |
+| `frp` | 0.0951 | 119 | 5.5 | 1.42 |
+| `l4-plain~aa` | 0.0793 | **3 655** | 13 | 3.32 |
+| `l4-plain` (mhd) | 0.0776 | **1 381** | 16 | 2.92 |
+
+Floors: `throughput_gbps` **4.5 %**, `dropped_packets` 68 %.
+
+**Three readings, and the middle one is the point.**
+
+1. **mhd carries 18.7 % less than the TCP-based peers** — 0.0776 against 0.0955 — with the two halves of its own
+   binary 2.2 % apart, so the deficit is well outside both the floor and its twin's scatter.
+2. **The drops are mhd's own.** 1 381 against rathole's 17 — two orders of magnitude — on a queue where the
+   peers' own TCP stacks back off and mhd's window does not. That is what this cell was built to show: the loss
+   rate follows the sender's rate, so "should the window react?" is now a question with an answer rather than a
+   guess.
+3. **CPU per carried Gbit is 4× rathole's** on the same cell, 2.92 against 0.72 — consistent with §4.168's 57 %
+   on the gigabit cell, and larger here because the sender is working against its own drops.
+
+**What it licenses, and what it does not.** It licenses the experiment §4.153-style pre-registration demands:
+change how the window recovers after a loss, judge it on the **tunnel-leg `loss5`** cell's `throughput_gbps`, and
+hold `dropped_packets` here as the guard — a change that buys lossy-path throughput by dropping more on a shallow
+queue has not fixed anything, it has moved the cost. It does **not** by itself say which recovery rule is right;
+that is the next round's job, with the criteria written before the run.
+
 ### 4.175 P5's gates and the repeat policy, run on this tree (2026-11-09)
 
 The closing half of §12 is a set of gates, and a gate that is not run is a claim. All of them on the current

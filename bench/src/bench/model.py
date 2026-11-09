@@ -783,6 +783,13 @@ CONDITIONS: dict[str, Condition] = {
         "a long round trip",
         ("rate", "1000mbit", "delay", "2ms", "limit", "4000"),
     ),
+    "rate100_shallow": Condition(
+        "rate100_shallow",
+        "a 100 Mbit uplink whose queue is ~11 ms deep: shallow enough that a "
+        "sender without a loss response overruns it, so the drops are the "
+        "sender's own rate rather than the shaper's",
+        ("rate", "100mbit", "delay", "20ms", "limit", "100"),
+    ),
     "loss1_rate100": Condition(
         "loss1_rate100",
         "a 100 Mbit uplink that also loses packets (the lossy-WAN case)",
