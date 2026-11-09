@@ -377,6 +377,51 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.210 B is fixed: `send_gso` was fragmenting every lane's first stream packet (2026-11-10)
+
+§4.209 left two questions: which field of the refused datagram was wrong, and why only the first packet of a lane. The
+bytes answered both. What the client posted was a 17-byte credit followed by a 74-byte stream packet; what the server
+refused was a **17-byte datagram whose flags said `stream`** — the first seventeen bytes of the 74-byte packet — plus a
+`len=6` fragment of the same packet in the same second. A packet cut into pieces of the credit's length is not a decode
+bug: it is `UDP_SEGMENT`.
+
+**The bug, in `SendBatch::send_gso`.** It sized its segments from the **first** span, counted the spans that matched
+that size, and then allowed one "shorter piece at the end" — checking only that it *was* the last one, never that it was
+shorter. A run whose second datagram is *longer* than the first (the opening run of every lane: 17-byte credit, then the
+first stream packet) therefore went out with `UDP_SEGMENT = 17`, and the kernel split the stream packet into 17-byte
+fragments. The receiver refused them as `malformed_decode`, one lane at a time, and the number they carried — zero —
+was never seen. **That is why the accepting end's first sighting was always 1 and why the cumulative frontier stayed at
+zero for every product lane's whole life** (§4.182).
+
+**The fix is one condition**: the tail must be *shorter* than the segment, or the batch is refused and the caller falls
+back to one datagram per span. The test pins it (`a_longer_tail_is_refused_so_the_caller_sends_it_whole`).
+
+**Before and after, on the artifact** (`rr-1`, clean path, `MOLEHILL_TRACE_ZERO`; traces are out of the tree):
+
+| reading | before | after |
+|---|---|---|
+| `malformed_decode` refusals on a 13-lane run | **13** | **0** |
+| server `first_seen` | 1, on every lane | **0, on all 90 lane-seconds** |
+| client `own_below` (the frontier) | 0, forever | **11 017 / 12 934 / 15 008 / …**, within one or two of what the peer reports |
+
+**And the cell, for the first time, reads healthy at `--scale 2`** — three arms, three rounds, `loss5`, tunnel leg:
+
+| arm | `mhd_lane_dup_pct` | `throughput_gbps` | `rtt_p99_ms` |
+|---|---|---|---|
+| candidate (with the fix) | 13.0 / 13.3 / 54.0 | **0.425 / 0.542 / 0.467** | 2 032 / 1 419 / 1 405 |
+| candidate twin | 18.4 / 12.3 / 13.3 | 0.361 / 0.413 / 0.432 | 2 184 / 1 724 / 1 262 |
+| pre-change binary | 16.1 / 14.0 / 12.5 | 0.501 / 0.515 / 0.420 | 1 395 / 1 502 / 1 404 |
+
+The pre-registered guard is `throughput_gbps ≥ 0.3628`; **every candidate round clears it**, against the four reverted
+attempts that read 0.055–0.118. **What this run does not say**: that the fix caused the throughput. The pre-change
+binary read 0.42–0.52 in the same run, and the storm was bistable before, so the honest statement is that the cell is
+healthy *now* on both binaries and the fix's own mechanism is proven separately (the frontier, above). What the fix
+does establish is that a lane's recovery is no longer starting from a hole at number zero.
+
+**B's completion criteria**: `first_seen == 0` on every lane — **met**; `below` advancing — **met**; the cell's metrics
+moving — **the cell is healthy and inside its guard**, with the attribution caveat above. A (the recovery-loop
+re-architecture) is next, and it is the one that has to be judged on the storm when the storm is present.
+
 ### 4.209 B, first half: the missing number zero is a decoder refusal, not a lost packet (2026-11-10)
 
 The question was where the dialer's number-0 packet goes on the product path, given the accepting end's first sighting
