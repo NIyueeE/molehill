@@ -367,7 +367,58 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.160 The loop's work is finished, and here is exactly what that means (2026-11-08)
+### 4.161 Auditing the plan for performance items I had not closed: two found, one measured (2026-11-09)
+
+The goal was marked complete and then a direct question asked whether the plan was really all handled. It was
+not: re-reading the original against the record found **three stale statements and two unclosed performance
+items**, all in the performance half.
+
+**The stale statements, now fixed.** §0's row for phase 6 still said "so this one has to wait for an
+`l4-plain` baseline record" — that baseline exists (15.840 Gbit/s, §4.143) and the judgement is done (96.8 %,
+§4.146) — *and* it repeated §4.157's wrong default ("`molehill` inherits `noise_data=True`, not the product
+default"), which is backwards. The two closing paragraphs of §0 still said "the human has decided: attack the
+25 µs" (§4.145 closed it as declined) and "whether 2.2 % per lane is acceptable must be decided by a human"
+(§4.153 decided: keep 1 ms). **I had updated the table row and left the prose that said the opposite**, which
+is the same failure as §4.157 in a different form: fixing the copy I was looking at instead of every copy.
+
+**Unclosed performance item 1: §6.4's "measure `loss1`/`loss5`/`jitter` in the same round".** Only `loss1`
+had been run. `loss5` is now measured on `rr-1`, four arms, six rounds, 28 samples, 1 732 s:
+
+| arm | `rtt_p50_ms` | `rtt_p99_ms` | `rate_per_s` |
+|---|---|---|---|
+| `l4-plain` (mhd) | 200.64 | 865.11 | 3.95 |
+| `l4-plain~aa` (its twin) | 200.65 | **794.82** | 4.05 |
+| `frp` | 200.79 | 907.64 | 3.90 |
+| `rathole` | 200.61 | 810.65 | 4.10 |
+
+**The arms are indistinguishable, and the proof is the twin**: mhd differs from itself by 8.8 % on p99, which
+is wider than the whole spread across arms (795–908). The model says why — this cell's `setup_p50_ms` needs
+**1 075 rounds** to resolve 15 %, and its `rtt_samples` resolve 6.8 % against a 0 % floor. So `rr-1`+loss5
+**cannot** answer the carrier question, exactly as `rr-1`+loss1 could not (§4.135). What it does answer:
+nothing regressed beyond noise.
+
+**Unclosed performance item 2, and this one is a real gap: §10.4's "the existing `loss5` latency *and*
+throughput advantage must not be erased".** That advantage (3.7× throughput, 31 % tighter tail) was measured
+on the **`timeline`** scenario with `MOLEHILL_DATA_CARRIER` pinning each carrier — a different cell from
+anything run in this session. At `--scale 0.05` it is 358 s per arm-round, so two carrier pins × four rounds is
+about **48 minutes**, and it has **not been run**. Until it is, the claim that this session's changes (the
+drain loop, the one-range probe, the RACK revert) left the loss5 advantage intact **rests on bulk-n and loss1
+only**.
+
+**A third item, measurement-side: §3.4's protocol metrics were never registered.** §3.4 asks for
+`transport_open_p99_us`, `transport_first_byte_p99_us`, `transport_recovery_p99_us` and
+`transport_stream_error_rate_pct` with unit, direction, denominator, applicable workloads, materiality,
+selfcheck and bilingual docs. The model holds **37 metrics and none of them is a `transport_*` one**, and no
+scenario invokes the harness. The numbers *are* reported, by the harness's own NDJSON, so §10.3's "report L1/L2
+independently" is satisfied in substance — but not in the form §3.4 specified, and they cannot appear in a run
+file or the gate. `HANDOFF.md` §0 line "protocol metrics and the runner workload are not wired yet" has been
+true since the plan was approved.
+
+**So the honest answer to "is it all handled": no.** Two items remain and one is a real verification gap:
+`loss5` on the `timeline` cell (~48 min), `jitter` (§6.4 names it, never run), and the protocol metrics'
+registration (§3.4). The first two are measurements; the third is a small feature.
+
+### 4.160 The loop's work is finished, and here is exactly what that means (2026-11-08)### 4.160 The loop's work is finished, and here is exactly what that means (2026-11-08)
 
 Every section of the plan now carries a status, and no row of its progress table says "not started" — the
 last one, phase 4, was a *standing process* rather than a phase and now says so with the four times this
