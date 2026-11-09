@@ -377,6 +377,46 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.185 The storm is reproducible, the pre-registration is written, and §4.182's contradiction dissolves (2026-11-09)
+
+**Reproduction.** `cost`, tunnel leg, `loss5`, arm `l4-mux8` (eight lanes), `--scale 1`, three rounds plus the A/A
+twin, 419.2 s. One lane went into the regime and its peers did not:
+
+| lane | sent | ack | dup | late | pfx | num |
+|---|---|---|---|---|---|---|
+| 1054200012 | 1 570 MB | 479 MB | **68.6 %** | 50 MB | 176 MB | 333 MB |
+| 1054200008 | 1 020 MB | 862 MB | 13.8 % | 98 MB | 158 MB | 812 MB |
+| 1054200011 | 1 063 MB | 900 MB | 14.7 % | 114 MB | 178 MB | 840 MB |
+| 1054200014 | 1 028 MB | 860 MB | 15.8 % | 121 MB | 186 MB | 796 MB |
+
+Cell `throughput_gbps` 0.249 / 0.3749 / 0.3548 (twin 0.3035 / 0.4058), `retrans_segments` 182–208,
+`dropped_packets` 47 476–62 646, `wire_per_visitor_byte` 1.17–1.19. So the doubling of lanes does not *guarantee*
+the storm, but it produces it often enough to judge a change against — and the lane-level reading names which lane
+paid.
+
+**And the contradiction §4.182 recorded dissolves.** It said `flight` at 8.4 MB against `cwnd` at 102 KB could not
+be explained: either something reduced `cwnd` (nothing does) or the flight counted bytes no window admitted. It is
+the second, and now with a mechanism:
+
+- a record whose bytes the peer already holds stays in the flight while neither the cumulative frontier (dead,
+  §4.183) nor the 64-number bitmap nor that stream's prefix can reach it;
+- a repair is admitted regardless of the window, so it can be *sent* while the window is closed.
+
+So `flight` is "records we have not been allowed to forget", not "bytes the window admitted", and on a path where
+retirement is blind it grows to whatever the peer already has. That is why `cwnd − flight` sits at zero on a lane
+that is delivering at 479 MB over a minute.
+
+**The pre-registration is in the plan**, under D3, written before any code: the cell above, `throughput_gbps` as
+the primary against both its materiality floor and the run's own A/A floor, eight guards (worst-lane `dup`,
+receiver `arrdup`, `late`, `retrans_segments`, `dropped_packets`, `rtt_p99_ms`, `cpu_s_per_gbit`, `wedge_count`),
+two cross-guards (`bulk-n`, `rate1000`), and a whole-revert rule.
+
+**The candidate is byte-range acknowledgement** — the ack names the byte ranges the receiver holds above its
+contiguous prefix, and the sender retires any record wholly covered by them. That attacks the chain at its root
+(step 3: no out-of-order evidence). The alternative, admitting repairs against the window, only silences the
+amplifier (step 5) and is recorded as the fallback for the case where this one is falsified — not as a cheaper
+first try, because it leaves every lane re-sending what the peer already has.
+
 ### 4.184 The receiver's duplicate share: the re-sends really are bytes it already held (2026-11-09)
 
 §4.183 left one question: is the carrier re-sending data the peer already holds, or carrying real loss? The
