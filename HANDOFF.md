@@ -367,6 +367,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.178 The lossy-path penalty is a defect, not a trade-off: doubling the flow does not help (2026-11-09)
+
+§4.177 closed P4 as "no controller, mechanism named", and the entry after it framed the lossy-path cost as
+something the product could accept and document. **Both of those were too generous, and the human's objection —
+"isn't this a hard defect?" — is the correct reading.** The test that decided it was cheap: run the same cell
+with the stage twice as long, because if the window is merely growing slowly, a longer flow gives it time.
+
+| stage | `throughput_gbps` | `rtt_p99_ms` | `retrans_segments` |
+|---|---|---|---|
+| 60 s, six rounds, with A/A | 0.2886 (0.242–0.403), twin 0.3332 | 2 038 | 153 |
+| **120 s** (`--scale 2`), single arm | **0.2306** | 1 462 | 69.5 |
+
+**Doubling the duration did not raise throughput.** The 120 s reading is single-arm with no twin, so the honest
+statement is "not higher" rather than "lower" — but the hypothesis that the penalty is a transient of a short
+window was that the window would climb, and it did not. So the penalty is a **level at about a quarter of clean
+throughput, independent of how long the flow runs**, which is the shape of a defect rather than of a trade-off
+someone chose.
+
+**And the mechanism is not yet explained, which is the part I have to be careful about.** My arithmetic said
+additive growth adds 1 349 B per round trip — 6.7 KB/s at 200 ms — so over 120 s the window should have gained
+~800 KB and the rate with it. It did not. So either `cwnd` does not grow the way I read the code, or something
+else caps it near 1.5 MB. §4.174's series reached 1 471 759 and stopped there (that value was both p90 and max),
+which is consistent with a plateau that my model of the growth rule does not predict.
+
+**What that leaves.** The classification changes: this is an **unfixed defect** — a carrier that carries a
+quarter of its capacity on a path that loses 5 %, for as long as the flow lasts, and that drops two orders of
+magnitude more than its peers on a shallow queue (§4.176). What does *not* change is that no controller has been
+written and none should be written on the current evidence, because the next question is smaller and comes
+first: **why does `cwnd` plateau at 1.5 MB on that path?** That is one stats run at `--scale 2` with
+`RUST_LOG=molehill=debug`, reading the same per-lane series that produced §4.174, and it is the precondition for
+either a fix or an honest "we do not know".
+
+**Recording the reversal rather than the conclusion.** Two framings in a row were wrong here — "accept and
+document" and then "it is a transient" — and both were mine, made before the cheap test that settled it. The
+lesson is the one this file already carries, applied to a judgement instead of a number: **test the classification
+before putting it to someone as a decision.**
+
 ### 4.177 P4 closes without a change: the candidate rule is arithmetically dead, and the real fix is a redesign (2026-11-09)
 
 §4.176 built the cell that makes "should the window react?" falsifiable. Before spending a run on a candidate,
@@ -7371,7 +7408,13 @@ of it. State at revision 2 of that objective:
 - **P5 done** (§4.175): `just check`, `just interop`, `just l3-accept`, three full integration runs and twenty
   runs of the once-flaky cell, plus the TCP carrier's suite at 435 passed — all on the tree that carries the
   changes.
-- **P4 closed without a change, and that is the finding** (§4.176–§4.177). The shallow-queue cell now exists and
+- **The lossy-path penalty is an unfixed defect** (§4.178). Doubling the flow from 60 s to 120 s did not raise
+  throughput (0.2306 against 0.2886, single arm, so "not higher"), so the quarter-rate is a level rather than a
+  transient of a short window. Two earlier framings — "accept and document" and then "it is a transient" — were
+  mine and both were wrong; the cheap test that settled it should have come first.
+- **P4 still closes without a controller** (§4.176–§4.177), on a narrower basis: no controller until the smaller
+  question is answered — why `cwnd` plateaus near 1.5 MB on that path, which my reading of the growth rule does
+  not predict. One stats run at `--scale 2` answers it. The shallow-queue cell now exists and
   shows mhd dropping two orders of magnitude more than its peers while carrying 19 % less — so loss does follow
   its own rate. The cheap recovery rule is arithmetically dead (a clean window at 5 % loss is 0.6 % likely at a
   hundred packets), and the growth rate is 6.7 KB/s at 200 ms, so the window is nearly frozen at whatever value
