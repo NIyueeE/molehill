@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.213 The repair budget halves the drops and misses, and the reason points somewhere else (2026-11-10)
+
+The budget from §4.212 — repairs may have at most `cwnd/2` outstanding, counted apart from `flight`, never blocked —
+was implemented and measured on the cell the defect lives in:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0955 / 0.0952 | 60 / 16 |
+| frp | 0.0952 / 0.0951 | 16 / 16 |
+| molehill (with the budget) | **0.0800 / 0.0627** | **1 373 / 1 068** |
+| molehill twin | 0.0725 / 0.0843 | 1 228 / 7 078 |
+
+Before the budget the same cell read 0.0829 / 0.0838 with **2 261 / 2 465** drops. So the primary moved **in the right
+direction and by half**, and that is not enough: the criterion is *the same order as the peers' 16–17*, and 1 068–1 373
+is still two orders away; the throughput guard (≥ 95 % of a peer = 0.090) misses as well. **Reverted whole**, and the
+unit suite never even noticed — the five-percent-loss transfer still delivered, so the budget does not deadlock the way
+the window gate did.
+
+**What the number says instead.** A repair budget bounds one of the two streams that fill the queue, and the other one
+is the one nobody has touched: **new data**. The window on this cell is around **2.3 MB** — roughly 1 700 packets — on a
+path whose queue is a hundred-odd packets deep. Nothing in this carrier reduces that window when packets are lost: it
+grows on acknowledgements and it is cut by nothing. On a deep path that is merely optimistic; on a shallow one it
+*guarantees* overflow, and every drop this cell records is that guarantee being kept.
+
+**So the missing mechanism is a loss response, not a repair budget.** mhd has never had one — the summary in the plan
+says it plainly ("nothing cuts cwnd on loss"), and four rounds of work on the *recovery* side were changes to what
+happens after a declaration while the declaration's *cause* sat untouched on the sending side. The textbook rule is a
+halving per round trip on a declared loss, and it is the next candidate; it is a different mechanism from every attempt
+so far, so it gets its own pre-registration.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.212 A's first part dies in the unit test, which is cheaper than the bench (2026-11-10)
 
 A's pre-registration says repairs must be inside the congestion window. Implemented literally — the range picker
