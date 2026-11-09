@@ -460,8 +460,17 @@ impl Recovery {
     /// records (a bare finish) are left to the number path, because a prefix of
     /// `offset` says the bytes arrived and not that the peer saw the close.
     ///
-    /// Answers the bytes retired, for the connection's own accounting.
-    pub(crate) fn confirm_prefix(&mut self, stream: u32, prefix: u64) -> u64 {
+    /// Answers `(freed, late)`: the bytes this removed from the flight total, and
+    /// how many of them belonged to a record that had **already been declared
+    /// lost**.
+    ///
+    /// The second number is the one the ledger needs (`Conn::apply_ack`). A declared
+    /// loss leaves the flight but keeps its record, so `take` retires it without
+    /// touching `flight_bytes` — which is why the first number alone under-counts
+    /// what the peer confirmed, and why the duplicate share built on it would look
+    /// larger than it is. Those bytes are confirmed all the same: the peer has them,
+    /// by the *other* path, after this end had already decided it did not.
+    pub(crate) fn confirm_prefix(&mut self, stream: u32, prefix: u64) -> (u64, u64) {
         let confirmed: Vec<u32> = self
             .in_flight
             .iter()
@@ -475,13 +484,21 @@ impl Recovery {
             .map(|(number, _)| *number)
             .collect();
         let before = self.flight_bytes;
+        let mut late = 0u64;
         for number in confirmed {
+            // Read the record before `take` removes it: `lost_at` is what separates
+            // "this end was still waiting for the number" from "it had given up".
+            if let Some(sent) = self.in_flight.get(&number)
+                && sent.lost_at.is_some()
+            {
+                late = late.saturating_add(sent.range.map_or(0, |range| u64::from(range.len)));
+            }
             // `take` is the one place that knows how to remove a record without
             // double-retiring a declared loss, so the accounting stays in one pair
             // of hands.
             let _ = self.take(number);
         }
-        before.saturating_sub(self.flight_bytes)
+        (before.saturating_sub(self.flight_bytes), late)
     }
 
     /// Drop one packet's bytes from the flight total.
@@ -1079,16 +1096,16 @@ mod tests {
 
         // A prefix that ends inside the second range confirms only the first: a
         // partly confirmed range is still owed from its own first byte.
-        assert_eq!(recovery.confirm_prefix(1, 180), 100);
+        assert_eq!(recovery.confirm_prefix(1, 180), (100, 0));
         assert_eq!(recovery.flight_bytes(), 200, "the partial range stays");
         assert_eq!(recovery.in_flight(), 2);
 
         // Another stream's records are not this stream's business.
-        assert_eq!(recovery.confirm_prefix(9, 10_000), 0);
+        assert_eq!(recovery.confirm_prefix(9, 10_000), (0, 0));
         assert_eq!(recovery.flight_bytes(), 200);
 
         // The rest of the stream confirmed: everything the prefix covers goes.
-        assert_eq!(recovery.confirm_prefix(1, 300), 200);
+        assert_eq!(recovery.confirm_prefix(1, 300), (200, 0));
         assert_eq!(recovery.flight_bytes(), 0);
         assert_eq!(recovery.in_flight(), 0);
     }
@@ -1113,8 +1130,9 @@ mod tests {
 
         // The prefix now covers both ranges. The lost record contributes nothing
         // to the flight — it left when it was declared lost — and must not be
-        // subtracted a second time.
-        assert_eq!(recovery.confirm_prefix(1, 200), 100);
+        // subtracted a second time; it *is* reported back as a late confirmation,
+        // because the peer had those bytes after this end had given up on them.
+        assert_eq!(recovery.confirm_prefix(1, 200), (100, 100));
         assert_eq!(recovery.flight_bytes(), 0);
         assert_eq!(recovery.in_flight(), 0);
         assert_eq!(

@@ -389,8 +389,9 @@ same report that prints `cwnd` so the two describe one interval:
 | field | what it answers |
 |---|---|
 | `sent` / `rep` / `pkt` | bytes handed to packets, how many of them were a range already sent, and how many packets carried them — `rep` as a percentage is the duplicate share §4.179 said nobody could compute |
-| `ack` / `num` / `pfx` | bytes the peer confirmed, split by the path that confirmed them: the packet-number block, or the stream byte prefix |
-| `late` | confirmed bytes that arrived **after** the lane had declared the packet lost — the size of the spurious-loss problem |
+| `ack` | stream bytes the peer confirmed, counted from the **stream's frontier**: a byte that crossed the wire twice is one byte of delivery |
+| `num` / `pfx` | **record** bytes retired by the packet-number block, and by the stream byte prefix — `pfx` being the path that does not grow the window |
+| `late` | of those, the records that had already been declared lost: a declaration the path did not support, or one whose range a repair then delivered |
 | `loss` = `Nt` / `Nm` | declarations by evidence: N later packets seen, versus the timer finding live records older than the reordering window |
 | `probe` | timer firings that re-sent one range because nothing was stale |
 | `grow` | how much `cwnd` actually gained in the second |
@@ -414,6 +415,16 @@ same report that prints `cwnd` so the two describe one interval:
    process-wide counter has a `buffer` class now, and the per-lane one has `refus=b`. The tie-break keeps
    `credit` winning a three-way tie, so the long-standing number still means what it meant for the two cases it
    could already tell apart.
+
+**A third finding is about this entry's own first draft.** The ledger began by counting *records*: `acked` was
+the sum of every retired record's bytes. The repaired-byte test then read `ack=9541` for an 8 192-byte payload,
+because a repaired range is two records and both were retired — the repair by number, the original by the prefix
+that the repair's arrival moved. That is not a duplicate delivery, it is one delivery counted twice, and a
+duplicate share computed from it would have been off by exactly the number it exists to measure. `ack` is now
+the **stream frontier's** advance, which cannot be fooled that way, and the record counts stayed as `num`/`pfx`
+where they belong: they answer "which path retired the record", not "how much was delivered". The lesson is the
+one §4.179 already wrote down — a plausible number is not a checked one — and the test that caught it is
+`a_repaired_byte_crosses_the_wire_twice_and_is_counted_once`.
 
 **What it costs, and why it is not behind the switch.** Two adds per data packet on the send path, a match per
 stopped pass, and nothing else: no clock read, no allocation, no lock. It is *not* gated on

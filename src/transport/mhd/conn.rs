@@ -569,22 +569,25 @@ pub(crate) struct SendLedger {
     /// Packets that carried stream bytes.
     sent_packets: u64,
     /// Stream bytes the peer confirmed, which is the delivery rate's numerator.
+    ///
+    /// Counted from the **stream's frontier**, not from the records: a byte that
+    /// crossed the wire twice is one byte of delivery, and adding up retired records
+    /// would count it twice — once when the repair was acknowledged, once when a
+    /// prefix finally covered the original. The frontier cannot be fooled that way,
+    /// which is why this is the number every ratio here is taken against.
     acked_bytes: u64,
-    /// Of those, the ones a packet-number block named.
+    /// Record bytes retired by the packet-number block, by the stream byte prefix.
+    ///
+    /// Record bytes rather than stream bytes: a repair and its original are two
+    /// records of one range, and this pair says which path retired which record —
+    /// the accounting question, `pfx` being the path that does *not* grow the window.
     acked_by_number: u64,
-    /// Of those, the ones the peer's byte prefix retired.
-    ///
-    /// The second path, and the one that does **not** grow the window: it frees a
-    /// record the number frontier can no longer name, and `apply_ack` never feeds
-    /// it to `Acked::bytes`. Reporting it apart is what says whether that omission
-    /// matters at the scale the lane runs at.
     acked_by_prefix: u64,
-    /// Of those, the ones acknowledged *after* the packet had been declared lost.
+    /// Of those, the ones whose record had already been declared lost.
     ///
-    /// A declaration the path did not support: the original arrived, and the lane
-    /// had already queued and sent its range again. Each one is a duplicate the
-    /// carrier paid for on its own, so the count is the size of the spurious-loss
-    /// problem rather than a symptom of it.
+    /// A declaration the path did not support, or one whose range a repair then
+    /// delivered: either way this end had given up before the bytes were confirmed,
+    /// and the two cases are told apart by which path retired the record.
     acked_late: u64,
     /// Loss declarations by the evidence that named them: a later packet seen, or
     /// the timer finding nothing fresh to probe.
@@ -621,10 +624,19 @@ impl SendLedger {
         self.sent_packets = self.sent_packets.saturating_add(1);
     }
 
-    /// One retired record, from whichever acknowledgement named it.
-    fn note_acked(&mut self, bytes: u64, late: bool) {
+    /// Stream bytes the peer confirmed, from the frontier that moved to make them
+    /// confirmed.
+    fn note_delivered(&mut self, bytes: u64) {
         self.acked_bytes = self.acked_bytes.saturating_add(bytes);
-        self.acked_by_number = self.acked_by_number.saturating_add(bytes);
+    }
+
+    /// One retired record, from whichever acknowledgement named it.
+    fn note_retired(&mut self, bytes: u64, by_prefix: bool, late: bool) {
+        if by_prefix {
+            self.acked_by_prefix = self.acked_by_prefix.saturating_add(bytes);
+        } else {
+            self.acked_by_number = self.acked_by_number.saturating_add(bytes);
+        }
         if late {
             self.acked_late = self.acked_late.saturating_add(bytes);
         }
@@ -3246,12 +3258,15 @@ impl Conn {
                 None => 0,
             };
             self.buffered = self.buffered.saturating_sub(moved);
+            // The frontier's own advance is what the peer confirmed — see
+            // `SendLedger::acked_bytes` for why a record count cannot stand in for it.
+            self.ledger.note_delivered(moved);
             // `lost_at` survives `take`, so this is the one place that can tell a
             // packet confirmed in its own right from one confirmed **after** the
             // lane had already declared it lost and queued the range again: the
             // second is a duplicate this carrier paid for on its own judgement.
             self.ledger
-                .note_acked(u64::from(range.len), sent.lost_at.is_some());
+                .note_retired(u64::from(range.len), false, sent.lost_at.is_some());
         }
         // The byte prefix is the authority on this stream's frontier, because
         // it cannot stall the way the range acknowledgements can: a packet
@@ -3265,6 +3280,9 @@ impl Conn {
             let moved = state.send.advance_to(ack.prefix);
             state.acknowledged = true;
             self.buffered = self.buffered.saturating_sub(moved);
+            // The prefix moves the same frontier the number path does, so its
+            // delivery is counted the same way and only once.
+            self.ledger.note_delivered(moved);
         }
         // **And the same confirmation retires the recovery records it covers.** The
         // prefix is the only acknowledgement that cannot stall on a lost packet
@@ -3275,13 +3293,22 @@ impl Conn {
         // `buffered` is not touched again: `advance_to` above already released those
         // bytes from the stream's buffer, and the flight is a separate total.
         if ack.prefix > 0 {
-            let retired = self.recovery.confirm_prefix(ack.stream, ack.prefix);
+            let (freed, late) = self.recovery.confirm_prefix(ack.stream, ack.prefix);
             // The second confirmation path, kept apart on purpose: these bytes are
             // **not** in `Acked::bytes`, so they free the flight without growing
             // the window. Whether that omission matters is a measurement, not a
             // reading of the code — this is the counter that decides it.
-            self.ledger.acked_by_prefix = self.ledger.acked_by_prefix.saturating_add(retired);
-            self.ledger.acked_bytes = self.ledger.acked_bytes.saturating_add(retired);
+            //
+            // `freed` alone would under-count what the peer confirmed: a record
+            // already declared lost left the flight then, so retiring it frees
+            // nothing, and its bytes arrive here as `late`. Both are confirmed all
+            // the same, which is why the ledger adds them together and reports the
+            // late part separately.
+            // Two populations, counted separately: the records this end was still
+            // waiting for, and the ones it had already declared lost. `freed` is the
+            // first (they carried the flight total), `late` the second.
+            self.ledger.note_retired(freed, true, false);
+            self.ledger.note_retired(late, true, true);
         }
         // A loss only rewinds the send point: the bytes are still in the
         // buffer, so the next pass carries them again from the same offset.
@@ -5031,6 +5058,54 @@ mod tests {
         );
         assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
         assert_eq!(link.a.cwnd, before, "the window is exactly where it was");
+    }
+
+    /// A prefix that covers a declared loss confirms those bytes, and says they were late.
+    ///
+    /// Retiring a record that had already been declared lost frees nothing — it left
+    /// the flight at the declaration — so a ledger built on the freed count alone
+    /// would under-count what the peer confirmed by exactly the bytes this end had
+    /// given up on, and the duplicate share built on it would look larger than it is.
+    #[test]
+    fn a_prefix_over_a_declared_loss_counts_those_bytes_as_late() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(2_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        let mut buf = Vec::new();
+        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+            link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+        }
+        // The timer gives up on both records; nothing is pumped, so nothing is
+        // re-sent and the ledger's send side stays where it was.
+        let (_, declared) = link.a.on_timeout(now + Duration::from_secs(2));
+        assert_eq!(declared, 2, "both records are stale");
+
+        let len = u64::try_from(bytes.len()).unwrap();
+        link.a.apply_ack(
+            now,
+            super::wire::Ack {
+                largest: 1_000,
+                below: 0,
+                bits: 0,
+                stream: stream.id,
+                prefix: len,
+            },
+            false,
+        );
+
+        let ledger = link.a.take_ledger();
+        assert_eq!(
+            ledger.acked_by_prefix, len,
+            "the prefix confirmed every byte"
+        );
+        assert_eq!(ledger.acked_by_number, 0, "the block named none of them");
+        assert_eq!(
+            ledger.acked_late, len,
+            "and every byte had been given up on before it arrived: {ledger}"
+        );
+        assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
     }
 
     /// A finished flow stops growing, and stops accumulating.
