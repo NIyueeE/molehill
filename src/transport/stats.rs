@@ -762,14 +762,20 @@ pub(crate) fn note_shared() {
 
 /// Refused writes, by which bound refused.
 ///
-/// Three bounds can hold a write, and only two of them were ever visible. The
+/// Four bounds can hold a write, and each waits for a different thing. The
 /// congestion window waits for an acknowledgement and the credit waits for the
-/// peer's reader; the third refuses new data when the oldest packet in flight is
-/// older than the retransmission timer, and a sender held by it has **no** backlog
-/// and **no** credit block — it looks idle while its writer is parked, which is
-/// exactly the shape of a stage that carries nothing.
+/// peer's reader; the buffer ceiling waits for the peer's frontier to pass bytes
+/// already queued; and the fourth refuses new data when the oldest packet in
+/// flight is older than the retransmission timer, and a sender held by it has
+/// **no** backlog and **no** credit block — it looks idle while its writer is
+/// parked, which is exactly the shape of a stage that carries nothing.
+///
+/// `buffer` was invisible until it had a name: the refusal was classified by
+/// comparing two of the three minima that decide `room`, so a write held by
+/// `MAX_BUFFERED` was counted as held by the window (`HANDOFF.md` §4.179).
 static REFUSED_CREDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REFUSED_BUFFER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_AGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_CREDIT_OPENING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -778,6 +784,7 @@ pub(crate) fn note_refused(why: &str) {
     let counter = match why {
         "credit" => &REFUSED_CREDIT,
         "credit_opening" => &REFUSED_CREDIT_OPENING,
+        "buffer" => &REFUSED_BUFFER,
         "window" => &REFUSED_WINDOW,
         _ => &REFUSED_AGED,
     };
@@ -1232,12 +1239,13 @@ fn report_phases() {
 fn report_starvation() {
     let credit = REFUSED_CREDIT.swap(0, std::sync::atomic::Ordering::Relaxed);
     let window = REFUSED_WINDOW.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let buffer = REFUSED_BUFFER.swap(0, std::sync::atomic::Ordering::Relaxed);
     let aged = REFUSED_AGED.swap(0, std::sync::atomic::Ordering::Relaxed);
     let opening = REFUSED_CREDIT_OPENING.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if credit + window + aged + opening > 0 {
+    if credit + window + buffer + aged + opening > 0 {
         info!(
             credit,
-            window, aged, opening, "mhd-stats: writes refused, by the bound that refused"
+            window, buffer, aged, opening, "mhd-stats: writes refused, by the bound that refused"
         );
     }
     let polled = VISITORS_POLLED.swap(0, std::sync::atomic::Ordering::Relaxed);

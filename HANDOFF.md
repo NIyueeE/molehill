@@ -377,6 +377,55 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.180 D1: the per-lane ledger, and the instrument defect it found on the way (2026-11-09)
+
+The plan's D1 asked for evidence that can tell a window problem from a scheduler problem, an
+acknowledgement problem, a repair problem and a counting problem. Three of those had no counter at all, and the
+one that did was aggregated across lanes.
+
+**What the window line now carries, per lane, once a second.** A `SendLedger` on the connection, taken by the
+same report that prints `cwnd` so the two describe one interval:
+
+| field | what it answers |
+|---|---|
+| `sent` / `rep` / `pkt` | bytes handed to packets, how many of them were a range already sent, and how many packets carried them — `rep` as a percentage is the duplicate share §4.179 said nobody could compute |
+| `ack` / `num` / `pfx` | bytes the peer confirmed, split by the path that confirmed them: the packet-number block, or the stream byte prefix |
+| `late` | confirmed bytes that arrived **after** the lane had declared the packet lost — the size of the spurious-loss problem |
+| `loss` = `Nt` / `Nm` | declarations by evidence: N later packets seen, versus the timer finding live records older than the reordering window |
+| `probe` | timer firings that re-sent one range because nothing was stale |
+| `grow` | how much `cwnd` actually gained in the second |
+| `refus` = `w`/`b`/`c`/`a` | writes refused by the window, the buffer ceiling, the peer's credit, the age gate |
+| `stop` = `none`/`quiet`/`closed`/`other` | passes that built nothing, by reason — the per-lane shape of the process-wide `stats::note_none_reason` table |
+
+**Two findings, and one of them is a defect in the instrument rather than in the carrier.**
+
+1. **The byte prefix does not grow the window, and now the line says how much it retires.** `confirm_prefix`
+   frees recovery records the number frontier can no longer name — the §4.108 escape hatch — but it returns its
+   byte count to nobody, and `apply_ack` never fed it to `Acked::bytes`, so those bytes buy no window. That may
+   be right (they are not evidence of a larger pipe) or wrong (they are evidence the peer has the data), and the
+   point of `pfx` is that the question is now measurable instead of arguable. `a_prefix_confirmation_retires_bytes_without_growing_the_window`
+   pins the current behaviour with a block whose frontier is pinned at zero while a thousand later packets
+   arrived — the state a hole in another stream produces.
+2. **A write refused by `MAX_BUFFERED` was counted as refused by the window.** `write` computes
+   `room = credit.min(window).min(held)` and then classified the refusal by comparing `credit` against `window`
+   only, so the third minimum was invisible: every buffer refusal was reported as a window refusal. On a lossy
+   path that is the difference between "acknowledgements are not coming back" and "they are coming back too
+   slowly for what was admitted", and §4.174's reading of the cell leaned on exactly that distinction. The
+   process-wide counter has a `buffer` class now, and the per-lane one has `refus=b`. The tie-break keeps
+   `credit` winning a three-way tie, so the long-standing number still means what it meant for the two cases it
+   could already tell apart.
+
+**What it costs, and why it is not behind the switch.** Two adds per data packet on the send path, a match per
+stopped pass, and nothing else: no clock read, no allocation, no lock. It is *not* gated on
+`MOLEHILL_MHD_STATS`, because a unit test runs with the switch off and counters that only move under a switch
+are counters the tests cannot pin — and because the line that prints them is already inside the stats gate, so a
+production run pays the adds and never prints the line.
+
+**What D1 does not do, stated so it is not read as more.** It does not estimate a delivery rate (that is D3's
+estimator, built on `ack`), it does not decide which seconds count (D2 filters the series to intervals with a
+sustained backlog, which is what §4.179 says the plateau reading should have done), and it changes no behaviour:
+five new tests pin the accounting, and nothing in the repair, growth or scheduling paths was touched.
+
 ### 4.179 The plateau was an artifact of the stage ending, and the growth arithmetic was wrong too (2026-11-09)
 
 The plan was replaced with a D0–D5 version whose subject is this defect, not its classification. Before it could

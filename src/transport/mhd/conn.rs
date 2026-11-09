@@ -296,16 +296,26 @@ pub(crate) struct StreamHandle {
 
 /// Which bound refused a partial write.
 ///
-/// The two wait for different things: the congestion window waits for an
-/// acknowledgement, the peer's credit waits for its *reader*. A stream that
-/// stalls with the credit refusing is waiting on the far end's application, and
-/// nothing this connection sends will move it.
+/// The three wait for different things: the congestion window waits for an
+/// acknowledgement, the peer's credit waits for its *reader*, and the buffer
+/// ceiling waits for the peer's frontier to move past bytes this end already
+/// holds. A stream that stalls with the credit refusing is waiting on the far
+/// end's application, and nothing this connection sends will move it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
     /// This end's congestion window had no room in flight.
     Window,
     /// The peer's advertised credit had no room for new bytes.
     Credit,
+    /// `MAX_BUFFERED` had no room: the bytes are queued and unacknowledged, so the
+    /// writer waits on the peer's frontier rather than on a packet in flight.
+    ///
+    /// Its own variant because this case used to be reported as `Window`
+    /// (`credit.min(window).min(held)` keeps the smallest, and the classification
+    /// only compared two of the three). On a lossy path the difference decides
+    /// everything: a window refusal says acknowledgements are not coming back, a
+    /// buffer refusal says they are coming back too slowly for what was admitted.
+    Buffer,
     /// The oldest data packet is older than the retransmission timer, so nothing
     /// new may join a flight the timer cannot police.
     ///
@@ -533,6 +543,139 @@ type StreamKeys = (
 /// table" from being two different derivations.
 type Opened<'a> = (std::borrow::Cow<'a, [u8]>, Option<StreamKeys>);
 
+/// What one lane put on the wire, against what the peer confirmed — per lane.
+///
+/// The window line has always known how many bytes it *posted*; it never knew how
+/// many of those were a byte sent before. That difference is the first question a
+/// lossy path asks: a lane that re-sends a fifth of its bytes is paying for a
+/// recovery defect, not for a small window, and the two want opposite fixes. The
+/// process-wide counters cannot answer it — `stats::note_refused` and
+/// `stats::note_none_reason` sum every lane into one distribution, so four
+/// interleaved lanes read as one that oscillates (`HANDOFF.md` §4.179).
+///
+/// Every field is a count this end can produce from what it already holds: no new
+/// clock read, no new allocation, and two adds per packet on the send path.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SendLedger {
+    /// Stream bytes handed to packets, repairs included: everything that left.
+    sent_bytes: u64,
+    /// How many of those bytes were a range already sent once.
+    ///
+    /// `sent_bytes - sent_repair_bytes` is the new data the lane moved, and
+    /// `sent_repair_bytes` above it is the price of recovery. A carrier with a
+    /// large share here is not short of window; it is re-sending what the path
+    /// dropped, and the question becomes whether it had to.
+    sent_repair_bytes: u64,
+    /// Packets that carried stream bytes.
+    sent_packets: u64,
+    /// Stream bytes the peer confirmed, which is the delivery rate's numerator.
+    acked_bytes: u64,
+    /// Of those, the ones a packet-number block named.
+    acked_by_number: u64,
+    /// Of those, the ones the peer's byte prefix retired.
+    ///
+    /// The second path, and the one that does **not** grow the window: it frees a
+    /// record the number frontier can no longer name, and `apply_ack` never feeds
+    /// it to `Acked::bytes`. Reporting it apart is what says whether that omission
+    /// matters at the scale the lane runs at.
+    acked_by_prefix: u64,
+    /// Of those, the ones acknowledged *after* the packet had been declared lost.
+    ///
+    /// A declaration the path did not support: the original arrived, and the lane
+    /// had already queued and sent its range again. Each one is a duplicate the
+    /// carrier paid for on its own, so the count is the size of the spurious-loss
+    /// problem rather than a symptom of it.
+    acked_late: u64,
+    /// Loss declarations by the evidence that named them: a later packet seen, or
+    /// the timer finding nothing fresh to probe.
+    lost_by_threshold: u64,
+    lost_by_timer: u64,
+    /// Timer probes that re-sent one range because nothing was stale.
+    probes: u64,
+    /// Bytes the window grew by since the last report.
+    grown: u64,
+    /// Writes refused by each bound. `aged` is the flight-age gate, which refuses a
+    /// lane that has done nothing wrong except fall behind on acknowledgements;
+    /// `buffer` is the ceiling this end's own `MAX_BUFFERED` put on bytes the peer
+    /// has not confirmed.
+    refused_window: u64,
+    refused_credit: u64,
+    refused_buffer: u64,
+    refused_aged: u64,
+    /// Passes that built nothing, by reason — the per-lane shape of
+    /// `stats::note_none_reason`'s process-wide table.
+    stop_no_stream: u64,
+    stop_nothing_to_say: u64,
+    stop_closed: u64,
+    stop_other: u64,
+}
+
+impl SendLedger {
+    /// A packet carrying `len` stream bytes, `repair` if the range had been sent.
+    fn note_sent(&mut self, len: usize, repair: bool) {
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        self.sent_bytes = self.sent_bytes.saturating_add(len);
+        if repair {
+            self.sent_repair_bytes = self.sent_repair_bytes.saturating_add(len);
+        }
+        self.sent_packets = self.sent_packets.saturating_add(1);
+    }
+
+    /// One retired record, from whichever acknowledgement named it.
+    fn note_acked(&mut self, bytes: u64, late: bool) {
+        self.acked_bytes = self.acked_bytes.saturating_add(bytes);
+        self.acked_by_number = self.acked_by_number.saturating_add(bytes);
+        if late {
+            self.acked_late = self.acked_late.saturating_add(bytes);
+        }
+    }
+
+    /// The share of what left that was a range already sent once, in percent.
+    fn repair_share_pct(&self) -> u64 {
+        self.sent_repair_bytes
+            .saturating_mul(100)
+            .checked_div(self.sent_bytes)
+            .unwrap_or(0)
+    }
+}
+
+/// One line, so the window report stays one field wide.
+///
+/// The words are chosen to be read in place: `sent` and `ack` are the two sides of
+/// the duplicate question, `rep` is the answer as a percentage, `late` is how much
+/// of `ack` arrived after the lane had already decided the packet was lost, and
+/// `refus`/`stop` say which bound or budget ended the passes in this second.
+impl std::fmt::Display for SendLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sent={} rep={}({}%) pkt={} ack={} num={} pfx={} late={} \
+             loss={}t/{}m probe={} grow={} refus={}w/{}b/{}c/{}a \
+             stop={}none/{}quiet/{}closed/{}other",
+            self.sent_bytes,
+            self.sent_repair_bytes,
+            self.repair_share_pct(),
+            self.sent_packets,
+            self.acked_bytes,
+            self.acked_by_number,
+            self.acked_by_prefix,
+            self.acked_late,
+            self.lost_by_threshold,
+            self.lost_by_timer,
+            self.probes,
+            self.grown,
+            self.refused_window,
+            self.refused_buffer,
+            self.refused_credit,
+            self.refused_aged,
+            self.stop_no_stream,
+            self.stop_nothing_to_say,
+            self.stop_closed,
+            self.stop_other,
+        )
+    }
+}
+
 /// A connection between two of this carrier's endpoints.
 #[derive(Debug)]
 pub(crate) struct Conn {
@@ -631,6 +774,12 @@ pub(crate) struct Conn {
     /// above it. Only the first kind can unblock a stalled stream.
     repairs_at_base: u64,
     repairs_above: u64,
+    /// What this lane sent, what the peer confirmed, and why it stopped.
+    ///
+    /// Per lane, and reset once a second by the window line: the numbers are only
+    /// useful as *this* lane's series, and the process-wide totals this file used
+    /// to lean on cannot be divided back into lanes (`HANDOFF.md` §4.179).
+    ledger: SendLedger,
     /// Acknowledgements this end applied and attached, for the window line.
     acks_applied: u64,
     acks_attached: u64,
@@ -933,6 +1082,7 @@ impl Conn {
             last_ack_largest: 0,
             repairs_at_base: 0,
             repairs_above: 0,
+            ledger: SendLedger::default(),
             acks_applied: 0,
             acks_attached: 0,
             issued: 0,
@@ -1156,20 +1306,46 @@ impl Conn {
             // per packet — and a write the window accepted whole clocks nothing.
             self.unsent_at.get_or_insert_with(Instant::now);
             state.unsent_at.get_or_insert_with(Instant::now);
-            // Which bound refused, recorded because the two wait for different
+            // Which bound refused, recorded because the three wait for different
             // things: the congestion window waits for an acknowledgement, the
-            // peer's credit waits for its *reader*. A stream that stalls with
-            // its budget refusing is waiting on the far end's application, and
-            // nothing this connection does will move it.
-            // The age gate has already said why, if it is why.
+            // peer's credit waits for its *reader*, and the buffer ceiling waits for
+            // the peer's frontier. A stream that stalls with its credit refusing is
+            // waiting on the far end's application, and nothing this connection does
+            // will move it. The age gate has already said why, if it is why.
+            //
+            // Three minima, and the smallest is the one that refused: `room` is
+            // `credit.min(window).min(held)`, so comparing only two of them — as
+            // this did — reports every buffer refusal as a window refusal. The
+            // order of the comparisons is the tie-break, and `credit` still wins a
+            // three-way tie, so the long-standing counter keeps its old meaning for
+            // the two cases it could already tell apart.
             let refusal = if refused_by_age {
                 Refusal::Aged
-            } else if credit <= window {
+            } else if credit <= window && credit <= held {
                 Refusal::Credit
-            } else {
+            } else if window <= held {
                 Refusal::Window
+            } else {
+                Refusal::Buffer
             };
             self.last_refusal = Some(refusal);
+            // Per lane, beside the process-wide counter: four lanes summed into one
+            // line cannot say whether *this* writer was parked on the window or on
+            // the buffer (`HANDOFF.md` §4.179).
+            match refusal {
+                Refusal::Aged => {
+                    self.ledger.refused_aged = self.ledger.refused_aged.saturating_add(1);
+                }
+                Refusal::Buffer => {
+                    self.ledger.refused_buffer = self.ledger.refused_buffer.saturating_add(1);
+                }
+                Refusal::Credit => {
+                    self.ledger.refused_credit = self.ledger.refused_credit.saturating_add(1);
+                }
+                Refusal::Window => {
+                    self.ledger.refused_window = self.ledger.refused_window.saturating_add(1);
+                }
+            }
             // By bound **and** by class: an opening stream that is refused is the
             // arrival path paying for the bulk spine, and the reserve exists to make
             // that impossible. If this counter never moves, the reserve works and the
@@ -1177,6 +1353,7 @@ impl Conn {
             let opened = still_opening;
             crate::transport::stats::note_refused(match (refusal, opened) {
                 (Refusal::Aged, _) => "aged",
+                (Refusal::Buffer, _) => "buffer",
                 (Refusal::Credit, true) => "credit_opening",
                 (Refusal::Credit, false) => "credit",
                 (Refusal::Window, _) => "window",
@@ -1966,6 +2143,10 @@ impl Conn {
             // any of them costs the arrival its latency.
             !state.acknowledged,
         );
+        // What this packet cost the wire, and whether the range was new: the pair
+        // is the whole of the "is the lane re-sending itself" question, and it is
+        // recorded here because this is the one place a data packet leaves.
+        self.ledger.note_sent(len, repair);
         if let Some(state) = self.streams.get_mut(&id) {
             if repair {
                 // The range is on the wire again; what is still owed stays
@@ -2302,6 +2483,26 @@ impl Conn {
         // Counted here, once per pass that built nothing: the distribution of *why*
         // the pump stops is the number that says whether a budget or the scheduler's
         // walk is what keeps `flight` below the window (HANDOFF §4.58).
+        //
+        // **Per lane as well as process-wide.** The process-wide table is what mixed
+        // four lanes into one line and made "no eligible stream" look like a window
+        // problem; a lane that stops because it has nothing queued and a lane that
+        // stops because its window is shut are opposite findings, and only the
+        // per-lane copy can tell them apart (`HANDOFF.md` §4.179).
+        match reason {
+            "no eligible stream" => {
+                self.ledger.stop_no_stream = self.ledger.stop_no_stream.saturating_add(1);
+            }
+            "nothing to say" => {
+                self.ledger.stop_nothing_to_say = self.ledger.stop_nothing_to_say.saturating_add(1);
+            }
+            "connection closed" => {
+                self.ledger.stop_closed = self.ledger.stop_closed.saturating_add(1);
+            }
+            _ => {
+                self.ledger.stop_other = self.ledger.stop_other.saturating_add(1);
+            }
+        }
         crate::transport::stats::note_none_reason(reason);
         self.none_snapshot = Some(NoneSnapshot {
             reason,
@@ -2725,6 +2926,17 @@ impl Conn {
         )
     }
 
+    /// This lane's send/receive ledger since the last call, and clear it.
+    ///
+    /// Once a second, from the same place the window line is read, so the two lines
+    /// describe one interval. Taking rather than reading is deliberate: the numbers
+    /// are a *rate* question (`sent` against `acked` per second is the duplicate
+    /// share of what the wire carried right now), and a cumulative total would let a
+    /// burst at the start of a stage dominate every later second of the series.
+    pub(crate) fn take_ledger(&mut self) -> SendLedger {
+        std::mem::take(&mut self.ledger)
+    }
+
     /// What the window is compared against, and what is really waiting.
     ///
     /// Three numbers that must agree and, measured on the clean cell, do not:
@@ -3034,6 +3246,12 @@ impl Conn {
                 None => 0,
             };
             self.buffered = self.buffered.saturating_sub(moved);
+            // `lost_at` survives `take`, so this is the one place that can tell a
+            // packet confirmed in its own right from one confirmed **after** the
+            // lane had already declared it lost and queued the range again: the
+            // second is a duplicate this carrier paid for on its own judgement.
+            self.ledger
+                .note_acked(u64::from(range.len), sent.lost_at.is_some());
         }
         // The byte prefix is the authority on this stream's frontier, because
         // it cannot stall the way the range acknowledgements can: a packet
@@ -3057,7 +3275,13 @@ impl Conn {
         // `buffered` is not touched again: `advance_to` above already released those
         // bytes from the stream's buffer, and the flight is a separate total.
         if ack.prefix > 0 {
-            self.recovery.confirm_prefix(ack.stream, ack.prefix);
+            let retired = self.recovery.confirm_prefix(ack.stream, ack.prefix);
+            // The second confirmation path, kept apart on purpose: these bytes are
+            // **not** in `Acked::bytes`, so they free the flight without growing
+            // the window. Whether that omission matters is a measurement, not a
+            // reading of the code — this is the counter that decides it.
+            self.ledger.acked_by_prefix = self.ledger.acked_by_prefix.saturating_add(retired);
+            self.ledger.acked_bytes = self.ledger.acked_bytes.saturating_add(retired);
         }
         // A loss only rewinds the send point: the bytes are still in the
         // buffer, so the next pass carries them again from the same offset.
@@ -3070,6 +3294,10 @@ impl Conn {
             // The path dropped something: its capacity has been found, and the
             // window grows additively from here on. Nothing is cut — the loss
             // itself is repaired by retransmission.
+            self.ledger.lost_by_threshold = self
+                .ledger
+                .lost_by_threshold
+                .saturating_add(u64::try_from(acked.lost.len()).unwrap_or(u64::MAX));
             self.slow_start = false;
         }
         for sent in acked.lost {
@@ -3112,6 +3340,7 @@ impl Conn {
         // additive — one packet per window acknowledged — and the window is
         // never cut: a loss is repaired by retransmission, not paid for by
         // halving the pipe for a round trip.
+        let before = self.cwnd;
         if acked.progress {
             let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
             if self.slow_start {
@@ -3131,6 +3360,13 @@ impl Conn {
                 }
             }
         }
+        // What the window actually gained, beside how many bytes were confirmed:
+        // the two together say whether growth is one packet per window (as the
+        // code reads) or something else entirely (as a lossy path measures).
+        self.ledger.grown = self
+            .ledger
+            .grown
+            .saturating_add(self.cwnd.saturating_sub(before));
         // A stream whose every byte is now acknowledged can say its finish
         // (see `settle`): the acknowledgement is the proof that the reset
         // will not overtake the data it follows.
@@ -3191,6 +3427,17 @@ impl Conn {
         // with nothing in flight there is nothing to recover, and the pump's
         // next pass emits the probe (see `poll_transmit`).
         let (expiry, lost) = self.recovery.on_timeout(now);
+        // Which evidence named this loss: a probe of a silent path, or the timer
+        // finding live records older than the reordering window. They are different
+        // defects — one is a path that answered nothing, the other is a path whose
+        // acknowledgements are late — and only one of them is what a lossy cell
+        // should be doing.
+        let declared = u64::try_from(lost.len()).unwrap_or(u64::MAX);
+        if expiry == Expiry::Timeout {
+            self.ledger.probes = self.ledger.probes.saturating_add(declared);
+        } else {
+            self.ledger.lost_by_timer = self.ledger.lost_by_timer.saturating_add(declared);
+        }
         self.note_retransmits(lost.len());
         if !lost.is_empty() {
             // A timer that re-sent the flight is a path that could not carry it:
@@ -4587,6 +4834,234 @@ mod tests {
             conn.next_stream_range().is_some(),
             "still found after the cursor moved: cursor={}",
             conn.cursor
+        );
+    }
+
+    /// Every byte that crosses this lane is counted once, and what crossed twice is
+    /// counted as what it is.
+    ///
+    /// The ledger exists to answer one question a lossy path asks and the old window
+    /// line could not: **what share of what left was a byte already sent once**. On a
+    /// clean path the answer must be zero, and the accounting must close — bytes sent,
+    /// bytes confirmed, and no repair among them.
+    #[test]
+    fn a_clean_transfer_sends_each_byte_once_and_counts_it_once() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(6_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        link.pump(now);
+
+        let ledger = link.a.take_ledger();
+        let len = u64::try_from(bytes.len()).unwrap();
+        assert_eq!(ledger.sent_bytes, len, "every byte went out once");
+        assert_eq!(ledger.acked_bytes, len, "and every byte was confirmed once");
+        assert_eq!(ledger.sent_repair_bytes, 0, "nothing had to be re-sent");
+        assert_eq!(
+            ledger.acked_late, 0,
+            "nothing arrived after being declared lost"
+        );
+        assert!(ledger.grown > 0, "a clean path does grow the window");
+    }
+
+    /// A repaired byte crosses the wire twice and is still acked once.
+    ///
+    /// This is the shape the lossy cell is made of, in one stream: the dropped range
+    /// leaves the flight, its repair re-enters it, so `sent` exceeds `acked` by
+    /// exactly the price of recovery. If the two were equal on a losing path, either
+    /// nothing was lost or the repair was never sent.
+    #[test]
+    fn a_repaired_byte_crosses_the_wire_twice_and_is_counted_once() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(8 * 1024);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        // Take the first datagram that carries stream data off the wire.
+        let mut dropped = 0;
+        for _ in 0..8 {
+            let mut buf = Vec::new();
+            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+                break;
+            };
+            let datagram = buf[buf.len() - len..].to_vec();
+            let packet = super::wire::decode(&datagram).unwrap();
+            let carries = matches!(
+                packet.frame,
+                super::wire::Frame::Stream { id, .. } if id == stream.id
+            );
+            if carries && dropped == 0 {
+                dropped += 1;
+                continue;
+            }
+            link.a_to_b.push_back(datagram);
+        }
+        assert_eq!(dropped, 1, "one stream packet was dropped");
+
+        // Let the lane find the hole and repair it.
+        for step in 0..8 {
+            link.pump(now + Duration::from_millis(step));
+        }
+
+        let ledger = link.a.take_ledger();
+        let len = u64::try_from(bytes.len()).unwrap();
+        assert_eq!(ledger.acked_bytes, len, "the peer ended up with every byte");
+        assert!(
+            ledger.sent_repair_bytes > 0,
+            "the dropped range went out a second time: {ledger}"
+        );
+        assert!(
+            ledger.sent_bytes > ledger.acked_bytes,
+            "the wire carried more than the payload, which is the price of recovery: {ledger}"
+        );
+        assert!(
+            ledger.lost_by_threshold + ledger.lost_by_timer > 0,
+            "the loss was named by evidence, not guessed: {ledger}"
+        );
+    }
+
+    /// An acknowledgement that arrives after the loss was declared is counted as one.
+    ///
+    /// A declaration the path did not support costs twice: the original arrived, and
+    /// the lane had already queued and sent its range again. That is why `late` is its
+    /// own number — it is the size of the spurious-loss problem, and a lane whose
+    /// `late` is a large share of `ack` is over-declaring, not under-repairing.
+    #[test]
+    fn an_acknowledgement_after_a_loss_declaration_is_counted_as_late() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(1_000);
+        assert!(link.a.write(stream.id, &bytes) > 0);
+
+        // Hold the first stream datagram back instead of delivering it.
+        let mut held = None;
+        for _ in 0..4 {
+            let mut buf = Vec::new();
+            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+                break;
+            };
+            let datagram = buf[buf.len() - len..].to_vec();
+            if matches!(
+                super::wire::decode(&datagram).unwrap().frame,
+                super::wire::Frame::Stream { .. }
+            ) {
+                held = Some(datagram);
+                break;
+            }
+        }
+        let Some(held) = held else {
+            unreachable!("the write reaches the wire as a stream packet")
+        };
+
+        // The timer finds it stale, so this is a declaration rather than a probe: the
+        // record stays in the table, which is what a late acknowledgement lands on.
+        let later = now + Duration::from_secs(2);
+        let (_, lost) = link.a.on_timeout(later);
+        assert_eq!(lost, 1, "the timer named the unacknowledged range lost");
+
+        // Now the original arrives, after the lane already decided it would not.
+        link.b.on_datagram(later, &held).unwrap();
+        let mut buf = Vec::new();
+        while let Some(len) = link.b.poll_transmit(later, &mut buf) {
+            link.b_to_a.push_back(buf[buf.len() - len..].to_vec());
+        }
+        while let Some(datagram) = link.b_to_a.pop_front() {
+            link.a.on_datagram(later, &datagram).unwrap();
+        }
+
+        let ledger = link.a.take_ledger();
+        assert!(
+            ledger.acked_late > 0,
+            "the late acknowledgement was counted as late: {ledger}"
+        );
+    }
+
+    /// The byte prefix retires records, and the window does not grow from it.
+    ///
+    /// The prefix is the second confirmation path, and today it is *not* part of
+    /// `Acked::bytes`, so those bytes free the flight without buying window. Whether
+    /// that is right is a measurement — the ledger reports the two paths apart so the
+    /// question can be answered — but the behaviour must not change by accident, so it
+    /// is pinned here. The block in this test says nothing at all, which is what a
+    /// hole in a *different* stream produces.
+    #[test]
+    fn a_prefix_confirmation_retires_bytes_without_growing_the_window() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(2_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        // Send everything and deliver nothing: the records are in flight.
+        let mut buf = Vec::new();
+        while let Some(len) = link.a.poll_transmit(now, &mut buf) {
+            link.a_to_b.push_back(buf[buf.len() - len..].to_vec());
+        }
+        let before = link.a.cwnd;
+
+        let len = u64::try_from(bytes.len()).unwrap();
+        // The block a real peer sends when a hole in *another* stream pins the
+        // cumulative frontier at zero while a thousand later packets have arrived:
+        // the bitmap reaches sixty-four numbers below `largest`, so this stream's
+        // records are outside it and only the prefix can retire them. `below = 0`
+        // is what a hole at the start of the number space looks like.
+        link.a.apply_ack(
+            now,
+            super::wire::Ack {
+                largest: 1_000,
+                below: 0,
+                bits: 0,
+                stream: stream.id,
+                prefix: len,
+            },
+            false,
+        );
+
+        let ledger = link.a.take_ledger();
+        assert_eq!(
+            ledger.acked_by_prefix, len,
+            "the prefix retired every byte: {ledger}"
+        );
+        assert_eq!(ledger.acked_by_number, 0, "the block named none of them");
+        assert_eq!(
+            ledger.acked_bytes, len,
+            "and the two paths together counted each byte once"
+        );
+        assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
+        assert_eq!(link.a.cwnd, before, "the window is exactly where it was");
+    }
+
+    /// A finished flow stops growing, and stops accumulating.
+    ///
+    /// The window line's maximum is a maximum over the stage, and the stage outlives
+    /// the flow: §4.174 read a value taken in the bulk stream's last second as a
+    /// steady-state plateau, and it was neither steady nor a plateau. This pins the
+    /// fact that makes that reading wrong — once the peer has everything, the next
+    /// second adds nothing to either side.
+    #[test]
+    fn a_finished_flow_adds_nothing_to_the_ledger() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(6_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        link.pump(now);
+        let first = link.a.take_ledger();
+        assert!(first.acked_bytes > 0);
+
+        let (flight, buffered, _) = link.a.flight_and_buffered();
+        assert_eq!(flight, 0, "nothing is left in flight");
+        assert_eq!(buffered, 0, "and nothing is left buffered");
+
+        link.pump(now);
+        let after = link.a.take_ledger();
+        assert_eq!(after.grown, 0, "the window does not keep growing");
+        assert_eq!(after.acked_bytes, 0, "and no byte is confirmed twice");
+        assert_eq!(
+            after.sent_repair_bytes, 0,
+            "nothing is re-sent to a quiet peer"
         );
     }
 

@@ -179,6 +179,13 @@ impl Staging {
 /// flat. The lane id is part of the line because four connections report
 /// independently: without it the four series interleave and read as one that
 /// oscillates.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one second of one lane, in one line: every field is read against the \
+              others — window against flight, sent against acknowledged, growth \
+              against the ceiling — so splitting it would destroy the correlation \
+              that is the whole point of the instrument"
+)]
 fn report_window(shared: &Arc<Shared>) {
     if !crate::transport::stats::enabled() {
         return;
@@ -190,6 +197,11 @@ fn report_window(shared: &Arc<Shared>) {
         }
         conn.note_window_reported(now);
         let (cwnd, flight, slow_start, acked_since_growth) = conn.window_state();
+        // Taken here rather than in a line of its own so the send/receive ledger and
+        // the window describe one interval: a duplicate share computed over a
+        // different second than the window it explains would be two measurements
+        // pretending to be one.
+        let ledger = conn.take_ledger();
         // What `flight` is compared against, and what is really waiting: the
         // three only agree when no re-sent range is being counted twice (see
         // `Conn::flight_and_buffered`).
@@ -301,6 +313,10 @@ fn report_window(shared: &Arc<Shared>) {
             flight_packets,
             slow_start,
             acked_since_growth,
+            // What this lane sent against what the peer confirmed, and why it
+            // stopped: one field because they are read together and the line is
+            // already the widest thing in the tree.
+            ledger = %ledger,
             backlog_streams = backlog.streams,
             backlog_bytes = backlog.total,
             worst_stream,

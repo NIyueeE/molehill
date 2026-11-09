@@ -176,9 +176,10 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
   ≈28 KB/s on a 200 ms path. And the lane then carries much less than the path could: a 5 %-loss tunnel leg gives
   0.29 Gbit/s against 1.19 on a clean one, and on a 100 Mbit queue about 11 ms deep the same lane drops two orders
   of magnitude more than its TCP peers while carrying 19 % less. **That is an open defect, not a property to
-  work around**: no counter in the tree yet says what share of a lane's wire is a byte already sent once, and
-  until one does, a controller would be guesswork. The plan and the instrumentation that closes the gap are
-  `HANDOFF.md` §4.179 and §5.
+  work around.** The per-lane window line carries the numbers that price it: `sent` against `ack`, `rep` as the
+  share of what left that was a range already sent, `late` for acknowledgements that landed after the lane had
+  declared the packet lost, and `refus`/`stop` for the bound or budget that ended the passes. A controller is
+  written only if those say the window is the limit (`HANDOFF.md` §4.179–§4.180).
 
 - **A lane's recovery is its own, and it is deliberately small.** Every packet
   that carried stream data schedules an acknowledgement, and so does every credit
