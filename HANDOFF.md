@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.204 The next candidate is designed and blocked on the fake clock, not on the engine (2026-11-09)
+
+The evidence from §4.203 defines one candidate, and this entry records its design and the reason it is not in the tree
+yet. Neither is a change of direction: both are the same fix.
+
+**The design.** Three pieces, and they only work together:
+
+1. **A wider acknowledgement block** — word 0 plus up to seven tail words, 512 numbers, variable length, built by the
+   receiver from the holes it actually holds, `AHEAD` 256 → 1024. Measured to work mechanically (§4.203: `num`
+   retirement 0 → 312 051 per lane-second, `cwnd` 13 480 → 198 156).
+2. **A timer that only fires on its own deadline** — `Recovery::on_timeout` must compare `now` with its armed timer
+   before *declaring*; the probe path stays on every pump tick, which is what keeps a shallow hole's repair at ~2 ms.
+3. **A declaration anchored on time, not on a count** — a record is lost when it is unnamed by the acknowledgement
+   **and** a packet sent a reordering window later has been acknowledged. The window is a quarter of `loss_delay`, so
+   it tracks the path. Plus a cap of [`MAX_DECLARES_PER_ACK`] records per acknowledgement, oldest first, because a
+   declaration is a burst and repairs are exempt from the window — the amplifier §4.203 measured.
+
+**Why it is not landed.** Piece 3 needs the fake clock to advance *between* packets, and the test harness does not do
+that: `Link::pump(now)` stamps a whole batch with one instant, so a hole and the packets that overtake it carry the
+same send time and the anchor difference is zero. Seven connection-level tests and two recovery tests depend on that
+shape, and rewriting them is a change to the harness, not to the engine — with its own verification (the harness must
+still be able to produce the count-rule cases the current tests describe).
+
+**So the next step is the harness, and it is a step with a definition of done**: `Link` gains a clock that advances per
+packet by a configurable spacing, the seven tests are rewritten to that clock with their *intent* unchanged, and only
+then does piece 3 go in with its own A/B — the same cell and the same pre-registered guard as §4.203
+(`throughput_gbps ≥ 0.3628`, `rtt_p99_ms ≤ 1 412`, `transport_loss_detect_us ≤ 20 ms`, clean `bulk-n ≥ 13.10`).
+
+**What is committed from this round: nothing in the engine.** The tree is the state §4.203 left it in, 107 tests green.
+That is deliberate: a half-landed declaration rule that the harness cannot exercise is a defect this repository has
+already paid for once.
+
 ### 4.203 The storm's mechanism, found and measured: a lane whose records can never be retired by number (2026-11-09)
 
 The per-lane ledger from a storming arm and a healthy arm of the **same run** names the state, and it is not
