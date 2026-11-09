@@ -377,6 +377,59 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.182 D2's second run: on a lossy path most of the wire is repair, and the healthy lane is the exception (2026-11-09)
+
+`cost` on the carrier leg under `loss5`, two rounds plus the A/A twin, `--scale 1`, 537.7 s, same binary and
+same switch as §4.181. The cell's own resolution is poor on this shape (throughput resolves 21.8 % against a
+10 % floor, ~19 rounds would reach it), which is why nothing here is a claim — the per-lane ledger is what the
+run is for.
+
+**Per lane over the whole stage.** `sent` and `ack` are the ledger's wire bytes and unique delivered bytes; `dup`
+is `rep` as a share of `sent`; `late` is acknowledged bytes whose record had already been declared lost.
+
+| lane | sent | ack | dup | late | pfx | num |
+|---|---|---|---|---|---|---|
+| 1748352497 | 4 440 MB | 472 MB | **89.1 %** | 84 MB | 168 MB | 383 MB |
+| 246251900 | 3 766 MB | 474 MB | **86.7 %** | 80 MB | 126 MB | 425 MB |
+| 1748352500 | 3 687 MB | 480 MB | **86.6 %** | 81 MB | 181 MB | 368 MB |
+| 246251902 | 1 955 MB | 566 MB | 70.4 % | 88 MB | 126 MB | 527 MB |
+| 246251901 | 1 036 MB | 651 MB | **33.9 %** | 77 MB | 136 MB | 615 MB |
+| 246251899 | 1 172 MB | 682 MB | 41.2 % | 64 MB | 145 MB | 604 MB |
+| 3227764096 | 1 134 MB | 981 MB | **12.1 %** | 101 MB | 158 MB | 936 MB |
+
+**Three things this establishes, and one it does not.**
+
+1. **The carrier spends most of its capacity re-sending.** On the busiest lanes seven of every eight bytes that
+   leave are a range already sent once, and the ratio between `sent` and `ack` is 8–9×. The cell's ~0.22–0.30
+   Gbit/s is what is left after that, not what the path carried.
+2. **The healthy lane is the low-`dup` one, not the fast one.** `3227764096` re-sent 12 % and delivered 981 MB —
+   more than any other lane — while lanes with 89 % duplicate share delivered half that. The correlation runs the
+   way the mechanism predicts: repair traffic is the cost, not the cure.
+3. **`late` is a large share of `ack` on every lane** — 64–101 MB against 472–981 MB delivered, i.e. 10–20 % of
+   confirmed bytes arrived after the lane had given up on them. So a substantial part of the declaration traffic
+   is provably spurious, and each spurious declaration buys a re-send.
+
+What it does **not** establish: whether the re-sends come mostly from the *timer* declarations (as on §4.181's
+collapsed lane, where `num=0` and 521 561 timer firings) or from re-declaring the same range repeatedly after a
+real loss. Both produce this table. Distinguishing them needs the per-lane `loss=Nt/Nm` split per second, which
+the ledger now carries and this summary has not yet read.
+
+**One contradiction to record rather than explain away.** The single-stream `bulk-1` run on the same `rtt100`
+path (§4.181's next measurement, 47.6 s) shows a healthy lane — `cwnd` climbing 102 KB → 402 KB in five
+seconds, `grow` 50–120 KB/s, `dup` 1–2 %, zero loss declarations — but it also shows **`flight` at 8.4 MB
+against a `cwnd` of 102 KB**, with `buffered` identical to the byte. My model says `write` admits at most
+`cwnd − flight`, that `cwnd` only ever grows, and that the ceiling binding here was 16 MiB; so either `cwnd` was
+once ~8 MB and something reduced it (nothing in the code does), or the flight counts bytes no window ever
+admitted. The existing test `the_flight_never_outgrows_the_window` passes, which means it does not model the
+state the artifact shows. **This is a counter-versus-code question, and it goes before the next candidate**:
+a fix designed against a window whose own accounting is unexplained would be a guess.
+
+**What D3 will therefore be.** Not a controller. The plan's order puts the recovery side before the window, and
+two runs now say the same thing from opposite directions — a loss-free path where one lane never retired a
+record by number (§4.181) and a lossy path where seven of eight bytes are repairs (§4.182). The candidate is the
+declaration-and-repair path, and the first thing it needs is the `loss=Nt/Nm` split per lane per second plus an
+answer to the `flight ≫ cwnd` contradiction above.
+
 ### 4.181 D2's first run: on a loss-free path, one lane's window never leaves its initial value (2026-11-09)
 
 D2 opens with `rtt100` on the carrier leg, because a path with no random loss removes the obvious suspect.
