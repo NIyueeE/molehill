@@ -367,6 +367,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.175 P5's gates and the repeat policy, run on this tree (2026-11-09)
+
+The closing half of §12 is a set of gates, and a gate that is not run is a claim. All of them on the current
+tree, after the bench model, the pump and the docs changed:
+
+| gate | result |
+|---|---|
+| `just check` (fmt, clippy ×2, machete, audit, deny, outdated, docs, ruff, pyright, bench self-check at **770**, tests) | **exit 0**, "pre-push checks passed" |
+| `just interop` | **3 passed, 0 failed** |
+| `just l3-accept` | **16 PASS**, exit 0 |
+| integrations, mhd | **3 consecutive runs, 22 passed each** (94.31 / 93.98 / 93.78 s) |
+| `striped_data_channels` alone | **20 passed, 0 failed** |
+| integrations, `MOLEHILL_DATA_CARRIER=tcp` | **435 passed, 0 failed** |
+| lib tests | **383 passed** |
+
+**The numbers moved in the right direction and by the amount they should.** The suite is 435 with the TCP
+carrier against 430 in §4.149 — five more, which is the four new pump tests plus one; and the three full runs
+take 94 s against 90 s before, on a tree with five more tests. Nothing here is fast because a check was skipped:
+`just check` still runs both clippy passes, the audits and the 770-check self-check.
+
+**Two things this round did not do, stated so the table is not read as more than it is.** It did not run
+`just bench gate` — that needs a sweep-shaped run and belongs to the release ritual (§4.143). And it did not
+touch `timeline --scale 1.0`, for the same reason.
+
 ### 4.174 The attribution lands on the window after all — but on how *slowly it grows*, not on a missing cut (2026-11-09)
 
 §4.173 pre-registered one run to separate three candidates: transmission inflation, repair latency, or a
