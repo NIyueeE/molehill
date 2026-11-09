@@ -367,6 +367,52 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.173 The lossy-path collapse is measured but its mechanism is not — and the one I named is wrong (2026-11-09)
+
+§4.169 and §4.170 both end by saying the collapse is "the 'no loss response' gap in measured form", and §4.169
+adds the repair path: "one range per probe". Reading `recovery.on_timeout` and `conn.on_timeout` to plan the
+next step shows that this is not what the code does, and the claim has to come out.
+
+`Recovery::on_timeout` has **two branches**, and only one of them is the probe:
+
+- **Nothing is stale** — the timer fired before the reordering window elapsed — and *this* is the branch that
+  re-sends **one** oldest range (§4.126). Its own comment says why: a probe exists to elicit an
+  acknowledgement, and re-sending the flight would multiply it by the number of probes.
+- **Something is stale** — which is the normal case on a path that is actually losing — and this branch declares
+  **every** stale range lost and returns them all. `Conn::on_timeout` then does `note_retransmits(lost.len())`
+  and queues a repair for each.
+
+So bulk repair already exists on the branch that a 5 %-loss path takes. **"One range per probe" cannot be the
+reason throughput falls to a quarter**, and neither §4.169 nor §4.170 has evidence for *any* mechanism — they
+have a level (0.29 Gbit/s against 1.19 clean, six rounds) and a guess that the code does not support.
+
+**What the two claims were, and what is left.** The measured part stands unchanged: on a carrier path that drops
+5 %, mhd carries about a quarter to a third of its clean throughput, as a level rather than a lottery, and the
+window ceiling is not the limiter. What is withdrawn is the *explanation*, and with it the shape of the decision
+I put to the human — "add a loss-response stage, or accept the behaviour" was framed on a mechanism I had not
+checked. Asking someone to choose between those two before knowing which lever exists is the same mistake as
+§4.157: a conclusion drawn from my own summary of the code rather than from the code.
+
+**Candidates that survive, in the order they are worth measuring:**
+
+1. **Repair latency.** `loss_delay` is `9/8 × max(latest_rtt, srtt)` — about 225 ms on this 200 ms path — so
+   every packet the three-packet threshold does not name waits that long. Whether that is a *quarter* of the
+   throughput depends on how much of the repair is threshold-driven, which no counter currently says.
+2. **Transmission inflation.** A range declared lost and re-declared could be re-sent more than once; the window
+   line carries `worst_retransmits` and `worst_repairs`, and `posted_mbit_per_s` against the cell's carried rate
+   would show wire working harder for the same goodput.
+3. **A stream-side stall.** `worst_ready_ms` and `backlog_*` on the same line distinguish "the sender has nothing
+   to post" from "the sender is posting into a path that eats it".
+
+**The measurement that separates them** (pre-registered, cheap, one arm, two rounds, ~7 min): the tunnel-leg
+`loss5` cell with `MOLEHILL_MHD_STATS=1` and `RUST_LOG=molehill=debug`, reading per lane — summed, per §4.58's
+denominator lesson — `posted_mbit_per_s`, `worst_retransmits`, `worst_repairs`, `worst_ready_ms`, `backlog_*`.
+If posted ≈ 4× carried, the wire is inflated (2); if posted ≈ carried and repair counters are small, the wait is
+in the timer (1); if `worst_ready_ms` is large with an empty backlog, it is the application (3).
+
+**Until that runs, the answer to "which direction" is that the question is not yet well-formed**, and I would
+rather say so than have the plan record a decision made on a bad premise.
+
 ### 4.172 P3 closes §4.120 #6 and the admission half of #7 (2026-11-09)
 
 The two lifecycle items §4.120 could only mark "partial" now have tests that observe the *release* rather than
@@ -476,6 +522,10 @@ does not make the earlier two-round number wrong — 0.074 was inside the same d
 question is §4.169's, and it is a loss *response* question: the window is at the 16 MiB cap on that path, so it
 is not the ceiling, and the repair path is one range per probe.
 
+> **Mechanism withdrawn — see §4.173.** The repair path is *not* one range per probe on a
+> losing path: that rule governs only the branch where nothing is stale. The level stands; the
+> explanation does not.
+
 ### 4.169 §4.165–§4.167 measured the wrong leg; the counters caught it, and the corrected number is severe (2026-11-09)
 
 **The mistake.** `--condition` defaults to the **visitor** leg — the visitor-to-server hop — while the carrier
@@ -509,7 +559,11 @@ between an arm and itself. What survives the noise is the **order of magnitude**
 drops 5 %, mhd carries **one-seventh of what the clean path carries** (0.074–0.174 against 1.19), with 31–107
 TCP segments retransmitted in the namespaces and a zero error rate on the interactive probe.
 
-**That is the "no loss response" gap from §4.163, in a measured form.** `conn.rs` never cuts the window on
+**That is the "no loss response" gap from §4.163, in a measured form.**
+
+> **Withdrawn — see §4.173.** The gap is measured; the mechanism named here is not what the code does:
+> `on_timeout` re-sends one range only on the branch where nothing is stale, and repairs every stale range
+> otherwise. The explanation is open again. `conn.rs` never cuts the window on
 loss; it repairs and continues (§4.163's quote). On a 5 %-loss carrier path that design keeps flying into a
 path that drops one datagram in twenty, and throughput collapses. **This is not a window-ceiling problem** —
 `srtt` on that path puts the ceiling at the 16 MiB cap, far above any bandwidth-delay product involved — so
