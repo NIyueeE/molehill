@@ -377,6 +377,55 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.203 The storm's mechanism, found and measured: a lane whose records can never be retired by number (2026-11-09)
+
+The per-lane ledger from a storming arm and a healthy arm of the **same run** names the state, and it is not
+congestion:
+
+| reading | storming lane | healthy lane |
+|---|---|---|
+| `num` (records retired by number) | **0 for the whole run** | 500 699 → 9 885 787 per second |
+| `grow` (window-growth events) | **0** | 12 141 → 116 014 |
+| `cwnd` | **13 480** (its initial ten packets), never moves | 25 631 → **141 645** |
+| `flight` | 400–3 000 % of `cwnd` (repairs are window-exempt) | within `cwnd` |
+| `loss` | 0 threshold / **20 306** timer per second | 24 threshold / 4 973 |
+
+So the storm is: **records are never retired by number → the window never grows → new data cannot be admitted →
+the repairs, which are exempt from the window, are all the path carries → 80–90 % of the wire is re-sends.** The
+window is not too small *because of congestion*; it is small because the only retirement path left is the
+per-stream byte prefix, which cannot feed the growth hook.
+
+**Why nothing is retired by number.** `Ack::contains` reached exactly **64 numbers** behind `largest`, so any record
+older than that was invisible to the acknowledgement and could only be retired by the prefix. And the cumulative
+frontier — the one path that would cover old numbers — is pinned at **zero on every product lane**, because the
+dialer's number-0 packet never reaches the accepting connection: the server's `first_seen` is **1** in 4 of 4 lanes,
+every run. A trace at the admission point shows the opening *credit* dropped exactly as designed (unnumbered, not an
+opening) and **no stream datagram refused at all** — so number zero never arrives at the dispatcher, and the cause is
+still open. The bare carrier probe does see number zero, so the loss is in the product path.
+
+**Two changes were built and both are reverted, on the pre-registered guard.**
+
+1. **The timer only does what a timer does**: `Recovery::on_timeout` must wait for its own deadline before *declaring*
+   losses; the probe path is untouched. Two tests pin it (`a_pump_tick_declares_nothing_before_the_timer_expires`,
+   `a_tick_with_nothing_stale_still_probes_one_range`).
+2. **A wider acknowledgement block**: word 0 plus up to seven tail words (512 numbers), variable length, built by the
+   receiver from the holes it actually holds; the memory bound `AHEAD` went 256 → 1024, and the shadow bitmap beside
+   the hole set was deleted rather than kept in sync.
+
+**The wider block works, and that is the important measurement.** With it, `num` retirement went from **0 to
+6 312–312 051 per lane-second** and `cwnd` grew **13 480 → 198 156** — the retirement defect is real, and the block
+width was its cause.
+
+**And the cell got worse**, which is why it is reverted. Three arms, three rounds, same run: candidate
+`dup 64.1 / 70.3 / 76.7` at `0.055–0.092 Gbit/s`; its twin `62.4 / 79.1 / 65.7` at `0.044–0.093`; the **pre-change
+binary** `13.4 / 92.0 / 92.2` at `0.325–0.540`. The pre-registered guard is `throughput_gbps ≥ 0.3628`, so the
+candidate misses it by four to eight times, while the old binary still reaches `0.54` in its healthy round.
+
+**Why it got worse is visible in the same numbers**: an acknowledgement that can name 512 numbers names *many*
+holes, and the rule that declares a hole lost "three numbers behind the largest" then declares all of them at once.
+The wider block feeds the mass declaration. **A wider block is only safe with a declaration rule that does not read
+queueing delay as loss** — that pairing is the next candidate, and it is now defined by evidence rather than guessed.
+
 ### 4.202 The human's ruling: a defect is not deliverable, so D3 reopens on the timer (2026-11-09)
 
 Two instructions arrived together, and they change what this stage is for.
