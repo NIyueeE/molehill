@@ -367,7 +367,94 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.161 Auditing the plan for performance items I had not closed: two found, one measured (2026-11-09)
+### 4.162 `jitter` is resolved, and it says the carriers are equal there (2026-11-09)
+
+§6.4 names `jitter` alongside `loss1`/`loss5`; it had never been run. `rr-1`, four arms, six rounds,
+28 samples, 1 716.9 s:
+
+| arm | `rtt_p50_ms` | `rtt_p99_ms` | `rate_per_s` |
+|---|---|---|---|
+| `l4-plain` (mhd) | 40.78 | **57.52** | 24.5 |
+| `l4-plain~aa` (its twin) | 40.83 | 57.70 | 24.5 |
+| `frp` | 40.84 | 57.99 | 24.5 |
+| `rathole` | 40.54 | 57.85 | 24.5 |
+
+**All four agree to within 0.8 % on p99 and exactly on rate**, and — unlike `loss1` and `loss5` — **this cell
+resolves**: mhd's own twin differs by 0.3 %, so "no difference" is a finding here rather than noise. On a path
+with 20 ms of delay and added jitter the carrier is indistinguishable from both TCP-based tools, and its p99 is
+nominally the lowest of the four.
+
+**That makes the picture coherent across conditions**: mhd's deficit is a **clean-path** phenomenon (§4.131:
+p99 +24.8 % against rathole on `rr-16[clean]`), it disappears once the path adds jitter (this entry), and on loss
+the cells cannot tell the arms apart at all (§4.135 at 1 %, §4.161 at 5 %). So the 25 µs task hop matters where
+nothing else dominates, and nowhere else — which is exactly the shape §4.145 left the design in.
+
+**One number worth stating**: `setup_p50_ms` here resolves 27.4 % and would need ~13 rounds for 15 %, so the
+*open* latency on a jittery path is still unresolved even though the round trip is not.
+
+### 4.163 The window's ceiling follows the round trip and nothing follows a loss — a real gap (2026-11-09)
+
+Asked whether the carrier still has anything left to improve, the honest answer starts in the code rather than
+in the record, and this is the one place where the two disagree about completeness.
+
+**What the code does**, read off `conn.rs` today:
+
+- `window_ceiling()` = `WINDOW_FLOOR (256 KiB) × max(1, min_rtt / 1 ms)`, capped at `MAX_CWND` (16 MiB). **It is
+  a function of delay alone** — no measured bandwidth, no loss signal.
+- Slow start adds every acknowledged byte to the window; after the first loss it turns additive ("one packet
+  per window acknowledged") and **the window is never cut** — the comment says so in as many words: *"a loss is
+  repaired by retransmission, not paid for by halving the pipe for a round trip"*.
+
+So the window grows to the ceiling and stays there whatever the path's capacity turns out to be. The arithmetic
+on two existing conditions:
+
+| condition | BDP | ceiling | ratio |
+|---|---|---|---|
+| `rate100` — 100 Mbit, 20 ms delay each way, 2 000-packet queue | ≈ 500 KB | `256 KiB × 40` = **10 MiB** | **20×** |
+| `rate20` — 20 Mbit, 40 ms each way | ≈ 200 KB | `256 KiB × 80` = **20 MiB**, capped at 16 MiB | **80×** |
+
+**Twenty times the bandwidth-delay product, with a queue of 2.8 MB and no mechanism that ever reduces it.** The
+prediction written here was a permanently full queue — of order 200 ms of standing delay at 100 Mbit — plus
+tail-drop loss that is repaired but never interpreted as a signal.
+
+**Measured, and the prediction is wrong.** `bulk-1` + `rate100`, six rounds, three arms (mhd, its A/A twin,
+rathole), 179.9 s:
+
+| arm | `throughput_gbps` | `offered_gbps` | `retrans_segments` |
+|---|---|---|---|
+| `l4-plain` (mhd) | 0.0955 | 0.0883 | **0.0** |
+| `l4-plain~aa` | 0.0955 | 0.0884 | 0.0 |
+| `rathole` | 0.0955 | 0.0854 | 0.0 |
+
+All three carry **95.5 Mbit/s of a 100 Mbit limit, identically, with zero retransmissions from mhd** — so the
+window is not overflowing the queue at all. **And the reason is structural**: the ceiling is a *cap*, not a
+target, and a window only grows as fast as the sender has bytes to acknowledge. `bulk-1`'s source is itself
+feedback-limited by the same shaped path, so its window stops at the bandwidth-delay product (≈470 KB at
+95 Mbit and 40 ms) and never approaches the 10 MiB ceiling. **A single TCP source cannot offer more than the
+path carries, so this instrument cannot expose an oversized window.**
+
+The mirror case — 10 Gbit/s at 1 ms RTT against a 256 KiB ceiling, i.e. a fifth of the path — is still
+untested, and it would need a path whose capacity is *higher* than any condition here provides.
+
+**So the gap is narrower than this entry first claimed and its severity is unknown.** An oversized window
+becomes reachable only when the offered load exceeds the path (several concurrent flows on one shaped link, or
+a UDP source), and no cell does that today: `bulk-pair` gives two services their own streams but not one
+saturated shared link, and `udp-blast` measures loss, not queueing delay. Recording the correction rather than
+the prediction is the point: the arithmetic was right and the reachability was not.
+
+**Why this matters for the next decision.** It is the one open item that can move a *product* number on a real
+deployment rather than on loopback, and it is also the one the model is thinnest on: there is no cell that
+carries bulk through a rate limit while an interactive probe runs. `timeline` is the closest — its interactive
+series runs alongside the bulk stages — at 358 s per arm-round at `--scale 0.05`, so two arms and three rounds
+is about 36 minutes. **That is the decisive measurement and it has not been made**: `bulk-1` alone would show
+carried throughput but not the standing delay, which is the symptom.
+
+**What is not a gap, for the same reason.** The `mhd` stream's own read path (1.8 µs), the ack path (§4.154),
+recovery (§4.126/§4.155) and the pool's structure were each measured and found sound; the deficit on a clean
+path is the userspace task hop (§4.134/§4.145), decided. So the remaining risk is concentrated in **flow
+control against a capacity limit**, not in the datapath.
+
+### 4.161 Auditing the plan for performance items I had not closed: two found, one measured (2026-11-09)### 4.161 Auditing the plan for performance items I had not closed: two found, one measured (2026-11-09)
 
 The goal was marked complete and then a direct question asked whether the plan was really all handled. It was
 not: re-reading the original against the record found **three stale statements and two unclosed performance
