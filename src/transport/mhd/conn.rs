@@ -649,6 +649,11 @@ pub(crate) struct SendLedger {
     stop_nothing_to_say: u64,
     stop_closed: u64,
     stop_other: u64,
+    /// Repair packets the scheduler had ready but did not send, because the re-sent
+    /// bytes already in flight were at or above the window.
+    ///
+    /// The number that says the budget bit rather than the lane having nothing to do.
+    repairs_gated: u64,
     /// Stream bytes that arrived here, and how many of them the stream already
     /// held.
     ///
@@ -711,7 +716,7 @@ impl std::fmt::Display for SendLedger {
             f,
             "sent={} rep={}({}%) pkt={} ack={} num={} pfx={} late={} \
              loss={}t/{}m probe={} grow={} refus={}w/{}b/{}c/{}a \
-             stop={}none/{}quiet/{}closed/{}other recv={} dup={}",
+             stop={}none/{}quiet/{}closed/{}other recv={} dup={} gate={}",
             self.sent_bytes,
             self.sent_repair_bytes,
             self.repair_share_pct(),
@@ -734,6 +739,7 @@ impl std::fmt::Display for SendLedger {
             self.stop_other,
             self.recv_bytes,
             self.recv_duplicate_bytes,
+            self.repairs_gated,
         )
     }
 }
@@ -2209,6 +2215,10 @@ impl Conn {
             // several datagrams (a selector byte, then the message), and losing
             // any of them costs the arrival its latency.
             !state.acknowledged,
+            // Which of the two this packet is, for the repair budget: the scheduler
+            // admits a repair only while the re-sent bytes in flight are under the
+            // window (`HANDOFF.md` §4.187).
+            repair,
         );
         // What this packet cost the wire, and whether the range was new: the pair
         // is the whole of the "is the lane re-sending itself" question, and it is
@@ -2454,7 +2464,9 @@ impl Conn {
                 len: 0,
                 fin: true,
             }),
-            // A finish-only packet carries no bytes of the opening.
+            // A finish-only packet carries no bytes of the opening, and it is not a
+            // repair: it has no range for the budget to count.
+            false,
             false,
         );
         self.ack_pending = false;
@@ -2509,7 +2521,15 @@ impl Conn {
             return None;
         }
         let cursor = self.cursor;
-        let eligible = |(id, state): (&u32, &StreamState)| {
+        // **A repair may only join a flight that still has window left for it.** The
+        // writer bounds new data against `cwnd − flight`, but a repair is not written
+        // at all — it is scheduled from the recovery table — so until this rule existed
+        // a lane could put an unbounded amount of re-sent bytes in flight, which is the
+        // amplifier behind the storm (`HANDOFF.md` §4.182, §4.187). Measured before it:
+        // one lane posted 1 909 MB and delivered 226 MB.
+        let repairs_allowed = self.recovery.repair_flight() < self.cwnd;
+        let mut gated = 0u64;
+        let mut eligible = |(id, state): (&u32, &StreamState)| {
             // `Finished` ends the peer's *write* direction, not the stream: the
             // other direction is still ours to use (that is what half-close
             // means). Only an abort or a refusal stops our writes too.
@@ -2520,6 +2540,13 @@ impl Conn {
             // A declared loss first: it is the range that unblocks the peer's
             // reader, and it is one range — not a rewind of everything after it.
             if let Some((offset, len)) = state.send.next_repair(MAX_STREAM_PAYLOAD) {
+                if !repairs_allowed {
+                    // Counted, not dropped silently: a lane that stops repairing
+                    // because its budget is spent is a different finding from one
+                    // with nothing to repair, and only this counter tells them apart.
+                    gated = gated.saturating_add(1);
+                    return None;
+                }
                 return Some(Pick {
                     id: *id,
                     offset,
@@ -2539,10 +2566,13 @@ impl Conn {
                 }
             })
         };
-        self.streams
+        let picked = self
+            .streams
             .range(cursor..)
-            .find_map(eligible)
-            .or_else(|| self.streams.range(..cursor).find_map(eligible))
+            .find_map(&mut eligible)
+            .or_else(|| self.streams.range(..cursor).find_map(&mut eligible));
+        self.ledger.repairs_gated = self.ledger.repairs_gated.saturating_add(gated);
+        picked
     }
 
     /// Capture why this pass built nothing, while the lock is still held.
@@ -5231,6 +5261,67 @@ mod tests {
             "and every byte had been given up on before it arrived: {ledger}"
         );
         assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
+    }
+
+    /// A repair is gated once the re-sent bytes in flight are at the window.
+    ///
+    /// The rule the scheduler now holds (`HANDOFF.md` §4.187): new data is bounded by the
+    /// writer against `cwnd − flight`, but a repair is not written at all — it is
+    /// scheduled from the recovery table — so before this rule a lane could put an
+    /// unbounded amount of re-sent bytes in flight. One lane measured 1 909 MB posted
+    /// against 226 MB delivered.
+    ///
+    /// Built rather than driven: on a merely lossy link the budget never fills, because
+    /// declaring a loss frees exactly the bytes its repair will take, so the gate is a
+    /// safety valve for the state where re-sends dominate — which is what the test
+    /// states directly. The invariant it protects is checked by
+    /// `a_repair_never_pushes_the_re_sent_flight_past_the_window` in the same file.
+    #[test]
+    fn a_repair_is_gated_when_the_re_sent_flight_is_at_the_window() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(4 * 1024);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        let mut buf = Vec::new();
+        while link.a.poll_transmit(now, &mut buf).is_some() {}
+        let (_, lost) = link.a.on_timeout(now + Duration::from_secs(2));
+        assert!(lost > 0, "the timer queued a repair");
+
+        // Borrow the whole window's worth of repair budget the smallest way the counter
+        // allows: records this test invents, so the gate is what is under test and not a
+        // loss pattern that happens to fill it.
+        let mut number = 1_000u32;
+        while link.a.recovery.repair_flight() < link.a.cwnd {
+            link.a.recovery.on_sent(
+                now,
+                number,
+                Some(SentRange {
+                    stream: stream.id,
+                    offset: 0,
+                    len: u16::try_from(1_349).unwrap(),
+                    fin: false,
+                }),
+                false,
+                true,
+            );
+            number += 1;
+        }
+        assert_eq!(
+            link.a.recovery.repair_flight(),
+            link.a.cwnd,
+            "the budget is exactly full"
+        );
+
+        let pick = link.a.next_stream_range();
+        assert!(
+            pick.is_none_or(|pick| !pick.repair),
+            "no repair joins a full budget"
+        );
+        assert!(
+            link.a.ledger.repairs_gated > 0,
+            "and the refusal is counted, so a lane that stops repairing is not mistaken              for one with nothing to repair"
+        );
     }
 
     /// A 5 %-lossy memory link delivers everything, and it does **not** storm.

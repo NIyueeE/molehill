@@ -181,6 +181,13 @@ pub(crate) struct Sent {
     /// an acknowledgement of it arrives (see [`LOST_HOLD`]). It is not in
     /// flight: the byte total and the congestion window do not count it.
     pub(crate) lost_at: Option<Instant>,
+    /// Whether this packet carried a range the recovery had already sent once.
+    ///
+    /// The flag exists for one number: how many bytes of *repair* are in flight. That is
+    /// what a window has to bound if a lane is not to spend the whole path re-sending
+    /// (`HANDOFF.md` §4.186–§4.187) — repairs used to be exempt from the window
+    /// entirely, which is the amplifier behind the storm.
+    pub(crate) repair: bool,
     /// Whether this packet is part of a stream's **opening flight**.
     ///
     /// A stream's packets before its first acknowledgement are the handshake,
@@ -353,6 +360,13 @@ pub(crate) struct Recovery {
     live: usize,
     /// Stream bytes the table holds, kept exact by [`Self::retire`].
     flight_bytes: u64,
+    /// Of those, how much went out as a range already sent once.
+    ///
+    /// Its own total because it is separately bounded: new data is admitted against
+    /// `cwnd − flight` by the writer, while a repair is not written at all — it is
+    /// scheduled from this table — so without this number a lane can put an unbounded
+    /// amount of re-sent bytes in flight.
+    repair_flight: u64,
     rtt: Rtt,
     /// When the timer should fire, if anything is in flight.
     timer: Option<Instant>,
@@ -374,6 +388,7 @@ impl Recovery {
             lost: BTreeSet::new(),
             live: 0,
             flight_bytes: 0,
+            repair_flight: 0,
             rtt: Rtt::default(),
             timer: None,
             silent: 0,
@@ -438,6 +453,11 @@ impl Recovery {
 
     pub(crate) fn flight_bytes(&self) -> u64 {
         self.flight_bytes
+    }
+
+    /// How much of the flight is a range the recovery already sent once.
+    pub(crate) fn repair_flight(&self) -> u64 {
+        self.repair_flight
     }
 
     /// Retire every record the peer's byte prefix has already confirmed.
@@ -507,7 +527,11 @@ impl Recovery {
     /// path removes it: an acknowledgement, a loss declaration, or a probe.
     fn retire(&mut self, sent: &Sent) {
         if let Some(range) = sent.range {
-            self.flight_bytes = self.flight_bytes.saturating_sub(u64::from(range.len));
+            let len = u64::from(range.len);
+            self.flight_bytes = self.flight_bytes.saturating_sub(len);
+            if sent.repair {
+                self.repair_flight = self.repair_flight.saturating_sub(len);
+            }
         }
     }
 
@@ -601,16 +625,21 @@ impl Recovery {
         number: u32,
         range: Option<SentRange>,
         opening: bool,
+        repair: bool,
     ) {
         let sent = Sent {
             number,
             time: now,
             range,
             lost_at: None,
+            repair,
             opening,
         };
         if let Some(range) = range {
             self.flight_bytes += u64::from(range.len);
+            if repair {
+                self.repair_flight += u64::from(range.len);
+            }
             self.in_flight.insert(number, sent);
             self.live += 1;
         }
@@ -774,6 +803,7 @@ impl Recovery {
             self.lost.clear();
             self.live = 0;
             self.flight_bytes = 0;
+            self.repair_flight = 0;
             return (Expiry::Dead, all);
         }
         let delay = self.rtt.loss_delay();
@@ -929,7 +959,7 @@ mod tests {
 
     fn send_one(recovery: &mut Recovery, now: Instant, offset: u64) -> u32 {
         let number = recovery.next_number();
-        recovery.on_sent(now, number, Some(range(offset)), false);
+        recovery.on_sent(now, number, Some(range(offset)), false, false);
         number
     }
 
@@ -1050,7 +1080,7 @@ mod tests {
 
         // The repair: the same byte range, a new number.
         let repair = recovery.next_number();
-        recovery.on_sent(start, repair, Some(range(0)), false);
+        recovery.on_sent(start, repair, Some(range(0)), false, true);
         assert_eq!(
             recovery.flight_bytes(),
             100,
@@ -1189,7 +1219,7 @@ mod tests {
         let mut recovery = Recovery::new();
         for i in 0..u32::try_from(MAX_LOST).unwrap() + 16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)), false);
+            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)), false, false);
             let _ = recovery.declare_lost(start, number);
         }
         assert!(
@@ -1294,12 +1324,12 @@ mod tests {
         let mut recovery = Recovery::new();
         for step in 1u64..=16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(step * 100)), false);
+            recovery.on_sent(start, number, Some(range(step * 100)), false, false);
         }
         assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
         let at = start + Duration::from_millis(10);
         let number = recovery.next_number();
-        recovery.on_sent(at, number, Some(range(0)), true);
+        recovery.on_sent(at, number, Some(range(0)), true, false);
         let waited = recovery
             .poll_timeout()
             .unwrap()
@@ -1396,7 +1426,7 @@ mod tests {
         let mut recovery = Recovery::new();
         for step in 1u64..=16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(step * 100)), false);
+            recovery.on_sent(start, number, Some(range(step * 100)), false, false);
         }
         assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
         let waited = recovery
@@ -1532,7 +1562,7 @@ mod tests {
             // is what the kill rule counts.
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range, sent.opening);
+                recovery.on_sent(now, number, sent.range, sent.opening, sent.repair);
             }
         }
         assert_eq!(
@@ -1658,7 +1688,7 @@ mod tests {
             let (_, resent) = recovery.on_timeout(now);
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range, sent.opening);
+                recovery.on_sent(now, number, sent.range, sent.opening, sent.repair);
             }
         }
         assert_eq!(waits[0], MIN_RTO_SMALL_FLIGHT, "the first step is cheap");
