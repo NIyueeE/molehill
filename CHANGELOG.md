@@ -73,6 +73,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The benchmark can price the carrier itself, with nothing above it.** A new
+  `transport` scenario runs the protocol harness twice per arm — a raw TCP socket
+  on the control arm against an mhd stream on a tool arm — with the listener in
+  the server namespace and the dialer in the visitor's, so the traffic crosses the
+  shaped path rather than loopback. Four declared metrics come out of it: open,
+  first byte, the wait after the first byte, and the harness's own error rate. The
+  numbers they produce are the carrier's alone: an mhd stream opens in 3 µs
+  against a TCP connect's 48, and a round trip costs 2.5× the bare socket's.
+
+- **A lossy path now has a stated cost, measured rather than argued.** On a
+  carrier path that drops 5 % of datagrams, mhd carries about a quarter of what
+  the same cell carries clean — 0.29 Gbit/s against 1.19 — as a level over six
+  rounds, not a scatter. The counters say the window is what limits it: it reaches
+  1.47 MB against a 16 MiB ceiling, which over a 200 ms round trip is 236 Mbit/s,
+  while retransmissions stay at 4.3 %, the loss rate. [Benchmarks](docs/benchmarks.md)
+  says what the model still cannot answer about it.
 - **This is a re-baseline release for the benchmark.** The engine changed —
   `bench/src/bench/model.py` gained the `l4-plain` arm and `Arm.noise_data`, so
   runs can measure the plain data plane — while the metric registry did not

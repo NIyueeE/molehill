@@ -786,6 +786,14 @@ Stated so a reader does not ask a chart for something it never measured:
   the shaper dominates, and the reorder-window cell does not exist. See
   [HANDOFF.md](../HANDOFF.md) §4.134 and §4.145.
 
+- **Whether a loss is random or caused by the carrier's own rate.** On a carrier path that drops 5 % of
+  datagrams at random, mhd carries about a quarter of what the same cell carries clean, and the counters say
+  why: its window reaches 1.47 MB against a 16 MiB ceiling, which over a 200 ms round trip is 236 Mbit/s — the
+  measured 290 — while retransmissions stay at 4.3 %, the loss rate. The window grows one packet per window
+  after the first loss, so on a long path it recovers slowly. **No cell here makes loss depend on the offered
+  rate**, so nothing can say whether a window that responded to loss would help or hurt: `loss1_rate100` shapes
+  a rate and adds loss, but its queue is deep enough that the drops are the shaper's, not the sender's.
+
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
   two runs on one machine whose probes drifted beyond tolerance are refused

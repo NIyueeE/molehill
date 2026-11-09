@@ -167,6 +167,14 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
 - `CreateDataChannelFor` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the lane, and the stream's prologue names the service it carries.
 - On an `mhd` lane the stream is the carrier's own: byte offsets, a connection-wide acknowledgement bitmap and credit live in `src/transport/mhd/`, with no yamux and no record layer between the visitor's bytes and the lane's packet scheduler. Noise is per stream, so one stream cannot read another's bytes and a reordering never desynchronises a record counter. On a TCP lane the stream is a yamux stream over the Noise-wrapped connection, as before.
+- **A lane's window grows additively after its first loss.** Until the path drops something, every acknowledged
+  byte buys a byte of window, so the flight doubles per round trip; the first loss latches slow start off **for
+  good**, and from there the window grows by one packet per window. Nothing cuts it on a loss — the loss is
+  repaired, not charged to the window. The consequence is visible on a long path: over a 200 ms round trip a
+  lane that loses 5 % of its datagrams climbs from its initial ten packets to about 1.5 MB in twenty seconds,
+  and carries roughly `window / rtt` while it climbs. That is a property of the design worth knowing before
+  reading a lossy-path number, not a defect to be fixed here.
+
 - **A lane's recovery is its own, and it is deliberately small.** Every packet
   that carried stream data schedules an acknowledgement, and so does every credit
   change; there is no delayed-ack timer, so the block rides whatever packet the
