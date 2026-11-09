@@ -7753,14 +7753,23 @@ writing, and the answer to the defect it uncovered was left as "no change, mecha
 The **third objective** (`goal-baa3d2de-a96a-4be8-a5b3-30cd6801d18a`, 120 rounds) is the one that runs now, and
 its text is the **D0–D5** plan that replaced the plan file on the same day:
 
-| stage | what it produces |
-|---|---|
-| **D0** | the three copies agree — plan file, this file, the objective |
-| **D1** | per-lane instrumentation that can tell window, scheduler, acknowledgement, repair and counting apart |
-| **D2** | two attribution runs (`rtt100`, then tunnel-leg `loss5` at `--scale 2` with A/A) that **choose** the fix |
-| **D3** | **one** candidate, submitted and reverted alone: accounting first, scheduling second, a rate-driven window only if the counters say the window is the limit |
-| **D4** | the pre-registered criteria and guards (six cells, listed in the plan's §四) |
-| **D5** | `just fmt`/`check`/`interop`/`l3-accept`, both carriers' integration suites, capacity, soak, docs, changelog |
+| stage | what it produces | state (2026-11-09) |
+|---|---|---|
+| **D0** | the three copies agree — plan file, this file, the objective | **done** (`15e4d76`) |
+| **D1** | per-lane instrumentation that can tell window, scheduler, acknowledgement, repair and counting apart | **done** (`cebd0bc`, `8e9a189`, `c0a5216`, `cdb98f5`): the `SendLedger` and eight tests |
+| **D2** | attribution runs that **choose** the fix | **done** (§4.181–§4.185): the cause is out-of-order evidence, and the storm reproduces at `l4-mux8` |
+| **D3** | **one** candidate, submitted and reverted alone | **pre-registered and designed** (`819afd0`, `5d11331`); the code is not written |
+| **D4** | the pre-registered criteria and guards (six cells, listed in the plan's §四) | waiting on D3 |
+| **D5** | `just fmt`/`check`/`interop`/`l3-accept`, both carriers' integration suites, capacity, soak, docs, changelog | waiting on D4 |
+
+**The candidate, in one paragraph**, because this is the sentence the next session needs: a byte-range
+acknowledgement — a separate optional `Ranges` frame naming up to four byte ranges the receiver holds above its
+reported prefix, sent only when there is such data. The sender retires whole records covered by those ranges
+(`flight` falls) and leaves the stream's contiguous `base` alone, so stream semantics do not move and a later
+prefix cannot double-count a retired record. The predicted chain is `flight` down → `cwnd − flight` open → new
+data admitted → the queue drains → acknowledgements land inside `loss_delay` → the timer stops over-declaring →
+growth resumes. Its cell, primary metric, eight guards, two cross-guards and revert rule are in the plan under
+"D3 预登记"; nothing about them is to be renegotiated after a run.
 
 **Read the plan file, not this paragraph, when the two differ** — it is the approved document and this is a
 summary of it. What §12 left behind, kept here because these are measurements and not a plan:
@@ -7802,16 +7811,20 @@ third plan exists: "no change, mechanism named" is an honest end to a *plan*, an
 
 **What is queued now, in order** (the plan's D-stages, with the evidence each one owes):
 
-1. **D0 is done on this commit** — the plan file replaced, §4.179 recording both withdrawals, this section
-   rewritten, `docs/internals.md` no longer calling the window rule "a property of the design … not a defect",
-   and the objective restated as the D0–D5 plan.
-2. **D1, per-lane instrumentation.** The counters that exist are process-global (`stats::note_none_reason` sums
-   every lane into one line, §4.179's finding) and the ones that are per-lane do not separate new bytes from
-   repaired bytes. Nothing in the tree can currently answer "what fraction of this lane's wire was the same byte
-   sent again", which is the plan's first decision row.
-3. **D2, the two attribution runs** — `rtt100` first (does a loss-free long path grow and retire normally?), then
-   tunnel-leg `loss5` at `--scale 2` with the A/A twin, `MOLEHILL_MHD_STATS=1` and `RUST_LOG=molehill=debug`.
-4. **D3, one candidate** chosen by that table; then D4's six cells and D5's gates.
+1. **D0 done** (`15e4d76`) — the plan file replaced, §4.179 recording both withdrawals, this section rewritten,
+   `docs/internals.md` no longer calling the window rule "a property of the design … not a defect", and the
+   objective restated as the D0–D5 plan.
+2. **D1 done** (`cebd0bc`, `8e9a189`, `c0a5216`, `cdb98f5`) — the per-lane `SendLedger` on the window line, the
+   first-numbered-packet log, the logged admitting refusal, and eight tests. It found two instrument defects on
+   the way: `MAX_BUFFERED` refusals were counted as window refusals, and the first version of `ack` counted
+   records instead of delivery.
+3. **D2 done** (§4.181–§4.185) — `rtt100`, `loss5`, and `bulk-1`; the cause is that every lane's cumulative
+   frontier is dead (number 0 never arrives) so retirement runs on 64 numbers and a per-stream prefix; the
+   duplicate share is 8.5–37 % in a healthy run and 68.6 % in the storm, which reproduces at `l4-mux8`.
+4. **D3 in progress** — pre-registration and design are committed and are the only authority for what "passes".
+   The code is next: the `Ranges` frame, the receiver's report, the sender's retirement, the tests, then the
+   pre-registered cell.
+5. **D4 then D5** — the six acceptance cells and the gates; neither starts before D3 has an outcome.
 
 **Two things this round must not repeat.** A plan that closes a defect without fixing it, and an entry that names
 a mechanism from an aggregate row instead of from a counter. Both are in this file's record now; neither is a
