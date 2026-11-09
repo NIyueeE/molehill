@@ -377,6 +377,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.198 D4's `transport` cell holds, and the six-criterion picture so far (2026-11-09)
+
+**`transport`, clean** (dev profile, two measured rounds plus the twin, 12.2 s): the carrier's own numbers, with the
+bare TCP socket as the control.
+
+| arm | open p99 (µs) | first-byte p99 (µs) | recovery p99 (µs) | errors |
+|---|---|---|---|---|
+| molehill (fresh / reuse) | **3.0** / — | 73.5 / 80.5 | 4.5 / 4.0 | 0 % |
+| molehill~aa (fresh / reuse) | 3.0 / — | 70.5 / 68.5 | 4.5 / 3.5 | 0 % |
+| control (TCP, fresh / reuse) | **48.0** / — | 22.0 / 30.0 | 15.5 / 16.5 | 0 % |
+
+An mhd stream opens in 3 µs against a TCP connect's 48, its round trip is ~2.5× the bare socket's, and the wait
+after the first byte is a quarter of the control's. That is the §4.171 record reproduced with the twin beside it,
+and the criterion for this cell — the four `transport_*` numbers inside their floors — **holds**.
+
+**D4's six criteria, as the cells now stand.** Only the cells that have been run in this stage are listed; the
+formal 120 s `loss5` and the clean interactive numbers are next.
+
+| criterion | state |
+|---|---|
+| tunnel-leg `loss5` `throughput_gbps` | **fails, known**: the storm is steady at 120 s (§4.191: 0.011–0.252 Gbit/s, 81–91 % duplicate share) |
+| `rate100_shallow` against peers | **fails**: 20 % less carried, two orders of magnitude more drops (§4.197) |
+| `rate100` / `rate1000` | `rate1000` **does not reproduce its record** (79 % of the shaper, 0.85 s tail); unreconciled (§4.197) |
+| clean / `rtt100`, `bulk-n ≥ 13.35` | **undecided, at the boundary**: 13.10 median, twin's best 13.345, no same-method baseline (§4.196) |
+| `loss1` and the jitter family | `loss1` **holds** (4.2–5.3 Gbit/s, 100–128 ms tail); jitter not run |
+| `transport` | **holds** (this entry) |
+
+**So the acceptance is going to be a split verdict, and that is the honest one**: the carrier's protocol-level
+numbers and 1 %-loss behaviour hold; the lossy and shallow-queue cells fail on the defect D3 could not fix; one
+cell sits on its floor; one no longer reproduces its record.
+
 ### 4.197 D4 continues: the shallow-queue defect reproduces, and `rate1000` no longer reads like its record (2026-11-09)
 
 **`rate100_shallow`, `bulk-1`, against the two peers** (dev profile, two measured rounds plus the twin, 108.9 s).
