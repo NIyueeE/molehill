@@ -367,6 +367,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.170 Six rounds make the lossy-path collapse a level, not a lottery (2026-11-09)
+
+§4.169's two-round reading was 0.074–0.174 Gbit/s on a 62 % floor, which could not say whether the collapse was a
+plateau or a coin flip. Six measured rounds with the A/A twin and one warm-up, judged on `throughput_gbps` alone,
+pre-registered before the run:
+
+| arm | `throughput_gbps` median | min–max | `rtt_p99_ms` |
+|---|---|---|---|
+| `molehill` (mhd) | **0.2886** | 0.242 – 0.403 | 2 038.0 |
+| `molehill~aa` | 0.3332 | 0.200 – 0.376 | 1 896.5 |
+
+Floors: `throughput_gbps` **26.4 %**, `rtt_p99_ms` 92 %. 1 787.7 s for 28 samples; six rounds per arm, **five of
+which contributed a value** — one round in each arm's set carried nothing, which is the cell's own
+`carried nothing` guard doing its job rather than a silent zero.
+
+**It is a level, and the 0.074 was a bad round.** The two halves of the same binary overlap (0.242–0.403 against
+0.200–0.376) and their medians differ by 15.5 %, inside the 26.4 % floor. So the honest statement is a level
+with a spread, not a number: **on a carrier path that drops 5 %, mhd carries about 0.29 Gbit/s — between a
+fifth and a third of the 1.19 Gbit/s the same cell carries clean.**
+
+**And one round in the log was a near-stall** — `cpu_s_per_gbit` 21 728 at 184 s of stage, i.e. about
+0.046 Mbit/s — which is precisely the round that contributed no value. So the distribution has a lower tail
+that neither the median nor the min above shows; the level is a central reading and the extreme is real.
+
+**What this settles and what it does not.** It settles the *size* of the lossy-path penalty: roughly a factor of
+four on throughput, reproducible to about a quarter, not a coin flip. It does not identify the mechanism, and it
+does not make the earlier two-round number wrong — 0.074 was inside the same distribution's tail. The mechanism
+question is §4.169's, and it is a loss *response* question: the window is at the 16 MiB cap on that path, so it
+is not the ceiling, and the repair path is one range per probe.
+
 ### 4.169 §4.165–§4.167 measured the wrong leg; the counters caught it, and the corrected number is severe (2026-11-09)
 
 **The mistake.** `--condition` defaults to the **visitor** leg — the visitor-to-server hop — while the carrier
