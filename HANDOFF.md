@@ -377,6 +377,23 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.205 The harness prerequisite is in: the fake clock lets time pass between packets (2026-11-09)
+
+§4.204 named the blocker and this is the first half of it, landed on its own so that it can be shown inert:
+
+- `Link::pump` now stamps every datagram **a spacing after the one before it** (`2 ms`) instead of giving a whole
+  batch one instant, and delivers the acknowledgements after the batch.
+- The manual `poll_transmit(now, …)` loops in the connection tests go through `Link::next_a` / `next_b`, which stamp
+  each packet after the previous one.
+
+**With the declaration rule unchanged, all 107 tests pass** — so the harness change moves nothing on its own, which is
+what makes it safe to land before the rule it exists for. And it removes the objection that stalled §4.204: a test
+that wants "a hole and a packet that overtook it" can now say so in time.
+
+What is left for the next change, and it is one change: the three pieces of §4.204 plus the expectations of the seven
+connection tests whose scenarios were written against a clock that never advanced. The harness can express both shapes
+now, so those tests can be rewritten to `pump_spaced(now, gap)` and to assertions about *time*, not about counts.
+
 ### 4.204 The next candidate is designed and blocked on the fake clock, not on the engine (2026-11-09)
 
 The evidence from §4.203 defines one candidate, and this entry records its design and the reason it is not in the tree
