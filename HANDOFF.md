@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.207 The fourth candidate compiles and its rule is right, but the harness cannot exercise it (2026-11-09)
+
+The fourth candidate was implemented: the wide block, the gated timer, the time-anchored capped declaration, and the
+**escape hatch** — when the acknowledgement frontier has not advanced for a smoothed round trip, the clock may declare
+up to eight records, oldest first, no more often than a reordering window apart (`Recovery::escapes`).
+
+It compiles, the whole recovery and wire suite passes with the new rule, and **four connection tests do not**: the hole
+in each is never re-sent, so the stream delivers nothing. The ledger from one of them shows why the rule cannot fire
+there:
+
+```
+sent=8000 rep=0(0%) pkt=6 ack=0 num=6652 pfx=0 late=0 loss=0t/0m probe=0 grow=6652
+```
+
+`num=6652` (bytes retired by number) with `rep=0` and no declarations: the receiver named every record it received, the
+sender retired them, and the *hole* — the first packet, the one carrying the stream's first byte — is never declared
+because the anchor it needs is `smoothed/4` away and the harness's `smoothed` is an artefact of its own batching: the
+ack's round trip is "however long the batch took to drain", not a path. Widening the batch spacing to 20 ms made it
+*worse* (six tests failed instead of four), which is what an artefact looks like when you push on it.
+
+**So the blocker is the same one as §4.204, one level deeper.** Stepping the clock per packet was necessary and is
+landed (§4.205); it is not sufficient, because a rule about *time* needs a link whose **delay is a number the test
+chooses** — one-way latency, an acknowledgement clock, and a queue — rather than a side effect of how many packets a
+pump happened to move. That is the harness the fifth attempt needs, and it is a change to the test link, not to the
+engine.
+
+**Committed from this round: nothing in the engine.** The tree is the state §4.206 left it in, 107 tests green. The
+fourth candidate's design stays in the plan; its implementation was reverted with its measurements unrun, and that is
+stated rather than implied.
+
+**Where this leaves the mechanism family**: three attempts measured and reverted (§4.203–§4.206), one implemented and
+reverted before it could be measured (this one). The next step is not a fifth variation of the rule — it is the link
+harness that can tell the rule apart from its own scaffolding.
+
 ### 4.206 The anchored declaration fails too, and the failure says why (2026-11-09)
 
 The three pieces of §4.204 were built together — wide block, gated timer, time-anchored and capped declaration — with
