@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.212 A's first part dies in the unit test, which is cheaper than the bench (2026-11-10)
+
+A's pre-registration says repairs must be inside the congestion window. Implemented literally — the range picker
+refuses a repair when `cwnd − flight == 0` — the suite answered in twelve seconds:
+
+```
+five_percent_loss_on_a_fake_link_delivers_without_storming:
+  every byte arrives even when one in twenty is dropped:
+  sent=128155 rep=29678(23%) pkt=95 ack=98477 num=121410 pfx=6745 late=29678 loss=2t/20m
+  left: 98477  right: 131072
+```
+
+**Three quarters of the transfer arrives and then it stops.** The reason is structural, and it is the same one §4.188
+measured from the other side: `flight_bytes` **includes the repair records**, so gating a repair on
+`flight < cwnd` waits for room that only the repair itself could make. A repair is not new data competing for the
+window — it is the *same* bytes, already counted, being sent again. Blocking it asks the window to open while forbidding
+the only thing that can open it.
+
+So part 1 as written is **falsified at the unit level, in one test, before any bench time**: cheaper and more decisive
+than §4.188's four-arm run, and it says why that run failed too.
+
+**What the shallow-queue defect needs instead.** The exemption is not the problem in itself — a repair has to be allowed
+to overtake — the problem is that nothing bounds how *much* repair traffic a lane puts on a shallow queue. Two levers
+that do not close the loop:
+
+1. **A repair budget proportional to `cwnd`**, counted separately from `flight` (e.g. at most `cwnd/2` bytes of repair
+   in flight at once), so repairs are bounded but never blocked by the window they are trying to open;
+2. **Pacing the repairs** — the picker already runs once per pass, so a byte-per-pass budget per lane sets the rate
+   directly, and the shallow queue's depth is what decides whether that is enough.
+
+Both are written here rather than tried in the same round: the first was falsified by a unit test in one minute, and the
+second is a different mechanism that deserves its own pre-registration.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.211 What B's fix changed in the acceptance cells, and what it did not (2026-11-10)
 
 Re-measured on the fixed engine, before designing A:
