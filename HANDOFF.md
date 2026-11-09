@@ -367,7 +367,93 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.164 The plan was extended: five stages, and the controller is conditional (2026-11-09)
+### 4.166 P1's second half: against a TCP carrier, `loss5` shows no throughput advantage and a worse tail (2026-11-09)
+
+The same `cost` single point, the same `loss5` path, the same binary, run twice — once on mhd and once with
+`MOLEHILL_DATA_CARRIER=tcp`. **Same fingerprint** (`3864bdd29651a505`), and the pin travels in
+`molehill_switches: {"MOLEHILL_DATA_CARRIER": "tcp"}` rather than as an arm, which is §12's rule and
+`refuse_carrier_arm`'s design.
+
+| | mhd | TCP carrier | difference |
+|---|---|---|---|
+| `rtt_p99_ms` | **2 904.5** | **1 878.6** | mhd **+54.6 %** |
+| `throughput_gbps` | 1.0974 | 1.1629 | mhd −5.6 % |
+| `cpu_s_per_gbit` | **0.757** | **0.513** | mhd **+47.6 %** |
+| that file's A/A floor, p99 | 32.7 % | 47.7 % | |
+| that file's A/A floor, throughput | 19.1 % | 3.7 % | |
+| `control` arm, p99 | 1 867.1 | **2 745.3** | **+47 % between two runs of the same bare path** |
+
+**Three statements this supports, and one it does not.**
+
+1. **The published "3.7× throughput at 5 % loss" is not reproduced in this shape.** mhd's 1.0974 is 5.6 % below
+   the TCP carrier's 1.1629, which is **inside mhd's own 19.1 % floor** — indistinguishable, not an advantage
+   and not a defeat. mhd's own number is very close to the published row's 1.11 Gbit/s; it is the **TCP side**
+   that reads differently here (1.16 against 0.30).
+2. **The interactive tail is worse, and the size is above either file's floor** — but the two files are
+   **not paired runs**, so this is directional, not a claim. Stated as measured: mhd waits 1.03 s longer at
+   p99 than the TCP carrier on the same path.
+3. **CPU per carried Gbit is 47.6 % higher for mhd**, and both files resolve that metric to about 2 %, so this
+   one is comfortably beyond noise. Under loss5 with concurrent bulk the carrier costs about 1.5× the CPU per
+   byte it delivers.
+4. **And the shape is noisy across files in a way that limits all of the above.** The `control` arm — no tool
+   at all, the same path, the same binary — reads **1 867 ms in one run and 2 745 ms in the other, a 47 %
+   swing**. Nothing about a carrier can be resolved more finely than the thing both runs share, so the honest
+   precision of every cross-file number above is "tens of percent, and the tail especially".
+
+**The discrepancy is the finding, and it is not explained.** The published row and this run share a nominal
+shape (four bulk streams, one interactive stream, 5 % loss) yet disagree about the TCP carrier by nearly 4×.
+Either the `timeline` stage and the `cost` stage differ in something I have not identified — the staged one
+re-dials its bulk spine after the leg goes quiet, and the `cost` one imposes the condition onto an already
+running arm — or one of the two numbers is wrong. Recording it as unexplained is the only honest option;
+inventing a mechanism for it is exactly what §4.50 did with units.
+
+**What this means for P4.** The entry condition for a controller was "`flight ≈ cwnd` with `none_reason =
+window` dominating". Nothing here provides that evidence, and nothing here provides a throughput deficit for a
+controller to fix. What it provides is a **tail** problem under loss with concurrent bulk, which points at
+scheduling and queueing rather than at the window. So P4 stays shut until the attribution run in §12.2 is done,
+and the next measurement is that attribution rather than a controller.
+
+### 4.165 P1's first half: under `loss5`, mhd's interactive tail is 56 % above the bare path (2026-11-09)### 4.165 P1's first half: under `loss5`, mhd's interactive tail is 56 % above the bare path (2026-11-09)
+
+§12 P1 asks for a `cost` single point (60 s, four bulk streams and one interactive stream at once) under
+`loss5`, with mhd against its own A/A twin and a TCP side. The enabler came first: **`--condition` did not
+reach a staged single point at all** — `single`'s timeline named `clean` outright, so `--condition loss5` on
+`cost` silently measured a clean path, which is the §4.141 failure shape again. `single` now names a
+`campaign` sentinel resolved by `model.staged_condition` from the run's own condition, `expected_cells` and the
+workload resolve it from the same params, and a smoke run confirms the cell is labelled `loss5`.
+
+**Measured**, three arms, one warm-up plus two measured rounds, 754.2 s:
+
+| arm | `rtt_p99_ms` | `rtt_worst_1s_ms` | `throughput_gbps` | `cpu_s_per_gbit` |
+|---|---|---|---|---|
+| `molehill` (mhd) | **2 904.5** | 2 908.6 | 1.0974 | 0.757 |
+| `molehill~aa` (its twin) | 3 065.2 | 3 272.1 | 0.9289 | 0.775 |
+| `control` (no tool) | **1 867.1** | 2 816.9 | 1.1395 | — |
+
+**The run's own noise floor is the only thing that makes this readable**, and it is printed with the table:
+p99 **32.7 %** (absolute 1 002 ms), `worst_1s` 24.3 %, throughput **19.1 %**, `cpu_s_per_gbit` 2.3 %.
+
+- **The interactive tail is the finding.** mhd is 55.6 % above the tool-free path on p99, above a 32.7 %
+  floor, so this is a real cost and not scatter. A single interactive stream sharing the carrier with four
+  bulk streams on a 5 %-loss path waits behind them.
+- **Throughput is not.** 1.097 against the control's 1.139 is inside the 19.1 % floor; mhd carries what the
+  path carries.
+- **The A/A twin is doing its job and is unusually wide here**: 2 904 against 3 065 on p99 (4.1 %), but its
+  *scatter* is 32.7 % — the twin's two rounds differ from each other far more than they differ from the arm.
+  That is why the entry above quotes the floor rather than the point estimate.
+
+**What this is not yet.** §10.4's claim is about mhd against a **TCP carrier on the same path**, and this run
+has only the tool-free control as its reference. The second half — the same shape with the carrier pinned to
+TCP — is the run that answers it, and §12's own rule applies: the pin travels in `molehill_switches`, not as
+an arm.
+
+**And one thing worth naming honestly.** The shape that produced the original 3.7× claim was the staged
+`timeline` with the carrier pinned, not a `cost` single point, so a difference between this and §3's published
+row would not by itself refute that row. What this run establishes is narrower and firmer: on a 5 %-loss path
+with four bulk streams, the carrier's interactive tail is a third of a second per round trip worse than the
+bare path, and its throughput is not.
+
+### 4.164 The plan was extended: five stages, and the controller is conditional (2026-11-09)### 4.164 The plan was extended: five stages, and the controller is conditional (2026-11-09)
 
 After §4.161–§4.163 the human asked whether mhd still had anything to finish, then approved an extension
 rather than a new plan. `MHD-FINALIZATION-PLAN.md` §12 is the approved text; this entry is the record of why
