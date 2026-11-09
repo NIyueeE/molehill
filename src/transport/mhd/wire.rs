@@ -86,6 +86,17 @@ pub(crate) const CREDIT: usize = 8;
 pub(crate) const RESET: usize = 5;
 /// The datagram frame's fixed part: the layer's `u32` id, then the payload.
 pub(crate) const DATAGRAM: usize = 4;
+/// The ranges frame's fixed part: stream, the prefix the ranges sit above, a count.
+pub(crate) const RANGES: usize = 4 + 8 + 1;
+/// One range: how far above the prefix it starts, and how long it is.
+pub(crate) const RANGE_ENTRY: usize = 4 + 2;
+/// The most ranges one frame names.
+///
+/// Four, because the point is to cover the holes a receiver is actually holding —
+/// usually one or two — and because six bytes each must not crowd a datagram that is
+/// otherwise carrying payload. A receiver with more than four holes sends the four
+/// lowest; the next one carries the rest.
+pub(crate) const MAX_RANGES: usize = 4;
 
 /// The most stream bytes a reliable frame can carry.
 pub(crate) const MAX_STREAM_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - STREAM;
@@ -123,6 +134,21 @@ pub(crate) enum Kind {
     /// reads it back on arrival, so the carrier never learns or cares which socket it
     /// was.
     Datagram = 4,
+    /// Byte ranges this end holds **above** the prefix it reports in the
+    /// acknowledgement block.
+    ///
+    /// The one thing the 28-byte block cannot say, and the reason a lossy path
+    /// re-sends what the peer already has (`HANDOFF.md` §4.185): a number that was
+    /// lost is never re-sent under the same number, so the cumulative frontier stops
+    /// there for the connection's life, and the bitmap only reaches sixty-four
+    /// numbers behind the largest seen. Everything older is unrepresentable — the
+    /// sender cannot retire it, so it keeps the flight closed and re-sends data the
+    /// receiver is holding in its reorder buffer.
+    ///
+    /// A separate frame rather than a longer acknowledgement block on purpose: the
+    /// ordinary block stays 28 bytes and this cost is paid only by a packet that has
+    /// out-of-order data to name.
+    Ranges = 5,
 }
 
 impl Kind {
@@ -133,6 +159,7 @@ impl Kind {
             2 => Some(Self::Credit),
             3 => Some(Self::Reset),
             4 => Some(Self::Datagram),
+            5 => Some(Self::Ranges),
             _ => None,
         }
     }
@@ -345,6 +372,22 @@ pub(crate) enum Frame<'a> {
         /// The bytes, exactly as the application handed them over.
         data: &'a [u8],
     },
+    /// Byte ranges this end holds above [`Frame::Ranges::base`] (see [`Kind::Ranges`]).
+    ///
+    /// `base` is the contiguous prefix the same packet's acknowledgement block
+    /// reports, carried here as well so the frame is self-describing: a sender that
+    /// somehow lost the block can still place the ranges, and a reader does not have
+    /// to pair two fields to know what the deltas mean.
+    Ranges {
+        /// Which stream these ranges belong to.
+        stream: u32,
+        /// The contiguous frontier the deltas are measured from.
+        base: u64,
+        /// How many of `entries` are live.
+        count: u8,
+        /// `(delta above base, length)` per range, lowest first.
+        entries: [(u32, u16); MAX_RANGES],
+    },
 }
 
 impl Frame<'_> {
@@ -356,6 +399,7 @@ impl Frame<'_> {
             Self::Credit { .. } => CREDIT,
             Self::Reset { .. } => RESET,
             Self::Datagram { data, .. } => DATAGRAM + data.len(),
+            Self::Ranges { count, .. } => RANGES + RANGE_ENTRY * (*count as usize),
         }
     }
 
@@ -366,8 +410,103 @@ impl Frame<'_> {
             Self::Credit { .. } => Kind::Credit,
             Self::Reset { .. } => Kind::Reset,
             Self::Datagram { .. } => Kind::Datagram,
+            Self::Ranges { .. } => Kind::Ranges,
         }
     }
+}
+
+impl Frame<'_> {
+    /// A ranges frame from a slice of `(delta, length)`, refusing what will not fit.
+    ///
+    /// The constructor is what keeps `count` honest: an encoder that trusted a caller
+    /// to count its own entries would write ranges the decoder cannot read. More than
+    /// [`MAX_RANGES`] are truncated to the lowest ones, which is the useful half —
+    /// the lowest hole is the one holding the frontier back.
+    pub(crate) fn ranges(
+        stream: u32,
+        base: u64,
+        ranges: impl IntoIterator<Item = (u32, u16)>,
+    ) -> Self {
+        let mut entries = [(0u32, 0u16); MAX_RANGES];
+        let mut count = 0u8;
+        for (delta, len) in ranges {
+            if len == 0 || usize::from(count) == MAX_RANGES {
+                continue;
+            }
+            entries[usize::from(count)] = (delta, len);
+            count = count.saturating_add(1);
+        }
+        Self::Ranges {
+            stream,
+            base,
+            count,
+            entries,
+        }
+    }
+
+    /// Whether `[start, end)` is named by this frame's ranges.
+    ///
+    /// Wholly inside, never overlapping: a range the peer partly holds is still owed
+    /// from its own first byte, and retiring a record on a partial match would leave a
+    /// hole nothing could describe — the same rule the byte prefix follows.
+    ///
+    /// `cfg(test)` because the sender applies this rule inside
+    /// `Recovery::confirm_range`, against packet records rather than byte offsets; this
+    /// is the statement of it that a wire test can check without building a connection.
+    #[cfg(test)]
+    pub(crate) fn covers(&self, start: u64, end: u64) -> bool {
+        let Self::Ranges {
+            base,
+            count,
+            entries,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        entries
+            .iter()
+            .take(usize::from(*count))
+            .any(|(delta, len)| {
+                let at = base.saturating_add(u64::from(*delta));
+                let to = at.saturating_add(u64::from(*len));
+                start >= at && end <= to
+            })
+    }
+}
+
+/// A ranges frame's body: the stream, the base, a count, then that many entries.
+///
+/// Its own function because `decode` is at the line budget, and because the validation
+/// is half the point: a count the array cannot hold, or a zero-length range — which is
+/// what a truncated frame looks like — is refused rather than read as data.
+fn ranges_frame(buf: &[u8], at: usize) -> Result<Frame<'_>, Malformed> {
+    let stream = buf.get(at..at + 4).ok_or(Malformed)?;
+    let stream = u32::from_le_bytes(stream.try_into().map_err(|_| Malformed)?);
+    let base = buf.get(at + 4..at + 12).ok_or(Malformed)?;
+    let base = u64::from_le_bytes(base.try_into().map_err(|_| Malformed)?);
+    let count = buf.get(at + 12).copied().ok_or(Malformed)?;
+    if usize::from(count) > MAX_RANGES {
+        return Err(Malformed);
+    }
+    let mut entries = [(0u32, 0u16); MAX_RANGES];
+    for (index, entry) in entries.iter_mut().take(usize::from(count)).enumerate() {
+        let start = at + RANGES + index * RANGE_ENTRY;
+        let delta = buf.get(start..start + 4).ok_or(Malformed)?;
+        let delta = u32::from_le_bytes(delta.try_into().map_err(|_| Malformed)?);
+        let len = buf.get(start + 4..start + RANGE_ENTRY).ok_or(Malformed)?;
+        let len = u16::from_le_bytes(len.try_into().map_err(|_| Malformed)?);
+        if len == 0 {
+            return Err(Malformed);
+        }
+        *entry = (delta, len);
+    }
+    Ok(Frame::Ranges {
+        stream,
+        base,
+        count,
+        entries,
+    })
 }
 
 /// A datagram frame's body: a fixed-width id, then whatever bytes are left.
@@ -418,7 +557,11 @@ pub(crate) fn encode(
     }
     if matches!(
         frame,
-        Frame::None | Frame::Credit { .. } | Frame::Reset { .. } | Frame::Datagram { .. }
+        Frame::None
+            | Frame::Credit { .. }
+            | Frame::Reset { .. }
+            | Frame::Datagram { .. }
+            | Frame::Ranges { .. }
     ) {
         // Nothing here is retransmitted, so nothing here may hold a number the
         // peer's frontier would wait for (see `FLAG_UNNUMBERED`).
@@ -463,6 +606,21 @@ pub(crate) fn encode(
         Frame::Reset { id, code } => {
             buf[at..at + 4].copy_from_slice(&id.to_le_bytes());
             buf[at + 4] = code as u8;
+        }
+        Frame::Ranges {
+            stream,
+            base,
+            count,
+            entries,
+        } => {
+            buf[at..at + 4].copy_from_slice(&stream.to_le_bytes());
+            buf[at + 4..at + 12].copy_from_slice(&base.to_le_bytes());
+            buf[at + 12] = count;
+            for (index, (delta, len)) in entries.iter().take(usize::from(count)).enumerate() {
+                let entry = at + RANGES + index * RANGE_ENTRY;
+                buf[entry..entry + 4].copy_from_slice(&delta.to_le_bytes());
+                buf[entry + 4..entry + RANGE_ENTRY].copy_from_slice(&len.to_le_bytes());
+            }
         }
     }
     Some(total)
@@ -686,6 +844,7 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
             Frame::Reset { id: stream, code }
         }
         Kind::Datagram => datagram_frame(buf, at)?,
+        Kind::Ranges => ranges_frame(buf, at)?,
     };
     Ok(Packet {
         id,
@@ -751,6 +910,15 @@ mod tests {
                 data: &data,
             },
             Frame::None,
+            // The frame that carries out-of-order evidence, with a full set of ranges:
+            // `count` is the only thing that says how many of `entries` are live, so a
+            // decode that ignored it would still pass a one-entry case.
+            Frame::ranges(
+                7,
+                1 << 32,
+                [(0u32, 60u16), (1_349, 300), (4_000, 1), (9_000, 1_349)],
+            ),
+            Frame::ranges(11, 0, std::iter::empty()),
         ];
         for frame in cases {
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -760,6 +928,27 @@ mod tests {
             assert_eq!(packet.ack, Some(ack));
             assert_eq!(packet.frame, frame, "frame {frame:?} must survive");
         }
+    }
+
+    /// A range names what sits wholly inside it, and nothing else.
+    ///
+    /// The rule that keeps a partly-covered record in flight: a range the peer holds only
+    /// part of is still owed from its own first byte, and retiring it would leave a hole
+    /// nothing could describe — the same rule the byte prefix follows.
+    #[test]
+    fn a_range_covers_only_what_sits_wholly_inside_it() {
+        let frame = Frame::ranges(1, 1_000, [(50u32, 100u16)]);
+        assert!(frame.covers(1_050, 1_150), "the range itself");
+        assert!(frame.covers(1_060, 1_140), "a record wholly inside it");
+        assert!(!frame.covers(1_040, 1_060), "one that starts before it");
+        assert!(!frame.covers(1_140, 1_160), "one that ends after it");
+        assert!(!frame.covers(1_150, 1_160), "one past its end");
+        assert!(
+            !Frame::None.covers(0, 1),
+            "and no other frame covers anything"
+        );
+        // A frame with no live entries covers nothing, whatever its array holds.
+        assert!(!Frame::ranges(1, 1_000, std::iter::empty()).covers(1_000, 1_001));
     }
 
     /// A datagram frame takes no packet number and never reaches the recovery table.
