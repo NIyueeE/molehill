@@ -377,6 +377,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.196 D4 begins: `loss1` holds, and `bulk-n` sits exactly on its floor (2026-11-09)
+
+D4's acceptance cells, run on the tree that has no fix in it. Two of the six so far, both with the A/A twin.
+
+**`loss1` on the carrier leg** (`cost`, `--scale 1`, two measured rounds plus the twin, 373 s):
+
+| arm | `throughput_gbps` | `rtt_p99_ms` |
+|---|---|---|
+| molehill | 5.271 / 4.204 | 119.6 / 105.3 |
+| molehill~aa | 4.235 / 4.223 | 128.5 / 100.1 |
+
+1 % loss costs about a fifth of the clean rate and leaves the tail in the hundreds of milliseconds, which is the
+published shape rather than a new one; nothing here is worse than the record. **And the new metric reported itself
+absent with a reason** — this run did not set `MOLEHILL_MHD_STATS`, so `mhd_lane_dup_pct` is a typed absence rather
+than a zero, which is the behaviour §4.187 designed and this is its first real run proving it.
+
+**`bulk-n` clean, the 85 % guardrail** (`throughput_gbps`, two measured rounds plus the twin, 70.7 s):
+
+| arm | `throughput_gbps` |
+|---|---|
+| molehill | 13.168 / 13.023 (median **13.10**) |
+| molehill~aa | 13.227 / 13.345 (median 13.29) |
+| control (no tool) | 62.920 / 62.943 |
+
+The criterion in the plan is `bulk-n ≥ 13.35 Gbit/s`. **The median is below it and the twin's best round is 13.345 —
+the cell is sitting exactly on the floor, not above it.** Two honest statements follow, and neither is a claim yet:
+
+1. **It is not a measured regression.** 13.35 came from 85 % of a **15.840 Gbit/s** baseline taken under an earlier
+   method; a comparison across methods is one this model refuses (`analysis.comparability`), so nothing here says
+   throughput fell. What it says is that the floor and today's reading are the same number to three digits.
+2. **It is not a pass either.** D4 needs a *same-method* baseline for this cell before it can say "85 % of it", and
+   that baseline does not exist yet — the last one is method-incomparable by construction.
+
+So D4's fourth criterion is recorded as **undecided, at the boundary**, and the next step for it is to take a
+same-method baseline of this cell (the plan's own re-baseline rule) rather than to quote 13.10 as a regression or
+as a pass.
+
 ### 4.195 D3 closes as a falsification: four directions measured, none of them the fix (2026-11-09)
 
 The plan's D3 asks for "a fix **or an explicit falsification**". The last four rounds produced the second, and this
