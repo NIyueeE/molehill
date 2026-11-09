@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.211 What B's fix changed in the acceptance cells, and what it did not (2026-11-10)
+
+Re-measured on the fixed engine, before designing A:
+
+| cell | reading after the fix | before |
+|---|---|---|
+| `loss5`, `--scale 2`, 3 arms × 3 rounds | candidate **0.425 / 0.542 / 0.467**, duplicates 13 / 13 / 54 %; twin 0.361–0.432; pre-change binary 0.420–0.515 | candidate 0.055–0.118, duplicates 55–91 % |
+| `rate100_shallow` vs rathole/frp | molehill **0.0829 / 0.0838**, **drops 2 261 / 2 465**; twin 0.0826–0.0853, drops 2 450–6 726; peers 0.0951–0.0955, drops **16–17** | 0.0688–0.0833, drops 1 605–4 664 |
+| clean `bulk-n` | molehill **12.16 / 12.05**, twin 12.86 / 12.19, control 65.1 / 65.8 | 13.17 / 13.02, twin 13.23 / 13.35 |
+| `transport` | open 3.5 µs, first byte 74.5 µs, recovery 4.5 µs, 0 errors | 3.0 / 73.5 / 4.5 / 0 |
+
+**The storm's fuel is gone**: every arm of the `loss5` run has `num` retirement in the millions and `cwnd` growing to
+**2.2–2.4 MB**, where before the fix the storming lane's `cwnd` was frozen at 13 480 and its `num` was zero all run.
+The B-fix's own mechanism is what §4.210 measured directly (refusals 13 → 0, `first_seen` 0 everywhere, `below`
+advancing), and the cell now reads healthy on all three arms.
+
+**What it did not fix, and what A is for**: on `rate100_shallow` the carrier still drops **two orders of magnitude more**
+than either peer (2 261–2 465 against 16–17) and carries ~12 % less — the shallow queue is still being overflowed by the
+carrier's own repairs, which remain exempt from the window.
+
+**One guard is not met today, and it is not the fix**: clean `bulk-n` reads **12.16 / 12.05** against the plan's
+13.10 and 13.35 floor, and the twin fell with it (12.86 / 12.19) while the control stayed at 65 Gbit/s. Both arms of
+the same binary sit ~8 % below the earlier reading, so this is the host or the run, not the change — recorded as **not
+reproduced**, to be re-established with a same-method baseline rather than quoted as a regression.
+
 ### 4.210 B is fixed: `send_gso` was fragmenting every lane's first stream packet (2026-11-10)
 
 §4.209 left two questions: which field of the refused datagram was wrong, and why only the first packet of a lane. The
