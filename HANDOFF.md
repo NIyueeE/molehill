@@ -377,6 +377,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.188 The repair budget made the storm **more frequent**, and it is reverted too (2026-11-09)
+
+D3's second pre-registered candidate: admit a repair only while the re-sent bytes in flight are under the window
+(`repair_flight < cwnd`), which bounds a lane to one window of repairs. Implemented in `397ece1`, measured against
+the `346d5e3` binary in the pre-registered cell — `cost`, tunnel leg, `loss5`, `l4-mux8`, `--scale 1`, **six**
+rounds, `--aa` plus `--ab-arm` — and reverted on its own verdict.
+
+| arm | `mhd_lane_dup_pct` per round | median | `throughput_gbps` median |
+|---|---|---|---|
+| candidate | 13.7, 14.2, 14.8, **79.9, 92.0, 85.8** | **47.3** | 0.2469 |
+| candidate twin | 14.0, **82.3**, 14.1, **82.8**, 12.9, **86.6** | 48.2 | 0.2469 |
+| baseline | 14.0, 12.6, 14.3, 13.4, **87.8**, 14.8 | **14.2** | 0.3146 |
+
+**The candidate is worse, and the twin says it is the binary and not the noise.** It stormed in three rounds of
+six against the baseline's one, its twin (the same build) also stormed in three, and the twin's throughput median
+is identical to the candidate's to four decimals while the baseline's is 21 % higher. So the effect is far outside
+both the pooled A/A and the metric's floor, and it points the wrong way: by bounding repairs, the lane frees its
+window more slowly, its hole stays open longer, acknowledgements arrive later, and the timer declares more — the
+gate fed the very loop it was meant to damp.
+
+**That refutes the amplifier hypothesis, and that is worth more than the candidate.** §4.182's step 5 said repairs
+exempt from the window are what sustains the storm; the measurement says the opposite is at least as true:
+**repairs must keep moving, or the acknowledgement path stalls behind them.** Two candidates have now been built
+on the chain from §4.183 and both were falsified — one on retirement evidence (§4.186), one on repair volume here.
+What both leave standing is the *trigger*: the timer declaring a loss because an acknowledgement arrived later
+than `loss_delay`, which on this path is a queueing delay the carrier created itself.
+
+**Where D3 stands, and the decision it needs.** Two mechanisms are dead with evidence; the remaining lever is the
+declaration rule, not the recovery volume and not the retirement paths. RACK-shaped delivery-delay detection is the
+obvious one and it is **closed in the plan** for a stated reason — "no cell keeps two or three packets in flight
+per stream" — which this cell does not change: its streams carry dozens of packets, so a RACK threshold would have
+later evidence to anchor on but the cell was never the one RACK was refused for. **Re-opening it is a plan
+change, not an implementation choice**, so it goes to the human rather than being started.
+
+Also recorded here because it is the one thing this round improved permanently: the metric that made both verdicts
+possible, and the discipline that a candidate is judged on the number its mechanism moves — which is why the
+six-round run took 22 minutes and produced an answer instead of a fifth ambiguous "no claim cleared the floors".
+
 ### 4.187 A metric for the thing the candidate moved, and what it says about the candidate (2026-11-09)
 
 §4.186's verdict was that no candidate on this shape could pass, because the number the mechanism moves was not a
