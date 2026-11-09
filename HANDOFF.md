@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.209 B, first half: the missing number zero is a decoder refusal, not a lost packet (2026-11-10)
+
+The question was where the dialer's number-0 packet goes on the product path, given the accepting end's first sighting
+is always 1. Two gated traces answered it, one at each end, on a **clean** path (`rr-1`, no configured loss):
+
+| trace | what it shows |
+|---|---|
+| what the client **posted**, decoded back from its own wire bytes | `credit` (unnumbered, number 0) then **`stream`, number 0** — the packet exists and left the process |
+| what the server's **dispatcher saw** | the same `credit`, and then the next numbered packet is **`stream`, number 1** — number 0 never appears |
+| the server's refusal line | `malformed_decode=13` on a run with **13 lanes** |
+
+So the packet is **sent and not lost**: it arrives and the decoder refuses it. One refusal per lane, one lane per
+refusal, and the missing number is exactly the one the cumulative frontier waited for its whole life. That is why
+`below` pins at zero on every product lane — not loss, not the admission rule (§4.203 excluded that), but a packet the
+accepting end cannot parse.
+
+**What is still open, and how it closes.** Why that one packet does not decode. The next step is to print the first
+bytes of the datagram at the `malformed_decode` site and compare them with the bytes the client posted for the same
+packet — a field-by-field diff, not another hypothesis. The candidates worth checking against that diff: a sealed
+frame whose length arithmetic is off for a short payload, a header the client writes after the checksum, and a
+truncated write on the first send of a fresh socket.
+
+**Reverted**: both traces were `MOLEHILL_TRACE_ZERO`-gated instrumentation and are out of the tree; the working tree is
+the state §4.208 left it in, 107 tests green.
+
 ### 4.208 The fourth attempt is measured, reverted, and the conclusion goes to the human (2026-11-09)
 
 The delayed link (§4.205, `4a67b08`) made the fourth candidate exercisable: **all 107 tests passed with the wide block,
