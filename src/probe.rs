@@ -214,6 +214,67 @@ impl std::fmt::Debug for Listener {
     }
 }
 
+/// What one of this carrier's datagrams carries, for an instrument that is not the
+/// carrier.
+///
+/// The bench has an instrument that sits **between** two lanes and sees datagrams, not
+/// frames: to timestamp "the repair of the range that was dropped" it has to know which
+/// offset a datagram names. The decoder that knows is the carrier's own, so this exposes
+/// it read-only instead of letting the instrument re-implement the header — a second
+/// decoder is a second thing to be wrong, and the one that lies would be the one
+/// measuring (`HANDOFF.md` §4.189, §4.191).
+///
+/// `None` for anything this carrier cannot decode, including another protocol's bytes: a
+/// relay that guessed would report timings for traffic it does not understand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carried {
+    /// The stream the frame names, when the frame is a stream range.
+    pub stream: Option<u32>,
+    /// Where those bytes start, when the frame is a stream range.
+    pub offset: u64,
+    /// How many bytes it carries.
+    pub len: u16,
+    /// Whether this range ends the stream.
+    pub fin: bool,
+    /// Whether the packet carries no frame at all — an acknowledgement on its own.
+    pub ack_only: bool,
+}
+
+/// What this datagram carries, or `None` if it is not one of this carrier's packets.
+#[must_use]
+pub fn describe(datagram: &[u8]) -> Option<Carried> {
+    let packet = crate::transport::mhd::wire::decode(datagram).ok()?;
+    match packet.frame {
+        crate::transport::mhd::wire::Frame::Stream {
+            id,
+            offset,
+            fin,
+            data,
+            ..
+        } => Some(Carried {
+            stream: Some(id),
+            offset,
+            len: u16::try_from(data.len()).unwrap_or(u16::MAX),
+            fin,
+            ack_only: false,
+        }),
+        crate::transport::mhd::wire::Frame::None => Some(Carried {
+            stream: None,
+            offset: 0,
+            len: 0,
+            fin: false,
+            ack_only: true,
+        }),
+        _ => Some(Carried {
+            stream: None,
+            offset: 0,
+            len: 0,
+            fin: false,
+            ack_only: false,
+        }),
+    }
+}
+
 /// Start the carrier's once-a-second statistics reporter.
 ///
 /// The product starts it from its own runtime, so the phase and reader-park

@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.192 The RACK cell exists: a shallow flight, a drop box, and 2 210 µs between the evidence and the repair (2026-11-09)
+
+§4.189 built the *protocol* cell. This is the bench one, run inside the harness with no product setting touched: the
+harness gained `--role shallow`, which starts the acceptor lane, the dialer lane **and a drop box between them** in
+one process. The box drops the second stream datagram (the first is the carrier's own open), timestamps the next
+one through — later evidence that the dropped range is missing — and timestamps the first datagram that carries
+that range again.
+
+| reading | value |
+|---|---|
+| drop | 155 µs after start, offset 1 349, length 1 349 |
+| later evidence through | **+9 µs** (the next packet of the same burst) |
+| the dropped range re-sent | **+2 179 µs** |
+| `detect_after_later_us`, five runs | 2 186 / 2 197 / 2 210 / 2 232 / 2 320 µs (median **2 210**, spread 6 %) |
+| served | 2 698 of 2 698 bytes |
+
+**It needed one read-only seam.** The box has to know which offset a datagram names, and the decoder that knows is
+the carrier's own, so `probe::describe` exposes it (`Carried { stream, offset, len, fin, ack_only }`) rather than
+letting the instrument re-implement the header — a second decoder is a second thing to be wrong, and the one that
+lies would be the one measuring.
+
+**What 2 210 µs is, stated carefully.** It is *not* `loss_delay`: on loopback that is about 225 µs, and the carrier
+declared the loss about ten times later than that. It is the **pump's cadence** — the declaration waits for a pass
+to notice the stale record, and the pump wakes at `READ_POLL` (1 ms) while a stream is live, so two or three passes
+is the floor here. On a shaped path the same rule would wait for `loss_delay` instead, which is 225 ms over a
+200 ms round trip. **So the cell measures the rule, and the rule's delay is whichever is later: the clock's floor
+or the pump's poll** — and the model has no metric for either yet.
+
+**Boundary of this first version, and what it changes for the next step.** Both lanes are loopback, so the number
+above describes the rule at a zero-length path. To price the rule where the defect lives, the drop box has to be a
+process of its own (`--role relay`) sitting on the shaped leg between a normal server and client — that is the next
+step, and only after it does declaring a `model.METRICS` entry make sense, because a metric is a claim and this
+cell is not yet on the path the claim would be about.
+
 ### 4.191 A two-minute stage turns the storm from a coin flip into the steady state, and the metric becomes judgeable (2026-11-09)
 
 §4.190 concluded that the cell was the problem, not the statistic. One probe settles it: the same cell with

@@ -68,6 +68,14 @@ enum Mode {
 enum Role {
     Server,
     Client,
+    /// Both ends and a drop box in **one process**: the shallow-flight cell.
+    ///
+    /// Its own role because the cell is not a workload — it is a state. Two lanes, one
+    /// stream, three packets in flight, the middle one dropped, and the question is how
+    /// long the carrier takes to re-send it *after a later packet has already proved it
+    /// missing* (`HANDOFF.md` §4.191). Nothing above the carrier is involved, and no
+    /// product setting is touched: the drop happens in a relay socket this process owns.
+    Shallow,
 }
 
 /// Whether a request pays for a new connection or stream.
@@ -165,7 +173,8 @@ fn parse_args() -> Result<Args> {
                 role = Some(match value.as_str() {
                     "server" => Role::Server,
                     "client" => Role::Client,
-                    other => bail!("--role takes server or client, got {other:?}"),
+                    "shallow" => Role::Shallow,
+                    other => bail!("--role takes server, client or shallow, got {other:?}"),
                 });
             }
             "--addr" => {
@@ -233,6 +242,7 @@ async fn main() -> Result<()> {
         (Role::Server, Mode::Mhd) => serve_mhd(args.addr, args.size).await,
         (Role::Client, Mode::Tcp) => client_tcp(&args).await,
         (Role::Client, Mode::Mhd) => client_mhd(&args).await,
+        (Role::Shallow, _) => shallow(args.addr, args.size).await,
     }
 }
 
@@ -477,6 +487,193 @@ async fn client_tcp(args: &Args) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(args.hold_ms)).await;
     }
     Ok(())
+}
+
+/// The shallow-flight cell: two lanes, a drop box, and how late the repair is.
+///
+/// **What it measures.** The carrier's loss detection, at the shape RACK was refused
+/// for (`HANDOFF.md` §4.189): a stream whose flight is three packets. The box drops the
+/// second stream datagram, timestamps the next one through (which is later evidence that
+/// the dropped range is missing), and timestamps the first datagram that carries that
+/// range again. The difference between those two is the number a delivery-time-based
+/// detector would shrink, and it needs no product setting to measure: the drop happens in
+/// a socket this process owns.
+///
+/// **Why one process.** A relay is a third endpoint; making it a third *process* would
+/// add a runner, a port and a failure mode to a cell whose whole point is one state. The
+/// same runtime drives the acceptor, the dialer and the box, so the timestamps come from
+/// one clock.
+///
+/// Emits `drop`, `later`, `repair` and `summary` lines; the last carries
+/// `detect_after_later_us`, which is the number the cell exists for.
+async fn shallow(addr: SocketAddr, size: usize) -> Result<()> {
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    let mut listener = molehill_rathole::probe::Listener::bind(addr)
+        .with_context(|| format!("cannot bind {addr}"))?;
+    let server_addr = listener.local_addr();
+    let box_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let relay_addr = box_socket.local_addr()?;
+    emit(
+        "listening",
+        &[
+            ("addr", format!("\"{server_addr}\"")),
+            ("relay", format!("\"{relay_addr}\"")),
+            ("mode", "\"shallow\"".to_owned()),
+        ],
+    );
+
+    // The acceptor: one lane, one stream, reads the selector and the payload.
+    let served = tokio::spawn(async move {
+        let Some(lane) = listener.accept().await else {
+            bail!("the listener never accepted a lane");
+        };
+        let Some(mut io) = lane.accept().await else {
+            bail!("the lane never opened a stream");
+        };
+        let mut selector = [0u8; 1];
+        io.read_exact(&mut selector).await?;
+        let mut buf = vec![0u8; size];
+        let started = Instant::now();
+        let mut got = 0usize;
+        while got < size {
+            match io.read(&mut buf[got..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        Ok::<_, anyhow::Error>((got, us(started.elapsed())))
+    });
+
+    let t0 = Instant::now();
+    let boxed = tokio::spawn(relay_shallow(Arc::clone(&box_socket), server_addr, t0));
+
+    // The dialer: one stream, exactly two payload packets, so the flight is three.
+    let lane = molehill_rathole::probe::Lane::dial(relay_addr)
+        .await
+        .context("cannot dial the drop box")?;
+    let mut stream = lane.open().await.context("cannot open a stream")?;
+    let payload = vec![0xA5u8; size];
+    stream.write_all(&payload).await.context("writing")?;
+    stream.flush().await.context("flushing")?;
+
+    let (served_bytes, served_us) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), served)
+            .await
+            .context("the acceptor never finished")???;
+    let timings = tokio::time::timeout(std::time::Duration::from_secs(10), boxed)
+        .await
+        .context("the drop box never finished")???;
+    drop(stream);
+    drop(lane);
+
+    let (dropped_at, later_at, repair_at) = timings;
+    let detect = match (later_at, repair_at) {
+        (Some(later), Some(repair)) => Some(us(repair.duration_since(later))),
+        _ => None,
+    };
+    emit(
+        "served",
+        &[
+            ("bytes", served_bytes.to_string()),
+            ("us", served_us.to_string()),
+            ("expected", size.to_string()),
+        ],
+    );
+    emit(
+        "summary",
+        &[
+            ("size", size.to_string()),
+            ("mode", "\"shallow\"".to_owned()),
+            ("dropped", dropped_at.is_some().to_string()),
+            ("later_seen", later_at.is_some().to_string()),
+            ("repair_seen", repair_at.is_some().to_string()),
+            (
+                "detect_after_later_us",
+                detect.map_or("null".to_owned(), |us| us.to_string()),
+            ),
+        ],
+    );
+    Ok(())
+}
+
+/// Forward between the dialer and the acceptor, dropping one stream datagram.
+///
+/// Answers the three instants the cell needs: when the datagram was dropped, when the
+/// next one carrying stream bytes went through, and when the dropped range came back.
+/// The drop is the **second** stream datagram — the first is the carrier's own open,
+/// and dropping that would test the opening flight instead of a mid-flight hole.
+async fn relay_shallow(
+    socket: std::sync::Arc<tokio::net::UdpSocket>,
+    server: SocketAddr,
+    t0: Instant,
+) -> Result<(Option<Instant>, Option<Instant>, Option<Instant>)> {
+    use molehill_rathole::probe::{Carried, describe};
+
+    let mut client: Option<SocketAddr> = None;
+    let mut stream_datagrams = 0u32;
+    let mut dropped: Option<(u64, Instant)> = None;
+    let mut later: Option<Instant> = None;
+    let mut repair: Option<Instant> = None;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let (len, from) = socket.recv_from(&mut buf).await?;
+        if from == server {
+            // Back towards whoever dialed: the answer to the dropped range lands here
+            // too, and a box that swallowed it would be a second fault.
+            if let Some(peer) = client {
+                let _ = socket.send_to(&buf[..len], peer).await;
+            }
+            continue;
+        }
+        client = Some(from);
+        let carried: Option<Carried> = describe(&buf[..len]);
+        let mut forward = true;
+        if let Some(carried) = carried
+            && let Some(_) = carried.stream
+        {
+            stream_datagrams = stream_datagrams.saturating_add(1);
+            match dropped {
+                None if stream_datagrams == 2 => {
+                    dropped = Some((carried.offset, Instant::now()));
+                    forward = false;
+                    emit(
+                        "drop",
+                        &[
+                            ("offset", carried.offset.to_string()),
+                            ("len", carried.len.to_string()),
+                            ("at_us", us(t0.elapsed()).to_string()),
+                        ],
+                    );
+                }
+                Some((offset, _)) if later.is_none() && carried.offset != offset => {
+                    later = Some(Instant::now());
+                    emit("later", &[("at_us", us(t0.elapsed()).to_string())]);
+                }
+                Some((offset, at)) if repair.is_none() && carried.offset == offset => {
+                    repair = Some(Instant::now());
+                    emit(
+                        "repair",
+                        &[
+                            ("at_us", us(t0.elapsed()).to_string()),
+                            (
+                                "after_drop_us",
+                                us(Instant::now().duration_since(at)).to_string(),
+                            ),
+                        ],
+                    );
+                }
+                _ => {}
+            }
+        }
+        if forward {
+            let _ = socket.send_to(&buf[..len], server).await;
+        }
+        if repair.is_some() {
+            return Ok((dropped.map(|(_, at)| at), later, repair));
+        }
+    }
 }
 
 /// L2's client: the same workload over the carrier's own streams.
