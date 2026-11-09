@@ -1928,6 +1928,18 @@ class Kind:
     )
 
 
+#: The smallest carried rate at which the "per gigabit" ratios mean anything.
+#:
+#: A ratio needs a denominator, and a stalled cell's denominator is not a cost —
+#: it is the stall. Two samples in one D4 run reported `cpu_s_per_gbit` 3 762 and
+#: `wire_per_visitor_byte` 436.8 from cells that had carried under half a
+#: megabit, i.e. numbers about a queue that never moved rather than about the
+#: tool (`HANDOFF.md` §4.200). Below this rate those two metrics are absent, and
+#: `offered_gbps` — which is a measurement, not a ratio — is still reported, so
+#: the stall is visible rather than hidden. It lives here because it decides
+#: whether a metric exists, and the method fingerprint has to move with it.
+MIN_RATIO_GBPS: float = 0.001
+
 #: How the parameterized *kinds* name the cells they produce — by kind, not
 #: by scenario id, because several scenarios share a runner (bulk-1 and
 #: bulk-n are the same workload at different widths, rr-1 and rr-16 likewise)

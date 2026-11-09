@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.201 The ratio floor lands, `jitter` holds, and a warm-up round breaks that cell (2026-11-09)
+
+**The floor first, because two samples in §4.200 needed it.** `cpu_s_per_gbit` 3 762 and
+`wire_per_visitor_byte` 436.8 came from cells that had carried under half a megabit: a ratio over a stalled cell
+describes the stall. `model.MIN_RATIO_GBPS = 0.001` (1 Mbit/s) now makes both metrics absent below it, while
+`offered_gbps` keeps reporting what the visitor actually offered — so a stalled cell shows a small offer and two
+dashes, not a spectacular ratio. Declared in `model.py` because it decides whether a metric exists (it is part of the
+method fingerprint), stated on the benchmarks page in both languages, and it fired in the broken run below:
+`offered_gbps = 0.0001`, both ratios absent.
+
+**`jitter` holds** (`cost`, tunnel leg, two measured rounds, 356.7 s):
+
+| arm | `throughput_gbps` | `offered_gbps` | `rtt_p99_ms` | errors |
+|---|---|---|---|---|
+| molehill | 1.7813 / 1.8427 | 1.60 / 1.79 | 155.2 / 168.2 | 0 % |
+| molehill~aa | 1.8685 / 1.7383 | 1.68 / 1.56 | 161.3 / 155.5 | 0 % |
+
+Nearly two Gbit/s through 20 ms ± 5 ms of jitter, a 155–168 ms tail, no errors: the cell holds and there is no
+repair loop.
+
+**But the first attempt at this cell was broken, and by a documented option.** With `--warmup-rounds 1` the
+*first* arm of every round ran a **0.5 s** stage while the twin ran 62–68 s — `window_s` 0.508, 0.499, 0.498 against
+67.7, 62.8, 62.8 — so its throughput was absent rather than low, and the twin read 1.7–2.1 Gbit/s beside it. The same
+command without the warm-up round is clean on both arms. **A warm-up round is not free on this cell**, and a run that
+reports an absent primary because of one is a measurement defect, not a reading.
+
 ### 4.200 The storm is not loss-specific: both shaped cells storm where their records were clean (2026-11-09)
 
 `rate100` (100 Mbit shaper on the carrier leg) twice, the second after killing eight harness servers a previous run

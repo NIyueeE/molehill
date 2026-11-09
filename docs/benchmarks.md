@@ -266,6 +266,13 @@ Two conventions the table cannot state, because they belong to the workload:
   (`cpu_s_per_gbit`, `wire_per_visitor_byte`, `syscalls_per_s`) use the
   counters' window, which brackets exactly the workload's process — so a
   ratio's numerator and denominator cover the same seconds.
+- **A ratio is not reported when the cell carried under 1 Mbit/s.** A stalled
+  cell's denominator is the stall, so `cpu_s_per_gbit` and
+  `wire_per_visitor_byte` are absent there — the table shows a dash, and
+  `offered_gbps` still reports what the visitor actually offered, which is how a
+  reader sees that the cell stalled rather than that the tool was cheap. Without
+  the floor one run reported 3 762 s/Gbit and 436 wire bytes per visitor byte
+  from cells that had carried under half a megabit.
 - **`wire_per_visitor_byte` has a floor of 1 for one-way traffic and 2 for a
   strict request/response workload**, because it counts both directions of the
   tunnel link and a round trip is carried there twice. Read it against the

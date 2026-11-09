@@ -215,6 +215,11 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 有两条约定这张表说不出来,因为它们属于工作负载:
 
+- **格子每秒 carried 不到 1 Mbit 时,比值不报。** 停滞格子的分母就是停滞本身,所
+  以 `cpu_s_per_gbit` 与 `wire_per_visitor_byte` 在那里是缺失(表里显示为破折号),
+  而 `offered_gbps` 照常报访客真正发出了多少——读者因此看得出「格子停了」,而不
+  是「工具很便宜」。没有这道地板时,同一次运行里出现过 3 762 s/Gbit 与 436 wire
+  bytes/visitor byte,而对应的格子 carried 不到半个 Mbit。
 - **速率的窗口是仪器自己的,而且它是有名字的。** bulk 速率取接收端预热之后的
   窗口(iperf3 的);往返速率取探针的测量窗口,而不是解释器启动的那一刻(启
   动成本记录在 `meta.probe_startup_s` 里);数据报速率取探针的接收窗口,对一

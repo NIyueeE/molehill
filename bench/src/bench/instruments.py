@@ -29,7 +29,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from bench import hostinfo, topology
+from bench import hostinfo, model, topology
 
 #: The `/proc/<pid>/io` fields this model reads. `rchar`/`wchar` count bytes at
 #: the syscall boundary, so their ratio to `syscr`/`syscw` is the I/O *shape* —
@@ -338,6 +338,11 @@ def counter_metrics(sample: dict, peaks: dict, device_io: bool = True) -> dict:
     """
     window = max(sample.get("elapsed_s", 0.0), 1e-9)
     offered = visitor_bytes(sample)
+    carried = offered * 8 / window / 1e9
+    # A ratio over a stalled cell describes the stall. `offered_gbps` stays a
+    # reading either way: it is what the visitor actually offered, which is the
+    # fact a reader needs when the two ratios go absent (`model.MIN_RATIO_GBPS`).
+    ratios = carried >= model.MIN_RATIO_GBPS
     link = wire_of(sample)
     packets = packets_of(sample)
     calls = sample.get("syscalls", 0)
@@ -348,14 +353,14 @@ def counter_metrics(sample: dict, peaks: dict, device_io: bool = True) -> dict:
         for d in sample.get("drops", {}).values()
     )
     return {
-        "offered_gbps": round(offered * 8 / window / 1e9, 4) if offered else None,
+        "offered_gbps": round(carried, 4) if offered else None,
         "cpu_s_per_gbit": (
-            round(sample["cpu_s_total"] / (offered * 8 / 1e9), 4) if offered else None
+            round(sample["cpu_s_total"] / (offered * 8 / 1e9), 4) if ratios else None
         ),
         "cpu_cores": round(sample["cpu_s_total"] / window, 3),
         "bytes_per_syscall": (round(moved / calls, 1) if calls and device_io else None),
         "syscalls_per_s": round(calls / window, 1) if calls and device_io else None,
-        "wire_per_visitor_byte": round(link / offered, 4) if offered else None,
+        "wire_per_visitor_byte": round(link / offered, 4) if ratios else None,
         "mean_carried_packet_b": round(link / packets, 1) if packets else None,
         "rss_peak_mib": (
             round(peaks["rss_kib"] / 1024, 1) if peaks.get("rss_kib") else None
