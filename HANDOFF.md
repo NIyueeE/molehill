@@ -377,6 +377,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.202 The human's ruling: a defect is not deliverable, so D3 reopens on the timer (2026-11-09)
+
+Two instructions arrived together, and they change what this stage is for.
+
+**First: mhd has to be a complete protocol, with no known defect.** It is going to sit beside the TCP carrier as the
+basis for later design decisions, so a quarter-throughput lossy path is not a trade-off to be documented — it is a
+blocker. That retires the "closed as an explicit falsification" framing of §4.195: a falsification proves the
+protocol is **not ready**, which is a stage result but not a deliverable.
+
+**Second: measurement choices are mine to make.** No more waiting on a human for "should this cell be judged by
+throughput or by the duplicate share", or "may I build an older engine to tell a regression from an environment".
+If a question can be answered by running something, it gets run.
+
+**So D3 reopens, with the third candidate pre-registered before any code moves** (plan, *D3 第三次预登记*):
+
+**The candidate: the timer only does what a timer does.** `Recovery::on_timeout` must wait for **its own deadline**
+before it *declares* losses; the probe path is untouched (one range per tick, which is what keeps a shallow hole's
+repair at ~2 ms).
+
+**Why this one, from three measured facts.** `pump::wait()` caps its deadline at `READ_POLL` whenever a stream is
+live, and that cap arrives as `Wake::Timer` (`pump.rs:767`, `:976`). `Recovery::on_timeout` never compares `now`
+with its own timer — it clears it and decides (`recovery.rs:763`) — so **every millisecond** it either probes (when
+nothing is stale) or **declares the whole stale set lost and re-sends it** (`recovery.rs:780–830`). And the stale set
+is mostly not loss: 80–90 % of declarations come from the timer (§4.189), and the shaped cells storm without any
+configured loss at all because the carrier's own re-sending fills the queue (§4.200). Queue → declaration → re-send
+→ deeper queue is the loop.
+
+**The criteria, fixed before the run** (they are in the plan, and this entry is the copy that travels with the
+record): cell `cost` + `loss5` + tunnel leg + `--scale 2`, two rounds and the A/A twin; **primary
+`mhd_lane_dup_pct`** against 5 % materiality and the cell's own 4.9 % floor; **guards** `throughput_gbps ≥ 0.3628`
+(the acceptance floor — the candidate has to *double* today's 0.1843, not merely not-worsen), `rtt_p99_ms ≤ 1 412`
+ms, `transport_loss_detect_us ≤ 20` ms (the shallow hole must stay at millisecond scale — latency outranks
+throughput), clean `bulk-n ≥ 13.10` Gbit/s and `rate100_shallow` no worse than today. Any guard broken, the whole
+change goes back.
+
+**Status: pre-registered, no engine code touched yet.** The next commit is the change plus its unit tests, then the
+A/B.
+
 ### 4.201 The ratio floor lands, `jitter` holds, and a warm-up round breaks that cell (2026-11-09)
 
 **The floor first, because two samples in §4.200 needed it.** `cpu_s_per_gbit` 3 762 and
@@ -8298,8 +8336,8 @@ its text is the **D0–D5** plan that replaced the plan file on the same day:
 | **D0** | the three copies agree — plan file, this file, the objective | **done** (`15e4d76`) |
 | **D1** | per-lane instrumentation that can tell window, scheduler, acknowledgement, repair and counting apart | **done** (`cebd0bc`, `8e9a189`, `c0a5216`, `cdb98f5`): the `SendLedger` and eight tests |
 | **D2** | attribution runs that **choose** the fix | **done** (§4.181–§4.185): the cause is out-of-order evidence, and the storm reproduces at `l4-mux8` |
-| **D3** | **one** candidate, submitted and reverted alone | **two candidates falsified and reverted**: the ranges frame (`3043039` → `b3e9778`) and the repair budget (`397ece1` → `0c26311`). Judgeability built on the way: the metric (`a54cb8d`), the long cell that steadies the storm (§4.191, floor 76 % → 4.9 %), the protocol cell for a shallow flight (`7ae9d2c`), and the **bench** cell for it (`5f0f3a2`, `e7d899e`: scenario `transport-loss`, metric `transport_loss_detect_us`, A/A floor 4.2 %). Its reading is not yet about a path — see §4.193 — and the direction still waits on a human decision |
-| **D4** | the pre-registered criteria and guards (six cells, listed in the plan's §四) | **in progress, four of six verdicts in**: `loss5` **fails** at 51 % of its floor with a 1.4 s tail (§4.199); `rate100_shallow` **fails** (§4.197); `rate100`/`rate1000` **do not reproduce their records** (§4.197, §4.200); `bulk-n` sits **on** its floor, undecided until a same-method baseline exists (§4.196); `loss1` and `transport` **hold** (§4.196, §4.198). And the finding that reframes two of the cells: **the storm is not loss-specific** — the shaped cells build the queue and overflow it themselves (§4.200). `jitter` not run |
+| **D3** | **one** candidate, submitted and reverted alone | **reopened**: the human ruled that a defect is not deliverable — mhd has to be a complete protocol before anything is designed beside it — so the "explicit falsification" closure (§4.195) is a proof it is *not* ready, not a terminal state. Two candidates falsified and reverted (§4.186–§4.188); four directions measured and closed (§4.195); judgeability built on the way (the metric, the 120 s cell, the protocol cell, the bench cell). **Third candidate in progress: the timer only does what a timer does** — declaring must wait for its own deadline (§4.202) |
+| **D4** | the pre-registered criteria and guards (six cells, listed in the plan's §四) | **six cells measured, and the defect cell fails**: `loss5` at 51 % of its floor with a 1.4 s tail (§4.199); `rate100_shallow` behind both peers with two orders of magnitude more drops (§4.197); `rate100`/`rate1000` no longer reproducing their records (§4.197, §4.200); `bulk-n` on its floor (§4.196); `loss1`, `jitter` and `transport` hold (§4.196, §4.198, §4.201). These are the **before** numbers: once D3's fix lands, all six are re-run, and they are not a verdict until then |
 | **D5** | `just fmt`/`check`/`interop`/`l3-accept`, both carriers' integration suites, capacity, soak, docs, changelog | waiting on D4 |
 
 **The candidate, in one paragraph**, because this is the sentence the next session needs: a byte-range
