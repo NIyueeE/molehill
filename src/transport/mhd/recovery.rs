@@ -308,29 +308,6 @@ impl Rtt {
     }
 }
 
-/// What one byte-range confirmation did.
-///
-/// The two counts are separate for the same reason [`Acked`]'s are: `freed` is what
-/// left the flight total, and a record already declared lost had left it long ago —
-/// so its bytes are confirmed without being freed, and a sender that used `freed`
-/// alone would under-count what the peer holds.
-#[derive(Debug, Default)]
-pub(crate) struct RangeAcked {
-    /// Bytes this removed from the flight total.
-    pub(crate) freed: u64,
-    /// Of those, bytes whose record had already been declared lost.
-    pub(crate) late: u64,
-    /// When the newest retired record was sent, for a round-trip sample.
-    pub(crate) newest: Option<Instant>,
-}
-
-impl RangeAcked {
-    /// Stream bytes the range confirmed: everything it retired, late or not.
-    pub(crate) fn confirmed(&self) -> u64 {
-        self.freed.saturating_add(self.late)
-    }
-}
-
 /// What one acknowledgement did.
 #[derive(Debug, Default)]
 pub(crate) struct Acked {
@@ -522,64 +499,6 @@ impl Recovery {
             let _ = self.take(number);
         }
         (before.saturating_sub(self.flight_bytes), late)
-    }
-
-    /// Retire every record whose whole range sits inside `[start, end)` of `stream`.
-    ///
-    /// The ranges frame's counterpart to [`Recovery::confirm_prefix`], and the reason
-    /// that frame exists (`HANDOFF.md` §4.185): a receiver holds bytes above a hole,
-    /// and without this the sender can only learn about them through the number block
-    /// — which stops at the first lost number and reaches only sixty-four numbers
-    /// behind the largest seen. So a record the peer had long ago keeps the flight
-    /// closed, and the lane re-sends what is already buffered on the other side.
-    ///
-    /// Wholly inside, never overlapping: a range the peer partly holds is still owed
-    /// from its own first byte. `len == 0` records (a bare finish) are left to the
-    /// number path, because a range says the bytes arrived and not that the peer saw
-    /// the close — the same rule the prefix follows.
-    pub(crate) fn confirm_range(&mut self, stream: u32, start: u64, end: u64) -> RangeAcked {
-        let covered: Vec<u32> = self
-            .in_flight
-            .iter()
-            .filter(|(_, sent)| {
-                sent.range.is_some_and(|range| {
-                    range.stream == stream
-                        && range.len > 0
-                        && range.offset >= start
-                        && range.offset.saturating_add(u64::from(range.len)) <= end
-                })
-            })
-            .map(|(number, _)| *number)
-            .collect();
-        let before = self.flight_bytes;
-        let mut out = RangeAcked::default();
-        for number in covered {
-            if let Some(sent) = self.in_flight.get(&number) {
-                if sent.lost_at.is_some() {
-                    out.late = out
-                        .late
-                        .saturating_add(sent.range.map_or(0, |range| u64::from(range.len)));
-                }
-                // The newest record sets the trip's sample: it is the one whose send
-                // time is closest to now, so the sample is the tightest this evidence
-                // can give.
-                out.newest = Some(out.newest.map_or(sent.time, |at| at.max(sent.time)));
-            }
-            let _ = self.take(number);
-        }
-        out.freed = before.saturating_sub(self.flight_bytes);
-        out
-    }
-
-    /// Feed a round trip learned from evidence other than the number block.
-    ///
-    /// A retired range is proof the peer received those bytes, so it times the path
-    /// exactly as a number acknowledgement does — and the calls that keep the window
-    /// growing are the same ones. Without this a lane whose retirement ran entirely
-    /// on ranges would never sample a trip.
-    pub(crate) fn sample_trip(&mut self, sample: Duration) {
-        self.rtt.sample(sample);
-        self.heard();
     }
 
     /// Drop one packet's bytes from the flight total.

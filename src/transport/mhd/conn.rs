@@ -128,15 +128,6 @@ pub(crate) const GAP_SLOW_US: u64 = 200;
 /// latency this frame exists to buy. Small on purpose — a burst absorber, not a buffer.
 pub(crate) const DATAGRAM_QUEUE: usize = 64;
 
-/// The smallest gap between two ranges reports on one lane.
-///
-/// The frame exists to tell a sender what it cannot otherwise learn, and the sender
-/// learns it once: a report every ten milliseconds is enough to keep a lossy lane's
-/// flight retiring, and it bounds the cost at a hundred 74-byte packets a second —
-/// 0.06 % of a 100 Mbit lane. Sent per arriving packet it would be a packet of
-/// overhead per packet of payload, which is the trade this constant refuses.
-const RANGES_INTERVAL: Duration = Duration::from_millis(10);
-
 /// Whether a stream is still opening: it has not written a reserve's worth yet.
 fn opening(state: &StreamState) -> bool {
     state.send.written() < OPEN_RESERVE
@@ -536,7 +527,6 @@ fn frame_name(frame: &super::wire::Frame<'_>) -> &'static str {
         super::wire::Frame::Credit { .. } => "credit",
         super::wire::Frame::Reset { .. } => "reset",
         super::wire::Frame::Datagram { .. } => "datagram",
-        super::wire::Frame::Ranges { .. } => "ranges",
     }
 }
 
@@ -591,21 +581,6 @@ type StreamKeys = (
 /// table" from being two different derivations.
 type Opened<'a> = (std::borrow::Cow<'a, [u8]>, Option<StreamKeys>);
 
-/// Which acknowledgement path retired a record.
-///
-/// Three, and they are not interchangeable: the number block is the ordinary path,
-/// the byte prefix is the one that frees a record the number frontier can no longer
-/// name, and the ranges frame is the one that says "I hold these bytes out of order".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfirmPath {
-    /// A packet-number block or its bitmap named the record.
-    Number,
-    /// The peer's contiguous byte prefix covered it.
-    Prefix,
-    /// A ranges frame named the range it sits in.
-    Range,
-}
-
 /// What one lane put on the wire, against what the peer confirmed — per lane.
 ///
 /// The window line has always known how many bytes it *posted*; it never knew how
@@ -646,14 +621,6 @@ pub(crate) struct SendLedger {
     /// the accounting question, `pfx` being the path that does *not* grow the window.
     acked_by_number: u64,
     acked_by_prefix: u64,
-    /// Record bytes retired by a **ranges** frame: the peer told this end which
-    /// byte ranges it holds above its prefix, and those records were wholly inside
-    /// one of them (`HANDOFF.md` §4.185).
-    ///
-    /// The path that exists so a sender need not re-send what the receiver is
-    /// already holding — which is what an out-of-order path costs when the only
-    /// evidence is sixty-four packet numbers.
-    acked_by_range: u64,
     /// Of those, the ones whose record had already been declared lost.
     ///
     /// A declaration the path did not support, or one whose range a repair then
@@ -712,17 +679,11 @@ impl SendLedger {
     }
 
     /// One retired record, from whichever acknowledgement named it.
-    fn note_retired(&mut self, bytes: u64, path: ConfirmPath, late: bool) {
-        match path {
-            ConfirmPath::Number => {
-                self.acked_by_number = self.acked_by_number.saturating_add(bytes);
-            }
-            ConfirmPath::Prefix => {
-                self.acked_by_prefix = self.acked_by_prefix.saturating_add(bytes);
-            }
-            ConfirmPath::Range => {
-                self.acked_by_range = self.acked_by_range.saturating_add(bytes);
-            }
+    fn note_retired(&mut self, bytes: u64, by_prefix: bool, late: bool) {
+        if by_prefix {
+            self.acked_by_prefix = self.acked_by_prefix.saturating_add(bytes);
+        } else {
+            self.acked_by_number = self.acked_by_number.saturating_add(bytes);
         }
         if late {
             self.acked_late = self.acked_late.saturating_add(bytes);
@@ -748,7 +709,7 @@ impl std::fmt::Display for SendLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "sent={} rep={}({}%) pkt={} ack={} num={} pfx={} rng={} late={} \
+            "sent={} rep={}({}%) pkt={} ack={} num={} pfx={} late={} \
              loss={}t/{}m probe={} grow={} refus={}w/{}b/{}c/{}a \
              stop={}none/{}quiet/{}closed/{}other recv={} dup={}",
             self.sent_bytes,
@@ -758,7 +719,6 @@ impl std::fmt::Display for SendLedger {
             self.acked_bytes,
             self.acked_by_number,
             self.acked_by_prefix,
-            self.acked_by_range,
             self.acked_late,
             self.lost_by_threshold,
             self.lost_by_timer,
@@ -776,23 +736,6 @@ impl std::fmt::Display for SendLedger {
             self.recv_duplicate_bytes,
         )
     }
-}
-
-/// The ranges report one end owes the peer.
-///
-/// Set when a packet lands **above** a stream's contiguous frontier: those are the
-/// bytes the sender cannot retire from the number block or the prefix, so they are the
-/// ones it re-sends for nothing (`HANDOFF.md` §4.185). Kept together because the three
-/// move as one — a report is about one stream, and once sent it is not owed again for
-/// [`RANGES_INTERVAL`].
-#[derive(Debug, Default, Clone, Copy)]
-struct RangesOwed {
-    /// Whether one is owed.
-    pending: bool,
-    /// Which stream it is about.
-    stream: Option<u32>,
-    /// When the last one went out, if one ever did.
-    at: Option<Instant>,
 }
 
 /// A connection between two of this carrier's endpoints.
@@ -845,12 +788,6 @@ pub(crate) struct Conn {
     stall_logged_at: Option<Instant>,
     /// Which bound refused the last partial write (see [`Conn::write`]).
     last_refusal: Option<Refusal>,
-    /// The ranges report this end owes the peer, if any (`HANDOFF.md` §4.185).
-    ///
-    /// One field rather than three because the three move together — a report is owed
-    /// about one stream, and once sent it is not owed again for `RANGES_INTERVAL` — and
-    /// because a struct of its own keeps this one's flags countable.
-    ranges: RangesOwed,
     /// When the recovery table's hold was last logged, so a refused write in a hot
     /// loop costs one line a second and not one per call.
     table_logged_at: std::cell::Cell<Option<Instant>>,
@@ -1191,7 +1128,6 @@ impl Conn {
             idle_passes: 0,
             stall_logged_at: None,
             last_refusal: None,
-            ranges: RangesOwed::default(),
             table_logged_at: std::cell::Cell::new(None),
             none_reason: None,
             none_snapshot: None,
@@ -2008,15 +1944,6 @@ impl Conn {
         if self.credit_due() {
             return self.transmit_credit(now, out, ack);
         }
-        // **Before the streams, after the credit.** A ranges report is what lets the
-        // peer retire records it would otherwise re-send, so it is as urgent as the
-        // credit — and it is bounded to one per `RANGES_INTERVAL`, so it cannot crowd
-        // out payload the way an unbounded report per packet would.
-        if self.ranges_due(now)
-            && let Some(len) = self.transmit_ranges(now, out, ack)
-        {
-            return Some(len);
-        }
         // **Before the streams.** A datagram is the latency-sensitive class: it is
         // already on the wire from the application's point of view, and a queue behind
         // a bulk stream is exactly the delay this frame exists to remove. One per
@@ -2568,129 +2495,6 @@ impl Conn {
             return None;
         }
         wire::encode_control(out, self.id, self.recovery.last_number(), ack, Frame::None)
-    }
-
-    /// The window opens in two phases, the way every transport that has to find a
-    /// path's capacity does it.
-    ///
-    /// Until the path has dropped something, every acknowledged byte buys a byte of
-    /// window: the flight doubles once per round trip, which is what lets a flow of
-    /// *small* packets reach the path's capacity in a few round trips instead of
-    /// crawling there one big packet per window. After a loss it is additive — one
-    /// packet per window acknowledged — and the window is never cut: a loss is
-    /// repaired by retransmission, not paid for by halving the pipe for a round trip.
-    ///
-    /// Its own function because two kinds of evidence feed it: the number block, and
-    /// a ranges frame (both are proof the peer holds those bytes).
-    fn grow_on(&mut self, bytes: u64) {
-        if self.slow_start {
-            // Doubling stops at the ceiling and the additive rule takes over,
-            // because an unspaced burst that outruns the peer's buffer costs the
-            // connection its liveness (see [`WINDOW_FLOOR`]).
-            self.cwnd = self.cwnd.saturating_add(bytes).min(self.window_ceiling());
-            return;
-        }
-        self.acked_since_growth += bytes;
-        if self.acked_since_growth >= self.cwnd {
-            self.acked_since_growth = 0;
-            self.cwnd = self
-                .cwnd
-                .saturating_add(MAX_STREAM_PAYLOAD as u64)
-                .min(self.window_ceiling());
-        }
-    }
-
-    /// The peer holds these byte ranges above its prefix: retire what they cover.
-    ///
-    /// The receiving end of the ranges frame, and the one path by which a sender can
-    /// forget a record the number block will never name again (`HANDOFF.md` §4.185).
-    /// Three things happen here and the order matters only for the counters:
-    ///
-    /// - the records wholly inside a range leave the flight, which is what reopens
-    ///   `cwnd − flight` and lets new data go out at all;
-    /// - the newest of them times the path, because a retired range is proof the peer
-    ///   received bytes;
-    /// - the confirmed bytes feed the window, exactly as a number acknowledgement's do.
-    ///
-    /// The stream's `base` is deliberately **not** touched: `base` is the contiguous
-    /// frontier, a range is out of order by definition, and moving the frontier over a
-    /// hole would hand the reader bytes it never received.
-    fn apply_ranges(&mut self, now: Instant, stream: u32, base: u64, entries: &[(u32, u16)]) {
-        let mut confirmed = 0u64;
-        let mut freed = 0u64;
-        let mut late = 0u64;
-        let mut newest: Option<Instant> = None;
-        for (delta, len) in entries {
-            let start = base.saturating_add(u64::from(*delta));
-            let end = start.saturating_add(u64::from(*len));
-            let acked = self.recovery.confirm_range(stream, start, end);
-            confirmed = confirmed.saturating_add(acked.confirmed());
-            freed = freed.saturating_add(acked.freed);
-            late = late.saturating_add(acked.late);
-            if let Some(at) = acked.newest {
-                newest = Some(newest.map_or(at, |known| known.max(at)));
-            }
-        }
-        if confirmed == 0 {
-            return;
-        }
-        self.ledger.note_retired(freed, ConfirmPath::Range, false);
-        self.ledger.note_retired(late, ConfirmPath::Range, true);
-        if let Some(at) = newest {
-            self.recovery.sample_trip(now.saturating_duration_since(at));
-        }
-        self.grow_on(confirmed);
-    }
-
-    /// Whether a ranges report is owed, and long enough since the last one.
-    fn ranges_due(&self, now: Instant) -> bool {
-        self.ranges.pending
-            && self
-                .ranges
-                .at
-                .is_none_or(|at| now.saturating_duration_since(at) >= RANGES_INTERVAL)
-    }
-
-    /// One packet naming the ranges this end holds above a stream's frontier.
-    ///
-    /// Built from the receive buffer rather than from the insert that triggered it, so
-    /// the report is the buffer's current truth: pieces merge as more of a hole's
-    /// neighbours arrive, and a report sent from a stale snapshot would name ranges
-    /// that no longer exist.
-    fn transmit_ranges(
-        &mut self,
-        now: Instant,
-        out: &mut Vec<u8>,
-        ack: Option<wire::Ack>,
-    ) -> Option<usize> {
-        let id = self.ranges.stream?;
-        let state = self.streams.get(&id)?;
-        let base = state.recv.arrived();
-        let entries: Vec<(u32, u16)> = state
-            .recv
-            .ranges_above_frontier()
-            .take(wire::MAX_RANGES)
-            .filter_map(|(start, end)| {
-                let delta = u32::try_from(start.saturating_sub(base)).ok()?;
-                let len = u16::try_from(end.saturating_sub(start)).ok()?;
-                (len > 0).then_some((delta, len))
-            })
-            .collect();
-        if entries.is_empty() {
-            self.ranges.pending = false;
-            return None;
-        }
-        let number = self.recovery.last_number();
-        let packet_len = wire::encode_control(
-            out,
-            self.id,
-            number,
-            ack,
-            wire::Frame::ranges(id, base, entries),
-        )?;
-        self.ranges.at = Some(now);
-        self.ranges.pending = false;
-        Some(packet_len)
     }
 
     /// The next stream with bytes to send, walking from the cursor.
@@ -3459,18 +3263,6 @@ impl Conn {
         // rather than on the packet records that carried them (see `wire::ACK`).
         self.arrived_stream = id;
         self.arrived_prefix = state.recv.arrived();
-        // Bytes that landed **above** the frontier are the ones the peer cannot
-        // retire: the number block stops at the first lost number and the prefix stops
-        // at the first hole, so without a report the sender keeps them in flight and
-        // re-sends them for nothing (`HANDOFF.md` §4.185). One flag per lane, and the
-        // report itself is built later from the buffer's current state.
-        if state.recv.beyond_frontier().1 > 0 {
-            self.ranges = RangesOwed {
-                pending: true,
-                stream: Some(id),
-                at: self.ranges.at,
-            };
-        }
         // The reader that owns this stream is the only one the pump has to wake: it
         // got bytes or an end, and the rest of the lane's readers did not.
         self.woke.push(id);
@@ -3529,19 +3321,6 @@ impl Conn {
                 };
                 self.accept_stream(now, &range, fresh, sampled)?;
                 self.ack_pending = true;
-            }
-            // The peer is telling this end which of its bytes it holds out of order.
-            // Silence is the right answer: nothing here is acknowledged, because the
-            // frame's only job is to let the sender retire what the receiver already
-            // has (`Conn::apply_ranges`).
-            Frame::Ranges {
-                stream,
-                base,
-                count,
-                entries,
-            } => {
-                let live = &entries[..usize::from(count).min(wire::MAX_RANGES)];
-                self.apply_ranges(now, stream, base, live);
             }
             Frame::Credit { connection } => {
                 self.send_credit = connection;
@@ -3611,11 +3390,8 @@ impl Conn {
             // packet confirmed in its own right from one confirmed **after** the
             // lane had already declared it lost and queued the range again: the
             // second is a duplicate this carrier paid for on its own judgement.
-            self.ledger.note_retired(
-                u64::from(range.len),
-                ConfirmPath::Number,
-                sent.lost_at.is_some(),
-            );
+            self.ledger
+                .note_retired(u64::from(range.len), false, sent.lost_at.is_some());
         }
         // The byte prefix is the authority on this stream's frontier, because
         // it cannot stall the way the range acknowledgements can: a packet
@@ -3656,8 +3432,8 @@ impl Conn {
             // Two populations, counted separately: the records this end was still
             // waiting for, and the ones it had already declared lost. `freed` is the
             // first (they carried the flight total), `late` the second.
-            self.ledger.note_retired(freed, ConfirmPath::Prefix, false);
-            self.ledger.note_retired(late, ConfirmPath::Prefix, true);
+            self.ledger.note_retired(freed, true, false);
+            self.ledger.note_retired(late, true, true);
         }
         // A loss only rewinds the send point: the bytes are still in the
         // buffer, so the next pass carries them again from the same offset.
@@ -3718,7 +3494,23 @@ impl Conn {
         // halving the pipe for a round trip.
         let before = self.cwnd;
         if acked.progress {
-            self.grow_on(u64::try_from(acked.bytes).unwrap_or(u64::MAX));
+            let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
+            if self.slow_start {
+                // Doubling stops at the ceiling and the additive rule takes
+                // over, because an unspaced burst that outruns the peer's
+                // buffer costs the connection its liveness (see
+                // [`WINDOW_FLOOR`]).
+                self.cwnd = self.cwnd.saturating_add(bytes).min(self.window_ceiling());
+            } else {
+                self.acked_since_growth += bytes;
+                if self.acked_since_growth >= self.cwnd {
+                    self.acked_since_growth = 0;
+                    self.cwnd = self
+                        .cwnd
+                        .saturating_add(MAX_STREAM_PAYLOAD as u64)
+                        .min(self.window_ceiling());
+                }
+            }
         }
         // What the window actually gained, beside how many bytes were confirmed:
         // the two together say whether growth is one packet per window (as the
@@ -5225,126 +5017,6 @@ mod tests {
         assert!(ledger.grown > 0, "a clean path does grow the window");
     }
 
-    /// A range report retires the records it covers, and leaves the stream's base alone.
-    ///
-    /// The point of the frame (`HANDOFF.md` §4.185): a receiver holding bytes above a
-    /// hole can say so, the sender forgets those records and `cwnd − flight` reopens —
-    /// while the contiguous `base` does not move, because those bytes are out of order
-    /// by definition and a reader handed them would read a hole as data.
-    #[test]
-    fn a_range_report_retires_the_records_it_covers() {
-        let now = Instant::now();
-        let mut link = Link::new();
-        let stream = link.a.open();
-        let bytes = payload(96 * 1024);
-        let mut written = 0;
-        let mut hole: Option<(u64, u64)> = None;
-        let mut reports = 0;
-        for step in 0..600u64 {
-            let at = now + Duration::from_millis(step);
-            written += link.a.write(stream.id, &bytes[written..]);
-            let mut buf = Vec::new();
-            while let Some(len) = link.a.poll_transmit(at, &mut buf) {
-                let datagram = buf[buf.len() - len..].to_vec();
-                if let super::wire::Frame::Stream {
-                    id, offset, data, ..
-                } = super::wire::decode(&datagram).unwrap().frame
-                    && id == stream.id
-                {
-                    // The **second** stream packet is the hole — the first opens the
-                    // stream, and dropping that would test an unknown-stream refusal
-                    // instead. Its repair is the same range sent again, so it is held
-                    // back too: the hole has to stay a hole for the report to matter.
-                    if hole.is_none() && offset > 0 {
-                        hole = Some((offset, offset + u64::try_from(data.len()).unwrap()));
-                    }
-                    if hole.is_some_and(|(start, end)| offset >= start && offset < end) {
-                        continue;
-                    }
-                }
-                link.b.on_datagram(at, &datagram).unwrap();
-            }
-            let mut buf = Vec::new();
-            while let Some(len) = link.b.poll_transmit(at, &mut buf) {
-                let datagram = buf[buf.len() - len..].to_vec();
-                if matches!(
-                    super::wire::decode(&datagram).unwrap().frame,
-                    super::wire::Frame::Ranges { .. }
-                ) {
-                    reports += 1;
-                }
-                link.a.on_datagram(at, &datagram).unwrap();
-            }
-            if written == bytes.len() && reports > 0 {
-                break;
-            }
-        }
-        let Some((hole_start, _)) = hole else {
-            unreachable!("the second stream packet defines the hole")
-        };
-        assert!(reports > 0, "the receiver reported the bytes it holds");
-        assert_eq!(
-            link.a
-                .streams
-                .get(&stream.id)
-                .map(|state| state.send.base()),
-            Some(hole_start),
-            "and the contiguous base stopped at the hole: the reader must not be \
-             handed bytes out of order"
-        );
-    }
-
-    /// A crafted report retires records, and the contiguous base does not move.
-    ///
-    /// The sender's half on its own, because the end-to-end test above runs on a flight
-    /// narrow enough for the sixty-four-number bitmap to name everything — which is
-    /// exactly the state the frame is *not* for. Here nothing is delivered, so every
-    /// packet is a record in flight, and one report covering the whole stream takes them
-    /// all out of it.
-    #[test]
-    fn a_crafted_range_report_retires_records_and_leaves_the_base() {
-        let now = Instant::now();
-        let mut link = Link::new();
-        let stream = link.a.open();
-        let bytes = payload(8 * 1024);
-        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
-        let mut buf = Vec::new();
-        while link.a.poll_transmit(now, &mut buf).is_some() {}
-        assert!(link.a.recovery.flight_bytes() > 0, "packets are in flight");
-
-        let base_before = link
-            .a
-            .streams
-            .get(&stream.id)
-            .map(|state| state.send.base());
-        let report = super::wire::Frame::ranges(stream.id, 0, [(0u32, 8_192u16)]);
-        let mut out = Vec::new();
-        let _ =
-            super::wire::encode_control(&mut out, link.a.id, 0, None, report).unwrap_or_default();
-        let len = out.len();
-        let datagram = out.drain(..len).collect::<Vec<u8>>();
-        link.a.on_datagram(now, &datagram).unwrap();
-
-        let ledger = link.a.take_ledger();
-        assert_eq!(
-            ledger.acked_by_range, 8_192,
-            "the report retired every byte it named: {ledger}"
-        );
-        assert_eq!(
-            link.a.recovery.flight_bytes(),
-            0,
-            "so the flight is empty, which is what reopens cwnd − flight"
-        );
-        assert_eq!(
-            link.a
-                .streams
-                .get(&stream.id)
-                .map(|state| state.send.base()),
-            base_before,
-            "and the contiguous base did not move"
-        );
-    }
-
     /// A repaired byte crosses the wire twice and is still acked once.
     ///
     /// This is the shape the lossy cell is made of, in one stream: the dropped range
@@ -5584,16 +5256,9 @@ mod tests {
             link.pump_lossy(start + Duration::from_millis(step), 20);
             step += 1;
         }
-        // Then a clean path, so the assertion is about delivery and not about luck. The
-        // timer is driven here because a real pump drives it: without it this harness
-        // only ever repairs on the three-packet threshold, and a hole with no later
-        // packet behind it would wait for a timeout that never comes — which is what a
-        // change in the datagram sequence (an extra report packet) was enough to expose.
+        // Then a clean path, so the assertion is about delivery and not about luck.
         for extra in 0..400 {
-            let at = start + Duration::from_millis(step + extra);
-            let _ = link.a.on_timeout(at);
-            let _ = link.b.on_timeout(at);
-            link.pump(at);
+            link.pump(start + Duration::from_millis(step + extra));
         }
         let mut got: Vec<u8> = Vec::new();
         for _ in 0..64 {
@@ -5603,22 +5268,7 @@ mod tests {
         assert_eq!(
             got.len(),
             bytes.len(),
-            "every byte arrives even when one in twenty is dropped: written={written} {ledger} \
-             recv_frontier={:?} beyond={:?} send_base={:?} buffered={} flight={}",
-            link.b
-                .streams
-                .get(&stream.id)
-                .map(|state| state.recv.arrived()),
-            link.b
-                .streams
-                .get(&stream.id)
-                .map(|state| state.recv.beyond_frontier()),
-            link.a
-                .streams
-                .get(&stream.id)
-                .map(|state| state.send.base()),
-            link.a.buffered,
-            link.a.recovery.flight_bytes()
+            "every byte arrives even when one in twenty is dropped: {ledger}"
         );
         assert!(
             ledger.lost_by_threshold > 0,

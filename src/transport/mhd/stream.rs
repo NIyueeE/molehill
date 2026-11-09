@@ -840,28 +840,6 @@ impl RecvBuf {
         frontier
     }
 
-    /// The byte ranges this stream holds strictly above its contiguous frontier.
-    ///
-    /// Lowest first, absolute offsets. One item per **hole**, not per packet: a
-    /// `Piece` merges adjacent arrivals, so a receiver with one missing packet reports
-    /// one range however many packets landed after it. This is what the ranges frame
-    /// carries (`HANDOFF.md` §4.185) — the only out-of-order evidence the wire did not
-    /// have, and the reason a sender need not re-send bytes the receiver is holding.
-    ///
-    /// A piece that starts at the frontier is part of the frontier walk and so is not
-    /// returned; a piece beyond it is wholly unread, since the reader cannot pass the
-    /// hole before it.
-    pub(crate) fn ranges_above_frontier(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        let frontier = self.arrived();
-        self.pieces.iter().filter_map(move |(&at, piece)| {
-            if at <= frontier {
-                return None;
-            }
-            let len = u64::try_from(piece.len).unwrap_or(u64::MAX);
-            Some((at, at.saturating_add(len)))
-        })
-    }
-
     /// Bytes that have arrived and not yet been read out of this stream.
     ///
     /// The number a stalled reader is measured by: the connection's credit

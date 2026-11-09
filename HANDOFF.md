@@ -377,41 +377,6 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.186 D3's candidate: the ranges frame, and the harness gap it exposed (2026-11-09)
-
-The pre-registered candidate is implemented, tested, and **not yet measured** — the bench A/B is the next
-round's first job.
-
-**What landed.** A `Ranges` frame (`Kind::Ranges`, 13 bytes fixed plus 6 per entry, at most four entries) that
-carries `stream`, the contiguous `base` the deltas are measured from, and `(delta, len)` pairs. The receiver sets
-`RangesOwed` when a packet lands **above** a stream's contiguous frontier and emits one such frame at most every
-`RANGES_INTERVAL` (10 ms) — about 74 bytes per report, 0.06 % of a 100 Mbit lane. The sender retires, from that
-frame, every recovery record **wholly inside** one of the named ranges (`Recovery::confirm_range`), samples the
-trip from the newest of them, and feeds the confirmed bytes to the same growth rule a number acknowledgement
-feeds. It does **not** move the stream's `base`: a range is out of order by definition, and a reader handed those
-bytes would read a hole as data.
-
-**Five tests, and one of them is a harness fix that matters beyond this change.**
-
-| test | what it pins |
-|---|---|
-| `every_frame_round_trips` (extended) | the frame survives encode/decode with a full set of entries, and with none |
-| `a_range_covers_only_what_sits_wholly_inside_it` | the retirement rule: wholly inside, never overlapping |
-| `a_range_report_retires_the_records_it_covers` | end to end: a receiver holding a hole's worth of out-of-order bytes reports them, and the base stops at the hole |
-| `a_crafted_range_report_retires_records_and_leaves_the_base` | the sender's half alone: one report covering the stream empties the flight and leaves `base` where it was |
-| `five_percent_loss_on_a_fake_link_delivers_without_storming` | the memory link still delivers everything, with threshold declarations only |
-
-**The harness gap**: that last test failed after the frame landed, and the reason was not the frame. The fake link
-never drove `on_timeout`, so it only ever repaired on the three-packet threshold; a hole with no later packet
-behind it waited for a timeout that never came, and any change in the datagram sequence — one extra report packet
-— was enough to leave it waiting. The test now drives the timer, as a real pump does. That is a correction to the
-harness, not to the carrier: the earlier pass was luck, and the same luck is why `rep` read 4 repairs instead of 2
-on the run before.
-
-**What is deliberately not claimed.** No throughput, no duplicate-share change, nothing about the pre-registered
-cell: none of that has been run. The pre-registration in the plan still governs, and the A/B against the binary at
-`346d5e3` is what decides whether this stays.
-
 ### 4.185 The storm is reproducible, the pre-registration is written, and §4.182's contradiction dissolves (2026-11-09)
 
 **Reproduction.** `cost`, tunnel leg, `loss5`, arm `l4-mux8` (eight lanes), `--scale 1`, three rounds plus the A/A
