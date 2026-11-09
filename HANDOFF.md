@@ -367,6 +367,56 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.174 The attribution lands on the window after all — but on how *slowly it grows*, not on a missing cut (2026-11-09)
+
+§4.173 pre-registered one run to separate three candidates: transmission inflation, repair latency, or a
+stream-side stall. It named a fourth possibility only implicitly, and that is the one that won.
+
+Tunnel-leg `loss5`, `MOLEHILL_MHD_STATS=1` with `RUST_LOG=molehill=debug`, one arm, two measured rounds,
+278.2 s. The per-second series of one lane over 70 s, which is where medians had been hiding the shape:
+
+| | p10 | p50 | p90 | max |
+|---|---|---|---|---|
+| `cwnd` | 13 490 | 992 864 | 1 471 759 | **1 471 759** |
+| `flight` | 29 | 1.12 MB | 5.93 MB | 13.7 MB |
+| `buffered` | 29 | **5.97 MB** | 14.5 MB | 16.5 MB |
+| `posted_mbit_per_s` | 0 | **125** | 206 | 277 |
+| `worst_retransmits` (cumulative) | 0 | 32 863 | 71 474 | **81 938** |
+| `srtt_us` | 200 147 | | | |
+
+**Three candidates eliminated by the counters, and one arithmetic that closes.**
+
+1. **Not inflation.** 81 938 retransmissions over ~70 s is ≈ 1 170/s; at 290 Mbit/s carried that is one packet in
+   twenty-three — **4.3 %, which is the loss rate**. The wire is not doing the same work twice.
+2. **Not the ceiling.** `cwnd` reaches 1 471 759 against a `ceiling` of 16 MiB, so the ceiling never binds.
+3. **Not a stream-side stall.** `posted_mbit_per_s` is 125 at the median and the backlog is 6–16 MB — the sender
+   has both work to do and data to do it with, and `worst_ready_ms` is 0.
+4. **It is the window, and the arithmetic agrees.** 1.47 MB over a 200 ms round trip is **59 Mbit/s per lane**;
+   four lanes is 236 Mbit/s, against a cell that carries ~290. So throughput is set by the cwnd the lane *grew
+   to*, not by the path and not by the ceiling.
+
+**Which inverts the lever.** `slow_start` latches off at the **first** loss (the code says so in as many words),
+and from there the window grows one packet per window — so at a 200 ms round trip, climbing from 13 490 to
+1.47 MB costs roughly twenty seconds of a sixty-second stage, and the lane plateaus at a value it would have
+passed in a few round trips under slow start. The failure is **not that the window never shrinks; it is that it
+recovers too slowly** — the opposite of the "no loss response" reading in §4.169, and the reason adding a
+multiplicative decrease would have made this cell *worse*.
+
+**So P4's entry condition is met, with the sign reversed.** §12's P4 asked for `flight ≈ cwnd` with
+`none_reason = window` dominating before a controller could be written. The counters now say the window *is* the
+limiter on this shape — `flight` reaching 13.7 MB against a 1.47 MB cwnd, with 16 MB buffered behind it. What a
+controller should do here, however, is raise the window faster after a random loss, not lower it.
+
+**What that costs, and why it is not free.** "Re-enter slow start after a loss is followed by a full window of
+delivery" is a real congestion-control change: on a genuinely congested path it would be wrong, and the model has
+no cell where loss depends on the offered rate (§4.173's point). So the honest next step is still a cell before a
+change — a shallow-queue rate cell where mhd's own rate causes the drops — unless the human prefers to accept the
+lossy-path number and stop here.
+
+**Retransmission share is worth keeping as a guardrail**: 4.3 % against a 5 % loss rate is what "the repair path
+works" looks like, and any future change that lifts throughput by inflating this number is caught by a counter
+that already exists.
+
 ### 4.173 The lossy-path collapse is measured but its mechanism is not — and the one I named is wrong (2026-11-09)
 
 §4.169 and §4.170 both end by saying the collapse is "the 'no loss response' gap in measured form", and §4.169
@@ -7200,11 +7250,16 @@ of it. State at revision 2 of that objective:
   clean, a level rather than a lottery.
 - **P2 done** (§4.171): `transport` scenario, four declared metrics, bilingual rows, selfcheck 741 → 770. mhd's
   stream open is 3 µs against a TCP connect's 48, and its round trip is 2.5× the bare socket's.
-- **P4 is shut by measurement**, not by opinion: throughput equals the shaper and the bare path on both rate
-  cells, so the path limits and the window does not. On loss the limiter is the loss response, which is outside
-  §12's P4 list.
-- **One decision waits for the human**: add a loss-response stage, or record the lossy-path penalty as accepted
-  behaviour. P3 does not depend on it.
+- **P3 done** (§4.172): the listener's dispatchers and the admission cap now have tests that observe the
+  release — the task ending and the socket handle going — rather than the request for it, and both are
+  load-bearing. #7's task bound stays partial, recorded as structure rather than as measurement.
+- **P4's gate is met on one shape with the sign reversed** (§4.174): `rate100`/`rate1000` say the path limits,
+  but on a 5 %-loss carrier path the counters say the window does — `cwnd` reaching only 1.47 MB against a
+  16 MiB ceiling, which at 200 ms is 236 Mbit/s against the 290 measured. The failure is that the window
+  **recovers too slowly** after the first loss, not that it never shrinks, and a multiplicative decrease would
+  make that cell worse.
+- **The next step is P5** (docs, gates, repeat policy). A congestion-control experiment comes after it, and only
+  with the shallow-queue cell that makes it falsifiable.
 
 **Nothing is queued.** No measurement is outstanding, no decision is unanswered, and no row of the plan's
 progress table says "not started". The next round worth starting needs either a new instruction or a defect —
