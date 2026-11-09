@@ -723,6 +723,13 @@ CONDITIONS: dict[str, Condition] = {
         "a 20 Mbit uplink",
         ("rate", "20mbit", "delay", "40ms", "limit", "2000"),
     ),
+    "rate1000": Condition(
+        "rate1000",
+        "a gigabit metro link: fast enough that the path should not be the "
+        "carrier's limit, short enough that a window ceiling cannot hide behind "
+        "a long round trip",
+        ("rate", "1000mbit", "delay", "2ms", "limit", "4000"),
+    ),
     "loss1_rate100": Condition(
         "loss1_rate100",
         "a 100 Mbit uplink that also loses packets (the lossy-WAN case)",

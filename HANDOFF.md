@@ -367,7 +367,84 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.166 P1's second half: against a TCP carrier, `loss5` shows no throughput advantage and a worse tail (2026-11-09)
+### 4.168 P1 on a gigabit link: equal throughput, 4.3 % more tail, 57 % more CPU per Gbit (2026-11-09)
+
+The cleanest cell of this session, and the first where the control arm agrees with itself across two files. The
+same `cost` single point under the new `rate1000` condition (1 Gbit, 2 ms each way, 4 000-packet queue), run
+once on mhd and once with `MOLEHILL_DATA_CARRIER=tcp` — same fingerprint, pin in `molehill_switches`.
+
+| | mhd | TCP carrier | `control` (no tool) |
+|---|---|---|---|
+| `rtt_p99_ms` | **30.10** | **28.85** | 28.87 / 28.83 |
+| `throughput_gbps` | 0.93765 | 0.9377 | 0.93775 / 0.9376 |
+| `cpu_s_per_gbit` | **0.990** | **0.632** | — |
+| floors in that file | p99 0.74 %, thr 0.016 %, cpu 0.51 % | p99 **0.37 %**, thr 0.016 %, cpu 0.38 % | |
+
+**The control arm is the reason this cell can be read at all.** It reads 28.87 ms in one file and 28.83 in the
+other — 0.14 % apart — and 0.93775 against 0.9376 on throughput. Compare `loss5` (§4.166), where the same arm
+swung 47 % between two runs. **This cell is stable across files; that one is not**, and the difference is the
+condition, not the carrier: a rate limit is a deterministic shaper, and 5 % loss is not.
+
+**Three findings, all resolved:**
+
+1. **Throughput is identical** — 0.9377 Gbit/s for both carriers, 93.8 % of the shaper, and the same as the
+   tool-free path. On a gigabit link with four bulk streams and an interactive stream, mhd carries exactly what
+   the path carries. **The 256 KiB window ceiling does not cap it**: at a 4 ms round trip the ceiling is 1 MiB,
+   twice the bandwidth-delay product.
+2. **The interactive tail is 4.3 % worse** — 30.10 against 28.85 ms, i.e. **1.25 ms**, in a cell whose own floor
+   is 0.37–0.74 % and whose control is reproducible to 0.14 %. Small in absolute terms, and resolved rather
+   than directional: this is the first carrier-vs-carrier difference in the session that survives the
+   cross-file stability check.
+3. **CPU per carried Gbit is 56.6 % higher** — 0.990 against 0.632 s/Gbit, both files resolving that metric to
+   about half a percent. On a fast path the carrier's cost is CPU, not throughput and only marginally latency.
+
+**What this does to P4's entry condition, stated plainly.** §12 requires `flight ≈ cwnd` with
+`none_reason = window` dominating before a controller may be written. Here throughput **equals the shaper and
+the tool-free control**, so the path is the limiter and the window is not — on this shape, by construction of
+the numbers rather than by inspection of a counter. The `loss5` shape says the same about throughput and
+something else about the tail. **So the entry condition is not met on either shape, and P4 stays shut.**
+
+**What that leaves for P1.** One measurement, and it is now narrow: in `loss5`, where the tail is bad and the
+throughput is fine, *where does the interactive stream wait?* That is a scheduling and queueing question —
+`buffered` against `flight`, the `none_reason` distribution, and the read-side wake — not a window question.
+§12's rule applies to it unchanged: if `buffered` is large while `flight ≪ cwnd`, the answer is the send
+scheduler and the `flush` walk, and a controller would be the wrong instrument.
+
+**One caveat on the 4.3 %.** It is measured at one operating point (four bulk streams, one interactive, 1 Gbit).
+The interactive probe's own cadence is 50 ms, so 1.25 ms is a small fraction of what it measures; the cell is
+reproducible, but the *size* should not be extrapolated to other loads without measuring them.
+
+### 4.167 P1 on a rate-limited path: the carrier is not the limit, and nothing regresses (2026-11-09)### 4.167 P1 on a rate-limited path: the carrier is not the limit, and nothing regresses (2026-11-09)
+
+The `cost` single point under `rate100` (100 Mbit, 20 ms each way, 2 000-packet queue), four bulk streams and
+one interactive stream, one warm-up plus two measured rounds, 693.4 s:
+
+| arm | `rtt_p99_ms` | `rtt_worst_1s_ms` | `throughput_gbps` | `offered_gbps` | `cpu_s_per_gbit` | `retrans_segments` |
+|---|---|---|---|---|---|---|
+| `molehill` (mhd) | **203.16** | 196.37 | 0.0935 | 0.0947 | 6.05 | **0.0** |
+| `molehill~aa` | 200.25 | 194.73 | 0.0935 | 0.0947 | 6.24 | 0.0 |
+| `control` | 213.87 | 208.23 | 0.0935 | 0.0944 | — | 0.0 |
+
+Floors: `rtt_p99_ms` **6.6 %**, `throughput_gbps` **0.0 %**, `cpu_s_per_gbit` 3.1 %.
+
+**Three arms, one number.** Throughput 0.0935 Gbit/s for all three — 93.5 % of the shaper — offered 0.0947,
+and **zero TCP retransmissions everywhere**, so no queue is being overrun. mhd's interactive p99 is nominally
+*lower* than the tool-free path and inside its 6.6 % floor against its own twin.
+
+**That is the opposite of the `loss5` picture and it is the useful contrast**: on a path that is limited by
+rate and not by loss, the carrier adds nothing measurable — not to the tail, not to throughput, not to the
+queue. The 200 ms p99 here is the shaper's own standing queue, present for the control arm too.
+
+**And it independently confirms §4.163's correction**: `retrans_segments` is 0.0, so the window is not
+overflowing a 2 000-packet queue at 100 Mbit even though the *ceiling* is 20× the bandwidth-delay product. The
+ceiling is a cap that nothing reaches while the source is feedback-limited by the same path.
+
+**The one number worth a caveat.** `cpu_s_per_gbit` reads 6.05, which looks alarming beside `bulk-n`'s ~0.65 —
+but this cell carries 93 Mbit/s, so a Gbit takes eleven seconds of wall clock, and the idle polling of §4.151
+dominates the ratio. It is a per-Gbit CPU figure on a cell that cannot carry a Gbit per second; it should not
+be compared with a bulk cell's.
+
+### 4.166 P1's second half: against a TCP carrier, `loss5` shows no throughput advantage and a worse tail (2026-11-09)### 4.166 P1's second half: against a TCP carrier, `loss5` shows no throughput advantage and a worse tail (2026-11-09)
 
 The same `cost` single point, the same `loss5` path, the same binary, run twice — once on mhd and once with
 `MOLEHILL_DATA_CARRIER=tcp`. **Same fingerprint** (`3864bdd29651a505`), and the pin travels in
