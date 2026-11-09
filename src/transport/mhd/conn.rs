@@ -344,6 +344,24 @@ impl Conn {
     }
 }
 
+/// One arriving stream range, as the frame carried it.
+///
+/// A named type because the receive path takes five things at once — where the
+/// bytes start, what they are, which stream, whether they end it — and passing them
+/// one by one is what pushed that function past the argument budget. The fields are
+/// the frame's own, so a reader can check them against `wire::Frame::Stream`.
+#[derive(Clone, Copy)]
+struct Incoming<'a> {
+    /// Which stream.
+    id: u32,
+    /// Where these bytes start in it.
+    offset: u64,
+    /// The bytes.
+    data: &'a [u8],
+    /// Whether this range ends the stream.
+    fin: bool,
+}
+
 /// What the scheduler picked for one packet.
 ///
 /// `repair` is the difference between new data and a range the recovery already
@@ -631,6 +649,16 @@ pub(crate) struct SendLedger {
     stop_nothing_to_say: u64,
     stop_closed: u64,
     stop_other: u64,
+    /// Stream bytes that arrived here, and how many of them the stream already
+    /// held.
+    ///
+    /// The measurement §4.183 asks for: a carrier that re-sends a range the peer
+    /// already buffered pays for its own recovery with no delivery to show for it,
+    /// and no counter distinguished the two before this one. `dup` as a share of
+    /// `recv` is what says whether the lossy cell's 70–90 % duplicate share is real
+    /// loss or re-sent bytes the peer had.
+    recv_bytes: u64,
+    recv_duplicate_bytes: u64,
 }
 
 impl SendLedger {
@@ -683,7 +711,7 @@ impl std::fmt::Display for SendLedger {
             f,
             "sent={} rep={}({}%) pkt={} ack={} num={} pfx={} late={} \
              loss={}t/{}m probe={} grow={} refus={}w/{}b/{}c/{}a \
-             stop={}none/{}quiet/{}closed/{}other",
+             stop={}none/{}quiet/{}closed/{}other recv={} dup={}",
             self.sent_bytes,
             self.sent_repair_bytes,
             self.repair_share_pct(),
@@ -704,6 +732,8 @@ impl std::fmt::Display for SendLedger {
             self.stop_nothing_to_say,
             self.stop_closed,
             self.stop_other,
+            self.recv_bytes,
+            self.recv_duplicate_bytes,
         )
     }
 }
@@ -3139,6 +3169,106 @@ impl Conn {
         );
     }
 
+    /// One arriving stream range: the window check, the stream's creation if this
+    /// packet opens it, the storage, what arrived against what was news, and the
+    /// acknowledgement it owes.
+    ///
+    /// Its own function because `apply_datagram` is at the length the lint allows and
+    /// this arm is the longest of its frames — and because the arrival accounting is
+    /// a question of its own (`HANDOFF.md` §4.183).
+    fn accept_stream(
+        &mut self,
+        now: Instant,
+        range: &Incoming<'_>,
+        fresh: Option<StreamKeys>,
+        sampled: bool,
+    ) -> Result<(), Rejected> {
+        let Incoming {
+            id,
+            offset,
+            data,
+            fin,
+        } = *range;
+        if offset + data.len() as u64 > self.recv_credit {
+            return Err(Rejected::OverWindow);
+        }
+        let known = self.streams.contains_key(&id);
+        // One of *our* streams, and it is gone: its handle was dropped and the
+        // connection retired it while the peer still had bytes on the wire for it.
+        // Nobody wants those bytes, and the frame is dropped — but the packet is
+        // still acknowledged by the caller, because a sender that keeps re-sending a
+        // packet nobody will acknowledge counts ten unanswered retransmissions and
+        // declares the whole lane dead. That is how one short-lived visitor
+        // connection was killing the lane every other visitor shared.
+        let retired = self.is_retired_stream(id, known);
+        if retired {
+            tracing::debug!(stream = id, "mhd dropped data for a retired stream");
+            // The bytes are gone and nobody will read them, but the peer spent its
+            // window on them: give that window back, or a lane carrying many short
+            // streams narrows by one dead stream at a time until it carries nothing.
+            self.advance_read(data.len() as u64);
+            return Ok(());
+        }
+        if !known {
+            // The peer opens a stream by naming it; the accept queue is what tells
+            // its owner. A sealed stream arrives with the keys this packet was
+            // opened with.
+            let state = match fresh {
+                Some((send_cipher, recv_cipher)) => StreamState {
+                    sealed: true,
+                    send_cipher,
+                    recv_cipher,
+                    ..StreamState::default()
+                },
+                None => StreamState::default(),
+            };
+            self.streams.insert(id, state);
+            self.inbound.push_back(id);
+            self.inbound_at.insert(id, now);
+            self.stream_opened.insert(id, now);
+            self.highest_inbound = Some(self.highest_inbound.map_or(id, |h| h.max(id)));
+        }
+        let blocks = &mut self.blocks;
+        let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
+        // **What arrived, against what was news.** The stream buffers out-of-order
+        // bytes, so a re-sent range whose first copy simply arrived late is stored
+        // again and dropped by offset — invisible to every counter this end had.
+        // Whether the carrier is re-sending data the peer already holds is *the*
+        // question §4.183 leaves, and this is the only place that can answer it: the
+        // frontier and the held bytes before and after the insert, subtracted from
+        // what the packet carried.
+        let before = (state.recv.arrived(), state.recv.held());
+        stats::around(sampled, &stats::PHASES.append, || {
+            state.recv.insert(blocks, offset, data);
+        });
+        let after = (state.recv.arrived(), state.recv.held());
+        let arrived = u64::try_from(data.len()).unwrap_or(0);
+        let news = after
+            .0
+            .saturating_sub(before.0)
+            .saturating_add(after.1.saturating_sub(before.1));
+        self.ledger.recv_bytes = self.ledger.recv_bytes.saturating_add(arrived);
+        self.ledger.recv_duplicate_bytes = self
+            .ledger
+            .recv_duplicate_bytes
+            .saturating_add(arrived.saturating_sub(news));
+        state.inserted = state.inserted.saturating_add(arrived);
+        state.recv.note_ready(Some(now));
+        if fin {
+            state.recv.finish(offset + data.len() as u64);
+            state.peer_fin = true;
+        }
+        // Remember this stream's arrived prefix, which every acknowledgement from
+        // now on carries: it is what lets the peer's send buffer move on the bytes
+        // rather than on the packet records that carried them (see `wire::ACK`).
+        self.arrived_stream = id;
+        self.arrived_prefix = state.recv.arrived();
+        // The reader that owns this stream is the only one the pump has to wake: it
+        // got bytes or an end, and the rest of the lane's readers did not.
+        self.woke.push(id);
+        Ok(())
+    }
+
     /// The body of [`Conn::on_datagram`], with this datagram's sampling decision.
     fn apply_datagram(&mut self, now: Instant, buf: &[u8], sampled: bool) -> Result<(), Rejected> {
         let decode = stats::Timing::start(sampled);
@@ -3183,70 +3313,13 @@ impl Conn {
                 data,
             } => {
                 let (data, fresh) = self.open_stream_payload(&packet, id, data)?;
-                if offset + data.len() as u64 > self.recv_credit {
-                    return Err(Rejected::OverWindow);
-                }
-                let known = self.streams.contains_key(&id);
-                // One of *our* streams, and it is gone: its handle was dropped and
-                // the connection retired it while the peer still had bytes on the
-                // wire for it. Nobody wants those bytes, and the frame is dropped —
-                // but the packet is still acknowledged below, because a sender that
-                // keeps re-sending a packet nobody will acknowledge counts ten
-                // unanswered retransmissions and declares the whole lane dead. That
-                // is how one short-lived visitor connection was killing the lane
-                // every other visitor shared.
-                let retired = self.is_retired_stream(id, known);
-                if retired {
-                    tracing::debug!(stream = id, "mhd dropped data for a retired stream");
-                    // The bytes are gone and nobody will read them, but the peer
-                    // spent its window on them: give that window back, or a lane
-                    // carrying many short streams narrows by one dead stream at a
-                    // time until it carries nothing.
-                    self.advance_read(data.len() as u64);
-                } else {
-                    if !known {
-                        // The peer opens a stream by naming it; the accept queue is
-                        // what tells its owner. A sealed stream arrives with the
-                        // keys this packet was opened with.
-                        let state = match fresh {
-                            Some((send_cipher, recv_cipher)) => StreamState {
-                                sealed: true,
-                                send_cipher,
-                                recv_cipher,
-                                ..StreamState::default()
-                            },
-                            None => StreamState::default(),
-                        };
-                        self.streams.insert(id, state);
-                        self.inbound.push_back(id);
-                        self.inbound_at.insert(id, now);
-                        self.stream_opened.insert(id, now);
-                        self.highest_inbound = Some(self.highest_inbound.map_or(id, |h| h.max(id)));
-                    }
-                    let blocks = &mut self.blocks;
-                    let state = self.streams.get_mut(&id).ok_or(Rejected::UnknownStream)?;
-                    stats::around(sampled, &stats::PHASES.append, || {
-                        state.recv.insert(blocks, offset, &data);
-                    });
-                    state.inserted = state
-                        .inserted
-                        .saturating_add(u64::try_from(data.len()).unwrap_or(0));
-                    state.recv.note_ready(Some(now));
-                    if fin {
-                        state.recv.finish(offset + data.len() as u64);
-                        state.peer_fin = true;
-                    }
-                    // Remember this stream's arrived prefix, which every
-                    // acknowledgement from now on carries: it is what lets the
-                    // peer's send buffer move on the bytes rather than on the
-                    // packet records that carried them (see `wire::ACK`).
-                    self.arrived_stream = id;
-                    self.arrived_prefix = state.recv.arrived();
-                    // The reader that owns this stream is the only one the pump
-                    // has to wake: it got bytes or an end, and the rest of the
-                    // lane's readers did not.
-                    self.woke.push(id);
-                }
+                let range = Incoming {
+                    id,
+                    offset,
+                    data: data.as_ref(),
+                    fin,
+                };
+                self.accept_stream(now, &range, fresh, sampled)?;
                 self.ack_pending = true;
             }
             Frame::Credit { connection } => {
@@ -5158,6 +5231,59 @@ mod tests {
             "and every byte had been given up on before it arrived: {ledger}"
         );
         assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
+    }
+
+    /// A range that arrives twice is counted as a duplicate, not as delivery.
+    ///
+    /// The counter exists for §4.183's question: whether the carrier's 70–90 %
+    /// duplicate share on a lossy path is re-sending bytes the peer already holds.
+    /// The stream drops a repeat by offset, so without this the second copy is
+    /// invisible — delivered once, counted twice is the mistake this forbids.
+    #[test]
+    fn a_duplicate_range_is_counted_as_a_duplicate() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(3_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        // Deliver everything once, keeping the first stream packet to send again.
+        let mut repeat = None;
+        for _ in 0..8 {
+            let mut buf = Vec::new();
+            let Some(len) = link.a.poll_transmit(now, &mut buf) else {
+                break;
+            };
+            let datagram = buf[buf.len() - len..].to_vec();
+            let carried = match super::wire::decode(&datagram).unwrap().frame {
+                super::wire::Frame::Stream { id, data, .. } if id == stream.id => Some(data.len()),
+                _ => None,
+            };
+            link.b.on_datagram(now, &datagram).unwrap();
+            if repeat.is_none()
+                && let Some(size) = carried
+            {
+                repeat = Some((datagram, size));
+            }
+        }
+        let first = link.b.take_ledger();
+        assert_eq!(
+            first.recv_duplicate_bytes, 0,
+            "a clean first delivery has no duplicates: {first}"
+        );
+
+        let Some((datagram, size)) = repeat else {
+            unreachable!("the write reaches the wire as a stream packet")
+        };
+        link.b.on_datagram(now, &datagram).unwrap();
+        let again = link.b.take_ledger();
+        let size = u64::try_from(size).unwrap();
+        assert_eq!(again.recv_bytes, size, "the repeat carried those bytes");
+        assert_eq!(
+            again.recv_duplicate_bytes, size,
+            "and every one of them was already held: {again}"
+        );
+        assert_eq!(again.acked_bytes, 0, "so none of it is new delivery");
     }
 
     /// The accepting end counts the dialing end's first numbered packet.

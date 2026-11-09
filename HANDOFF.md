@@ -377,6 +377,45 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.184 The receiver's duplicate share: the re-sends really are bytes it already held (2026-11-09)
+
+§4.183 left one question: is the carrier re-sending data the peer already holds, or carrying real loss? The
+receiver could not answer it, because a repeated range is dropped by offset inside the stream and no counter saw
+it. It can now: `recv` (stream bytes that arrived) and `dup` (how many of them the stream already held), taken from
+the frontier and the held bytes around each insert, so the difference is exactly what the packet carried against
+what was news.
+
+**Measured on `loss5`, `cost`, two rounds plus the A/A twin, `--scale 1`, 343.9 s:**
+
+| side | reading |
+|---|---|
+| sending lanes (`sent` 790–1 185 MB) | re-send share **13–28 %**; `ack` 654–1 019 MB; `late` 94–117 MB |
+| receiving lanes (`recv` 750–1 137 MB) | **8.5–37 %** of arriving bytes were already held |
+| cell `throughput_gbps` | 0.2208 / 0.2906, twin 0.3775 / 0.2162 |
+
+**Two independent instruments agree.** The sender says one byte in five to one in eight was a range already sent;
+the receiver, counting separately and in the other direction, says one byte in twelve to one in three arrived as a
+duplicate it dropped. That is the first cross-check of the ledger against something that is not the ledger, and it
+holds: `dup` tracked the sender's `rep` on every lane.
+
+**And this run did not reproduce the state §4.182 measured.** There, several lanes re-sent 70–90 % of their bytes
+and the cell carried 0.1667 / 0.1653. Here every lane sat at 13–28 % and the cell carried 0.2208 / 0.2906. Same
+binary, same condition, same command shape, **different state** — and the two runs' wall times differ with it
+(537 s against 344 s, because a stormy stage drains for longer). So the 70–90 % figure is a *regime* the carrier
+falls into, not its steady cost, and that changes what a fix has to be judged on.
+
+**Which is why D3 has not started.** A candidate judged on a cell that may or may not be in the bad regime is
+exactly the trap this file keeps recording: one run would show a gain, the next would show nothing, and neither
+would be about the change. Before any fix there has to be a cell where the storm is reproducible on demand —
+the honest candidates are more concurrent lanes on the same shaped leg, a deeper shaper queue, or both — and the
+plan's D3 pre-registration goes into *that* cell, not into a lucky one.
+
+**What this does establish for the fix's shape.** The re-sent bytes are, in the receiver's own accounting, bytes it
+already had: the recovery is spending the path's capacity to hand the peer what the peer already holds. Two ways
+out, both to be judged in the reproduction: give the acknowledgement better out-of-order evidence (the byte
+prefix stops at the first hole; the only other evidence is 64 packet numbers), or stop re-sending a range the peer
+has already buffered — which the wire currently cannot express.
+
 ### 4.183 Every lane's cumulative frontier is dead: the peer never sees number 0 (2026-11-09)
 
 Chasing §4.182's `num=0` produced something larger than the question. Across **three runs and forty lanes**, on
