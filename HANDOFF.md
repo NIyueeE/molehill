@@ -7995,7 +7995,7 @@ its text is the **D0–D5** plan that replaced the plan file on the same day:
 | **D0** | the three copies agree — plan file, this file, the objective | **done** (`15e4d76`) |
 | **D1** | per-lane instrumentation that can tell window, scheduler, acknowledgement, repair and counting apart | **done** (`cebd0bc`, `8e9a189`, `c0a5216`, `cdb98f5`): the `SendLedger` and eight tests |
 | **D2** | attribution runs that **choose** the fix | **done** (§4.181–§4.185): the cause is out-of-order evidence, and the storm reproduces at `l4-mux8` |
-| **D3** | **one** candidate, submitted and reverted alone | **two candidates falsified and reverted**: the ranges frame (`3043039` → `b3e9778`) and the repair budget (`397ece1` → `0c26311`); judgeability **built** on the way (`a54cb8d`, `mhd_lane_dup_pct`, selfcheck 774); **stopped for a human decision** |
+| **D3** | **one** candidate, submitted and reverted alone | **two candidates falsified and reverted**: the ranges frame (`3043039` → `b3e9778`) and the repair budget (`397ece1` → `0c26311`). Judgeability **built** on the way: the metric (`a54cb8d`), the shallow-flight cell (`7ae9d2c`), and the cell that makes the storm steady at 120 s (§4.191, floor 76 % → 4.9 %). **Stopped for a human decision** on the remaining lever |
 | **D4** | the pre-registered criteria and guards (six cells, listed in the plan's §四) | waiting on D3 |
 | **D5** | `just fmt`/`check`/`interop`/`l3-accept`, both carriers' integration suites, capacity, soak, docs, changelog | waiting on D4 |
 
