@@ -377,6 +377,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.199 The formal `loss5` acceptance: half the floor, with a 1.4 s tail (2026-11-09)
+
+The headline cell, run properly: `cost` + `loss5` on the tunnel leg, **`--scale 2` (120 s stages), six measured
+rounds plus the twin** (1 677 s), with no statistics overhead so the throughput is the clean one.
+
+| arm | `throughput_gbps` (six rounds) | median | `rtt_p99_ms` | wire/visitor |
+|---|---|---|---|---|
+| molehill | 0.1215, 0.2327, 0.1206, 0.2291, 0.1395, 0.3437 | **0.1843** | 1 412 | 1.566 |
+| molehill~aa | 0.4510, 0.2276, 0.0282, 0.2250, 0.1242, 0.2451 | 0.2263 | 1 562 | 1.588 |
+
+**Against the plan's floor of 0.3628 Gbit/s (30.5 % of the 1.19 Gbit/s clean baseline), the median is 51 % of it.**
+The cell fails, and it fails by a factor the noise cannot cover — the criterion is a floor on the median of six
+rounds and every round is below it.
+
+Two things it also says, which matter more than the number:
+
+- **The tail is 1.4 s on a 100 ms path.** The plan's priority is 延迟 > 吞吐, so this is the more serious of the two
+  readings: a visitor on this path waits a second and a half at the 99th percentile.
+- **The spread is still huge** — 0.12–0.34 on the same binary, 0.03–0.45 on its twin — so this cell can only ever
+  support a *floor* claim, not a ratio. That is a property of the defect, not of the run: the storm's presence is
+  what varies, and six rounds of 120 s do not average it away.
+
 ### 4.198 D4's `transport` cell holds, and the six-criterion picture so far (2026-11-09)
 
 **`transport`, clean** (dev profile, two measured rounds plus the twin, 12.2 s): the carrier's own numbers, with the
