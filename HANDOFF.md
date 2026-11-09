@@ -7368,8 +7368,18 @@ of it. State at revision 2 of that objective:
   16 MiB ceiling, which at 200 ms is 236 Mbit/s against the 290 measured. The failure is that the window
   **recovers too slowly** after the first loss, not that it never shrinks, and a multiplicative decrease would
   make that cell worse.
-- **The next step is P5** (docs, gates, repeat policy). A congestion-control experiment comes after it, and only
-  with the shallow-queue cell that makes it falsifiable.
+- **P5 done** (§4.175): `just check`, `just interop`, `just l3-accept`, three full integration runs and twenty
+  runs of the once-flaky cell, plus the TCP carrier's suite at 435 passed — all on the tree that carries the
+  changes.
+- **P4 closed without a change, and that is the finding** (§4.176–§4.177). The shallow-queue cell now exists and
+  shows mhd dropping two orders of magnitude more than its peers while carrying 19 % less — so loss does follow
+  its own rate. The cheap recovery rule is arithmetically dead (a clean window at 5 % loss is 0.6 % likely at a
+  hundred packets), and the growth rate is 6.7 KB/s at 200 ms, so the window is nearly frozen at whatever value
+  slow start reached. What would work is a rate-driven window — a redesign with its own guard matrix, not a fix.
+
+**So §12 is complete: P1 through P5 each have an outcome, and the one item left partial is named.** §4.172's #7
+task-count bound stays structural rather than measured, and no controller was written — recorded as "no change,
+mechanism named" rather than as a gap.
 
 **Nothing is queued.** No measurement is outstanding, no decision is unanswered, and no row of the plan's
 progress table says "not started". The next round worth starting needs either a new instruction or a defect —
