@@ -417,6 +417,16 @@ contiguous prefix, and the sender retires any record wholly covered by them. Tha
 amplifier (step 5) and is recorded as the fallback for the case where this one is falsified — not as a cheaper
 first try, because it leaves every lane re-sending what the peer already has.
 
+**The design, fixed before the code so the next round does not re-derive it.** A separate optional `Ranges` frame
+rather than a longer acknowledgement block: the ordinary ack stays 28 bytes and the extra cost is paid only when
+there is out-of-order data to name. It carries up to four ranges above the reported prefix (`delta u32` +
+`len u16`), the receiver emits it when its pieces hold bytes above `arrived()`, and the sender uses it to retire
+**recovery records** — `flight` falls — while leaving the stream's `base` where it is, because `base` is the
+contiguous frontier and the stream's semantics do not change. A record retired by a range leaves nothing for the
+later prefix to find, so the two paths cannot double-count. The predicted chain is the one the measurements
+imply: `flight` down → `cwnd − flight` open → new data admitted → the queue drains → acknowledgements land inside
+`loss_delay` → the timer stops over-declaring → growth resumes.
+
 ### 4.184 The receiver's duplicate share: the re-sends really are bytes it already held (2026-11-09)
 
 §4.183 left one question: is the carrier re-sending data the peer already holds, or carrying real loss? The
