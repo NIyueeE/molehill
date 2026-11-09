@@ -377,6 +377,45 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.208 The fourth attempt is measured, reverted, and the conclusion goes to the human (2026-11-09)
+
+The delayed link (§4.205, `4a67b08`) made the fourth candidate exercisable: **all 107 tests passed with the wide block,
+the gated timer, the anchored declaration and the escape hatch in place.** The measurement then closed it:
+
+| arm | `mhd_lane_dup_pct` | `throughput_gbps` | `rtt_p99_ms` |
+|---|---|---|---|
+| candidate | 55.5 / 58.2 / 57.1 | **0.094 / 0.107 / 0.073** | 2 612 / 1 814 / 1 395 |
+| candidate twin | 56.1 / 66.4 / 90.6 | 0.069 / 0.021 / 0.101 | 1 399 / 1 400 / 1 472 |
+| pre-change binary | 13.8 / 13.4 / 92.0 | **0.404 / 0.417 / 0.273** | 1 486 / 1 517 / 1 390 |
+
+The guard is `throughput_gbps ≥ 0.3628`; the candidate misses it by three to five times. It is the best of the four —
+55–58 % duplicate share against the third attempt's 62–91 %, and both arms agree, so the mechanism is real — and it is
+still nowhere near the pre-change binary's *healthy* rounds (0.40 at 13 % duplicate share). **Reverted whole.**
+
+**Four attempts, four reverts, and the pattern is now the finding.**
+
+| attempt | what it changed | result |
+|---|---|---|
+| §4.203 | wide block + gated timer | `num` retirement 0 → 312 051/s, `cwnd` 13 480 → 198 156 — the retirement defect is real — but 0.055–0.092 against 0.325–0.540 |
+| §4.206 | + time-anchored, capped declaration | 0.086–0.118, p99 2.7–3.9 s: **deadlock**, not storm |
+| §4.208 | + escape hatch when the frontier stalls | 0.094–0.107 at 55–58 % duplicates: better, still 3–5× short |
+
+**The conclusion, stated as a conclusion.** In this architecture — repairs exempt from the window, a timer that
+declares, a cumulative frontier that pins at zero on every product lane, and a block that can only name a bounded
+window behind the largest number — **the lossy path cannot be brought to the pre-change binary's healthy rounds by
+changing the declaration rule.** Each attempt moved one of the four, and each was pulled back by another: widening the
+block exposes more holes than the rule can admit; gating the timer stops the flood and deadlocks; adding evidence
+without an escape deadlocks; adding the escape recovers throughput to a third and no further.
+
+**What would be needed is not a fifth variation.** It is a recovery loop whose parts are designed together: repairs
+*inside* the window (so the flight cannot grow to 30× `cwnd`), a frontier that cannot pin (so the cumulative path
+stays alive), an acknowledgement whose reach scales with the flight (so nothing is stranded), and a declaration rule
+with both evidence and an escape. That is a re-architecture of the recovery path, not a patch, and it is the human's
+call — which is exactly what the fourth pre-registration said would happen if this failed.
+
+**Committed from this round: nothing in the engine.** The tree is `4a67b08`'s state, 107 tests green. The four
+attempts' designs and numbers are in §4.203–§4.208 and in the plan's D3 pre-registrations; none of them is in the tree.
+
 ### 4.207 The fourth candidate compiles and its rule is right, but the harness cannot exercise it (2026-11-09)
 
 The fourth candidate was implemented: the wide block, the gated timer, the time-anchored capped declaration, and the
