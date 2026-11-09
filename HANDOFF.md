@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.195 D3 closes as a falsification: four directions measured, none of them the fix (2026-11-09)
+
+The plan's D3 asks for "a fix **or an explicit falsification**". The last four rounds produced the second, and this
+entry closes the stage on it — not on a fix, and not on "acceptable".
+
+| direction | verdict | evidence |
+|---|---|---|
+| byte-range acknowledgement (what the peer holds above its prefix) | **falsified** | mechanism fired (`rng` 21–25 MB/round) but the pre-registered primary could not resolve, and on the new metric the candidate was *worse* in healthy rounds: 25–30 % against the baseline's 14.5 % (§4.186–§4.187) |
+| admit repairs against the window | **falsified** | stormed in 3 of 6 rounds against the baseline's 1, throughput −21 %, reproduced by its own twin (§4.188) |
+| RACK-shaped delivery-time detection | **premise refuted** | the shallow cell reads 2.3–2.6 ms on a 200 ms path *with the round trip seeded*, because the pump probes on its 1 ms tick — there is nothing slow to fix (§4.194) |
+| bound the unconditional probe (this entry's own candidate) | **not worth it** | measured from the archived runs: probe bytes are **2.4–3.5 %** of what the lanes post (2.4 / 2.8 % at `--scale 2`, 3.0–3.5 % at `--scale 1`), and the change would also push a shallow hole's repair from ~2 ms out to the RTO — a throughput gain paid for in latency, against the plan's own 延迟 > 吞吐 ordering |
+
+**What the defect is, stated as it now stands.** On a carrier path that loses 5 % of datagrams, the lane settles into
+a state where most of the wire is repairs (68–92 % duplicate share), the window stays small, and the cell carries a
+tenth to a quarter of what a clean path does. The declaration that starts it is the **stale branch** — 80–90 % of
+declarations come from the clock rather than from later-packet evidence (§4.189) — and every candidate that tried to
+change what happens *around* that declaration failed or was refuted.
+
+**What is explicitly not claimed here.** That the defect is unfixable. Four directions were measured and closed;
+the fifth is not named, and finding it needs a new hypothesis, not another attempt on one of these four.
+
+**So D3 closes, and D4 opens with the defect on the record.** The acceptance cells now produce a verdict that says
+so, which is what the plan asks for: a defect kept as a defect rather than dressed as a trade-off.
+
 ### 4.194 The cell's real reading refutes RACK's premise: the carrier probes on the pump's tick (2026-11-09)
 
 §4.193 left the cell measuring a 2.2 ms "repair" on a 200 ms path and blamed a missing round-trip sample. The
