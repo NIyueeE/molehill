@@ -367,6 +367,56 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.177 P4 closes without a change: the candidate rule is arithmetically dead, and the real fix is a redesign (2026-11-09)
+
+§4.176 built the cell that makes "should the window react?" falsifiable. Before spending a run on a candidate,
+two pieces of arithmetic from the code killed the obvious one.
+
+**Candidate 1 — re-enter slow start after a full window of clean delivery.** The rule reads well: a loss followed
+by an entire window delivered is not congestion. But at a 5 % drop rate the probability that a whole window
+arrives cleanly is `0.95^n`, and the windows here are large:
+
+| window | P(clean) |
+|---|---|
+| 10 packets | 0.599 |
+| 100 packets | **0.0059** |
+| 500 packets | 0.0000016 |
+| 1 100 packets (1.47 MB) | ~0 |
+
+So the rule fires only while the window is a few tens of packets, and stops firing exactly when it would start
+to matter. **It cannot fix the cell it was designed for**, and the calculation costs nothing while a run would
+have cost ten minutes and a story about noise.
+
+**The growth rate is the real constraint, and it is one packet per round trip.** `on_ack` adds
+`MAX_STREAM_PAYLOAD` (1 349 B) once per window's worth of acknowledgements, so at a 200 ms round trip the window
+grows at **6.7 KB/s**. Climbing from the ~600 KB slow start reached to the 1.47 MB observed takes two minutes —
+longer than the stage. **The window is not "recovering slowly"; it is very nearly frozen at whatever value slow
+start happened to reach when the first loss landed.** That is why the same cell reads 0.24 to 0.40 Gbit/s: the
+spread is where the first loss fell.
+
+**And the plan's own P4 remedy does not apply.** §12's P4 says "window too small → ceiling from calibrated
+delivery-rate × min_rtt". On this path the ceiling is already the 16 MiB cap while `cwnd` is 1.47 MB — raising a
+ceiling `cwnd` never reaches changes nothing. **The lever is the growth rule, not the bound.**
+
+**What would actually work is a window that is a function of the delivery rate rather than an integrator** — a
+BBR-shaped `cwnd = rate × min_rtt × gain`, recomputed rather than accumulated. That is a redesign of the
+congestion controller, not a fix to it: it needs the delivery-rate estimator in the steady-state path, an
+app-limited rule, and a guard matrix this model cannot currently supply (one cell judges it, and §4.176 says the
+shallow-queue cell would punish a mistake in the other direction). The estimator itself is not the blocker —
+§4.58 measured the posted-bytes rate against the stage's own throughput at 0.91–1.05 across 32 cells. What was
+never tried is a *window* driven by it; pacing was rejected because the socket already delivers what is posted,
+which is a different question.
+
+**So P4 closes as: no change, with the mechanism named.** The lossy-path cost is real (a quarter to a third of
+clean throughput), its cause is measured (the window freezes where slow start left it, growing 6.7 KB/s after
+that), the cheap fixes are arithmetically excluded, and the one that would work is a controller redesign that
+belongs to its own plan with its own guard matrix. Recording that is more useful than a patch nobody can judge.
+
+**What is left for the model, if that plan ever runs.** A cell where the *offered rate* is held steady while the
+window is varied — neither `rate100_shallow` nor `loss5` does that; both let the sender run free. Without it, a
+rate-driven window's central claim (that it holds a rate rather than discovering one) has nothing to be measured
+against.
+
 ### 4.176 The cell that makes loss depend on the sender's rate — and what it says (2026-11-09)
 
 §4.174's conclusion was that the lossy-path cost is the window recovering too slowly, and that any change to the
