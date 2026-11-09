@@ -68,6 +68,13 @@ enum Mode {
 enum Role {
     Server,
     Client,
+    /// The drop box on its own, between a server and a client that are other processes.
+    ///
+    /// The shaped variant of the shallow cell: the client dials this process, this process
+    /// forwards to the server, and the leg the condition is imposed on carries the drop.
+    /// Separate from [`Role::Shallow`] because a single-process cell cannot put the drop on
+    /// the shaped leg — both its lanes are loopback by construction.
+    Relay,
     /// Both ends and a drop box in **one process**: the shallow-flight cell.
     ///
     /// Its own role because the cell is not a workload — it is a state. Two lanes, one
@@ -95,6 +102,8 @@ struct Args {
     size: usize,
     requests: usize,
     stream_mode: StreamMode,
+    /// The address a relay binds; unused by the other roles.
+    listen: SocketAddr,
     /// Keep the connection open and idle for this long before exiting.
     ///
     /// The idle cost of a live lane had no instrument at all: the pump wakes at
@@ -153,6 +162,7 @@ fn parse_args() -> Result<Args> {
     let mut mode = None;
     let mut role = None;
     let mut addr = None;
+    let mut listen = None;
     let mut size = 64usize;
     let mut requests = 1000usize;
     let mut stream_mode = StreamMode::Fresh;
@@ -174,7 +184,8 @@ fn parse_args() -> Result<Args> {
                     "server" => Role::Server,
                     "client" => Role::Client,
                     "shallow" => Role::Shallow,
-                    other => bail!("--role takes server, client or shallow, got {other:?}"),
+                    "relay" => Role::Relay,
+                    other => bail!("--role takes server, client, relay or shallow, got {other:?}"),
                 });
             }
             "--addr" => {
@@ -182,6 +193,13 @@ fn parse_args() -> Result<Args> {
                     value
                         .parse::<SocketAddr>()
                         .with_context(|| format!("--addr {value:?} is not host:port"))?,
+                );
+            }
+            "--listen" => {
+                listen = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .with_context(|| format!("--listen {value:?} is not host:port"))?,
                 );
             }
             "--size" => size = value.parse().context("--size wants bytes")?,
@@ -205,6 +223,7 @@ fn parse_args() -> Result<Args> {
         mode: mode.ok_or_else(|| anyhow!("--mode is required"))?,
         role: role.ok_or_else(|| anyhow!("--role is required"))?,
         addr: addr.ok_or_else(|| anyhow!("--addr is required"))?,
+        listen: listen.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap_or_else(|_| unreachable!())),
         size: size.max(1),
         requests: requests.max(1),
         stream_mode,
@@ -243,6 +262,7 @@ async fn main() -> Result<()> {
         (Role::Client, Mode::Tcp) => client_tcp(&args).await,
         (Role::Client, Mode::Mhd) => client_mhd(&args).await,
         (Role::Shallow, _) => shallow(args.addr, args.size).await,
+        (Role::Relay, _) => relay(&args).await,
     }
 }
 
@@ -547,7 +567,7 @@ async fn shallow(addr: SocketAddr, size: usize) -> Result<()> {
     });
 
     let t0 = Instant::now();
-    let boxed = tokio::spawn(relay_shallow(Arc::clone(&box_socket), server_addr, t0));
+    let boxed = tokio::spawn(drop_box(Arc::clone(&box_socket), server_addr, t0, true));
 
     // The dialer: one stream, exactly two payload packets, so the flight is three.
     let lane = molehill_rathole::probe::Lane::dial(relay_addr)
@@ -598,16 +618,61 @@ async fn shallow(addr: SocketAddr, size: usize) -> Result<()> {
     Ok(())
 }
 
+/// The drop box as its own process: forward `--listen` to `--addr`, drop one range.
+///
+/// Answers the same three instants as the single-process cell and exits once the range
+/// comes back, so a runner can wait on it like any other probe.
+async fn relay(args: &Args) -> Result<()> {
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    let socket = Arc::new(UdpSocket::bind(args.listen).await?);
+    emit(
+        "listening",
+        &[
+            ("addr", format!("\"{}\"", socket.local_addr()?)),
+            ("upstream", format!("\"{}\"", args.addr)),
+            ("mode", "\"relay\"".to_owned()),
+        ],
+    );
+    let t0 = Instant::now();
+    let (dropped, later, repair) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        drop_box(Arc::clone(&socket), args.addr, t0, false),
+    )
+    .await
+    .context("the drop box saw no repair within its budget")??;
+    let detect = match (later, repair) {
+        (Some(later), Some(repair)) => Some(us(repair.duration_since(later))),
+        _ => None,
+    };
+    emit(
+        "summary",
+        &[
+            ("mode", "\"relay\"".to_owned()),
+            ("dropped", dropped.is_some().to_string()),
+            ("later_seen", later.is_some().to_string()),
+            ("repair_seen", repair.is_some().to_string()),
+            (
+                "detect_after_later_us",
+                detect.map_or("null".to_owned(), |us| us.to_string()),
+            ),
+        ],
+    );
+    Ok(())
+}
+
 /// Forward between the dialer and the acceptor, dropping one stream datagram.
 ///
 /// Answers the three instants the cell needs: when the datagram was dropped, when the
 /// next one carrying stream bytes went through, and when the dropped range came back.
 /// The drop is the **second** stream datagram — the first is the carrier's own open,
 /// and dropping that would test the opening flight instead of a mid-flight hole.
-async fn relay_shallow(
+async fn drop_box(
     socket: std::sync::Arc<tokio::net::UdpSocket>,
     server: SocketAddr,
     t0: Instant,
+    stop_on_repair: bool,
 ) -> Result<(Option<Instant>, Option<Instant>, Option<Instant>)> {
     use molehill_rathole::probe::{Carried, describe};
 
@@ -618,7 +683,22 @@ async fn relay_shallow(
     let mut repair: Option<Instant> = None;
     let mut buf = vec![0u8; 4096];
     loop {
-        let (len, from) = socket.recv_from(&mut buf).await?;
+        // A standalone box has to keep forwarding after the repair — the echo still has
+        // to reach the client — so it ends on an idle gap instead. The single-process
+        // cell needs neither, and would only pay the wait.
+        let received = tokio::time::timeout(
+            if stop_on_repair {
+                std::time::Duration::from_secs(600)
+            } else {
+                std::time::Duration::from_millis(500)
+            },
+            socket.recv_from(&mut buf),
+        )
+        .await;
+        let Ok(Ok((len, from))) = received else {
+            // Idle: the standalone box has seen everything it is going to see.
+            return Ok((dropped.map(|(_, at)| at), later, repair));
+        };
         if from == server {
             // Back towards whoever dialed: the answer to the dropped range lands here
             // too, and a box that swallowed it would be a second fault.
@@ -652,17 +732,34 @@ async fn relay_shallow(
                     emit("later", &[("at_us", us(t0.elapsed()).to_string())]);
                 }
                 Some((offset, at)) if repair.is_none() && carried.offset == offset => {
-                    repair = Some(Instant::now());
+                    let now = Instant::now();
+                    repair = Some(now);
                     emit(
                         "repair",
                         &[
                             ("at_us", us(t0.elapsed()).to_string()),
-                            (
-                                "after_drop_us",
-                                us(Instant::now().duration_since(at)).to_string(),
-                            ),
+                            ("after_drop_us", us(now.duration_since(at)).to_string()),
                         ],
                     );
+                    // A standalone box keeps forwarding — the echo still has to reach
+                    // the client — so its answer is emitted **here**, at the instant the
+                    // measurement exists, rather than when the leg finally goes quiet.
+                    if !stop_on_repair {
+                        let detect = later.map(|later| us(now.duration_since(later)));
+                        emit(
+                            "summary",
+                            &[
+                                ("mode", "\"relay\"".to_owned()),
+                                ("dropped", "true".to_owned()),
+                                ("later_seen", later.is_some().to_string()),
+                                ("repair_seen", "true".to_owned()),
+                                (
+                                    "detect_after_later_us",
+                                    detect.map_or("null".to_owned(), |us| us.to_string()),
+                                ),
+                            ],
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -670,7 +767,7 @@ async fn relay_shallow(
         if forward {
             let _ = socket.send_to(&buf[..len], server).await;
         }
-        if repair.is_some() {
+        if stop_on_repair && repair.is_some() {
             return Ok((dropped.map(|(_, at)| at), later, repair));
         }
     }

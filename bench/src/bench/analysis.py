@@ -1208,6 +1208,8 @@ KIND_COLUMNS: dict = {
     # The protocol harness's four numbers, in the order a reader asks them: what a
     # round trip costs, what an open costs, what the tail after the first byte
     # costs, and whether any of it failed.
+    # One number, because the cell asks one question: how late the repair is.
+    "transport_loss": ("transport_loss_detect_us",),
     "transport": (
         "transport_first_byte_p99_us",
         "transport_open_p99_us",

@@ -250,6 +250,7 @@ the definitions are what the report and the verdict render.
 | `fds_peak` | count | lower is better | peak open file descriptors summed over the tool's daemons | one process set |
 | `threads_peak` | count | lower is better | peak thread count summed over the tool's daemons | one process set |
 | `service_sockets_peak` | count | lower is better | peak sockets on the exposed service port in the server's own namespace: the per-visitor state the architecture keeps | one visitor |
+| `transport_loss_detect_us` | us | lower is better | the wait from a later packet proving a range missing to that range being re-sent, in a stream whose flight is three packets: what a delivery-time loss detector would shrink | one dropped range |
 | `retrans_segments` | count | lower is better | TCP segments retransmitted by the visitor and server namespaces | one TCP segment |
 | `dropped_packets` | count | lower is better | packets the topology's devices and qdiscs dropped over the window | one packet |
 | `mhd_lane_dup_pct` | % | lower is better | the **busiest** carrier lane's share of the stream bytes it posted that were a range already sent once, read from the daemons' per-lane window lines. The worst lane rather than the mean: the carrier does it to one or two lanes while the rest look healthy. Produced only by a run that sets `MOLEHILL_MHD_STATS=1` with `RUST_LOG=molehill=debug`; any other run reports it **absent with a reason**, never as zero | one lane's posted stream bytes |
@@ -290,6 +291,7 @@ Two conventions the table cannot state, because they belong to the workload:
 | `reconnect` | `reconnect` | what a visitor pays after a restart: time from process start to answering | `startup_s` |
 | `udp-blast` | `udp` | the datagram ceiling when the probe offers as fast as it can | `udp_recv_mbit` |
 | `transport` | `transport` | what the carrier itself costs with nothing above it: one request/response over a raw TCP socket (the control arm) against one over an mhd stream, on the same shaped path | `transport_first_byte_p99_us` |
+| `transport-loss` | `transport_loss` | how late the carrier re-sends a range a later packet has already proved missing: three packets in flight, the middle one dropped by a box the harness runs on the shaped leg. **Diagnostic** — there is no control arm, because a path with no carrier has no loss detector — so a change is judged by comparing two runs of this cell | `transport_loss_detect_us` |
 
 A cell's **floor is a property of the run, not of the cell.** Four runs of
 `bulk-n` on the same host, same binary pair, same arm count, gave A/A twin

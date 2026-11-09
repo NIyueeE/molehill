@@ -207,6 +207,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `fds_peak` | count | 越低越好 | 工具各 daemon 打开的 fd 峰值之和 | 一组进程 |
 | `threads_peak` | count | 越低越好 | 工具各 daemon 的线程数峰值之和 | 一组进程 |
 | `service_sockets_peak` | count | 越低越好 | 服务端自己的 namespace 里,暴露服务端口上的 socket 峰值:该架构为每个访客保留的状态 | 一个访客 |
+| `transport_loss_detect_us` | us | 越低越好 | 从「更晚的包证明某段缺失」到「该段被重发」之间的等待，测在只有三包在飞的流上:投递延迟型丢包检测会缩短的就是这个数 | 一个被丢弃的范围 |
 | `retrans_segments` | count | 越低越好 | 访客 namespace 与服务端 namespace 重传的 TCP 段数 | 一个 TCP 段 |
 | `dropped_packets` | count | 越低越好 | 窗口内本拓扑各接口与 qdisc 丢弃的包数 | 一个包 |
 | `mhd_lane_dup_pct` | % | 越低越好 | **最忙**那条载体 lane 所发出的 stream 字节里,「已经发过一次的范围」占的比例,读自 daemon 的逐 lane 窗口行。取最忙而非平均:载体通常只在一两条 lane 上这样,其余看起来健康。只有设了 `MOLEHILL_MHD_STATS=1` 且 `RUST_LOG=molehill=debug` 的运行才产出它;其它运行报告的是**带原因的缺失**,绝不是 0 | 一条 lane 发出的 stream 字节 |
@@ -243,6 +244,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `reconnect` | `reconnect` | 访客在重启之后付出什么:从进程启动到能够应答的时间 | `startup_s` |
 | `udp-blast` | `udp` | 探针以力所能及的最快速率报价时的数据报上限 | `udp_recv_mbit` |
 | `transport` | `transport` | carrier 本身的开销，其上没有任何东西：裸 TCP socket（control 臂）与 mhd 流各跑一次请求/响应，走同一条整形路径 | `transport_first_byte_p99_us` |
+| `transport-loss` | `transport_loss` | carrier 有多晚才重发「已被更晚的包证明丢失」的那段字节：三包在飞、中间那个由 harness 在整形腿上自己跑的盒子丢掉。**诊断格**——没有 control 臂，因为不含 carrier 的路径没有丢包检测器——所以变更靠比较同一格子的两次运行来判 | `transport_loss_detect_us` |
 
 一个格子的**地板是这次运行的属性,不是这个格子的属性**。`bulk-n` 在同一台主机、
 同一对二进制、同样臂数下的四次运行,A/A 孪生的离散度分别是 5.4%、3.9%、14.9% 和

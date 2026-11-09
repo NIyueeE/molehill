@@ -1986,6 +1986,156 @@ def run_transport(ctx: Ctx, params: dict) -> list:
     return cells
 
 
+def run_transport_loss(ctx: Ctx, params: dict) -> list:
+    """The shallow-flight cell: three packets in flight, the middle one dropped.
+
+    Three processes, because the drop has to happen **on the leg the condition is
+    imposed on**: the server accepts a lane in its own namespace, the drop box listens
+    in the visitor's and forwards across the leg, and the client dials the box. A
+    single-process cell cannot do that — both its lanes are loopback by construction
+    (`HANDOFF.md` §4.192).
+
+    The box drops the second stream datagram, timestamps the next one through (later
+    evidence that the range is missing) and timestamps the first datagram that carries
+    that range again. The difference is `transport_loss_detect_us`, and it is the number
+    a delivery-time loss detector would shrink.
+    """
+    if ctx.arm.kind != "l4":
+        return [
+            Cell(
+                "loss",
+                True,
+                unavailable={
+                    "transport_loss_detect_us": {
+                        "reason": (
+                            f"a {ctx.arm.kind} arm has no carrier to lose packets in"
+                        )
+                    }
+                },
+                evidence={"mode": ctx.arm.kind},
+            )
+        ]
+    size = int(params["size"])
+    server_addr = f"{model.TOPO_SRV_IP}:{TRANSPORT_PORT}"
+    box_addr = f"{model.TOPO_VIS_IP}:{TRANSPORT_PORT + 10}"
+    server_log = ctx.work / f"loss-server-{ctx.arm.id}.log"
+    box_log = ctx.work / f"loss-box-{ctx.arm.id}.ndjson"
+    client_log = ctx.work / f"loss-client-{ctx.arm.id}.ndjson"
+    server = subprocess.Popen(
+        ctx.topo.ns_argv(
+            topology.SRV_NS,
+            _transport_argv("mhd", "server", server_addr, ["--size", str(size)]),
+        ),
+        stdout=server_log.open("wb"),
+        stderr=subprocess.STDOUT,
+    )
+    box = None
+    try:
+        _transport_wait(server_log)
+        box = subprocess.Popen(
+            ctx.topo.ns_argv(
+                topology.VIS_NS,
+                [
+                    str(paths.REPO_ROOT / TRANSPORT_HARNESS),
+                    "--mode",
+                    "mhd",
+                    "--role",
+                    "relay",
+                    "--listen",
+                    box_addr,
+                    "--addr",
+                    server_addr,
+                ],
+            ),
+            stdout=box_log.open("wb"),
+            stderr=subprocess.STDOUT,
+        )
+        _transport_wait(box_log)
+        result, rc, _wall = _spawn_probe(
+            ctx.topo.ns_argv(
+                topology.VIS_NS,
+                _transport_argv(
+                    "mhd",
+                    "client",
+                    box_addr,
+                    [
+                        "--size",
+                        str(size),
+                        "--requests",
+                        "1",
+                        "--stream-mode",
+                        "fresh",
+                    ],
+                ),
+            ),
+            client_log,
+            timeout=params["max_s"],
+        )
+        # The box prints its answer the instant the range comes back and keeps
+        # forwarding until the leg is quiet, so wait for that line rather than for the
+        # process to exit: a keepalive can keep it alive longer than the measurement.
+        summary = _wait_for_line(box_log, "summary", timeout=10.0)
+        rc_box = box.poll()
+        detect = summary.get("detect_after_later_us")
+        evidence = {
+            "size": size,
+            "client_rc": rc,
+            "box_rc": rc_box,
+            "dropped": summary.get("dropped"),
+            "later_seen": summary.get("later_seen"),
+            "repair_seen": summary.get("repair_seen"),
+            "client_first_us": result.get("first_us"),
+            "endpoints": {"box": box_addr, "server": server_addr},
+        }
+        # The client exits non-zero when a request failed, so its status *is* the
+        # request's verdict; `result` is its summary line, which carries no `ok`.
+        ok = rc == 0 and detect is not None
+        reason = ""
+        if not ok:
+            reason = (
+                "the drop box never saw the range come back "
+                f"(dropped={summary.get('dropped')}, "
+                f"later={summary.get('later_seen')}, "
+                f"repair={summary.get('repair_seen')})"
+            )
+        return [
+            Cell(
+                "loss",
+                ok,
+                reason=reason,
+                metrics={"transport_loss_detect_us": detect if ok else None},
+                evidence=evidence,
+            )
+        ]
+    finally:
+        for proc in (box, server):
+            if proc is None:
+                continue
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+
+
+def _wait_for_line(path: Path, kind: str, timeout: float = 10.0) -> dict:
+    """The first NDJSON line of this kind, waiting up to `timeout` for it.
+
+    A box that keeps forwarding prints its answer before it exits, so a reader that
+    waited for the process would wait for a keepalive to stop arriving.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        with contextlib.suppress(OSError, ValueError):
+            for line in path.read_text(errors="replace").splitlines():
+                if not line.startswith("{"):
+                    continue
+                row = json.loads(line)
+                if row.get("kind") == kind:
+                    return row
+        time.sleep(0.05)
+    return {}
+
+
 def _transport_wait(log: Path, timeout: float = 20.0) -> None:
     """Wait until the harness's listener has announced its address."""
     end = time.time() + timeout
@@ -2006,6 +2156,7 @@ RUNNERS = {
     model.Kind.CAPACITY: run_capacity,
     model.Kind.RECONNECT: run_reconnect,
     model.Kind.TRANSPORT: run_transport,
+    model.Kind.TRANSPORT_LOSS: run_transport_loss,
 }
 
 

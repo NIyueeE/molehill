@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.193 The shallow cell is wired into the model, and its first shaped reading is a surprise (2026-11-09)
+
+The cell from §4.192 is now a scenario with a metric rather than a hand-run binary: `transport-loss` runs the
+three processes (server in the server namespace, drop box in the visitor's, client dialling the box) and reports
+`transport_loss_detect_us`. It is **diagnostic** — `control=False`, stated in the plan and the docs — because a
+path with no carrier in it has no loss detector, so there is no control arm to compare against; a *change* is
+judged by comparing two runs of the same cell. `just bench-selfcheck` went 774 → **791**, both languages carry the
+metric and the scenario row, and the docs gate passes.
+
+**First shaped run**: `rtt100` on the tunnel leg, two measured rounds plus the twin, 21.3 s.
+
+| arm | `transport_loss_detect_us` | spread |
+|---|---|---|
+| molehill | 2 206 / 2 273 (median 2 240) | 3.0 % |
+| molehill~aa | 2 272 / 2 405 (median 2 339) | 5.7 % |
+| A/A floor | **4.2 %** | |
+
+**The cell is stable** — a 4.2 % floor against the storm cell's 76 %, and two rounds already separate a 10 %
+change. That was the point of building it.
+
+**And the number is a surprise: 2.2 ms on a 200 ms path.** It is the same figure loopback gave, so the path's delay
+never entered the measurement. The reason is the lane's state at the drop: **it has no round-trip sample yet**, and
+`loss_delay` therefore falls back to its millisecond floor — the record looks stale after about one millisecond,
+the pump notices on its next pass or two, and the range goes back out. The cell is measuring *that fallback*, not
+what a 200 ms path does to a shallow flight.
+
+**So the refinement is named rather than papered over**: the measured exchange has to come *after* a warm-up
+exchange on the same lane, so an acknowledgement has already seeded the round trip, and the drop index has to move
+past the warm-up's datagrams. Then the shaped number becomes path-dependent — on a 200 ms path the declaration
+should wait for `loss_delay` ≈ 225 ms — and the cell prices the rule where the defect actually lives. Until then
+its reading is a real number about a state that no shaped path reaches after its first round trip.
+
 ### 4.192 The RACK cell exists: a shallow flight, a drop box, and 2 210 µs between the evidence and the repair (2026-11-09)
 
 §4.189 built the *protocol* cell. This is the bench one, run inside the harness with no product setting touched: the

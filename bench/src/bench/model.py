@@ -652,6 +652,21 @@ METRIC_SPECS: tuple[dict, ...] = (
         "precision": 4,
     },
     {
+        "id": "transport_loss_detect_us",
+        "unit": "us",
+        "direction": "lower",
+        "definition": (
+            "the wait from the moment a later packet proves a range missing to the "
+            "moment that range is re-sent, in a stream whose flight is three packets. "
+            "Read by the harness's own drop box between two lanes, with no product "
+            "setting involved: the number a delivery-time loss detector would shrink"
+        ),
+        "denominator": "one dropped range",
+        "needs": ("transport_loss",),
+        "materiality": ("rel", 15.0),
+        "precision": 0,
+    },
+    {
         "id": "mhd_lane_dup_pct",
         "unit": "%",
         "direction": "lower",
@@ -1644,6 +1659,25 @@ def scenario_catalog() -> list:
             params={"requests": 4000, "size": 64, "max_s": 120},
             headline="transport_first_byte_p99_us",
         ),
+        Scenario(
+            id="transport-loss",
+            kind="transport_loss",
+            claim=(
+                "how late the carrier re-sends a range that a later packet already "
+                "proved missing, in a stream whose flight is three packets: the cell a "
+                "delivery-time loss detector would be judged in"
+            ),
+            # A diagnostic, and for a reason that will not go away: there is no
+            # control arm to compare against, because a path with no carrier in it has
+            # no loss detector. The number is quoted, and a *change* is judged by
+            # comparing two runs of this cell (`just bench compare`), never by an in-run
+            # control that cannot exist.
+            control=False,
+            # Two packets of payload plus the carrier's own opening packet: the flight
+            # the drop box needs, and nothing more.
+            params={"size": 2 * 1349, "max_s": 30},
+            headline="transport_loss_detect_us",
+        ),
     ]
 
 
@@ -1878,6 +1912,7 @@ class Kind:
     CAPACITY: ClassVar[str] = "capacity"
     RECONNECT: ClassVar[str] = "reconnect"
     TRANSPORT: ClassVar[str] = "transport"
+    TRANSPORT_LOSS: ClassVar[str] = "transport_loss"
 
     ALL: ClassVar[tuple] = (
         BULK,
@@ -1889,6 +1924,7 @@ class Kind:
         CAPACITY,
         RECONNECT,
         TRANSPORT,
+        TRANSPORT_LOSS,
     )
 
 
@@ -1901,6 +1937,7 @@ class Kind:
 #: the coverage check exists to catch.
 CELL_NAMING: dict = {
     Kind.BULK: lambda p: f"P{p['streams']}",
+    Kind.TRANSPORT_LOSS: lambda _p: "loss",
     Kind.BULK_PAIR: lambda _p: "pair",
     Kind.RR: lambda p: f"c{p['connections']}",
     Kind.UDP: lambda p: (
