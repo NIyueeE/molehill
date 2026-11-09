@@ -5233,6 +5233,57 @@ mod tests {
         assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
     }
 
+    /// A 5 %-lossy memory link delivers everything, and it does **not** storm.
+    ///
+    /// Two facts, and the second is the finding. A deterministic link that drops one
+    /// datagram in twenty still delivers every byte, with threshold declarations
+    /// doing the work and the timer never firing — because a memory link has no
+    /// queueing delay, so no acknowledgement is ever late. The regime §4.182 measured
+    /// (a window pinned at its initial value while most of the wire was repairs) is
+    /// therefore **not reproducible here**: it needs the delay a real qdisc adds, and
+    /// the reproduction has to be at the bench. This test keeps the memory link's
+    /// shape pinned so a change that makes *it* storm is caught immediately.
+    #[test]
+    fn five_percent_loss_on_a_fake_link_delivers_without_storming() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(128 * 1024);
+        let mut written = 0;
+        let mut step = 0u64;
+        while written < bytes.len() && step < 400 {
+            written += link.a.write(stream.id, &bytes[written..]);
+            link.pump_lossy(start + Duration::from_millis(step), 20);
+            step += 1;
+        }
+        // Then a clean path, so the assertion is about delivery and not about luck.
+        for extra in 0..400 {
+            link.pump(start + Duration::from_millis(step + extra));
+        }
+        let mut got: Vec<u8> = Vec::new();
+        for _ in 0..64 {
+            got.extend(take(&mut link.b, stream.id));
+        }
+        let ledger = link.a.take_ledger();
+        assert_eq!(
+            got.len(),
+            bytes.len(),
+            "every byte arrives even when one in twenty is dropped: {ledger}"
+        );
+        assert!(
+            ledger.lost_by_threshold > 0,
+            "the drops are found by later packets, not by the clock: {ledger}"
+        );
+        assert_eq!(
+            ledger.lost_by_timer, 0,
+            "a link with no queueing delay never makes an acknowledgement late: {ledger}"
+        );
+        assert!(
+            ledger.sent_repair_bytes * 5 < ledger.sent_bytes,
+            "and the re-sent share stays small, which is what a storm is not: {ledger}"
+        );
+    }
+
     /// A range that arrives twice is counted as a duplicate, not as delivery.
     ///
     /// The counter exists for §4.183's question: whether the carrier's 70–90 %

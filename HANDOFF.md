@@ -406,9 +406,16 @@ falls into, not its steady cost, and that changes what a fix has to be judged on
 
 **Which is why D3 has not started.** A candidate judged on a cell that may or may not be in the bad regime is
 exactly the trap this file keeps recording: one run would show a gain, the next would show nothing, and neither
-would be about the change. Before any fix there has to be a cell where the storm is reproducible on demand —
-the honest candidates are more concurrent lanes on the same shaped leg, a deeper shaper queue, or both — and the
-plan's D3 pre-registration goes into *that* cell, not into a lucky one.
+would be about the change. Before any fix there has to be a cell where the storm is reproducible on demand.
+
+**The deterministic route is closed, and that is itself a measurement.** A memory link that drops one datagram in
+twenty delivers every byte with **zero timer declarations** — the threshold finds all four losses and the timer
+never fires, because nothing in a memory link is ever late (`five_percent_loss_on_a_fake_link_delivers_without_storming`
+now pins that shape). So the storm is not "loss plus a wide flight": it needs the **queueing delay** a real qdisc
+adds, which is what makes an acknowledgement arrive later than `loss_delay`. A fake-clock reproduction would have
+to model that queue; the cheaper reproduction is at the bench, with a cell heavy enough that the receiver drains
+slower than the sender posts — more concurrent lanes on the same shaped leg, which is what §4.182's stormy run had
+and §4.184's did not.
 
 **What this does establish for the fix's shape.** The re-sent bytes are, in the receiver's own accounting, bytes it
 already had: the recovery is spending the path's capacity to hand the peer what the peer already holds. Two ways
