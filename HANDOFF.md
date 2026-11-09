@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.190 A bistable metric cannot carry a claim under the model's own floor rule (2026-11-09)
+
+The metric from §4.187 was built so the next candidate could be judged. Reading the last A/B's own noise table
+(§4.188) shows the judging is still not possible, and the reason is worth more than the metric:
+
+| reading | value |
+|---|---|
+| A/A paired difference, `mhd_lane_dup_pct` | **1.49 %** — the pairing is tight when neither half storms |
+| A/A **scatter** (the floor the model uses) | **76.4 %** (36.8 points) |
+| why | the twin stormed in 3 of its 6 rounds, so its own half-range *is* the storm |
+| candidate vs baseline, paired by round | candidate **higher in 5 of 6**, median +2.86 points |
+
+**The two readings disagree because the quantity is bistable.** Paired, the same binary differs by 1.5 %; unpaired,
+its own scatter is 76 %. The model's rule is "the floor is the largest of the readings", so on this metric the floor
+is the storm itself, and **no candidate can clear it** — not even the falsified one, which is *worse* in five rounds
+of six and still inside the floor. That is the same defect the plan recorded in §4.186 wearing different clothes:
+the number exists, and the rule that turns numbers into claims cannot use it.
+
+**What a future pre-registration has to do about it, decided before any run:**
+
+1. **Declare a stable statistic.** The share of rounds above a storm threshold (50 points), or the median of the
+   *lower* half, is stable enough for the same A/A: the twin would read 3/6 and the candidate 3/6 against a
+   baseline of 1/6. This is a metric declaration change, and it has the same cost as any other: registry, both
+   languages, self-check, and it must be written before the run it judges.
+2. **Or make the cell deterministic.** Both halves of an A/A must be driven into the same state, or neither — the
+   storm appears in one to three rounds out of six on the same binary, so a cell that leaves it to chance cannot
+   produce a floor worth quoting.
+
+**And this is not a reason to weaken the floor.** A 76 % floor on a metric that swings 12→92 is honest about the
+measurement; the dishonest move would be to quote the 1.49 % paired difference because it is smaller. The rule
+stays; the *statistic* or the *cell* has to change, and the change has to be declared before the run.
+
 ### 4.189 The cell RACK was refused for now exists, and the bench says the clock does 80–90 % of the declaring (2026-11-09)
 
 §12.5 closed RACK with a condition rather than a verdict: *"a cell where a stream keeps two or three packets in
