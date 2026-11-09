@@ -94,12 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [Benchmarks](docs/benchmarks.md) says what the model still cannot answer about it.
 - **This is a re-baseline release for the benchmark.** The engine changed —
   `bench/src/bench/model.py` gained the `l4-plain` arm and `Arm.noise_data`, so
-  runs can measure the plain data plane — while the metric registry did not
-  (`metrics_hash` unchanged). A published record gathered by a different engine
-  is not a comparable baseline, so `just bench gate` runs **without
-  `--baseline`** and the record this release produces becomes the next baseline;
-  the release notes say that rather than implying a comparison the fingerprints
-  would refuse. See [docs/release.md](docs/release.md).
+  runs can measure the plain data plane, and the registry gained
+  `mhd_lane_dup_pct`, the busiest carrier lane's share of the bytes it re-sent.
+  A published record gathered by a different engine is not a comparable
+  baseline, so `just bench gate` runs **without `--baseline`** and the record
+  this release produces becomes the next baseline; the release notes say that
+  rather than implying a comparison the fingerprints would refuse. See
+  [docs/release.md](docs/release.md) and, for what the new metric means and when
+  it is absent, [Benchmarks](docs/benchmarks.md).
 
 - **Each carrier now has a stated path condition, measured rather than assumed.** mhd
   wins on a lossy path and TCP wins on a clean one. On an unshaped cell TCP's tail is

@@ -651,6 +651,22 @@ METRIC_SPECS: tuple[dict, ...] = (
         "materiality": ("abs", 0.5),
         "precision": 4,
     },
+    {
+        "id": "mhd_lane_dup_pct",
+        "unit": "%",
+        "direction": "lower",
+        "definition": (
+            "the busiest lane's share of the stream bytes it posted that were a range "
+            "already sent once, over the stage window: the number a recovery defect "
+            "moves, and the one a window or scheduler defect shows up in. The worst "
+            "lane, not the mean, because the carrier does it to one or two lanes while "
+            "the rest look healthy"
+        ),
+        "denominator": "one lane's posted stream bytes",
+        "needs": ("staged",),
+        "materiality": ("abs", 5.0),
+        "precision": 2,
+    },
 )
 
 

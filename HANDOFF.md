@@ -377,6 +377,46 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.187 A metric for the thing the candidate moved, and what it says about the candidate (2026-11-09)
+
+§4.186's verdict was that no candidate on this shape could pass, because the number the mechanism moves was not a
+model metric. It is one now: **`mhd_lane_dup_pct`**.
+
+**Definition, and the two decisions inside it.** The metric is the **busiest lane's** share of the stream bytes it
+posted that were a range already sent once, read from the daemons' per-lane window lines inside the stage window.
+
+- **The worst lane, not the mean.** The carrier does this to one or two lanes while the rest look healthy
+  (§4.185: 68.6 % against 12.6–15.8 %), so a mean divides the finding by however many lanes the run happened to
+  have.
+- **A share of the busiest lane, not a byte floor.** The first version used 1 MiB and read **98.6 % on every arm
+  and every round** — it had selected the tunnels' control connections, which post two or three megabytes and
+  re-send almost all of them. A tenth of the busiest lane separates a lane that carries bulk from one that carries
+  a greeting, on any cell, without a constant that describes this host's traffic.
+
+**Validated against the archived A/B** (§4.186), through the module's own API rather than by hand:
+
+| arm | `mhd_lane_dup_pct` per round |
+|---|---|
+| candidate | 30.35 / 24.93 / 30.15 |
+| candidate twin | 28.89 / 30.67 / 23.43 |
+| baseline | 14.52 / 14.63 / **73.18** |
+
+**And it corroborates the revert for a second reason.** The candidate avoided the baseline's 73 % storm round —
+but in the two rounds where the baseline was healthy, its duplicate share (14.5 %, 14.6 %) was **lower than the
+candidate's** (24.9–30.7 %). So the ranges frame was not merely unproven: on these three rounds it looks mildly
+*harmful*, which is consistent with its lower throughput point estimates. `b3e9778` was right twice over.
+
+**What this unlocks.** A future candidate on this shape can be pre-registered on a number the mechanism actually
+moves, and the model now carries it end to end: a declaration with a materiality floor, a row on the benchmarks
+page in both languages, `just bench-selfcheck` at **774** checks, and a **typed absence with a reason** when the
+run did not enable the switch — because a run that never logged a lane has no view of this and must not read as a
+clean zero.
+
+**What it does not do.** It does not make the storm deterministic (the baseline read 14.5 % twice and 73 % once in
+three rounds), so a future pre-registration still has to say how many rounds it takes to see the worst lane, and
+the answer is "more than three". It also does not change the fact that this metric needs `MOLEHILL_MHD_STATS=1`
+with `RUST_LOG=molehill=debug`, so a performance claim and this reading cannot come from the same run.
+
 ### 4.186 The ranges frame was built, engaged, and **reverted**: the pre-registered cell could not judge it (2026-11-09)
 
 D3's candidate was implemented (`3043039`), measured against the binary at `346d5e3` in the pre-registered cell,

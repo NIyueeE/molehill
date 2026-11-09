@@ -22,9 +22,11 @@ from __future__ import annotations
 import contextlib
 import os
 import platform
+import re
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from bench import hostinfo, topology
@@ -522,3 +524,109 @@ def host_provenance(with_calibration: bool = True) -> dict:
 def unavailable(reason: str) -> dict:
     """One typed absence, in the shape the results file stores."""
     return {"reason": reason}
+
+
+#: One per-lane window line: the ledger's send/repair counts and the lane's identity.
+#:
+#: `sent` is stream bytes handed to packets and `rep` the part that was a range already
+#: sent once, so their ratio is the duplicate share; the lane and its role name the
+#: series, because four to eight of them report per connection and an average over them
+#: hides exactly the state this number exists to show.
+LANE_WINDOW = re.compile(
+    r"mhd window .*?lane=(?P<lane>\d+) role=\"(?P<role>[a-z]+)\".*?"
+    r"ledger=sent=(?P<sent>\d+) rep=(?P<rep>\d+)\("
+)
+
+#: How much of the busiest lane's traffic a lane must carry to be counted.
+#:
+#: A fraction rather than a byte count, because the count is workload-dependent and a
+#: hardcoded one is the kind of constant that silently describes the wrong lanes. The
+#: first version used 1 MiB and read **98.6 %** on every arm and round: it had selected
+#: the tunnels' control connections, which post a few megabytes and re-send almost all
+#: of them. A tenth of the busiest lane separates a lane that carries bulk from one that
+#: carries a greeting, on any cell.
+LANE_SHARE_OF_BUSIEST = 0.10
+
+
+def worst_lane_duplicate_pct(
+    paths: list[Path],
+    since: float,
+    until: float,
+    share_of_busiest: float = LANE_SHARE_OF_BUSIEST,
+):
+    """The busiest lane's share of posted bytes that were a re-send, and its evidence.
+
+    Reads the daemons' own per-lane window lines (`MOLEHILL_MHD_STATS=1` with
+    `RUST_LOG=molehill=debug`), keeps the ones inside the measured window, sums each
+    lane's `sent` and `rep`, and answers the **largest** `rep / sent` among the lanes
+    that posted at least `floor` bytes.
+
+    The largest, not the mean: a carrier whose recovery path re-sends what the peer
+    already holds does it to *one or two* lanes while the rest look healthy, and that is
+    the state this metric names. A mean over lanes dilutes it by however many lanes the
+    run happened to have (`HANDOFF.md` §4.186).
+
+    `None` when no lane cleared the floor, or when the logs carry no window lines at
+    all — the second is what a run without the switch looks like, and it must read as an
+    absence rather than as a clean zero.
+    """
+    lanes: dict = {}
+    lines = 0
+    for path in paths:
+        with contextlib.suppress(OSError), path.open(errors="replace") as handle:
+            for line in handle:
+                if "mhd window" not in line:
+                    continue
+                match = LANE_WINDOW.search(line)
+                if match is None:
+                    continue
+                stamp = _epoch(line[:26])
+                if stamp is None or not (since <= stamp <= until):
+                    continue
+                lines += 1
+                key = (match.group("role"), match.group("lane"))
+                entry = lanes.setdefault(key, {"sent": 0, "rep": 0})
+                entry["sent"] += int(match.group("sent"))
+                entry["rep"] += int(match.group("rep"))
+    busiest = max((value["sent"] for value in lanes.values()), default=0)
+    counted = {
+        key: value
+        for key, value in lanes.items()
+        if value["sent"] >= share_of_busiest * busiest
+    }
+    evidence = {
+        "window_s": round(until - since, 2),
+        "lines": lines,
+        "lanes": len(lanes),
+        "lanes_counted": len(counted),
+        "share_of_busiest": share_of_busiest,
+        "busiest_lane_bytes": busiest,
+        "worst": None,
+    }
+    if not counted:
+        return None, evidence
+    (role, lane), worst = max(
+        counted.items(), key=lambda item: item[1]["rep"] / max(item[1]["sent"], 1)
+    )
+    share = 100.0 * worst["rep"] / max(worst["sent"], 1)
+    evidence["worst"] = {
+        "role": role,
+        "lane": lane,
+        "sent": worst["sent"],
+        "rep": worst["rep"],
+    }
+    return round(share, 2), evidence
+
+
+def _epoch(stamp: str):
+    """A log line's ISO-8601 UTC instant as a POSIX timestamp, or `None`.
+
+    The daemons write `2026-11-09T06:31:50.645933Z`, and the stage window it is
+    compared against is `time.time()`. `fromisoformat` reads the trailing `Z` as UTC, so
+    the subtraction is instant-to-instant; a naive stamp would be read as local time and
+    select the wrong seconds on the one host that ran it.
+    """
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return None

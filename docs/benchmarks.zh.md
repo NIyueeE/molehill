@@ -209,6 +209,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `service_sockets_peak` | count | 越低越好 | 服务端自己的 namespace 里,暴露服务端口上的 socket 峰值:该架构为每个访客保留的状态 | 一个访客 |
 | `retrans_segments` | count | 越低越好 | 访客 namespace 与服务端 namespace 重传的 TCP 段数 | 一个 TCP 段 |
 | `dropped_packets` | count | 越低越好 | 窗口内本拓扑各接口与 qdisc 丢弃的包数 | 一个包 |
+| `mhd_lane_dup_pct` | % | 越低越好 | **最忙**那条载体 lane 所发出的 stream 字节里,「已经发过一次的范围」占的比例,读自 daemon 的逐 lane 窗口行。取最忙而非平均:载体通常只在一两条 lane 上这样,其余看起来健康。只有设了 `MOLEHILL_MHD_STATS=1` 且 `RUST_LOG=molehill=debug` 的运行才产出它;其它运行报告的是**带原因的缺失**,绝不是 0 | 一条 lane 发出的 stream 字节 |
 
 
 有两条约定这张表说不出来,因为它们属于工作负载:

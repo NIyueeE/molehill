@@ -220,6 +220,10 @@ class Span:
     since: float
     seconds: float
     params: dict
+    #: The daemons' own logs for this stage, when a metric is read out of them rather
+    #: than out of a probe: the per-lane window lines are the only place a carrier's
+    #: duplicate share exists, and a window is what makes a line belong to this stage.
+    lane_logs: tuple = ()
 
 
 #: The running arm's pid map, supplied by the runner.
@@ -1250,11 +1254,22 @@ def _stage_metrics(
             span.params.get("churn_per_s", 16.0) if "churn" in series else None
         ),
     }
-    return (
-        metrics,
-        evidence,
-        _stage_absences(metrics, interaction, datagrams, churn, series),
+    # The recovery path's own number, when the daemons logged it. Absent — typed, with
+    # a reason — otherwise: a run without the switch has no view of this at all, and a
+    # zero would read as a clean carrier.
+    share, lane = inst.worst_lane_duplicate_pct(
+        list(span.lane_logs), span.since, span.since + span.seconds
     )
+    evidence["lane_duplicates"] = lane
+    absent = _stage_absences(metrics, interaction, datagrams, churn, series)
+    if share is None:
+        absent["mhd_lane_dup_pct"] = inst.unavailable(
+            "no per-lane window lines in the measured window "
+            "(needs MOLEHILL_MHD_STATS=1 and RUST_LOG=molehill=debug)"
+        )
+    else:
+        metrics["mhd_lane_dup_pct"] = share
+    return metrics, evidence, absent
 
 
 def _per_second(points: list, since: float) -> list:
@@ -1566,7 +1581,12 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         interaction,
         datagrams,
         churn,
-        Span(since=t0, seconds=window_s, params=params),
+        Span(
+            since=t0,
+            seconds=window_s,
+            params=params,
+            lane_logs=(ctx.work / "server.log", ctx.work / "client.log"),
+        ),
         series,
     )
     stage_metrics |= {"slo_broken": _breaks_slo(stage_metrics)}

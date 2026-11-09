@@ -252,6 +252,7 @@ the definitions are what the report and the verdict render.
 | `service_sockets_peak` | count | lower is better | peak sockets on the exposed service port in the server's own namespace: the per-visitor state the architecture keeps | one visitor |
 | `retrans_segments` | count | lower is better | TCP segments retransmitted by the visitor and server namespaces | one TCP segment |
 | `dropped_packets` | count | lower is better | packets the topology's devices and qdiscs dropped over the window | one packet |
+| `mhd_lane_dup_pct` | % | lower is better | the **busiest** carrier lane's share of the stream bytes it posted that were a range already sent once, read from the daemons' per-lane window lines. The worst lane rather than the mean: the carrier does it to one or two lanes while the rest look healthy. Produced only by a run that sets `MOLEHILL_MHD_STATS=1` with `RUST_LOG=molehill=debug`; any other run reports it **absent with a reason**, never as zero | one lane's posted stream bytes |
 
 
 Two conventions the table cannot state, because they belong to the workload:
