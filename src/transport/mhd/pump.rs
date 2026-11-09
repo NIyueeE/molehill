@@ -1676,6 +1676,18 @@ pub(crate) struct MhdListener {
     /// each hold one socket, and a listener nobody polls has no other way to
     /// release the port.
     _sockets: Vec<Arc<UdpSocket>>,
+    /// One handle per dispatcher, so a test can wait for the task to **end**
+    /// rather than infer it from the stop channel having been set
+    /// (`HANDOFF.md` §4.172). Dropping a handle detaches, which is what the
+    /// listener did before it kept them.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "written by `bind` and read by the dispatcher-release test;                       dropping a handle detaches, which is the production behaviour"
+        )
+    )]
+    dispatchers: Vec<tokio::task::JoinHandle<()>>,
     /// Stops the dispatchers when the listener goes away.
     stop: tokio::sync::watch::Sender<bool>,
     _next_id: Arc<std::sync::atomic::AtomicUsize>,
@@ -1730,7 +1742,7 @@ fn spawn_dispatcher(
     tx: tokio::sync::mpsc::UnboundedSender<Arc<MhdLane>>,
     next_id: Arc<std::sync::atomic::AtomicUsize>,
     mut stop: tokio::sync::watch::Receiver<bool>,
-) {
+) -> tokio::task::JoinHandle<()> {
     #[cfg(target_os = "linux")]
     let mut batch = crate::transport::udp_batch::RecvBatch::new(16, 2048);
     #[cfg(not(target_os = "linux"))]
@@ -1865,7 +1877,7 @@ fn spawn_dispatcher(
             // ack goes out well inside the window it describes.
             tokio::task::yield_now().await;
         }
-    });
+    })
 }
 
 impl MhdListener {
@@ -1878,20 +1890,22 @@ impl MhdListener {
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let next_id = Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let mut dispatchers = Vec::with_capacity(sockets.len());
         for socket in &sockets {
-            spawn_dispatcher(
+            dispatchers.push(spawn_dispatcher(
                 Arc::clone(socket),
                 Arc::clone(&registry),
                 tx.clone(),
                 Arc::clone(&next_id),
                 stop_rx.clone(),
-            );
+            ));
         }
         Ok(Self {
             addr: bound,
             incoming,
             registry,
             _sockets: sockets,
+            dispatchers,
             stop,
             _next_id: next_id,
         })
@@ -1902,13 +1916,46 @@ impl MhdListener {
         self.addr
     }
 
-    /// End every connection this listener admitted and release its sockets.
+    #[cfg(test)]
+    /// The listening sockets, so a test can watch the dispatcher's handle go.
+    ///
+    /// The field's underscore says "held, never read by the product"; this accessor
+    /// is the one reader, which is why the lint is waived here rather than by
+    /// renaming a field whose name carries that meaning.
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "the test accessor is the only reader of a field the product holds"
+    )]
+    pub(crate) fn test_sockets(&self) -> &[Arc<UdpSocket>] {
+        &self._sockets
+    }
+
+    #[cfg(test)]
+    /// Take the dispatcher handles: awaiting them is how a test learns that the
+    /// tasks **ended** rather than that they were asked to.
+    pub(crate) fn test_take_dispatchers(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.dispatchers)
+    }
+
+    #[cfg(test)]
+    /// How many connections the listener still holds.
+    pub(crate) fn test_registry_len(&self) -> usize {
+        self.registry.lock().len()
+    }
+
+    /// End every connection this listener admitted, and stop its dispatchers.
     ///
     /// Called when the listener stops serving: a lane that outlived shutdown
     /// would hold a listening socket bound, and the restarted server would
     /// share the port with a connection table nobody reads. The dispatchers are
     /// stopped with the lanes — leaving one reading would keep a `SO_REUSEPORT`
     /// socket bound and take a share of the next server's datagrams.
+    ///
+    /// **The listening sockets themselves go when the listener is dropped**, not
+    /// here: this takes `&self`, and a struct that cleared its own handles would
+    /// have to be `&mut`. So the port is free once the listener is gone, which is
+    /// what a shutting-down server does — `close_all` then drop — and the
+    /// rebound-port test (`HANDOFF.md` §4.172) exercises exactly that order.
     pub(crate) fn close_all(&self) {
         let _ = self.stop.send(true);
         let mut table = self.registry.lock();
@@ -2516,6 +2563,135 @@ mod tests {
     /// socket is empty, so it must also be a future that **completes** when the lane
     /// closes rather than one that keeps looping. This asserts the whole chain: the
     /// task ends, and it drops its handle on the socket on the way out.
+    /// A closed listener's dispatchers **end**, and the port is released with them.
+    ///
+    /// The sixth lifecycle invariant (`HANDOFF.md` §4.120, #6, closed in §4.172):
+    /// "close releases pump, dispatcher, socket and receive". The pump half is
+    /// `a_closed_lane_lets_its_pump_go`; this is the dispatcher half, and it asserts
+    /// the *task ends* and its socket handle goes — setting the stop channel is what
+    /// asks, not what happens, and the difference is the whole point of the item.
+    #[tokio::test]
+    async fn a_closed_listener_lets_its_dispatchers_go() {
+        let mut listener = MhdListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_eq!(
+            listener.test_registry_len(),
+            0,
+            "a fresh listener holds nothing"
+        );
+        let held: Vec<Arc<UdpSocket>> = listener.test_sockets().to_vec();
+        let before: Vec<usize> = held.iter().map(Arc::strong_count).collect();
+        assert!(
+            before.iter().all(|count| *count >= 3),
+            "each dispatcher holds its socket beside the listener and this test: {before:?}"
+        );
+        let mut handles = listener.test_take_dispatchers();
+        assert_eq!(
+            handles.len(),
+            held.len(),
+            "one dispatcher per listening socket"
+        );
+        listener.close_all();
+        for handle in handles.drain(..) {
+            let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            assert!(
+                joined.is_ok(),
+                "a dispatcher must stop when the listener closes, and it did not"
+            );
+        }
+        let after: Vec<usize> = held.iter().map(Arc::strong_count).collect();
+        assert_eq!(
+            after,
+            before.iter().map(|count| count - 1).collect::<Vec<_>>(),
+            "and each must let go of its socket, or the port stays bound"
+        );
+        assert_eq!(listener.test_registry_len(), 0, "and the table is empty");
+    }
+
+    /// A datagram addressed to a rebound port reaches the **new** listener.
+    ///
+    /// `SO_REUSEPORT` means a second bind succeeds even while the first is alive, so
+    /// "the port was released" cannot be shown by binding alone. What can be shown is
+    /// the traffic: an opening datagram sent to the address after the first listener
+    /// closed must be admitted by the second one, which is impossible if the first
+    /// one's dispatcher is still reading that socket.
+    #[tokio::test]
+    async fn a_rebound_port_takes_the_traffic_the_closed_one_left() {
+        let mut first = MhdListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = first.local_addr();
+        let handles = first.test_take_dispatchers();
+        first.close_all();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+
+        // The sockets go with the listener, not with `close_all` (see its docs), and
+        // dropping is what a shutting-down server does after it.
+        drop(first);
+        let mut second = MhdListener::bind(addr).unwrap();
+        assert_eq!(second.local_addr(), addr, "the same address again");
+        let datagram = opening_datagram(11);
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&datagram, addr).await.unwrap();
+        let admitted = tokio::time::timeout(Duration::from_secs(2), second.accept()).await;
+        assert!(
+            matches!(admitted, Ok(Some(_))),
+            "the new listener must admit what the old one's dispatcher would have taken"
+        );
+    }
+
+    /// A connection table at its cap refuses a new id and inserts nothing.
+    ///
+    /// §4.120 #7's admission half (`HANDOFF.md` §4.172): the refusal path is where a
+    /// leak would live — a table that grows past `MAX_CONNECTIONS`, or one that
+    /// inserts and then reports failure, both look the same from a counter.
+    #[test]
+    fn a_full_connection_table_refuses_without_inserting() {
+        let mut table: std::collections::HashMap<u32, Arc<Shared>> =
+            std::collections::HashMap::new();
+        for id in 0..u32::try_from(MAX_CONNECTIONS).unwrap() {
+            table.insert(
+                id,
+                Shared::new(
+                    Conn::new(id, false),
+                    crate::transport::health::SessionHealth::new(),
+                ),
+            );
+        }
+        let refused_id = u32::MAX;
+        assert!(!admit(&mut table, refused_id), "a full table refuses");
+        assert_eq!(
+            table.len(),
+            MAX_CONNECTIONS,
+            "and the refusal inserts nothing"
+        );
+        assert!(!table.contains_key(&refused_id));
+    }
+
+    /// One opening datagram for a lane id: the shape a real client's first packet has.
+    ///
+    /// A fresh end's **first** packet is its credit, not its data (§4.154), so this
+    /// takes the first packet whose frame is a stream at offset zero — the exact shape
+    /// the listener's admission rule requires.
+    fn opening_datagram(id: u32) -> Vec<u8> {
+        let mut conn = Conn::new(id, true);
+        let stream = conn.open();
+        let _ = conn.write(stream.id, b"opening");
+        let mut buf = Vec::new();
+        for _ in 0..8 {
+            let Some(len) = conn.poll_transmit(std::time::Instant::now(), &mut buf) else {
+                break;
+            };
+            let packet = buf[buf.len() - len..].to_vec();
+            if matches!(
+                crate::transport::mhd::wire::decode(&packet).unwrap().frame,
+                crate::transport::mhd::wire::Frame::Stream { offset: 0, .. }
+            ) {
+                return packet;
+            }
+        }
+        unreachable!("a fresh write has an opening packet to send")
+    }
+
     #[tokio::test]
     async fn a_closed_lane_lets_its_pump_go() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

@@ -367,6 +367,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.172 P3 closes §4.120 #6 and the admission half of #7 (2026-11-09)
+
+The two lifecycle items §4.120 could only mark "partial" now have tests that observe the *release* rather than
+the request for it. Suite: **383 lib tests**, four of them new.
+
+**#6, the listener's dispatchers.** The seam is small and behavioural: `spawn_dispatcher` returns its
+`JoinHandle` and the listener keeps them, so a test can `await` the task instead of trusting the stop channel.
+Dropping a handle detaches, which is exactly what the listener did before, so nothing about shutdown changed.
+
+| test | what it observes |
+|---|---|
+| `a_closed_listener_lets_its_dispatchers_go` | after `close_all`, each dispatcher's task **finishes** within 2 s and its `Arc<UdpSocket>` count drops by one |
+| `a_rebound_port_takes_the_traffic_the_closed_one_left` | a closed listener's address can be bound again **and the opening datagram sent to it is admitted by the new listener** — impossible if the old dispatcher still reads that socket |
+| `a_full_connection_table_refuses_without_inserting` | at `MAX_CONNECTIONS` the refusal path inserts nothing and the table does not grow |
+
+**Load-bearing, checked by breaking the mechanism** — the discipline that has caught three of this session's
+mistakes: making the dispatcher `continue` instead of `return` on its stop signal turns the first two red;
+loosening `admit` from `<` to `<=` turns the third red. Restored, all four pass.
+
+**And one false break, worth recording** because it looked convincing: sending `false` on the stop channel
+instead of `true` changed nothing, because `tokio::sync::watch::Sender::send` notifies its receivers whether or
+not the value differs. A test that passed under that "break" would have told me the test was load-bearing when
+it was not — so the second attempt broke the *dispatcher's* handling instead of the value it is handed.
+
+**A doc defect found on the way.** `MhdListener::close_all` claimed to "release its sockets", and it does not:
+it takes `&self`, and the sockets go when the listener is dropped. The comment now says so and names the order a
+shutting-down server uses (`close_all` then drop), which is also what the rebound-port test exercises. That is a
+comment fix, not a behaviour change — making `close_all` clear its own sockets would need `&mut self` and buy
+nothing, since no caller keeps the listener afterwards.
+
+**What is still partial.** #7's other half — task and memory bounds under sustained loss — is unchanged:
+`the_lost_table_is_capped`, `silence_backs_off_and_then_kills_the_path` and
+`an_abandoned_stream_releases_its_buffer_after_the_hold` cover the tables, not a bound on the number of tasks a
+hostile or degrading path can make the process hold. §4.172 does not claim it.
+
 ### 4.171 P2 lands: the protocol harness is a workload, and its four numbers are in the run file (2026-11-09)
 
 §10.3 leans on "L1/L2 protocol metrics reported independently" and §3.4 asked for them as declarations with
