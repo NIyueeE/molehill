@@ -377,6 +377,50 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.183 Every lane's cumulative frontier is dead: the peer never sees number 0 (2026-11-09)
+
+Chasing §4.182's `num=0` produced something larger than the question. Across **three runs and forty lanes**, on
+both roles:
+
+| reading | what it says |
+|---|---|
+| accepting end's `first_seen` | **1**, on every lane — never 0 |
+| dialing end's `first_posted` | 0 — so number 0 *was* posted |
+| dialing end's `below`, every second | **0**, for the lane's whole life |
+| `unrouted` in the listener's cadence line | 0–9 per second, i.e. no flood of dropped unknown ids |
+| new line `mhd first numbered packet this end ever saw` | `number=1 frame="stream"` on the accepting side, `number=0 frame="stream"` on the dialing side |
+| listener's admitting call, now logged | **zero** refusals |
+
+So the dialer's first numbered packet is a stream frame, it is posted, and the accepting end never sees it — while
+the *other* direction delivers number 0 normally. One packet, at the head of the lane, in one direction.
+
+**The consequence is structural and it is the finding.** The accepting end's `below` is the cumulative frontier,
+and it only advances by filling the *first* hole. A lost packet is re-sent as a **new number**, so number 0 is
+never filled; `below` therefore stays 0 for the life of every lane. Retirement then runs on the only two paths
+left: the 64-number acknowledgement bitmap, and the per-stream byte prefix. `num=0` on §4.181's collapsed lane
+and the 70–90 % duplicate share on §4.182's are both this.
+
+**Two things were checked and are not the cause.** The plain two-connection seam is correct — a new test,
+`the_accepting_end_counts_the_dialers_first_numbered_packet`, hands a fresh dialer's first two datagrams to a
+fresh acceptor and gets `first_seen = 0` and `below = 1`. And the listener is not refusing the opening: its
+admitting call used to discard `on_datagram`'s result silently, which is now a debug line, and it fired **zero**
+times in a rerun. So the packet is lost between the two daemons, not refused by either.
+
+**Why this matters more than one lost packet.** The byte prefix is per stream and stops at the first hole *in that
+stream*; the receiver buffers bytes above a hole (`RecvBuf` keeps pieces), but the acknowledgement cannot say so —
+the only out-of-order evidence the wire carries is 64 packet numbers. At 5 % loss with a wide flight there is a
+hole every twenty packets, so everything more than 64 numbers behind `largest` can only be re-sent. **That is the
+70–90 % duplicate share**, and it is a wire-evidence limit rather than a controller question.
+
+**The next measurement is the one that decides it**: count, at the *receiver*, how many arriving bytes its stream
+already held — duplicate arrivals — beside how many were new. If most arriving bytes are duplicates the receiver
+already had, the carrier is re-sending data the peer holds and the fix is better out-of-order evidence (a wider
+bitmap or byte ranges, both inside the unreleased 6.0 dialect). If they are not, the re-sends are carrying real
+loss and the fix is elsewhere.
+
+**What was added to make that measurable**, all diagnostic and all off the default path: the first-numbered-packet
+line above, the logged admitting refusal, and one new test at the two-connection seam. No behaviour changed.
+
 ### 4.182 D2's second run: on a lossy path most of the wire is repair, and the healthy lane is the exception (2026-11-09)
 
 `cost` on the carrier leg under `loss5`, two rounds plus the A/A twin, `--scale 1`, 537.7 s, same binary and

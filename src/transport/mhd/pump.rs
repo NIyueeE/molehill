@@ -1843,7 +1843,16 @@ fn spawn_dispatcher(
                             crate::transport::health::SessionHealth::new(),
                         );
                         shared.with(|conn| {
-                            let _ = conn.on_datagram(now, datagram);
+                            // The result used to be discarded here while the *routed*
+                            // path logged it, so a lane whose opening datagram was
+                            // refused said nothing at all — and the artifact shows
+                            // every accepting end's first sighting one number too
+                            // high (`HANDOFF.md` §4.182). A refusal on the admitting
+                            // call is the one place that can explain a missing number
+                            // zero.
+                            if let Err(reason) = conn.on_datagram(now, datagram) {
+                                tracing::debug!("mhd listener refused an admitting datagram: {reason:?}");
+                            }
                         });
                         table.insert(packet.id, Arc::clone(&shared));
                         drop(table);

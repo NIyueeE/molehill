@@ -492,6 +492,26 @@ pub(crate) struct WorstStream {
     pub(crate) repair: Option<(u64, u64)>,
 }
 
+/// The frame class, for a log line that must not print the payload.
+///
+/// Its own function because the one caller needs a `&'static str` inside a `match`
+/// that later takes the frame by value, and because a payload printed next to a
+/// packet number is the kind of log line this crate's budget forbids.
+fn frame_name(frame: &super::wire::Frame<'_>) -> &'static str {
+    match frame {
+        super::wire::Frame::None => "none",
+        super::wire::Frame::Stream {
+            fin: true,
+            data: [],
+            ..
+        } => "fin",
+        super::wire::Frame::Stream { .. } => "stream",
+        super::wire::Frame::Credit { .. } => "credit",
+        super::wire::Frame::Reset { .. } => "reset",
+        super::wire::Frame::Datagram { .. } => "datagram",
+    }
+}
+
 /// Seal the payload `out[payload_at..]` in place and append its tag.
 ///
 /// The header — everything before the payload — is the associated data, so the
@@ -1755,6 +1775,11 @@ impl Conn {
             return;
         }
         self.first_seen = Some((number, self.own_below()));
+    }
+
+    /// This end's own numbering as it stands, for the one-line first-packet log.
+    fn own_numbering(&self) -> (u32, u32) {
+        (self.recovery.last_number(), self.own_below())
     }
 
     pub(crate) fn note_posted(&mut self, count: usize, bytes: usize) {
@@ -3084,6 +3109,36 @@ impl Conn {
         outcome
     }
 
+    /// Count one arriving packet, and say once per connection what carried it.
+    ///
+    /// Its own function because the first-packet log is thirty lines of explanation
+    /// for one `debug!`, and `apply_datagram` is at the length the lint allows. It
+    /// exists because the artifact says the accepting end's first sighting is number
+    /// 1 on every lane — never 0 — so the dialer's first numbered packet is lost on
+    /// the way and the cumulative frontier is pinned for the lane's life
+    /// (`HANDOFF.md` §4.182). The frame class is what says whether the listener's
+    /// "an unknown connection may only be opened by a stream frame at offset zero
+    /// **carrying bytes**" rule dropped it.
+    fn count_seen(&mut self, packet: &super::wire::Packet<'_>) {
+        if packet.unnumbered {
+            return;
+        }
+        self.numbers_seen = self.numbers_seen.saturating_add(1);
+        let first = self.first_seen.is_none();
+        self.note_first_seen(packet.number);
+        if !first {
+            return;
+        }
+        let (own_last, own_below) = self.own_numbering();
+        tracing::debug!(
+            number = packet.number,
+            frame = frame_name(&packet.frame),
+            own_last,
+            own_below,
+            "mhd first numbered packet this end ever saw"
+        );
+    }
+
     /// The body of [`Conn::on_datagram`], with this datagram's sampling decision.
     fn apply_datagram(&mut self, now: Instant, buf: &[u8], sampled: bool) -> Result<(), Rejected> {
         let decode = stats::Timing::start(sampled);
@@ -3096,10 +3151,7 @@ impl Conn {
             Rejected::Malformed
         })?;
         decode.stop(&stats::PHASES.decode);
-        if !packet.unnumbered {
-            self.numbers_seen = self.numbers_seen.saturating_add(1);
-            self.note_first_seen(packet.number);
-        }
+        self.count_seen(&packet);
         if packet.id != self.id {
             stats::note_rejected("malformed_lane");
             return Err(Rejected::Malformed);
@@ -5106,6 +5158,49 @@ mod tests {
             "and every byte had been given up on before it arrived: {ledger}"
         );
         assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
+    }
+
+    /// The accepting end counts the dialing end's first numbered packet.
+    ///
+    /// **Measured, and the reason this test exists**: across three runs and forty
+    /// lanes, every accepting end's `first_seen` was **1** and never 0 — the dialing
+    /// end's number 0 was posted (`first_posted=0`) and never seen — and every
+    /// dialing end read `below=0` for its whole life, so the peer's cumulative
+    /// frontier never advanced past the hole. That pins the *sender's* retirement to
+    /// the 64-number bitmap and the per-stream byte prefix for the life of every
+    /// lane, which is exactly the shape the lossy cell shows (`HANDOFF.md` §4.181,
+    /// §4.182).
+    ///
+    /// This is the smallest reproduction: two connections, the dialer's first two
+    /// datagrams, no socket, no dispatcher. If it passes, the hole is made outside
+    /// this seam — and the next place to look is the listener's admission rule,
+    /// which drops an unknown connection's datagram unless it is a stream frame at
+    /// offset zero *carrying bytes*.
+    #[test]
+    fn the_accepting_end_counts_the_dialers_first_numbered_packet() {
+        let now = Instant::now();
+        let mut dialer = Conn::new(11, true);
+        let stream = dialer.open();
+        assert!(dialer.write(stream.id, b"selector") > 0);
+
+        let mut acceptor = Conn::new(11, false);
+        let mut buf = Vec::new();
+        let mut fed = 0;
+        for _ in 0..2 {
+            let Some(len) = dialer.poll_transmit(now, &mut buf) else {
+                break;
+            };
+            let datagram = buf[buf.len() - len..].to_vec();
+            let _ = acceptor.on_datagram(now, &datagram);
+            fed += 1;
+        }
+        assert_eq!(fed, 2, "a fresh end owes a credit packet and an opening");
+        assert_eq!(
+            acceptor.first_numbers().1.map(|(number, _)| number),
+            Some(0),
+            "the first numbered packet the acceptor sees is the dialer's number 0"
+        );
+        assert_eq!(acceptor.own_below(), 1, "and its frontier advances past it");
     }
 
     /// A finished flow stops growing, and stops accumulating.
