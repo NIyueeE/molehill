@@ -7103,9 +7103,19 @@ stages: **P1 measurement → P2 instrument → P3 coverage → P4 controller (co
 records the mapping from each finding to its stage.
 
 **Read §12, not this paragraph, when the two differ** — the plan is the approved document and this is a summary
-of it. What the summary must not lose: P4 has an entry condition (`flight ≈ cwnd` with `none_reason = window`
-dominating, measured), and P1's judgement is pre-registered on `rtt_p99_ms` and `throughput_gbps` with a
-same-round A/A twin.
+of it. State at revision 2 of that objective:
+
+- **P1 done** (§4.165–§4.170) with one correction that mattered: the first three runs shaped the **visitor**
+  leg, not the carrier's, and a window line reading `srtt=1000us` under a 100 ms condition is what caught it.
+  Corrected, a 5 %-loss carrier path costs mhd about four-fifths of its throughput — 0.29 Gbit/s against 1.19
+  clean, a level rather than a lottery.
+- **P2 done** (§4.171): `transport` scenario, four declared metrics, bilingual rows, selfcheck 741 → 770. mhd's
+  stream open is 3 µs against a TCP connect's 48, and its round trip is 2.5× the bare socket's.
+- **P4 is shut by measurement**, not by opinion: throughput equals the shaper and the bare path on both rate
+  cells, so the path limits and the window does not. On loss the limiter is the loss response, which is outside
+  §12's P4 list.
+- **One decision waits for the human**: add a loss-response stage, or record the lossy-path penalty as accepted
+  behaviour. P3 does not depend on it.
 
 **Nothing is queued.** No measurement is outstanding, no decision is unanswered, and no row of the plan's
 progress table says "not started". The next round worth starting needs either a new instruction or a defect —
