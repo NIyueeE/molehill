@@ -377,6 +377,63 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.181 D2's first run: on a loss-free path, one lane's window never leaves its initial value (2026-11-09)
+
+D2 opens with `rtt100` on the carrier leg, because a path with no random loss removes the obvious suspect.
+One round, two arms (the profile's own A/A twin), 60 s stage, `--scale 1`, `MOLEHILL_MHD_STATS=1` with
+`RUST_LOG=molehill=debug`. `just bench doctor` before it: the binary is `sha256 bb853ab36a52dd74`, built from
+`8e9a189`, `stale=False`.
+
+**The cell carried 220 Mbit/s and the run resolved nothing** (every difference inside its own scatter; the A/A
+floor on `cpu_cores` was 317 %), which is what a single round buys and why the plan asks for more. The
+per-lane ledger is what this run was for, and it found something a cell median hides.
+
+**Of the four server lanes, three behaved and one collapsed.** Per lane over the stage, from the ledger:
+
+| lane | `cwnd` (median / max) | sent | ack | dup | timer losses | window refusals |
+|---|---|---|---|---|---|---|
+| 4164090728 | 1.07 / 1.57 MB | 1 036 MB | 1 008 MB | **2.6 %** | 1 126 | 89 969 |
+| 4164090729 | 0.82 / 1.02 MB | 1 002 MB | 531 MB | 46.8 % | 86 587 | 40 065 |
+| 4164090730 | **13 490 B / 13 490 B** | 1 909 MB | 226 MB | **87.9 %** | **521 561** | 67 831 |
+
+**Five facts about the collapsed lane, each read from the line rather than inferred.**
+
+1. **Its window never moved.** `cwnd=13490` in every second of 122 s — which is exactly `INITIAL_CWND`
+   (ten full packets) — and `grow=0` in every one of them. `acked_since_growth` stayed 0.
+2. **It posted twenty times what it delivered.** 1 909 MB sent, 226 MB confirmed, 87.9 % of it a re-send.
+3. **The peer's frontier was caught up, not pinned.** `below=1 827 856`, `largest=1 827 855` — the hole-pins-the-
+   frontier case, which the code has a comment and a test for, is **not** what happened here.
+4. **Not one record was retired by the packet-number block.** `num=0` for the whole stage; the 200 MB that was
+   confirmed came entirely from the byte prefix, and the rest of the table left by expiry.
+5. **The estimator was healthy.** `srtt_us=200 172` and `ceiling=16777216`: the round trip was measured and the
+   ceiling was 16 MiB, so neither an unseeded timer nor a low ceiling explains a 13 490-byte window.
+
+**And the same binary's other lanes grew normally**, to 0.8–1.5 MB with 1–2 % duplicate share. So this is a
+**bistable** failure — a lane that trips into it stays in it — which is also the shape of the 0.24–0.40 Gbit/s
+scatter §4.170 measured on the lossy cell and §4.178 could not explain.
+
+**What this rules out, stated because it is as useful as what it rules in.** The window is not limited by the
+ceiling (16 MiB), not by the peer's credit (`refus=c` is 7 in the whole stage), and not by a stalled number
+frontier (`below = largest + 1`). What remains is that **`progress` never became true on that lane**, because
+`Acked::progress` is set only when a record is retired *by number*, and no record ever was.
+
+**Three candidates for the next run, in the order the evidence already points.**
+
+1. **The storm is self-sustaining through the shaper's queue.** Repairs are exempt from `cwnd`, so a lane that
+   starts re-sending keeps re-sending; the queue fills; every acknowledgement then arrives later than
+   `loss_delay`; every packet looks stale; the timer declares them all. `lost=41 160m` in a single second against
+   a table of ~1 500 records is what a lane re-declaring everything it holds looks like.
+2. **Records expire before their acknowledgements.** `LOST_HOLD` is 3 s, the queue delay here is seconds, and a
+   record that is reaped leaves without a ledger entry: that is exactly the `num=0, late=0, pfx»0` pattern.
+3. **Something queues a repair without a loss declaration.** Second 1 already reads `rep=98 %` with `loss=0t/0m`,
+   which no mechanism in the code explains yet — `state.send.repair()` is called only from the two loss handlers
+   — so either the reading or the mechanism is wrong, and one of them has to be found.
+
+**The next measurement is smaller than this one.** `bulk-1` on the same path: one lane, one stream, no echo, no
+churn, no datagram series, so the ledger's numbers belong to exactly one flow. Then the same cell under `loss5`.
+Only after that is there a candidate worth building, and the plan's D3 order still holds — accounting and
+recovery first, a controller only if these say the window is the limit.
+
 ### 4.180 D1: the per-lane ledger, and the instrument defect it found on the way (2026-11-09)
 
 The plan's D1 asked for evidence that can tell a window problem from a scheduler problem, an
