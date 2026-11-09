@@ -814,8 +814,11 @@ TIMELINES: dict[str, tuple] = {
         ("loss5", 180.0),
         ("clean", 180.0),
     ),
-    # One stage: the fixed operating point a cost or screen run measures.
-    "single": (("clean", 60.0),),
+    # One stage at the campaign's own condition: the fixed operating point a
+    # cost or screen run measures. `campaign` is a sentinel resolved by
+    # `staged_condition` — a single-point run has to be able to choose the path
+    # it prices, or `--condition loss5` silently measures a clean one (§12 P1).
+    "single": (("campaign", 60.0),),
     # The L3 wedge's own timeline: the one condition that produces it, held
     # long enough to catch it, bracketed by the clean stages that show it is
     # not permanent. A diagnostic, not the sweep: the wedge appears in the
@@ -836,6 +839,21 @@ TIMELINES: dict[str, tuple] = {
 #: 0.31 % on clean stages); half a percent is above every arm measured so far.
 SLO_RTT_P99_MS = 50.0
 SLO_ERROR_RATE_PCT = 0.5
+
+
+def staged_condition(name: str, params: dict) -> str:
+    """The path a stage runs on, resolving the `campaign` sentinel.
+
+    A timeline that names a condition outright (the sweep, the soak) keeps it:
+    its shape *is* the schedule. A timeline whose stage means "the point this run
+    is about" names `campaign`, and the run's own `--condition` decides — so
+    `expected_cells` and the workload agree on the cell's name from the same
+    params, and a single-point run can price a lossy path instead of always
+    measuring a clean one.
+    """
+    if name != "campaign":
+        return name
+    return str(params.get("condition") or "clean")
 
 
 def timeline_for(name: str, scale: float = 1.0) -> tuple:
@@ -1315,9 +1333,10 @@ def expected_cells(scenario_id: str, params: dict) -> list:
         seen: dict = {}
         cells = []
         for condition, _ in holds:
-            seen[condition] = seen.get(condition, 0) + 1
+            resolved = staged_condition(condition, params)
+            seen[resolved] = seen.get(resolved, 0) + 1
             cells.append(
-                condition if seen[condition] == 1 else f"{condition}#{seen[condition]}"
+                resolved if seen[resolved] == 1 else f"{resolved}#{seen[resolved]}"
             )
         return [*cells, "run"]
     if scenario.kind == Kind.CAPACITY:
@@ -1436,6 +1455,9 @@ def scenario_catalog() -> list:
             params={
                 "timeline": "sweep",
                 "scale": 1.0,
+                # The path a `campaign` stage runs on; a timeline that names
+                # its own conditions (sweep, soak) ignores it (§12 P1).
+                "condition": "clean",
                 "streams": 4,
                 "ping_interval_ms": 50,
                 "udp_interval_ms": 20,
@@ -1455,6 +1477,9 @@ def scenario_catalog() -> list:
             params={
                 "timeline": "soak",
                 "scale": 1.0,
+                # The path a `campaign` stage runs on; a timeline that names
+                # its own conditions (sweep, soak) ignores it (§12 P1).
+                "condition": "clean",
                 "streams": 4,
                 "ping_interval_ms": 50,
                 "udp_interval_ms": 20,
@@ -1474,6 +1499,9 @@ def scenario_catalog() -> list:
             params={
                 "timeline": "single",
                 "scale": 1.0,
+                # The path a `campaign` stage runs on; a timeline that names
+                # its own conditions (sweep, soak) ignores it (§12 P1).
+                "condition": "clean",
                 "streams": 6,
                 "ping_interval_ms": 50,
                 "udp_interval_ms": 20,
@@ -1689,6 +1717,36 @@ PROFILES |= {
 DEFAULT_PROFILE = "smoke"
 
 
+def staged_overrides(args) -> dict:
+    """The staged scenarios' command-line overrides, as params by name.
+
+    Three of them, and each is a *method parameter* rather than a convenience:
+
+    * `scale` — a timeline's holds are its budget, and scaling them turns a full
+      sweep into a five-minute look without changing the schedule's shape;
+    * `series` — three probes running at once and one running alone are two
+      different measurements of the same tool, so a run must say which it was in
+      its fingerprint, not in a footnote (see `STAGED_SERIES`);
+    * `condition` — the path a `campaign` stage runs on (`single`'s sentinel),
+      injected for every staged scenario alike so `expected_cells` and the
+      workload resolve it from the same params. An unset `--condition` is
+      `clean`, which is what these profiles measured before the key existed.
+    """
+    overrides: dict = {}
+    scale = getattr(args, "scale", None)
+    if scale:
+        overrides["scale"] = scale
+    series = getattr(args, "series", "")
+    if series:
+        overrides["series"] = tuple(
+            name.strip() for name in str(series).split(",") if name.strip()
+        )
+    condition = getattr(args, "condition", "")
+    if condition:
+        overrides["condition"] = condition
+    return overrides
+
+
 def profile_of(name: str, args) -> dict:
     """The profile with the command line's explicit overrides applied."""
     if name not in PROFILES:
@@ -1702,28 +1760,11 @@ def profile_of(name: str, args) -> dict:
         profile["rounds"] = args.rounds
     if getattr(args, "warmup_rounds", None) is not None:
         profile["warmup_rounds"] = args.warmup_rounds
-    scale = getattr(args, "scale", None)
-    if scale:
-        # A staged scenario's budget is its timeline's holds: scaling them is
-        # how a full sweep becomes a five-minute look without changing the
-        # *shape* of the schedule, and it is recorded in the fingerprint like
-        # every other method parameter.
+    overrides = staged_overrides(args)
+    if overrides:
         for scenario in SCENARIOS.values():
             if scenario.kind == Kind.STAGED:
-                profile["params"].setdefault(scenario.id, {})
-                profile["params"][scenario.id]["scale"] = scale
-    # The probe set is a method parameter for the same reason `scale` is: three
-    # probes running at once and one running alone are different measurements of
-    # the same tool, and a run that measured the second must say so in its
-    # fingerprint rather than in a footnote (see `STAGED_SERIES`).
-    series = getattr(args, "series", "")
-    if series:
-        for scenario in SCENARIOS.values():
-            if scenario.kind == Kind.STAGED:
-                profile["params"].setdefault(scenario.id, {})
-                profile["params"][scenario.id]["series"] = tuple(
-                    name.strip() for name in str(series).split(",") if name.strip()
-                )
+                profile["params"].setdefault(scenario.id, {}).update(overrides)
     budget = getattr(args, "budget_s", None)
     del budget  # consumed by the caller, kept out of the fingerprint
     return profile

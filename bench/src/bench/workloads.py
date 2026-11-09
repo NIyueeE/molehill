@@ -1343,10 +1343,14 @@ def _stages_of(params: dict) -> list:
     seen: dict = {}
     stages = []
     for condition, secs in holds:
-        seen[condition] = seen.get(condition, 0) + 1
-        occurrence = seen[condition]
-        label = condition if occurrence == 1 else f"{condition}#{occurrence}"
-        stages.append((label, condition, max(secs, floor)))
+        # The `campaign` sentinel resolves to the run's own condition, so a
+        # single-point cost run can price the path it names (§12 P1) and its cell
+        # keeps the name `expected_cells` computed from the same params.
+        resolved = model.staged_condition(condition, params)
+        seen[resolved] = seen.get(resolved, 0) + 1
+        occurrence = seen[resolved]
+        label = resolved if occurrence == 1 else f"{resolved}#{occurrence}"
+        stages.append((label, resolved, max(secs, floor)))
     return stages
 
 
