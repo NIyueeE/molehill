@@ -377,6 +377,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.206 The anchored declaration fails too, and the failure says why (2026-11-09)
+
+The three pieces of §4.204 were built together — wide block, gated timer, time-anchored and capped declaration — with
+all 107 tests green, and measured on the same cell, three arms, three rounds, in one run:
+
+| arm | `mhd_lane_dup_pct` | `throughput_gbps` | `rtt_p99_ms` |
+|---|---|---|---|
+| candidate | 90.6 / 68.0 / 61.9 | **0.086 / 0.118 / 0.092** | 3 878 / 3 347 / 2 729 |
+| candidate twin | 76.0 / 83.9 / 79.2 | 0.172 / 0.137 / 0.028 | 923 / 1 640 / 1 477 |
+| pre-change binary | 14.5 / 13.9 / 44.5 | **0.517 / 0.364 / 0.496** | 1 671 / 1 402 / 1 394 |
+
+The guard is `throughput_gbps ≥ 0.3628`; the candidate misses it by three to four times and its tail doubles. **So it
+is reverted whole**, and this is the third mechanism in this family to fail.
+
+**The failure is informative, and it names the mistake.** With the timer gated and the threshold anchored, almost
+nothing declares any more: a hole needs a packet sent a quarter of the *smoothed* round trip later to have been
+acknowledged, and on a 100 ms path with a window that has stalled there is no such packet. So losses are never
+repaired, the stream stalls, and the numbers above are a carrier that stopped recovering rather than one that
+recovered too much. **The timer is not only the amplifier — it is also the only thing that can break a stall, and the
+gate removed exactly that.**
+
+**What the next attempt has to be, stated as a rule rather than a patch.** A declaration needs both properties at
+once: *evidence* (a later packet was acknowledged past the hole) **and** *an escape* (when no acknowledgement has
+advanced for a while, the timer may declare — bounded, oldest first, at most a few records). The first alone deadlocks
+as measured here; the second alone is the storm of §4.203. `oldest_flight_age` already exists for the escape hatch.
+
+**Not pursued further in this round**: the failing combination is well enough understood that the next change should
+be designed as that two-part rule, not as another tweak of these three.
+
 ### 4.205 The harness prerequisite is in: the fake clock lets time pass between packets (2026-11-09)
 
 §4.204 named the blocker and this is the first half of it, landed on its own so that it can be shown inert:
