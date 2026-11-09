@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.191 A two-minute stage turns the storm from a coin flip into the steady state, and the metric becomes judgeable (2026-11-09)
+
+§4.190 concluded that the cell was the problem, not the statistic. One probe settles it: the same cell with
+`--scale 2` (120 s stages) instead of 60 s.
+
+| | `--scale 1`, six rounds (§4.188) | **`--scale 2`, two rounds** |
+|---|---|---|
+| candidate `mhd_lane_dup_pct` | 13.7, 14.2, 14.8, 79.9, 92.0, 85.8 | **86.7, 90.7** |
+| twin | 14.0, 82.3, 14.1, 82.8, 12.9, 86.6 | **89.7, 81.4** |
+| A/A difference | 1.5 % | **4.0 %** |
+| **A/A floor (what a claim must clear)** | **76.4 %** | **4.9 %** |
+| `throughput_gbps` | 0.2469 median, spread 0.11–0.37 | 0.011 / 0.252 / 0.130 / 0.357 |
+
+**A longer stage does not average the storm away; it makes the storm the steady state.** Every round of both arms
+sits at 81–91 % duplicate share, so the two halves of the A/A agree to 4 %, and the floor drops from 76 % to 4.9 %.
+The candidate that pulls a lane out of the storm would read ~30 against ~87 — fifteen floors away, on two rounds.
+
+**So decision B dissolves, and decision A gets simpler.** No new statistic is needed and no metric has to change:
+the claim rule stays exactly as written, and the cell to judge a candidate exists — `cost`, tunnel leg, `loss5`,
+`l4-mux8`, **`--scale 2`**, two rounds plus the A/A twin. What the 60 s stage was measuring was *whether* the
+storm had started by the time it ended, which is why it read 14 % in half the rounds and 90 % in the rest.
+
+**And it sharpens the product statement.** On this path the carrier needs about two minutes to settle into the
+regime where nine bytes in ten are re-sends; the 120 s readings are 0.011–0.252 Gbit/s, i.e. a tenth to a quarter
+of the clean path. That is the defect the plan exists for, now measurable in a shape that can be claimed on.
+
 ### 4.190 A bistable metric cannot carry a claim under the model's own floor rule (2026-11-09)
 
 The metric from §4.187 was built so the next candidate could be judged. Reading the last A/B's own noise table
