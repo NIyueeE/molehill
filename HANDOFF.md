@@ -455,14 +455,13 @@ three rounds), so a future pre-registration still has to say how many rounds it 
 the answer is "more than three". It also does not change the fact that this metric needs `MOLEHILL_MHD_STATS=1`
 with `RUST_LOG=molehill=debug`, so a performance claim and this reading cannot come from the same run.
 
-**What follows, and it is written in the plan.** D3's **second** pre-registration is in place, unrun: the
-candidate is the one recorded as the fallback — **admit repairs against the window**, so a lane cannot re-send
-more than its window allows. It is next because the first candidate is falsified *and*, on the new metric, mildly
-harmful in healthy rounds (25–30 % against the baseline's 14.5 %), while the storm's shape is exactly repairs
-sustaining themselves outside the window. The cell is the same `l4-mux8` shape with **six rounds** — three were
-shown not to be enough — and the primary is `mhd_lane_dup_pct` against its 5 % materiality and the run's own A/A,
-with throughput now a **guard** rather than the primary, because the last candidate's throughput point estimate was
-the wrong thing to judge on and this one's is not obviously improved.
+**What followed, and what it cost.** D3's second pre-registration named the fallback candidate — **admit repairs
+against the window** — on the same `l4-mux8` shape with **six rounds** (three were shown not to be enough), judged
+on `mhd_lane_dup_pct` with throughput demoted to a guard. It was built (`397ece1`), measured, and **reverted**
+(`0c26311`): the candidate stormed in three rounds of six against the baseline's one and cost 21 % of the
+throughput, reproducible by its own twin. §4.188 records the numbers and the refutation they carry — bounding
+repairs feeds the loop it was meant to damp — and the plan's stage table now says D3 is **stopped for a human
+decision**, because the only lever left is the declaration rule itself and re-opening RACK is a plan change.
 
 ### 4.186 The ranges frame was built, engaged, and **reverted**: the pre-registered cell could not judge it (2026-11-09)
 
@@ -7897,7 +7896,7 @@ its text is the **D0–D5** plan that replaced the plan file on the same day:
 | **D0** | the three copies agree — plan file, this file, the objective | **done** (`15e4d76`) |
 | **D1** | per-lane instrumentation that can tell window, scheduler, acknowledgement, repair and counting apart | **done** (`cebd0bc`, `8e9a189`, `c0a5216`, `cdb98f5`): the `SendLedger` and eight tests |
 | **D2** | attribution runs that **choose** the fix | **done** (§4.181–§4.185): the cause is out-of-order evidence, and the storm reproduces at `l4-mux8` |
-| **D3** | **one** candidate, submitted and reverted alone | first candidate **reverted** (`3043039` → `b3e9778`); judgeability **built** (`a54cb8d`, `mhd_lane_dup_pct`, selfcheck 774); **second pre-registration written, unrun** |
+| **D3** | **one** candidate, submitted and reverted alone | **two candidates falsified and reverted**: the ranges frame (`3043039` → `b3e9778`) and the repair budget (`397ece1` → `0c26311`); judgeability **built** on the way (`a54cb8d`, `mhd_lane_dup_pct`, selfcheck 774); **stopped for a human decision** |
 | **D4** | the pre-registered criteria and guards (six cells, listed in the plan's §四) | waiting on D3 |
 | **D5** | `just fmt`/`check`/`interop`/`l3-accept`, both carriers' integration suites, capacity, soak, docs, changelog | waiting on D4 |
 
