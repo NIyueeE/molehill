@@ -367,7 +367,58 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.168 P1 on a gigabit link: equal throughput, 4.3 % more tail, 57 % more CPU per Gbit (2026-11-09)
+### 4.169 §4.165–§4.167 measured the wrong leg; the counters caught it, and the corrected number is severe (2026-11-09)
+
+**The mistake.** `--condition` defaults to the **visitor** leg — the visitor-to-server hop — while the carrier
+crosses the **tunnel** leg, server to client. So every `loss5` run in §4.165 and §4.166 shaped the visitor's
+TCP connection and left the carrier's own path clean. Those entries' numbers are real, but they answer
+"visitor-side loss with a clean carrier", not "the carrier on a lossy path", and their text says the latter.
+
+**What caught it was a counter, not a re-reading.** The per-lane window line from the attribution run reads
+
+```
+cwnd=262144 flight=59356 buffered=65216 ceiling=262144 srtt=1000us
+```
+
+`srtt = 1000 µs` is `recovery::GRANULARITY`, the estimator's floor — and the condition names **100 ms of delay
+each way**. A 200 ms path cannot report a 1 ms smoothed round trip, so the datagrams that lane sends were not
+crossing the shaped leg at all. §4.141's rule ("prove the premise in the same run") applies to the *condition*
+as much as to a code change, and this is the third time it has paid.
+
+**The corrected measurement**, `--condition loss5 --condition-leg tunnel`, four bulk streams and one
+interactive stream, one warm-up plus two rounds, 1 004.7 s:
+
+| arm | `rtt_p99_ms` | `rtt_worst_1s_ms` | `throughput_gbps` | error % | `retrans_segments` |
+|---|---|---|---|---|---|
+| `molehill` (mhd) | **744.5** | 1 016.5 | **0.0742** | 0.0 | 31 |
+| `molehill~aa` | 1 226.1 | 1 300.5 | **0.1736** | 0.53 | 107 |
+| `control` | 1 419.1 | 2 437.4 | 1.1903 | 0.55 | 164 805 |
+
+**This cell cannot be quantified and must not be.** Its own floors are `rtt_p99_ms` **71.8 %** and
+`throughput_gbps` **61.9 %**, and the two halves of the same binary read 0.074 and 0.174 Gbit/s — a 2.3× spread
+between an arm and itself. What survives the noise is the **order of magnitude**: when the carrier's own path
+drops 5 %, mhd carries **one-seventh of what the clean path carries** (0.074–0.174 against 1.19), with 31–107
+TCP segments retransmitted in the namespaces and a zero error rate on the interactive probe.
+
+**That is the "no loss response" gap from §4.163, in a measured form.** `conn.rs` never cuts the window on
+loss; it repairs and continues (§4.163's quote). On a 5 %-loss carrier path that design keeps flying into a
+path that drops one datagram in twenty, and throughput collapses. **This is not a window-ceiling problem** —
+`srtt` on that path puts the ceiling at the 16 MiB cap, far above any bandwidth-delay product involved — so
+P4's entry condition, as written, *still* is not met: the limiter is the loss response, which §12's P4 list
+does not cover.
+
+**What should happen next, stated as a choice rather than taken unilaterally.** Either §12 gains a stage for
+the loss response (a window that reacts to loss, or a repair rate that does not serialise behind one probe per
+timeout), or the lossy-path collapse is recorded as the carrier's accepted behaviour and the deployment advice
+says "do not use mhd where the path loses packets". The first is a design change in the engine; the second is a
+documentation change. Both are cheap to state and expensive to get wrong, so this waits for the human.
+
+**The measurement to sharpen it first** (pre-registered, before it runs): the same tunnel-leg `loss5` cell with
+**six measured rounds and the A/A twin**, judged on `throughput_gbps` alone, whose floor at that count should
+fall well below the 2.3× spread — the question is whether mhd's collapse is a plateau or a lottery, and only
+more rounds can say.
+
+### 4.168 P1 on a gigabit link: equal throughput, 4.3 % more tail, 57 % more CPU per Gbit (2026-11-09)### 4.168 P1 on a gigabit link: equal throughput, 4.3 % more tail, 57 % more CPU per Gbit (2026-11-09)
 
 The cleanest cell of this session, and the first where the control arm agrees with itself across two files. The
 same `cost` single point under the new `rate1000` condition (1 Gbit, 2 ms each way, 4 000-packet queue), run
@@ -416,6 +467,10 @@ reproducible, but the *size* should not be extrapolated to other loads without m
 
 ### 4.167 P1 on a rate-limited path: the carrier is not the limit, and nothing regresses (2026-11-09)### 4.167 P1 on a rate-limited path: the carrier is not the limit, and nothing regresses (2026-11-09)
 
+> **Leg caveat (§4.169).** These runs shaped the **visitor** leg, the default, while the carrier
+> crosses the **tunnel** leg — so the numbers below describe a clean carrier path. The corrected
+> tunnel-leg measurement is §4.169, where mhd loses about six-sevenths of its throughput.
+
 The `cost` single point under `rate100` (100 Mbit, 20 ms each way, 2 000-packet queue), four bulk streams and
 one interactive stream, one warm-up plus two measured rounds, 693.4 s:
 
@@ -445,6 +500,10 @@ dominates the ratio. It is a per-Gbit CPU figure on a cell that cannot carry a G
 be compared with a bulk cell's.
 
 ### 4.166 P1's second half: against a TCP carrier, `loss5` shows no throughput advantage and a worse tail (2026-11-09)### 4.166 P1's second half: against a TCP carrier, `loss5` shows no throughput advantage and a worse tail (2026-11-09)
+
+> **Leg caveat (§4.169).** These runs shaped the **visitor** leg, the default, while the carrier
+> crosses the **tunnel** leg — so the numbers below describe a clean carrier path. The corrected
+> tunnel-leg measurement is §4.169, where mhd loses about six-sevenths of its throughput.
 
 The same `cost` single point, the same `loss5` path, the same binary, run twice — once on mhd and once with
 `MOLEHILL_DATA_CARRIER=tcp`. **Same fingerprint** (`3864bdd29651a505`), and the pin travels in
@@ -491,6 +550,10 @@ scheduling and queueing rather than at the window. So P4 stays shut until the at
 and the next measurement is that attribution rather than a controller.
 
 ### 4.165 P1's first half: under `loss5`, mhd's interactive tail is 56 % above the bare path (2026-11-09)### 4.165 P1's first half: under `loss5`, mhd's interactive tail is 56 % above the bare path (2026-11-09)
+
+> **Leg caveat (§4.169).** These runs shaped the **visitor** leg, the default, while the carrier
+> crosses the **tunnel** leg — so the numbers below describe a clean carrier path. The corrected
+> tunnel-leg measurement is §4.169, where mhd loses about six-sevenths of its throughput.
 
 §12 P1 asks for a `cost` single point (60 s, four bulk streams and one interactive stream at once) under
 `loss5`, with mhd against its own A/A twin and a TCP side. The enabler came first: **`--condition` did not
