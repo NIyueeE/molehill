@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.194 The cell's real reading refutes RACK's premise: the carrier probes on the pump's tick (2026-11-09)
+
+§4.193 left the cell measuring a 2.2 ms "repair" on a 200 ms path and blamed a missing round-trip sample. The
+warm-up was added (a throwaway exchange on the same lane, `--warmup-ms 400`; the drop box now counts **streams**
+rather than datagrams, `--drop-stream 2`, and matches the repair on stream **and** offset, because two streams at
+the same offset is the ordinary case). The round trip was then seeded — `srtt_us=200 072` on the shaped leg — and
+the repair still came **2.3–2.6 ms** after the drop.
+
+**So the number was never about `loss_delay`, and the reason is in the pump.** `wait()` caps its deadline at
+`READ_POLL` (1 ms) whenever a stream is live (`pump.rs:767`), and that cap arrives as `Wake::Timer`, which calls
+`Conn::on_timeout` (`pump.rs:976`). `Recovery::on_timeout` does **not** compare `now` with its own timer — it clears
+it and decides (`recovery.rs:763`): if nothing is older than `loss_delay`, `stale` is empty and it takes the
+**probe** branch, which re-sends the oldest outstanding range as a new number. On a lane with a live stream that has
+anything in flight, that is **one re-send per millisecond, with no evidence required**.
+
+**What that means, in the two places it matters.**
+
+- **The shallow-flight cell is measuring the probe cadence, not loss detection.** A hole in a three-packet flight
+  is re-sent about two pump ticks after it is dropped. There is nothing slow here for a delivery-time detector to
+  fix: **RACK would not improve this cell**, and its premise — "the declaration waits for the clock" — was an
+  artefact of the protocol cell calling `on_timeout` once, by hand, at 500 ms.
+- **On a wide flight the same rule is a tax.** The ledger's own `probe=` counts on the storm lanes of §4.188 were
+  290–314 per second, i.e. about 3.2 Mbit/s per lane of unconditional re-sends; and when records *do* age past
+  `loss_delay`, the stale branch adds the mass that dominated §4.189's 80–90 %.
+
+**What this does to the decision, stated plainly.** Branch ① (re-open RACK) has lost its justification by
+measurement rather than by argument: the carrier is already re-sending a shallow hole at pump cadence, so the cell
+that was built to price RACK reads ~2 ms in its favour already. The defect the cell *does* expose is the opposite
+of the one the plan was chasing — **an unconditional re-send per tick** — which is a different candidate (bound the
+probe rate or require evidence for it), and a different plan change.
+
+**The cell is still worth what it cost**: it is stable (A/A floor 4.2 %), it is on the shaped path, and it is the
+instrument that would price *that* candidate. What changed is which candidate it argues about.
+
 ### 4.193 The shallow cell is wired into the model, and its first shaped reading is a surprise (2026-11-09)
 
 The cell from §4.192 is now a scenario with a metric rather than a hand-run binary: `transport-loss` runs the

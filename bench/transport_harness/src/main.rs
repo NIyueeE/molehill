@@ -104,6 +104,18 @@ struct Args {
     stream_mode: StreamMode,
     /// The address a relay binds; unused by the other roles.
     listen: SocketAddr,
+    /// How long the client runs a throwaway exchange before the measured one.
+    ///
+    /// The cell is worthless without it: a lane with no round-trip sample has
+    /// `loss_delay` at its millisecond floor, so the drop is declared before the path
+    /// has said anything (`HANDOFF.md` §4.193). One exchange first seeds the estimate.
+    warmup_ms: u64,
+    /// Which stream the drop box takes its victim from, counting distinct streams.
+    ///
+    /// A warm-up exchange is a stream, so the measured one is the second. Counting
+    /// streams rather than datagrams keeps that true however many packets a warm-up
+    /// happens to produce.
+    drop_stream: u32,
     /// Keep the connection open and idle for this long before exiting.
     ///
     /// The idle cost of a live lane had no instrument at all: the pump wakes at
@@ -163,6 +175,8 @@ fn parse_args() -> Result<Args> {
     let mut role = None;
     let mut addr = None;
     let mut listen = None;
+    let mut warmup_ms = 0u64;
+    let mut drop_stream = 1u32;
     let mut size = 64usize;
     let mut requests = 1000usize;
     let mut stream_mode = StreamMode::Fresh;
@@ -202,6 +216,12 @@ fn parse_args() -> Result<Args> {
                         .with_context(|| format!("--listen {value:?} is not host:port"))?,
                 );
             }
+            "--warmup-ms" => warmup_ms = value.parse().context("--warmup-ms wants ms")?,
+            "--drop-stream" => {
+                drop_stream = value
+                    .parse()
+                    .context("--drop-stream wants a stream ordinal")?;
+            }
             "--size" => size = value.parse().context("--size wants bytes")?,
             "--requests" => requests = value.parse().context("--requests wants a count")?,
             "--stream-mode" => {
@@ -224,6 +244,8 @@ fn parse_args() -> Result<Args> {
         role: role.ok_or_else(|| anyhow!("--role is required"))?,
         addr: addr.ok_or_else(|| anyhow!("--addr is required"))?,
         listen: listen.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap_or_else(|_| unreachable!())),
+        warmup_ms,
+        drop_stream,
         size: size.max(1),
         requests: requests.max(1),
         stream_mode,
@@ -567,7 +589,7 @@ async fn shallow(addr: SocketAddr, size: usize) -> Result<()> {
     });
 
     let t0 = Instant::now();
-    let boxed = tokio::spawn(drop_box(Arc::clone(&box_socket), server_addr, t0, true));
+    let boxed = tokio::spawn(drop_box(Arc::clone(&box_socket), server_addr, t0, true, 1));
 
     // The dialer: one stream, exactly two payload packets, so the flight is three.
     let lane = molehill_rathole::probe::Lane::dial(relay_addr)
@@ -638,7 +660,7 @@ async fn relay(args: &Args) -> Result<()> {
     let t0 = Instant::now();
     let (dropped, later, repair) = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        drop_box(Arc::clone(&socket), args.addr, t0, false),
+        drop_box(Arc::clone(&socket), args.addr, t0, false, args.drop_stream),
     )
     .await
     .context("the drop box saw no repair within its budget")??;
@@ -673,12 +695,15 @@ async fn drop_box(
     server: SocketAddr,
     t0: Instant,
     stop_on_repair: bool,
+    drop_stream: u32,
 ) -> Result<(Option<Instant>, Option<Instant>, Option<Instant>)> {
     use molehill_rathole::probe::{Carried, describe};
 
     let mut client: Option<SocketAddr> = None;
-    let mut stream_datagrams = 0u32;
-    let mut dropped: Option<(u64, Instant)> = None;
+    let mut streams: Vec<u32> = Vec::new();
+    // The stream **and** the offset: a lane carries several streams, and two of them
+    // sitting at the same offset is the ordinary case, not a coincidence.
+    let mut dropped: Option<(u32, u64, Instant)> = None;
     let mut later: Option<Instant> = None;
     let mut repair: Option<Instant> = None;
     let mut buf = vec![0u8; 4096];
@@ -697,7 +722,7 @@ async fn drop_box(
         .await;
         let Ok(Ok((len, from))) = received else {
             // Idle: the standalone box has seen everything it is going to see.
-            return Ok((dropped.map(|(_, at)| at), later, repair));
+            return Ok((dropped.map(|(_, _, at)| at), later, repair));
         };
         if from == server {
             // Back towards whoever dialed: the answer to the dropped range lands here
@@ -710,28 +735,56 @@ async fn drop_box(
         client = Some(from);
         let carried: Option<Carried> = describe(&buf[..len]);
         let mut forward = true;
-        if let Some(carried) = carried
-            && let Some(_) = carried.stream
+        if std::env::var_os("MOLEHILL_BOX_TRACE").is_some()
+            && let Some(seen) = carried
         {
-            stream_datagrams = stream_datagrams.saturating_add(1);
+            emit(
+                "seen",
+                &[
+                    (
+                        "stream",
+                        seen.stream.map_or("-".to_owned(), |id| id.to_string()),
+                    ),
+                    ("offset", seen.offset.to_string()),
+                    ("len", seen.len.to_string()),
+                    ("at_us", us(t0.elapsed()).to_string()),
+                ],
+            );
+        }
+        if let Some(carried) = carried
+            && let Some(stream) = carried.stream
+        {
+            if !streams.contains(&stream) {
+                streams.push(stream);
+            }
+            // Which distinct stream this is, counting from one: a warm-up exchange is
+            // the first, so the measured one is the second.
+            let ordinal =
+                u32::try_from(streams.iter().position(|seen| *seen == stream).unwrap_or(0) + 1)
+                    .unwrap_or(u32::MAX);
             match dropped {
-                None if stream_datagrams == 2 => {
-                    dropped = Some((carried.offset, Instant::now()));
+                None if ordinal == drop_stream && carried.offset > 0 => {
+                    dropped = Some((stream, carried.offset, Instant::now()));
                     forward = false;
                     emit(
                         "drop",
                         &[
+                            ("stream", stream.to_string()),
                             ("offset", carried.offset.to_string()),
                             ("len", carried.len.to_string()),
                             ("at_us", us(t0.elapsed()).to_string()),
                         ],
                     );
                 }
-                Some((offset, _)) if later.is_none() && carried.offset != offset => {
+                Some((victim, offset, _))
+                    if later.is_none() && (stream != victim || carried.offset != offset) =>
+                {
                     later = Some(Instant::now());
                     emit("later", &[("at_us", us(t0.elapsed()).to_string())]);
                 }
-                Some((offset, at)) if repair.is_none() && carried.offset == offset => {
+                Some((victim, offset, at))
+                    if repair.is_none() && stream == victim && carried.offset == offset =>
+                {
                     let now = Instant::now();
                     repair = Some(now);
                     emit(
@@ -768,7 +821,7 @@ async fn drop_box(
             let _ = socket.send_to(&buf[..len], server).await;
         }
         if stop_on_repair && repair.is_some() {
-            return Ok((dropped.map(|(_, at)| at), later, repair));
+            return Ok((dropped.map(|(_, _, at)| at), later, repair));
         }
     }
 }
@@ -780,6 +833,28 @@ async fn client_mhd(args: &Args) -> Result<()> {
         .await
         .with_context(|| format!("cannot dial {} over mhd", args.addr))?;
     emit("lane_setup", &[("us", us(setup.elapsed()).to_string())]);
+
+    // **The warm-up, before anything is measured.** A lane with no round-trip sample
+    // declares a loss at `loss_delay`'s millisecond floor, which is a statement about a
+    // state no shaped path stays in (`HANDOFF.md` §4.193). One throwaway exchange on
+    // this lane seeds the estimate; its echo is never read, and the exchange it belongs
+    // to is the one the drop box ignores (`--drop-stream`).
+    if args.warmup_ms > 0 {
+        let started = Instant::now();
+        let mut warm = lane.open().await.context("opening the warm-up stream")?;
+        let bytes = vec![0x5Au8; args.size];
+        warm.write_all(&bytes).await.context("warm-up write")?;
+        warm.flush().await.context("warm-up flush")?;
+        tokio::time::sleep(std::time::Duration::from_millis(args.warmup_ms)).await;
+        drop(warm);
+        emit(
+            "warmup",
+            &[
+                ("ms", args.warmup_ms.to_string()),
+                ("us", us(started.elapsed()).to_string()),
+            ],
+        );
+    }
 
     let payload = vec![0xA5u8; args.size];
     let mut reply = vec![0u8; args.size];

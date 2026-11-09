@@ -2045,6 +2045,11 @@ def run_transport_loss(ctx: Ctx, params: dict) -> list:
                     box_addr,
                     "--addr",
                     server_addr,
+                    # The warm-up is the first stream, so the measured one is the
+                    # second: counting streams keeps that true however many packets the
+                    # warm-up produces.
+                    "--drop-stream",
+                    "2",
                 ],
             ),
             stdout=box_log.open("wb"),
@@ -2065,6 +2070,11 @@ def run_transport_loss(ctx: Ctx, params: dict) -> list:
                         "1",
                         "--stream-mode",
                         "fresh",
+                        # Seed the lane's round trip first: without it `loss_delay` sits
+                        # at its millisecond floor and the path never enters the reading
+                        # (`HANDOFF.md` §4.193).
+                        "--warmup-ms",
+                        "400",
                     ],
                 ),
             ),
