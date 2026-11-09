@@ -1244,6 +1244,86 @@ mod tests {
         );
     }
 
+    /// The cell RACK needs: a flight of three, its **middle** packet lost.
+    ///
+    /// §12.5 of the plan says RACK may not be re-attempted before a cell exists "where a
+    /// stream keeps two or three packets in flight". This is that cell, and it exists to
+    /// measure the current rule rather than to justify a change:
+    ///
+    /// - the later packet's acknowledgement **is** evidence that the middle one is gone —
+    ///   it was sent after it and arrived;
+    /// - the rule ignores that evidence, because `on_ack` declares a loss only on the
+    ///   three-later-packet threshold and a flight of three has one later packet;
+    /// - so the declaration waits for the clock, and the clock's floor on a wide flight
+    ///   is [`MIN_RTO`].
+    ///
+    /// The number this pins is the gap between the two: evidence at 10 ms, declaration no
+    /// earlier than the timer — 20 ms on the cheap floor a one-packet flight gets, and
+    /// `MIN_RTO` (200 ms) the moment the flight is wider. RACK-shaped detection would
+    /// anchor on the arrival of the later packet instead, which is what a candidate
+    /// would have to beat and what a re-opened plan would pre-register against.
+    #[test]
+    fn a_middle_packet_of_three_in_flight_waits_for_the_clock_despite_later_evidence() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let first = send_one(&mut recovery, start, 0);
+        let middle = send_one(&mut recovery, start, 100);
+        let last = send_one(&mut recovery, start, 200);
+        assert_eq!(recovery.in_flight(), 3, "three packets in flight");
+
+        // The middle is lost; the third arrives ten milliseconds later and is
+        // acknowledged. That acknowledgement is later evidence about the middle.
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(10),
+            Ack {
+                largest: last,
+                // The first arrived cumulatively, the third by being the largest seen —
+                // and the bitmap names neither the middle nor anything else.
+                below: 1,
+                bits: 0,
+                ..Ack::default()
+            },
+        );
+        assert_eq!(
+            acked.newly.len(),
+            2,
+            "the first and the third are acknowledged: the evidence is in hand"
+        );
+        assert!(
+            acked.lost.is_empty(),
+            "and yet nothing is declared lost, because one later packet is below the \
+             three-packet threshold"
+        );
+        assert_eq!(
+            recovery.in_flight(),
+            1,
+            "only the lost packet's record is still held, and nothing has named it"
+        );
+
+        // Only the clock can name it now, and it names it later than the evidence — on
+        // the *cheap* floor, because a flight of one is a small flight. On a wide flight
+        // the same declaration would wait for `MIN_RTO` instead.
+        let soon = recovery.poll_timeout();
+        assert!(
+            soon.is_some_and(|at| at >= start + MIN_RTO_SMALL_FLIGHT),
+            "the timer is never earlier than the small-flight floor: {soon:?}"
+        );
+        assert!(
+            soon.is_some_and(|at| at > start + Duration::from_millis(10)),
+            "and it is later than the acknowledgement that carried the evidence: {soon:?}"
+        );
+        let (expiry, resent) = recovery.on_timeout(start + MIN_RTO);
+        assert!(
+            matches!(expiry, Expiry::Loss),
+            "a shallow flight's hole is a loss, not a probe of a silent path"
+        );
+        assert!(
+            resent.iter().any(|packet| packet.number == middle),
+            "and it is the middle packet that goes back on the wire"
+        );
+        let _ = first;
+    }
+
     #[test]
     fn three_later_acks_declare_a_loss() {
         let start = Instant::now();

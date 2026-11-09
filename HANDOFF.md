@@ -377,6 +377,47 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.189 The cell RACK was refused for now exists, and the bench says the clock does 80–90 % of the declaring (2026-11-09)
+
+§12.5 closed RACK with a condition rather than a verdict: *"a cell where a stream keeps two or three packets in
+flight"* did not exist, so a reordering- or delivery-time-based detector could not be judged. Both halves of that
+condition are now answered, and neither answer decides the plan by itself.
+
+**The protocol-level cell exists.** `a_middle_packet_of_three_in_flight_waits_for_the_clock_despite_later_evidence`
+(in `recovery.rs`) builds exactly that flight — three packets, the **middle** one dropped — and measures the
+current rule:
+
+| | measured |
+|---|---|
+| the later packet's acknowledgement | arrives at **10 ms**, and is proof the middle one is gone |
+| what `on_ack` declares from it | **nothing** — the threshold needs three later packets and a flight of three has one |
+| what the clock does | names it, and never earlier than the timer: **20 ms** on the small-flight floor, `MIN_RTO` = **200 ms** as soon as the flight is wider |
+
+So the gap a RACK-shaped rule would close is stated in milliseconds rather than asserted: **the evidence is in hand
+10 ms after the send and the declaration waits for a floor.** The cell is deterministic, needs no network, and is
+the thing a re-opened plan would pre-register against.
+
+**And at the bench the clock is what declares, by a wide margin.** Reading `loss=Nt/Nm` over the busy lanes of the
+last A/B (§4.188, `l4-mux8`, tunnel leg, `loss5`, six rounds):
+
+| arm | threshold declarations | timer declarations | timer share |
+|---|---|---|---|
+| candidate | 160 529 | 689 140 | 81.1 % |
+| candidate twin | 160 954 | 620 099 | 79.4 % |
+| baseline | 251 516 | 2 167 198 | **89.6 %** |
+
+**Eight or nine declarations in ten come from the clock, not from later-packet evidence**, on both builds. That is
+the same finding as the protocol cell, at the scale where the throughput is lost — and it is why both falsified
+candidates failed: they changed what happens *after* a declaration, while the declaration itself is what this path
+is drowning in.
+
+**What this does and does not change.** It satisfies the plan's *stated* condition for revisiting RACK at the
+protocol level. It does **not** satisfy the part that mattered: there is still no **bench** cell in which a stream
+carries two or three packets — the carrier's window is not configurable, and no condition in the model makes a
+stream's bandwidth-delay product three packets. So a re-opened RACK could be *shown correct* on the deterministic
+cell and could not be *priced* on a shaped one; that distinction is exactly what the human's decision has to weigh,
+and it is why this entry records the cell rather than starting the change.
+
 ### 4.188 The repair budget made the storm **more frequent**, and it is reverted too (2026-11-09)
 
 D3's second pre-registered candidate: admit a repair only while the re-sent bytes in flight are under the window
