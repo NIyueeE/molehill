@@ -303,8 +303,6 @@ pub(crate) struct StreamHandle {
 /// end's application, and nothing this connection sends will move it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
-    /// This end's congestion window had no room in flight.
-    Window,
     /// The peer's advertised credit had no room for new bytes.
     Credit,
     /// `MAX_BUFFERED` had no room: the bytes are queued and unacknowledged, so the
@@ -1324,12 +1322,15 @@ impl Conn {
         // The congestion window is the second bound, and it is what the flight —
         // and therefore the recovery table — is actually sized by.
         let credit = self.send_credit.saturating_sub(self.written);
-        let window = self.cwnd.saturating_sub(self.recovery.flight_bytes());
         // The buffer ceiling is the third bound: a byte stays buffered until an
         // acknowledgement moves its stream's frontier past it, and a frontier
         // that stalls must cost the writer a wait rather than unbounded memory.
         let held = MAX_BUFFERED.saturating_sub(self.buffered);
-        let room = credit.min(window).min(held);
+        // **Not the window.** The congestion window is applied when a packet is built
+        // (`next_stream_range`), which is where TCP applies it and the only place it can be
+        // an invariant of the wire (`HANDOFF.md` §4.236). Gating the buffer here instead
+        // meant the window was checked against a flight that the pump then grew.
+        let room = credit.min(held);
         // The fourth bound, and the one this cycle needed: **the flight may not
         // outlive the retransmission timer.** A carrier that lets a flight grow
         // past the timeout supposed to find a hole inside it is asking two
@@ -1373,8 +1374,13 @@ impl Conn {
         // see — credit 11.7 MB, buffer 28 MB. The reserve has to be a *lane*
         // budget an opening can spend, not a share of whatever is left, or it
         // reserves nothing exactly when it is needed.
+        // **The reserve is the peer's credit's, now that the window has its own.** A bulk
+        // stream stops one reserve short so a stream opening behind it can always write its
+        // handshake; the window's own overdraw for an opening lives at the send point
+        // (`next_stream_range`, `HANDOFF.md` §4.236). A write is bounded by the credit and by
+        // this end's buffer, and by nothing else.
         let room = if opening(state) {
-            credit.min(window.saturating_add(OPEN_RESERVE)).min(held)
+            credit.min(held)
         } else {
             room.saturating_sub(OPEN_RESERVE)
         };
@@ -1406,12 +1412,14 @@ impl Conn {
             // order of the comparisons is the tie-break, and `credit` still wins a
             // three-way tie, so the long-standing counter keeps its old meaning for
             // the two cases it could already tell apart.
+            // **Two bounds, because a write now has two.** The window refuses packets,
+            // not writes: it is consulted in `next_stream_range` (`HANDOFF.md` §4.236),
+            // so `Refusal::Window` is no longer produced here — `refused_window` staying
+            // at zero is the instrument saying so.
             let refusal = if refused_by_age {
                 Refusal::Aged
-            } else if credit <= window && credit <= held {
+            } else if credit <= held {
                 Refusal::Credit
-            } else if window <= held {
-                Refusal::Window
             } else {
                 Refusal::Buffer
             };
@@ -1429,9 +1437,6 @@ impl Conn {
                 Refusal::Credit => {
                     self.ledger.refused_credit = self.ledger.refused_credit.saturating_add(1);
                 }
-                Refusal::Window => {
-                    self.ledger.refused_window = self.ledger.refused_window.saturating_add(1);
-                }
             }
             // By bound **and** by class: an opening stream that is refused is the
             // arrival path paying for the bulk spine, and the reserve exists to make
@@ -1443,7 +1448,6 @@ impl Conn {
                 (Refusal::Buffer, _) => "buffer",
                 (Refusal::Credit, true) => "credit_opening",
                 (Refusal::Credit, false) => "credit",
-                (Refusal::Window, _) => "window",
             });
             // What the recovery table is holding when the age gate refuses. A
             // record that is neither acknowledged nor declared lost never leaves
@@ -1470,8 +1474,11 @@ impl Conn {
                 tracing::debug!(
                     stream,
                     credit,
-                    window,
                     held,
+                    // Kept on the line for the reader who is asking why an opening was
+                    // refused: the window no longer refuses writes, so a non-zero
+                    // `flight` above `cwnd` here means the lane is waiting on the peer or
+                    // on this end's buffer (`HANDOFF.md` §4.236).
                     flight = self.recovery.flight_bytes(),
                     cwnd = self.cwnd,
                     offered = bytes.len(),
@@ -2546,6 +2553,24 @@ impl Conn {
             return None;
         }
         let cursor = self.cursor;
+        // **The congestion window applies where bytes leave, not where they arrive**
+        // (`HANDOFF.md` §4.236). Admission is the peer's credit and this end's buffer
+        // ceiling; how much of that buffer may be on the wire at once is this. Until it
+        // was here, the window gated `write` and nothing re-checked it at `poll_transmit`,
+        // so bytes admitted while the flight was momentarily small were emitted later
+        // with a flight three to sixteen times the window — measured, and the reason every
+        // window-side controller looked like it never engaged.
+        let flight = self.recovery.flight_bytes();
+        let room = usize::try_from(self.cwnd.saturating_sub(flight)).unwrap_or(usize::MAX);
+        // An opening may overdraw the window by the reserve, for the reason the write path
+        // used to: the window can be full while a stream that has never been acknowledged
+        // still has to start, and a bulk run must not be able to spend this budget.
+        let opening_room = usize::try_from(
+            self.cwnd
+                .saturating_add(OPEN_RESERVE)
+                .saturating_sub(flight),
+        )
+        .unwrap_or(usize::MAX);
         let eligible = |(id, state): (&u32, &StreamState)| {
             // `Finished` ends the peer's *write* direction, not the stream: the
             // other direction is still ours to use (that is what half-close
@@ -2564,16 +2589,30 @@ impl Conn {
                     repair: true,
                 });
             }
-            state.send.has_unsent().then(|| {
-                let offset = state.send.next_offset();
-                let unsent = state.send.unacked();
-                let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
-                Pick {
-                    id: *id,
-                    offset,
-                    len: want,
-                    repair: false,
-                }
+            if !state.send.has_unsent() {
+                return None;
+            }
+            let offset = state.send.next_offset();
+            let unsent = state.send.unacked();
+            // A window with no room sends nothing new; one with less room than a segment
+            // sends what fits rather than stalling until the next acknowledgement.
+            let room = if state.acknowledged {
+                room
+            } else {
+                opening_room
+            };
+            let want = usize::try_from(unsent)
+                .unwrap_or(0)
+                .min(MAX_STREAM_PAYLOAD)
+                .min(room);
+            if want == 0 {
+                return None;
+            }
+            Some(Pick {
+                id: *id,
+                offset,
+                len: want,
+                repair: false,
             })
         };
         self.streams
@@ -3456,12 +3495,16 @@ impl Conn {
         // range acknowledged behind that hole then waits on a key the frontier
         // walk never reaches. The prefix only ever grows, so it frees those
         // bytes without needing the hole to be filled.
+        // The bytes this acknowledgement's prefix confirmed, kept for the growth rule
+        // below: the prefix is a delivery signal in its own right (`HANDOFF.md` §4.237).
+        let mut prefix_confirmed = 0u64;
         if ack.prefix > 0
             && let Some(state) = self.streams.get_mut(&ack.stream)
         {
             let moved = state.send.advance_to(ack.prefix);
             state.acknowledged = true;
             self.buffered = self.buffered.saturating_sub(moved);
+            prefix_confirmed = moved;
             // The prefix moves the same frontier the number path does, so its
             // delivery is counted the same way and only once.
             self.ledger.note_delivered(moved);
@@ -3549,8 +3592,17 @@ impl Conn {
         // never cut: a loss is repaired by retransmission, not paid for by
         // halving the pipe for a round trip.
         let before = self.cwnd;
-        if acked.progress {
-            let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
+        // **Both confirmation paths grow the window.** The number block and the byte prefix
+        // confirm the same thing — bytes the peer holds — and only the first used to grow it,
+        // because the prefix was added to free the flight and the window was thought to be its
+        // own signal (`HANDOFF.md` §4.108). With the window now applied at the send point
+        // (§4.236) that omission is fatal: a lane whose number block stalls — measured as
+        // `num=0` with `pfx=330 505` and `grow=0` — keeps delivering bytes and never opens its
+        // window, so it runs for ever at the one window it started with (`HANDOFF.md` §4.237).
+        if acked.progress || prefix_confirmed > 0 {
+            let bytes = u64::try_from(acked.bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(prefix_confirmed);
             if self.slow_start {
                 // Doubling stops at the ceiling and the additive rule takes
                 // over, because an unspaced burst that outruns the peer's
@@ -4509,6 +4561,43 @@ mod tests {
     /// zero. A leak here is not a slow number — it is the ceiling behind §4.50,
     /// where one abandoned stream's unacknowledged tail refused every later stream
     /// on the lane for the lane's whole life.
+    /// The window bounds the wire, and no longer the buffer.
+    ///
+    /// This is the invariant the shallow cell was missing (`HANDOFF.md` §4.236): bytes admitted
+    /// to the buffer while the flight was small used to be emitted later with a flight many
+    /// times the window, because nothing re-checked the window at `poll_transmit`. The buffer
+    /// may hold more than a window — that is the peer's credit's business — and the wire may not.
+    #[test]
+    fn the_wire_carries_no_more_than_the_window() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        link.pump(now);
+        let stream = link.a.open();
+        let bytes = payload(64 * 1024);
+        let written = link.a.write(stream.id, &bytes);
+        let written = u64::try_from(written).unwrap();
+        let cwnd = link.a.cwnd;
+        assert!(
+            written > cwnd,
+            "the buffer takes more than one window: {written}"
+        );
+        let mut buf = Vec::new();
+        for _ in 0..4096 {
+            if link.a.poll_transmit(now, &mut buf).is_none() {
+                break;
+            }
+        }
+        let flight = link.a.recovery.flight_bytes();
+        assert!(
+            flight <= cwnd.saturating_add(OPEN_RESERVE),
+            "the wire must not exceed the window (with the opening's reserve): flight {flight}, cwnd {cwnd}"
+        );
+        assert!(
+            flight < written,
+            "and the buffer still holds what the window kept back: flight {flight}, written {written}"
+        );
+    }
+
     /// The cumulative counters are not the interval ones.
     ///
     /// `take_ledger` is `mem::take`, so everything it returns is a per-second rate. The
@@ -5352,7 +5441,7 @@ mod tests {
     /// is pinned here. The block in this test says nothing at all, which is what a
     /// hole in a *different* stream produces.
     #[test]
-    fn a_prefix_confirmation_retires_bytes_without_growing_the_window() {
+    fn a_prefix_confirmation_retires_bytes_and_grows_the_window() {
         let now = Instant::now();
         let mut link = Link::new();
         let stream = link.a.open();
@@ -5393,8 +5482,13 @@ mod tests {
             ledger.acked_bytes, len,
             "and the two paths together counted each byte once"
         );
-        assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
-        assert_eq!(link.a.cwnd, before, "the window is exactly where it was");
+        // **The prefix grows the window, and it must.** It confirms the same thing the
+        // number block does — bytes the peer holds — and a lane whose number block has
+        // stalled would otherwise deliver for ever at the window it started with, which is
+        // exactly what the shallow cell measured (`HANDOFF.md` §4.237: `num=0`, `pfx=330 505`,
+        // `grow=0`). Growth no longer needs the number block to move.
+        assert_eq!(ledger.grown, len, "the prefix path grows the window");
+        assert_eq!(link.a.cwnd, before + len, "by the bytes it confirmed");
     }
 
     /// A prefix that covers a declared loss confirms those bytes, and says they were late.

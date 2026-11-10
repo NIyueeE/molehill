@@ -377,6 +377,107 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.237 The window moved to the send point: no drops, and two accounting defects exposed (2026-11-10)
+
+F2's first candidate, three changes, each one a consequence of §4.236:
+
+1. **The window is applied where a packet is built.** `next_stream_range` may take a new range
+   only while `flight + want ≤ cwnd` (an unacknowledged stream may overdraw by `OPEN_RESERVE`,
+   which is where that reserve now lives).
+2. **`write` no longer consults the window.** Admission is the peer's credit and this end's
+   buffer; the reserve stays there, as a reserve of the *credit*, so a bulk run cannot spend what
+   an opening needs.
+3. **The byte prefix grows the window.** It confirms the same thing the number block does, and
+   the growth rule had excluded it since §4.108.
+
+Measured on `rate100_shallow`, A/B against the frozen baseline in one campaign
+(`--binary-b /home/dsh/tmp/mhd-baseline-6ed32c1 --ab-arm molehill`):
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0955 / 0.0953 | 16 / 17 |
+| frp | 0.0952 / 0.0952 | 17 / 15 |
+| baseline (`molehill~b`) | 0.0830 / 0.0842 | **2 115 / 2 261** |
+| candidate | **0.0295 / 0.0295** | **0 / 0** |
+
+**The drops are gone and the throughput is 35 % of the baseline.** Both halves of that are
+information, and the second is the more useful.
+
+**What the fix did, per lane** (stats-on run, the busiest lane's last two lines):
+
+| fact | before (§4.236) | after |
+|---|---|---|
+| `cwnd` | 406 049 | 295 431, **and growing** (`grow=44 517`/s) |
+| `flight` | 6 665 480 (16.4 × cwnd) | **295 431 — exactly `cwnd`** |
+| `flight_packets` | 4 942 | 219 |
+| `srtt` | 386 ms | **43 ms** (path `min` 40 ms: the queue is empty) |
+| repairs' share of what was sent | 94 % | **7 %** |
+| timer declarations, whole stage | 15 067 | **3** |
+| retirement | `num=0`, `pfx=330 505` | `num=5 601 048`, `pfx=392 559` |
+
+So the two defects the fix exposed are both visible in the before column and both now behave:
+
+- **the number-ack path retired nothing** (`num=0`) while the prefix carried every byte — which is
+  why `acked.progress` was never true and `grow=0`: the congestion window had **no delivery signal
+  it recognised**. With the prefix counted, `num` works and the window grows.
+- **the timer declared 15 067 losses against 7 191 actual drops**, because a 16 × window flight
+  kept packets outstanding far past `loss_delay`. With the flight bounded by the window, there are
+  three declarations in a whole stage.
+
+**What is left, and it is one thing.** The lane now obeys its window honestly, and its window is
+small: 295 KB over a 43 ms path is 55 Mbit/s, of which the cell sees 29.5. `slow_start` is `false`
+— latched off by the first loss, by design ("nothing cuts the window; a loss is repaired") — so the
+window grows **one MSS per window** from wherever it was when that loss happened, which on this
+cell was a small fraction of the path. The rest of the gap is the ramp, not the window.
+
+**Next, therefore, is not a new controller**: it is the *slow-start restart* the existing growth
+rule is missing — a window that has fallen below the path's own bandwidth-delay product
+(`min_rtt × peak delivery`) doubles again until it gets there, and only then grows additively. That
+is `max(cwnd × 2, cwnd + acked)` in slow start and nothing else changes.
+
+**The candidate is not committed as a win**: drops are what F3 measures, and F3 also requires the
+throughput not to regress. This commit is the fix plus its record; the ramp is the next step.
+
+### 4.236 The window gates the buffer and not the wire (2026-11-10)
+
+F1's read-only run, with the cumulative counters from `9fdc625`. Three rounds of `rate100_shallow`, the busiest lane of the
+server side each time, read off the last window line of the round:
+
+| round | `cwnd` | `flight` | ratio | `buffered` | records | qdisc drops | threshold | timer |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 399 304 | 1 195 676 | **3.0×** | 1 195 676 | 887 | 2 008 | 297 | 5 916 |
+| 1 | 387 163 | 4 499 288 | **11.6×** | 4 499 288 | 3 336 | 1 773 | 85 | 2 057 |
+| 2 | 406 049 | 6 665 480 | **16.4×** | 6 665 480 | 4 942 | 7 191 | 2 505 | 15 067 |
+
+Three things are exact and they settle the attribution:
+
+1. **`flight` equals `buffered` to the byte in every round**, and `records × 1 349` reproduces `flight` (887 × 1349 =
+   1 196 963, 3 336 × 1349 = 4 500 264, 4 942 × 1349 = 6 666 758). So **every byte in the send buffer is on the wire as a
+   live record**: nothing is waiting unsent.
+2. **The flight is 3 to 16 times the congestion window.** The window is not bounding what is in flight, and it is not
+   bounded by anything else either — `ceiling` is 10 MB, so the window is nowhere near its own limit.
+3. `total_cuts = 0`: nothing cuts the window on a loss, which is the state the engine is in by design.
+
+**The mechanism.** `Conn::write` admits bytes against `cwnd - flight_bytes()`, and `next_stream_range` then sends whatever
+`has_unsent()` holds **without re-checking the window**. So the window gates *enqueue*, not *transmit*: bytes admitted when
+the flight was momentarily small stay in the buffer and are emitted later, when the flight is large. The two numbers agree
+exactly because the pump always drains the buffer to the wire.
+
+That explains, in one line, why every window-side controller in §4.212–§4.227 "barely engaged": **the window was never the
+constraint on the wire.** It explains the drops too — the wire carries `buffered` bytes over a path whose queue is 100
+packets deep, with no rate limit anywhere between them.
+
+**And it is the difference from TCP that matters.** TCP applies the congestion window where a segment leaves, so
+`flight ≤ cwnd` is an invariant of the wire. Here it holds only for the buffer.
+
+**Which row of F1.3's table this is:** "判损存在，但 `cwnd` 或实际 flight 没有相应下降" in its general form — the control is
+applied at the wrong boundary. The fix is not a controller: it is to apply the existing window at the existing send point
+(`MHD-FINALIZATION-PLAN.md` F2).
+
+**Also measured, and worth recording:** the timer declares 5 916 / 2 057 / 15 067 losses against 2 008 / 1 773 / 7 191
+actual qdisc drops — 3×, 1.2×, 2.1×. The timer over-declares when the queue is deep, which is the positive feedback
+§4.203 described, now counted cumulatively rather than inferred from a one-second sample.
+
 ### 4.235 The fourth plan's baseline is frozen (2026-11-10)
 
 The fourth plan's F0.3 step, done before any measurement so that every later A/B has something honest to compare against:
