@@ -377,6 +377,42 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.227 A⁸ judged against the same-run twin fails too, and `loss5` fails harder (2026-11-10)
+
+A⁸ changes the threshold, not the mechanism, so A⁷'s binary answers it on both cells. Shallow cell, against the criteria as
+written:
+
+| criterion | reading | verdict |
+|---|---|---|
+| `dropped_packets ≤ 3 439` (half the unpaced baseline) | **2 576 / 2 471** | **pass** |
+| throughput not below the same-run twin | **0.0751 / 0.0754** vs twin **0.0799 / 0.0813** | **miss** (6 %) |
+
+And the heavy-loss cell, which the carrier currently passes, with the same binary:
+
+| arm | `throughput_gbps` | guard |
+|---|---|---|
+| rathole | 0.0484 / 0.0171 | — |
+| frp | 0.1798 / 0.2532 | — |
+| molehill | **0.2537 / 0.0649** | **0.3628** |
+| molehill twin | 0.1240 / 0.2107 | — |
+
+**The ramp costs the cell the carrier already wins.** Halving the drops on a cell it loses, at the price of the cell it
+wins, is not a trade this stage can accept — the boundaries put throughput above everything except latency — so it is
+reverted whole again (`84037cd`).
+
+**Ten mechanisms have now been measured against this defect**, five of them in the last three rounds: window gate, repair
+budget, loss halving, BDP ceiling, burst budget, measured-rate pacer, `cwnd/srtt` pacer, schedule with run-sized credit,
+`cwnd/min_rtt`, and the rate-led ramp. The best of them (the ramp) halves the drops and costs 6 % on the shallow cell and
+two thirds on `loss5`. **The shallow cell's drops and the heavy cell's throughput are coupled through the same mechanism,
+and no single-knob variant moved one without the other.**
+
+That is the finding to hand over. The next step is not another knob: it is a decision about what the shallow cell is
+*for*. If `rate100_shallow`'s peer parity is a requirement, the carrier needs a queue estimate the peers get from TCP's
+own control loop, which is a design of its own; if it is a diagnostic cell, then the current carrier's behaviour there
+should be recorded as known and bounded rather than fixed at the cost of `loss5`.
+
+**Reverted whole.** The tree is `a02df07`'s state, 107 tests green, no schedule and no ramp in the engine.
+
 ### 4.226 The rate-led ramp is the best-balanced variant yet and still misses both thresholds (2026-11-10)
 
 A⁷ as pre-registered: the rate becomes the controlled variable (`paced_rate`), starting at
