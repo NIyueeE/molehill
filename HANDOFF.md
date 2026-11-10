@@ -377,6 +377,53 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.243 The clean cell's ten percent is not the ceiling, and the two sides are measured (2026-11-10)
+
+Two runs to find out what `bulk-n` is paying for, and the answer is neither of the things the last
+entry proposed.
+
+**The ceiling is not it.** `PIPE_GAIN` from 2 to 4 — four bandwidth-delay products allowed in flight
+instead of two — moved the clean cell from 11.415 to **11.653** Gbit/s against a baseline of 12.713
+and 13.051 in the same campaigns: the same −10 %, and the shallow cell stayed at 39.5 drops. The gain
+is back at 2, the number measured in §4.242.
+
+**What the two builds actually do on the clean cell**, from the window line of the busiest lanes with
+stats on:
+
+| | baseline (`molehill~b`) | candidate |
+|---|---|---|
+| `cwnd` | **262 144** (pinned at the calibration) | 1 097 780 / 249 784 |
+| `ceiling` | 262 144 | **1 711 162 / 2 772 622** (the pipe rule working) |
+| `flight` | **2 255 528** (8.6 round trips of data) | 1 009 052 (**2.6 round trips**) |
+| `loss=` | **`0t/0m`** | `0t/3428m`, `0t/7785m` |
+| `rep=` | 0 % | 1 % |
+| `late` | 0 | 4.6 / 10.5 MB per second |
+
+Three facts, and they decide the question:
+
+1. **The baseline never declares a loss on this cell.** Its flight is eight round trips deep and its
+   timer finds nothing stale, because its `loss_delay` is nine eighths of a *smoothed* estimate that
+   sits near the millisecond floor while its records retire in the same order they were sent.
+2. **The candidate declares 3 428–7 785 losses a second** and then sees `late` acknowledgements for
+   them — 2 % of its packets are being declared lost and then confirmed. Its flight is **2.6 round
+   trips**, not one, because the pipe estimator's `bdp` is computed over a window in which the lane
+   was sending faster than the RTT allows, and the ceiling follows it.
+3. **The wire rates are nearly equal** — the baseline's busiest lane sends 361 MB a second, the
+   candidate's 379 — while the *delivered* payload differs by 10 %. So the cost is not how much is
+   sent but what the sender does around it: 7 785 declarations a second each retire a record and
+   queue a repair, and the repairs plus the declarations' own bookkeeping are what the cell pays.
+
+**So the next change is the one the plan named and I have not made yet**: a declaration by timer must
+carry **evidence**, RACK's rule — a packet sent *after* the suspect has been acknowledged — or the
+`MIN_RTO` escape hatch for a genuinely silent path. The flight-scoped cut already prevents one episode
+from costing several reductions; the evidence rule prevents an episode from being invented out of
+reordering. The trap that §4.241 recorded and this entry confirms: gating on "the timer has expired"
+alone kills the shallow cell's declarations too (drops back to 1 711), so the rule has to *choose*
+between evidence and silence rather than merely gate.
+
+**Nothing committed here**: the gain experiment was reverted to 2 and the constant carries its result
+in its own doc comment. `bulk-n` stays at −10 % and is still the open guard.
+
 ### 4.242 Flight-scoped cuts and a pipe-aware ceiling: 41.5 drops with 7 % more throughput (2026-11-10)
 
 Two changes after §4.241's reading, and both are consequences of what it measured.

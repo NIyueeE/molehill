@@ -176,6 +176,15 @@ const WINDOW_REFERENCE: u64 = 1_000;
 /// window's round-trip arithmetic needs it without borrowing the estimator.
 const RTT_GRANULARITY: Duration = Duration::from_millis(1);
 
+/// How many of the path's own bandwidth-delay products the window may reach.
+///
+/// Two is BBR's `cwnd_gain` and the number the shallow cell was measured at (§4.242: 39–43
+/// drops in four rounds). Four was tried on the clean cell as the experiment between the two —
+/// deeper, to keep a fast pump busy — and moved nothing: 11.653 Gbit/s against the baseline's
+/// 13.051, the same −10 % the gain of two gives (`HANDOFF.md` §4.243). So the ceiling is not what
+/// costs the clean cell, and the smaller number stays.
+const PIPE_GAIN: u64 = 2;
+
 /// Why a frame could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rejected {
@@ -2752,15 +2761,14 @@ impl Conn {
             .unwrap_or(1)
             .max(1);
         let calibrated = WINDOW_FLOOR.saturating_mul(hops).min(MAX_CWND);
-        // **And never less than two of the pipe this end has measured.** The calibration is
-        // 256 KiB per millisecond of path, which is right on the shaped cells and far too narrow
-        // on a fast one: a clean lane carrying 1.6 GB/s over a 1 ms round trip needs 1.6 MB in
-        // flight, and the calibration allows 256 KiB — measured as the window pinned at the
-        // ceiling while the wire sat at 80 % of the baseline (`HANDOFF.md` §4.241). Two
-        // bandwidth-delay products is BBR's own bound on what may be in flight, so this raises the
-        // ceiling to what the path can hold and no further; the cut still brings the window down
-        // when the path disagrees.
-        let measured = self.bdp.saturating_mul(2).min(MAX_CWND);
+        // **And never less than the pipe this end has measured.** The calibration is 256 KiB per
+        // millisecond of path, which is right on the shaped cells and far too narrow on a fast one:
+        // a clean lane carrying 1.6 GB/s over a 1 ms round trip needs megabytes in flight, and the
+        // calibration allows 256 KiB — measured as the window pinned at the ceiling while the wire
+        // sat at 80 % of the baseline (`HANDOFF.md` §4.241). [`PIPE_GAIN`] bandwidth-delay products
+        // raises the ceiling to what the path can hold; the cut still brings the window down when
+        // the path disagrees.
+        let measured = self.bdp.saturating_mul(PIPE_GAIN).min(MAX_CWND);
         calibrated.max(measured)
     }
 
