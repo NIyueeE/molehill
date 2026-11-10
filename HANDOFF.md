@@ -377,6 +377,45 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.278 The lane-owned signal, measured: 294 drops at 43 % — the same trade, one more time (2026-11-11)
+
+The controller on top of the delivered-rate field, built and measured on the two cells that decide.
+
+| cell | arm | throughput | drops |
+|---|---|---|---|
+| `rate100_shallow` | baseline | 0.0833 | 2 220 |
+| | candidate | **0.0361** | **294.5** (339 / 345 / 250 / 248) |
+| `loss1` | baseline | 1.393 | 473 |
+| | candidate | **0.0110** | 139 |
+
+**It is the seventh mechanism and it behaves like the other six**: the shallow cell's drops fall by an
+order of magnitude (2 220 → 294) and the throughput falls to 43 %; `loss1` collapses to 0.011 Gbit/s.
+The one thing that makes this attempt different — the signal is measured *at the receiver*, cannot be
+confused with the path's standing queue, and cannot park below the delivery rate — **did not change the
+shape of the trade**.
+
+**What that now establishes, beyond argument**: on this path shape the carrier's throughput comes from
+sending without a rate limit, and its drops are the price of that. Seven mechanisms — the window at the
+send point, three variants of a delay gate, a delivery-driven rate, a doubling ramp, and a receiver
+reported rate over a **new wire field** — all pay between 57 % and 100 % of the throughput to reduce the
+drops, and the best of them (the doubling ramp, §4.272) reached the target and still lost 61 %.
+
+**My recommendation, stated plainly**: stop trying to control the rate inside the carrier. The two
+honest ways forward are the ones that need a human decision:
+
+1. **Accept the bounded defect** and close the release with it documented: 2 000–7 000 drops against the
+   peers' 16 on one cell, at 0.083 against 0.095 Gbit/s, with no storm, no wedge, and every other cell
+   at or above the baseline;
+2. **Open one fixed boundary** — a lossy path handed to TCP, or pacing done by the kernel (`fq`) rather
+   than by this code — both of which remove the trade instead of paying it.
+
+**Kept in the tree**: the wire field of §4.277 (`4fcc43a`), which is correct, tested, and **inert until
+a controller ships**. It is four bytes per acknowledgement and no reader; reverting it is one commit if
+the decision is to close without a rate controller, and re-applying the measured controller is the diff
+recorded in this entry.
+
+**Reverted**: the controller. 116 tests pass, tree clean.
+
 ### 4.277 Found it: the ack layout was written twice, and only one of them grew (2026-11-11)
 
 The backtrace the last entry asked for, and it named the line: **`udp_batch.rs:218`, the `Span::Staged`
