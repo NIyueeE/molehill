@@ -377,6 +377,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.257 F4's mechanical close-out on the baseline engine, and capacity is bimodal (2026-11-10)
+
+With the window family closed and the tree byte-identical to `6ed32c1`, the fourth plan's §七 regression
+list was run end to end. Everything that can be green is:
+
+| gate | result |
+|---|---|
+| `just check` | **exit 0** (full chain: fmt, clippy ×3, machete, ruff, pyright, selfcheck 791, the serial suite, audit, deny, outdated) |
+| `just interop` | **exit 0** (the three dialect-refusal cases) |
+| `just l3-accept` | **exit 0** (lane lending, `lend = false`, the lane cap) |
+| integrations, `MOLEHILL_DATA_CARRIER=mhd` | **3 × 22/22**, 91.21 / 93.29 / 93.32 s |
+| integrations, `MOLEHILL_DATA_CARRIER=tcp` | **3 × 22/22**, 81.13 / 81.42 / 82.01 s |
+| striped cell | **20/20** |
+| `capacity` | **bimodal — see below** |
+
+**`capacity` does not reproduce 8/8 reliably, on either arm, with the same binary.** Three runs:
+
+| run | `molehill` streams / headroom | twin `molehill~aa` |
+|---|---|---|
+| 1 | **4 / 50 %** | 8 / 0 % |
+| 2 | **4 / 50 %** | 8 / 0 % |
+| 3 (two rounds) | 4 / 50 %, then **8 / 0 %** | 8 / 0 %, then **1 / 87.5 %** |
+
+The twin reaching **one** stream with 87.5 % headroom is the telling one: both arms carry the same
+bytes, and the ramp is the thing that varies. So the plan's "capacity 8/8" guard is **not measurable
+as a pass/fail on a single run in this sitting** — a conclusion about the harness, and one that has
+to be written down rather than averaged away. What it is *not* is a regression from this work: the
+engine is byte-identical to the commit the earlier 8/8 was measured on.
+
+**Soak was not re-run**, and §七's own condition says why: it is required when a controller or the
+scheduler has changed substantially, and nothing landed. That is the one item of F4 deliberately left
+undone, recorded here rather than skipped silently.
+
+**定型 is not claimed.** §五.7 asks for the defect fixed and every guard with evidence; the defect is
+known and bounded (2 000–7 000 drops against the peers' 16 on one cell, no storm, no wedge, every
+other cell at or above the baseline), and the family that might have fixed it failed three times
+(§4.256). That decision is the human's, and the record is ready for it.
+
 ### 4.256 Limited transmit rescues the stall and the family is still three times slower (2026-11-10)
 
 The candidate §4.255 pointed at, built and measured: the window at the send point, the prefix growing
