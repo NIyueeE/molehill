@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.224 The three remaining failures say `live == 0` with two packets on the wire (2026-11-10)
+
+Probed `a_prefix_over_a_declared_loss_counts_those_bytes_as_late` directly with the schedule in. Two thousand bytes
+written, twelve datagrams built, **two carrying stream data**, no acknowledgement — and then:
+
+```
+declared=0  expiry=Loss  sent=2000 pkt=2 ack=0
+```
+
+`Expiry::Loss` with an empty set is precisely the `self.live == 0` early return in `Recovery::on_timeout`. **Two stream
+packets left the wire and no record is in flight.** That is not a pacing question and not a test-timing question: it says
+the send path built data frames that `Recovery` never recorded.
+
+Three candidate readings, none yet excluded:
+
+1. `reap(now)` with `now` two seconds ahead drops them before the stale test runs;
+2. the pick came back with `range: None` for some other reason and the frame went out unrecorded;
+3. `pkt` in `SendLedger` counts something other than recorded stream sends, and the probe is misreading it.
+
+**This is the third attempt on the same three tests**, so per the standing rule it stops here rather than becoming a
+fourth. What the next round should do first is not touch the tests at all: it should print `recovery`'s in-flight count
+*before* the timeout and after each `poll_transmit`, which separates reading 1 from reading 2 in one run.
+
+**Committed: nothing.** The tree is `a02df07`'s state, 107 tests green; `/tmp/schedule-credit.patch` holds the schedule
+with the run-sized credit and the first-window exemption (8 failures → 3).
+
 ### 4.223 Two changes cut the failures 8 → 3, and the last three are declarations, not pacing (2026-11-10)
 
 Rather than rewrite the harness's four send loops, two changes to the schedule itself:
