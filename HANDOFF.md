@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.219 The send schedule compiles and cannot be tested yet, which is the honest stopping point (2026-11-10)
+
+The step the seven failures point at — a **schedule** rather than a budget: `Conn` keeps `sent_at`, computes `next_due` as one
+segment per `schedule_rate()` (the larger of `cwnd/srtt` and the measured delivery rate, floor 256 KiB/s), the picker
+releases new data only when `now >= next_due`, and `poll_timeout` puts that instant into the pump's deadline so a paced
+lane wakes for its next packet instead of sleeping to the retransmission timer.
+
+**It compiles, it is coherent, and ten of the fake-clock connection tests fail with it** — all of them the same way: a
+`pump` call now emits one or two packets where it used to emit the whole run, so a test that pumps eight times for six
+packets no longer finishes its transfer. That is not a bug in the schedule; it is the schedule *working*, against a
+harness whose tests were written when a pass could send as much as it liked.
+
+**So the schedule needs the same treatment the delayed link got in §4.205**: land the harness that can express paced
+sending first, with the rule inert, and only then the rule. Concretely: `pump` must advance its clock by the schedule's
+spacing (or the tests must pump for enough virtual time), and the ten tests' loop counts become functions of the transfer
+size rather than constants. That is a change to the test link, and it is the fourth time this stage has hit the same
+class of blocker — the measuring apparatus, not the mechanism.
+
+**Not pursued further here.** The schedule is the redesign the human has been asked to authorise, and its first
+deliverable turns out to be another harness change; landing both in one round would put an unverified rule on top of an
+unverified harness, which is the mistake this stage has already paid for twice.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.218 The window-rate pacer fails the same way, and seven mechanisms now agree (2026-11-10)
 
 A⁵ — refill the bucket at `cwnd / smoothed_rtt` instead of at the measured rate — was implemented, with the bucket
