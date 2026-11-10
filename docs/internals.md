@@ -175,8 +175,13 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
   flight several times its `cwnd` and the window climbs faster than "one packet per round trip" would suggest —
   ≈28 KB/s on a 200 ms path. And the lane then carries much less than the path could: a 5 %-loss tunnel leg gives
   0.29 Gbit/s against 1.19 on a clean one, and on a 100 Mbit queue about 11 ms deep the same lane drops two orders
-  of magnitude more than its TCP peers while carrying 19 % less. **That is an open defect, not a property to
-  work around.** The per-lane window line carries the numbers that price it: `sent` against `ack`, `rep` as the
+  of magnitude more than its TCP peers while carrying 19 % less. **That is an open defect, and it has resisted every
+  mechanism tried against it**: moving the window to the send point (three times), a rate driven by delay (twice), a
+  rate driven by delivery, the burst size, and the kernel send buffer — each measured, each either slower or neutral.
+  What they share is the finding: the carrier sends at the path's rate into a buffer smaller than the path's
+  bandwidth-delay product, and nothing it can change about *how* it sends alters that. The cell's own round-to-round
+  spread is the same order as most of those differences, so the peers' gap is the only part of it worth quoting
+  (`HANDOFF.md` §4.249–§4.265). The per-lane window line carries the numbers that price it: `sent` against `ack`, `rep` as the
   share of what left that was a range already sent, `late` for acknowledgements that landed after the lane had
   declared the packet lost, and `refus`/`stop` for the bound or budget that ended the passes. A controller is
   written only if those say the window is the limit (`HANDOFF.md` §4.179–§4.180).
