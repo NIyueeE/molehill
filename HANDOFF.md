@@ -377,6 +377,51 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.230 The path is not shallow: 40 ms of path, 2 MB of buffer, and a relative target still misses (2026-11-10)
+
+The instrument the last entry asked for, on the shallow cell with the send schedule in place and no controller:
+
+```
+cwnd=376371  ceiling=10485760  srtt_us=311698  min_us=40101
+cwnd=407398  ceiling=10485760  srtt_us=204718  min_us=40101
+```
+
+**Three facts, and they overturn the premises of nine attempts.**
+
+1. **`min_rtt` is 40 ms and it is stable** — the path's own length is measurable, so a queueing-delay
+   signal is available. The estimate was never the problem in the way §4.229 supposed.
+2. **The queueing delay is 165–272 ms**, i.e. `srtt` is five to eight times `min`. At the delivery rate
+   (§4.228: 0.083 Gbit/s ≈ 10.4 MB/s) that is **a 2–3 MB standing queue**, which is exactly what the
+   first controller measured (`q3122136`) and read as a broken estimate.
+3. **The benchmark's shallow path is not shallow.** A 2 MB buffer at 100 Mbit/s is 160 ms of buffering:
+   it is a *bufferbloated* shaper. The "queue of tens of kilobytes" that §4.218 assumed — and against
+   which a 32 KiB target looked reasonable — does not exist on this cell.
+
+**So the target became dimensionless**: the round trip may not exceed twice the path's own length. That is
+A¹¹, and it still misses:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0953 / 0.0955 | 16 / 17 |
+| frp | 0.0951 / 0.0950 | 63 / 16 |
+| molehill (A¹¹) | **0.0668 / 0.0660** | **2 667 / 5 055** |
+| molehill twin | 0.0734 / 0.0740 | 3 451 / 1 865 |
+
+The controller engages (`trim=6…8`, queue peaks 71–150 ms over the path), the throughput falls 10 % below
+its own twin, and **the drops do not move into the peers' range**. Reverted whole.
+
+**Eleven mechanisms, and the same trade every time**: keep the drops, or keep the throughput. The peers do
+not face this trade because their rate control is TCP's, which reacts to *both* loss and delay with a
+multiplicative decrease that has been tuned for thirty years, and which runs in the kernel for free.
+
+**What that means for the defect is a decision, not another rule**: either the carrier gets a real
+controller (bounded inflight at `BDP × gain` with a multiplicative decrease on delay *and* loss, which is a
+design with its own measurement plan), or this cell's behaviour is recorded as known and bounded — a
+throughput cost of 8–11 % against TCP, with drops that do not storm (§4.211: no repair storm, 107 tests
+green, `transport` unchanged).
+
+**Reverted whole**: the tree is `ae049e8`'s state, 107 tests green, no controller in it.
+
 ### 4.229 The queue target stops the drops by stopping the traffic, and its estimate is the flaw (2026-11-10)
 
 A⁹ pre-registered a queue-target controller: `queue = (smoothed_rtt − min_rtt) × delivery rate`, trimmed proportional
