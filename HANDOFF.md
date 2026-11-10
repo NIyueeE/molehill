@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.232 The peak-rate controller runs and lands at minus thirty percent drops for minus three percent throughput (2026-11-10)
+
+A¹² again, with the harness fixed (§4.231) and with the two defects its first run exposed corrected:
+
+1. **The peak had no growth**, so the lane sat on the 256 KiB/s floor: measured `pk262144k`, throughput 0.0028 —
+   the same lock as every earlier pacer, and for the same reason (the peak can only rise when a sample exceeds it, and
+   the samples come from what the schedule released).
+2. **The ramp and the cut shared one timestamp**, so the ramp consumed the round trip the cut needed: `cut2=0` on every
+   lane while the peak ran away to 512 GB/s. Once separated, the cut fires (`cut2=10…11`).
+
+With both fixed:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0955 / 0.0954 | 16 / 16 |
+| frp | 0.0950 / 0.0952 | 17 / 16 |
+| molehill (A¹²) | **0.0808 / 0.0811** | **1 532 / 2 138** |
+| molehill twin | 0.0832 / 0.0832 | 1 635 / 2 110 |
+
+**Drops down by about thirty percent, throughput down by about three** — the best trade any of the thirteen mechanisms
+has produced, and still two orders of magnitude above the peers' 16. The primary is missed, so it is reverted whole.
+
+**What thirteen mechanisms establish.** The drops scale with how far the send rate exceeds what the shaper can carry
+(§4.216's arithmetic), and every control that keeps the rate near that figure pays throughput; the ones that do not keep
+the rate there keep the drops. The peers escape the trade because their rate control is TCP's, which reacts to loss and
+delay together with a tuned multiplicative decrease and runs in the kernel.
+
+**The defect is therefore characterised, not fixed**, and the honest options are unchanged: build a controller with its
+own measurement programme (the shape here is close — the peak estimator, the inflight cap and the cut are right; what is
+missing is a probe cycle that raises the rate deliberately rather than by doubling), or record the cell as known and
+bounded.
+
+**Reverted whole**: the tree is `1de5729`'s state, 107 tests green.
+
 ### 4.231 The peak-rate controller passes 106 of 107 tests and stops on one, by the rule (2026-11-10)
 
 A¹² as the last entry proposed it: pace at the **windowed peak** delivery rate (ten round trips, expiring), bound new
