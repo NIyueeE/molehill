@@ -377,6 +377,45 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.247 The frontier moves: one lost opening no longer pins the number path (2026-11-10)
+
+F3′'s first fix, and it is the receiver's, not the sender's: **a hole that outlives the ahead window
+is abandoned.** `AckSet` remembers up to `AHEAD` (256) out-of-order numbers; when one more arrives
+and the set is full it used to drop the *new* number, which leaves the oldest gap — very often the
+first packet of a flight — holding `below` back for ever. A number more than sixty-four behind
+`largest` is outside the bitmap and below the frontier is the only way the sender can retire it, so
+that one hole made the whole number path unretirable. Now the oldest gap is given up and the frontier
+jumps past it: the packet, if it ever arrives, is below `below` and ignored here, and its stream bytes
+are dropped by offset as the duplicate they are.
+
+**It fixes what it was aimed at.** The busiest lane on `loss5`, before and after:
+
+| | before (§4.246) | after |
+|---|---|---|
+| `num` (bytes retired by number, per second) | **0** | **978 025** |
+| `total_loss_timer` for the stage | **61 789** | **12** |
+| `total_loss_threshold` | 0 | 73 |
+| `rep` share | 98 % | 28–43 % |
+| `cwnd` | 78 KB | 159–529 KB, at `flight` |
+| the lane's own rate | ~0.4 MB/s | 1.3–2.1 MB/s |
+
+**It does not fix `loss5`.** The cell still reads **0.0023 Gbit/s** against the baseline's 0.0738,
+because the lane's 15 Mbit/s and the reader's 0.4 MB/s are different numbers: 28–43 % of what the
+lane sends is repairs, and the stream's contiguous prefix advances at a few hundred kilobytes a
+second. A repair is queued until the prefix passes its range, so a hole that is not filled re-sends
+the same range pass after pass — the §4.203 shape, now with the number path healthy underneath it.
+
+**The shallow cell is untouched**: four rounds at 49, 43, 43, 34 drops (median 43) and 0.08975
+Gbit/s against the baseline's 0.0836 — still the best reading this cell has had.
+
+**So the next question is the repair loop, not the frontier**: why a hole that is re-sent every pass
+does not get filled, and why the prefix starves while the lane carries fifteen megabits. That is a
+sender-side question about the repair queue, and it is what F3′ turns to next.
+
+**Committed**: the abandonment with its test (a control where ten later numbers are still reordering,
+and one lost opening with `AHEAD` behind it moving the frontier), and nothing else. `bulk-n` has not
+been re-measured since; the −8.8 % from §4.244 is the last reading.
+
 ### 4.246 `loss5` collapses to 0.0022 Gbit/s, and the window line says why (2026-11-10)
 
 The guard the 93-minute campaign could not answer, run on the cheap cell shape: `bulk-1`,
