@@ -377,6 +377,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.225 The schedule reduces the drops twenty-five-fold and cannot keep the throughput (2026-11-10)
+
+The clock was built, made to pass the whole suite (`6957cf0`; the harness clock running twenty-two seconds ahead of the
+test's was the last blocker — §4.224's `flight = 2000` reading), and measured. It engages: `paced ≈ 2100` per lane.
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0955 / 0.0955 | 16 / 17 |
+| frp | 0.0951 / 0.0951 | 15 / 246 |
+| molehill (`cwnd / srtt`) | **0.0006 / 0.0241** | **0 / 87** |
+| molehill twin | 0.0233 / 0.0227 | 271 / 279 |
+
+**The drops fall thirty-fold and the throughput falls fourfold.** Primary met in one round, guard missed by four times →
+**reverted whole**, as pre-registered.
+
+The cause was identifiable before the second run: `smoothed_rtt` **contains the queue the schedule exists to avoid**, so
+pacing by it lowers the rate that keeps the queue empty. The obvious correction — `cwnd / min_rtt`, the path without its
+queue, which is what `window_ceiling()` has always used — was pre-registered and measured:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| molehill (`cwnd / min_rtt`) | **0.0010 / 0.0012** | 0 / 0 |
+| molehill twin | 0.0006 / 0.0252 | 0 / 89 |
+
+**Worse, and now the reason is not a parameter.** A rate of a megabit against a path of ninety is the floor rate, which
+means `cwnd` never grew — and it cannot: **`cwnd` grows only on acknowledgements, and the schedule decides how much data
+there is to acknowledge.** Every one of the nine mechanisms tried since B has come back to that loop.
+
+**So the loop is the design flaw, and it has a name in this stage's record.** The window is a *consequence* of the
+acknowledgements; a schedule driven by the window is a schedule driven by its own output. The version that can break it
+is a **rate-based ramp**: hold the *rate* as the controlled variable, start it at a measured-safe value and double it
+each round trip until a delay or loss signal says stop — the window then follows the rate instead of the other way
+round. That is not a parameter, it is the other half of the redesign the human authorised, and it is where this stops
+for a decision rather than for another attempt.
+
+**Reverted whole** (`e3675e0`): the tree is `a02df07`'s state, 107 tests green, no schedule in the engine.
+
 ### 4.224 The three remaining failures say `live == 0` with two packets on the wire (2026-11-10)
 
 Probed `a_prefix_over_a_declared_loss_counts_those_bytes_as_late` directly with the schedule in. Two thousand bytes
