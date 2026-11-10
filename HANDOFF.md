@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.221 The schedule is a credit bucket now, the suite terminates, six tests assert the old contract (2026-11-10)
+
+The slot arithmetic from §4.220 was the wrong shape: a slot that advances per *packet* still lets a pass overdraw it into
+the future, and the suite hung on that (killed three times). The right shape is the one the seven failures had already
+argued for — **credit that accrues with time** — but with the rate the maximum of the two that used to lock:
+
+- `schedule_rate()` = `max(cwnd / smoothed_rtt, measured delivery rate, 256 KiB/s)`, divided into segments per second;
+- `take_credit(now)` accrues `rate × elapsed`, capped at two segments, and answers whether new data may leave;
+- repairs and probes are exempt (they exist to unblock the peer and the clock);
+- `pace_due()` puts the refill instant into the pump's deadline, so a paced lane wakes for its packet;
+- the ledger gained `paced=` so a run can prove it engaged.
+
+**The suite terminates with it** — no hangs — and the implementation is saved as `/tmp/schedule-credit.patch` (282 lines)
+so the next round starts from it rather than from scratch.
+
+**Six connection tests fail, and every one of them asserts the timing contract this replaces.** Two examples, quoted:
+
+```
+a_finished_exchange_leaves_nothing_counted:
+  internal error: entered unreachable code: the stream is named on arrival
+a_loss_re_sends_the_hole_and_not_what_follows_it:
+  the first frame re-sent is the hole itself: left: None
+```
+
+The first pumps once and expects the stream to have been opened by that pass; under pacing the open is one slot and the
+data another. The second expects three later packets to arrive in the same instant the hole was dropped, because that is
+how the three-behind threshold used to fire. **Both are true statements about unpaced sending and false ones about
+paced sending**, and rewriting them means deciding what each test is actually for — which is the work left.
+
+**Committed: nothing in the engine.** The tree is `a02df07`'s state, 107 tests green; the harness step is in, the rule
+is a patch on disk, and the six tests are the gap between them.
+
 ### 4.220 The schedule is authorised, its arithmetic is fixed, and five tests are left (2026-11-10)
 
 The human authorised option ① — the schedule — so this round did the two halves the last one named.
