@@ -377,6 +377,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.266 An open coverage question: the receiving end of an abandoned stream (2026-11-10)
+
+Three attempts at a test for "the peer abandons a stream it owes bytes on, and this end learns it",
+and all three saw the stream disappear from the peer's table **without a reset being queued**. That
+is either the harness or a gap, and I am recording it as a question rather than guessing a fourth
+time — the working rule is three attempts, then write it down.
+
+What is known, and it is not nothing:
+
+- `reap_abandoned` queues the reset only when `abandoned && send.held() > 0 && now - abandoned_at >=
+  ABANDON_HOLD`, and it retires the stream in the same step (`HANDOFF.md` §4.112's rule).
+- `close_stream` sets `abandoned`, stamps `abandoned_at` from the **real** clock, releases the receive
+  half, and calls `settle`, which queues a `fin` once `unacked() == 0`.
+- In the harness, a stream that B wrote 6 KiB on and immediately closed was gone from `streams`
+  before the hold expired, with `resets` empty — so either `settle` retired it (a graceful end, which
+  needs `unacked() == 0` and therefore means the write did not queue) or something else removed it.
+- The third attempt derived its deadline from the stream's own `abandoned_at` and still saw it gone,
+  which points away from the clock and towards the close itself.
+
+**Why it matters**: if a stream that owes bytes can be retired without telling the peer, the peer
+keeps a half-open stream for the connection's life — the exact condition the reset exists to prevent,
+and the reason `close_stream`'s doc comment says a peer that never sees one "keeps a dead stream".
+
+**Next step, and it is small**: a unit test on `Conn` alone (not through `Link`) that writes, closes,
+asserts the stream is still in the table, then calls `on_timeout` past the hold and asserts a reset is
+queued. That isolates the state machine from the harness's two clocks, and the existing
+`a_reset_leaves_even_with_bytes_still_unsent` is already the shape of it on the issuing side.
+
+**Nothing committed**: the engine is byte-identical to `6ed32c1`, 113 tests pass, and the three
+attempts left no test behind.
+
 ### 4.265 The kernel send buffer is not the lever either, and the cell's own noise is the story (2026-11-10)
 
 The last unmeasured thing on the send side: the socket's send buffer, thirty-two megabytes, which
