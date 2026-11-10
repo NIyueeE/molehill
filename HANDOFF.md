@@ -377,6 +377,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.275 The wire field's real blocker is the staging buffer, not the GSO rule (2026-11-11)
+
+§4.274 named two ways past the batching and preferred the smaller: **shrink the stream payload by
+four bytes when an acknowledgement rides along**. Both were done — the field, the receiver's
+accounting, the sender's follow-and-ramp control, and the four-byte clamp — and the suite still failed,
+with a different index:
+
+```
+range end index 1130 out of range for slice of length 1126   (udp_batch.rs:291)
+```
+
+**That is not the equal-segment rule.** `send_gso` accepts a shorter tail and refuses a longer one by
+returning 0, which the pump turns into `send_spans` — it cannot panic. The panic is in the iovec build:
+`&buf[hdr_off .. hdr_off + MHD_OVERHEAD]` runs past the staged buffer, and `MHD_OVERHEAD` is
+`HEAD + ACK`. So the buffer that stages a packet's header is **sized from something that did not
+follow the ack's growth**, and every packet whose header lands near the end of it panics.
+
+**What that means**: the wire change is not blocked by a design question any more, it is blocked by a
+buffer-size invariant that spans `conn.rs`, `dgram.rs` (`Span::Split`) and `udp_batch.rs`. Finding it
+is a two-line fix at the right constant, but it is a *staging* invariant, and getting it wrong in the
+last call of a long session is how a wire change becomes a memory bug. It wants a round of its own,
+and the search starts at whatever allocates the staged buffer for `Span::Split`.
+
+**Reverted**: `src/` is byte-identical to `6ed32c1`, 116 tests pass. Recorded here: the four-byte clamp
+is not enough on its own, the panic is a staging-buffer overrun rather than a segment-size refusal, and
+`MHD_OVERHEAD = HEAD + ACK` is where the search starts.
+
 ### 4.274 The receiver's delivery report: designed, wired, and blocked by the GSO batching (2026-11-11)
 
 The lead every reading in §4.270–§4.273 pointed at, attempted. The design: **the receiver reports the
