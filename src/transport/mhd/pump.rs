@@ -202,6 +202,18 @@ fn report_window(shared: &Arc<Shared>) {
         // different second than the window it explains would be two measurements
         // pretending to be one.
         let ledger = conn.take_ledger();
+        // Cumulative counters, read *after* the ledger is taken so both describe the same
+        // instant: the ledger resets, these do not (`HANDOFF.md` §4.234).
+        let (
+            total_loss_threshold,
+            total_loss_timer,
+            total_probe,
+            total_cuts,
+            total_sent_new,
+            total_sent_repair,
+            flight_new,
+            flight_repair,
+        ) = conn.totals_state();
         // What `flight` is compared against, and what is really waiting: the
         // three only agree when no re-sent range is being counted twice (see
         // `Conn::flight_and_buffered`).
@@ -329,6 +341,19 @@ fn report_window(shared: &Arc<Shared>) {
             srtt_us = conn
                 .smoothed_rtt()
                 .map_or(0, |rtt| u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX)),
+            // **Cumulative, and named so.** Everything in `ledger=` above is cleared by
+            // `take_ledger` every second, so those are rates; these are the same events for
+            // the whole stage, and they are the only ones that may be compared with a
+            // shaper's cumulative `qdisc dropped` (`HANDOFF.md` §4.234, §4.236).
+            total_loss_threshold,
+            total_loss_timer,
+            total_probe,
+            total_cuts,
+            total_sent_new_k = total_sent_new / 1000,
+            total_sent_repair_k = total_sent_repair / 1000,
+            // The instant's split of the flight: full of repairs or full of new data.
+            flight_new_k = flight_new / 1000,
+            flight_repair_k = flight_repair / 1000,
             "mhd window"
         );
     });

@@ -661,6 +661,28 @@ pub(crate) struct SendLedger {
     recv_duplicate_bytes: u64,
 }
 
+/// Counters that never reset, beside the interval ones.
+///
+/// [`SendLedger`] is cleared every second by
+/// [`Conn::take_ledger`], so every field in it is a *rate*. Comparing one of those
+/// against a shaper's cumulative `qdisc dropped` counter is invalid across a reset,
+/// and doing it produced the misreading `HANDOFF.md` §4.234 withdraws. These are the
+/// same events counted for the whole stage, and the window line prints them with a
+/// `total_` prefix so the two can never be confused again.
+#[derive(Debug, Default, Clone, Copy)]
+struct Totals {
+    /// Loss declarations by the verdict that named them.
+    loss_threshold: u64,
+    loss_timer: u64,
+    /// Timer probes: a re-send that is **not** a loss declaration.
+    probes: u64,
+    /// Times the congestion window was cut for a loss (`HANDOFF.md` §4.236).
+    cuts: u64,
+    /// Stream bytes posted, split by whether the range had been sent before.
+    sent_new: u64,
+    sent_repair: u64,
+}
+
 impl SendLedger {
     /// A packet carrying `len` stream bytes, `repair` if the range had been sent.
     fn note_sent(&mut self, len: usize, repair: bool) {
@@ -842,6 +864,8 @@ pub(crate) struct Conn {
     /// useful as *this* lane's series, and the process-wide totals this file used
     /// to lean on cannot be divided back into lanes (`HANDOFF.md` §4.179).
     ledger: SendLedger,
+    /// Cumulative control counters: see [`Totals`] for why they sit beside the ledger.
+    totals: Totals,
     /// Acknowledgements this end applied and attached, for the window line.
     acks_applied: u64,
     acks_attached: u64,
@@ -1145,6 +1169,7 @@ impl Conn {
             repairs_at_base: 0,
             repairs_above: 0,
             ledger: SendLedger::default(),
+            totals: Totals::default(),
             acks_applied: 0,
             acks_attached: 0,
             issued: 0,
@@ -2209,11 +2234,21 @@ impl Conn {
             // several datagrams (a selector byte, then the message), and losing
             // any of them costs the arrival its latency.
             !state.acknowledged,
+            // And whether the range had already been on the wire: the flight is split
+            // by this, because "full of repairs" and "full of new data" are different
+            // defects (`HANDOFF.md` §4.236).
+            repair,
         );
         // What this packet cost the wire, and whether the range was new: the pair
         // is the whole of the "is the lane re-sending itself" question, and it is
         // recorded here because this is the one place a data packet leaves.
         self.ledger.note_sent(len, repair);
+        let len_bytes = u64::try_from(len).unwrap_or(u64::MAX);
+        if repair {
+            self.totals.sent_repair = self.totals.sent_repair.saturating_add(len_bytes);
+        } else {
+            self.totals.sent_new = self.totals.sent_new.saturating_add(len_bytes);
+        }
         if let Some(state) = self.streams.get_mut(&id) {
             if repair {
                 // The range is on the wire again; what is still owed stays
@@ -2454,7 +2489,9 @@ impl Conn {
                 len: 0,
                 fin: true,
             }),
-            // A finish-only packet carries no bytes of the opening.
+            // A finish-only packet carries no bytes of the opening, and it is queued
+            // from the finish list rather than from the repair queue.
+            false,
             false,
         );
         self.ack_pending = false;
@@ -2993,6 +3030,26 @@ impl Conn {
         )
     }
 
+    /// The cumulative counters and the flight split, for the window line.
+    ///
+    /// Returns `(totals, new_flight, repair_flight)`. The totals never reset; the two
+    /// flight numbers are the instant's split, which is what says whether a full wire
+    /// is repairs or new data (`HANDOFF.md` §4.236).
+    pub(crate) fn totals_state(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+        let flight = self.recovery.flight_bytes();
+        let repair = self.recovery.flight_repair_bytes();
+        (
+            self.totals.loss_threshold,
+            self.totals.loss_timer,
+            self.totals.probes,
+            self.totals.cuts,
+            self.totals.sent_new,
+            self.totals.sent_repair,
+            flight.saturating_sub(repair),
+            repair,
+        )
+    }
+
     /// This lane's send/receive ledger since the last call, and clear it.
     ///
     /// Once a second, from the same place the window line is read, so the two lines
@@ -3446,10 +3503,9 @@ impl Conn {
             // The path dropped something: its capacity has been found, and the
             // window grows additively from here on. Nothing is cut — the loss
             // itself is repaired by retransmission.
-            self.ledger.lost_by_threshold = self
-                .ledger
-                .lost_by_threshold
-                .saturating_add(u64::try_from(acked.lost.len()).unwrap_or(u64::MAX));
+            let declared = u64::try_from(acked.lost.len()).unwrap_or(u64::MAX);
+            self.ledger.lost_by_threshold = self.ledger.lost_by_threshold.saturating_add(declared);
+            self.totals.loss_threshold = self.totals.loss_threshold.saturating_add(declared);
             self.slow_start = false;
         }
         for sent in acked.lost {
@@ -3587,8 +3643,10 @@ impl Conn {
         let declared = u64::try_from(lost.len()).unwrap_or(u64::MAX);
         if expiry == Expiry::Timeout {
             self.ledger.probes = self.ledger.probes.saturating_add(declared);
+            self.totals.probes = self.totals.probes.saturating_add(declared);
         } else {
             self.ledger.lost_by_timer = self.ledger.lost_by_timer.saturating_add(declared);
+            self.totals.loss_timer = self.totals.loss_timer.saturating_add(declared);
         }
         self.note_retransmits(lost.len());
         if !lost.is_empty() {
@@ -4451,6 +4509,35 @@ mod tests {
     /// zero. A leak here is not a slow number — it is the ceiling behind §4.50,
     /// where one abandoned stream's unacknowledged tail refused every later stream
     /// on the lane for the lane's whole life.
+    /// The cumulative counters are not the interval ones.
+    ///
+    /// `take_ledger` is `mem::take`, so everything it returns is a per-second rate. The
+    /// totals beside it must survive that reset: comparing a rate against a shaper's
+    /// cumulative `qdisc dropped` is the misreading `HANDOFF.md` §4.234 withdraws.
+    #[test]
+    fn the_cumulative_totals_survive_the_interval_ledger() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(4_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        let mut buf = Vec::new();
+        let mut sent = 0;
+        while link.a.poll_transmit(now, &mut buf).is_some() {
+            sent += 1;
+        }
+        assert!(sent > 0, "the opening flight leaves");
+        let first = link.a.totals_state();
+        assert!(first.4 > 0, "new stream bytes are counted cumulatively");
+        let _ = link.a.take_ledger();
+        let second = link.a.totals_state();
+        assert_eq!(
+            first.4, second.4,
+            "taking the interval ledger must not reset the totals"
+        );
+        assert_eq!(first.0 + first.1, second.0 + second.1);
+    }
+
     #[test]
     fn a_finished_exchange_leaves_nothing_counted() {
         let now = Instant::now();
