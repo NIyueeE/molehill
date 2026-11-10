@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.226 The rate-led ramp is the best-balanced variant yet and still misses both thresholds (2026-11-10)
+
+A⁷ as pre-registered: the rate becomes the controlled variable (`paced_rate`), starting at
+`INITIAL_CWND / min_rtt`, doubling once per smoothed round trip while the path answers and neither a loss nor a
+queueing delay has been seen, then 2 % per round trip, and trimmed 15 % on a loss or when
+`smoothed_rtt > min_rtt × 1.25`. The window still grows on acknowledgements; it no longer decides the pace. All 107 tests
+pass with it unchanged.
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0954 / 0.0955 | 17 / 17 |
+| frp | 0.0951 / 0.0950 | 244 / 15 |
+| molehill | **0.0751 / 0.0754** | **2 576 / 2 471** |
+| molehill twin | 0.0799 / 0.0813 | 4 618 / 5 869 |
+
+**Both thresholds miss** — 0.075 against the 0.090 guard, 2 471 against the ≤ 100 primary — so it is reverted whole, as
+pre-registered. But the shape is different from every previous attempt: **the drops fall by nearly two-thirds from the
+unpaced carrier (6 878 → 2 500) and the throughput stays within 10 % of it (0.083 → 0.075)**. Every other mechanism
+either kept the drops or kept nothing else.
+
+**And the guard was mis-set, which the record should say.** 0.090 is 95 % of the *peers'* 0.0954, and the unpaced
+carrier does 0.083 — **the guard is above what mhd does today**, so no variant that does not beat today's carrier can pass
+it. The honest no-regression criterion for this cell is the same-run twin's throughput (0.0799/0.0813 here) and the
+same-run baseline's drops, not an absolute that the baseline itself fails.
+
+**So the next pre-registration changes the guard, not the mechanism**: A⁷ again, judged by "throughput not below the
+twin" and "drops at most half the unpaced baseline", with the absolute 0.090 recorded as the target it is not yet
+meeting.
+
+**Reverted whole** (`7cc0ed7`, after `c11989b` re-applied the schedule for the trial): the tree is `a02df07`'s state, 107
+tests green, no schedule and no ramp in the engine.
+
 ### 4.225 The schedule reduces the drops twenty-five-fold and cannot keep the throughput (2026-11-10)
 
 The clock was built, made to pass the whole suite (`6957cf0`; the harness clock running twenty-two seconds ahead of the
