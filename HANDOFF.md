@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.255 The subset that survived every test breaks the 5 % one, and it is the collapse in miniature (2026-11-10)
+
+The subset §4.253 proposed — the window applied at the send point while `write` keeps its own bound,
+plus the byte prefix growing the window, and none of the cut/restart/evidence/queue-gate — was
+applied and run against the whole suite.
+
+**Two tests fail, and the second is the finding:**
+
+- `a_prefix_confirmation_retires_bytes_without_growing_the_window` pins the old rule that the prefix
+  must not grow the window. That one is expected: the rule changed on purpose.
+- **`five_percent_loss_on_a_fake_link_delivers_without_storming` delivers 98 477 of 131 072 bytes and
+  stops**: `refus=400w` — four hundred window refusals, one per write the test attempts — and
+  `stop=1639226none`, the picker finding nothing to send a million and a half times.
+
+**That is `loss1`'s zero-byte collapse, in miniature and in milliseconds.** The state is unambiguous:
+every byte written has been sent, `flight == cwnd`, so `write` refuses; the picker has nothing unsent,
+so it builds nothing; and the only traffic left is repairs and the acks that retire them. A lane in
+that state has data, a full window, and **no way to ask for more** — and on a lossy path the answers
+it depends on are exactly what the path is dropping.
+
+**So the window cannot be applied at the send point in this design**, and the reason is structural
+rather than a tuning matter: the window is only as large as what has been confirmed, and confirmation
+is what loss reduces. Moving the bound from `write` to `poll_transmit` removes the slack that used to
+keep a lossy lane asking. That is what the bench measured as zero bytes, and it is now a unit test
+that fails in a tenth of a second with the counters printed.
+
+**Reverted**: the engine is byte-identical to `6ed32c1`, 109 tests pass. The two-hundred-line
+experiment cost two minutes and produced the repro that eight bench rounds could not.
+
+**What to try next, and it is the opposite of the last four attempts**: give the lane a way to ask
+when it is full — one segment beyond the window on a pass that would otherwise send nothing (a probe
+of the path, not of the peer), which is what TCP's limited transmit and every lossy transport's
+"keep asking" rule do. The window then stays a bound on *volume* without becoming a bound on
+*enquiry*.
+
 ### 4.254 The harness never ran the timer, so "the tail never retires" was the harness (2026-11-10)
 
 §4.253's tail — 392 bytes in flight after twenty seconds of virtual time, `flight = buffered = 392`,
