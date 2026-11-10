@@ -4720,6 +4720,63 @@ mod tests {
         );
     }
 
+    /// **A peer that abandons an accepted stream is told, and the stream is held until it is.**
+    ///
+    /// Isolated from the harness on purpose (`HANDOFF.md` §4.266): the state machine alone, no `Link`
+    /// and no second clock. An accepted stream owes bytes when it closes, so the close is not
+    /// graceful — the stream stays in the table until the hold expires and the peer is owed a reset.
+    /// Without that reset the peer keeps a half-open stream for the connection's life, which is the
+    /// condition `close_stream`'s own documentation says the reset exists to prevent.
+    #[test]
+    fn an_abandoned_accepted_stream_holds_and_then_owes_a_reset() {
+        let now = Instant::now();
+        let mut b = Conn::new(9, false);
+        let mut buf = [0u8; 1500];
+        // The peer names the stream by sending bytes on it.
+        let opened = super::wire::encode(
+            &mut buf,
+            9,
+            0,
+            None,
+            super::wire::Frame::Stream {
+                // Odd: the dialing end numbers its streams odd, so an acceptor treats this as a
+                // stream the peer opened.
+                id: 3,
+                offset: 0,
+                fin: false,
+                data: b"hello",
+            },
+        )
+        .unwrap();
+        b.on_datagram(now, &buf[..opened]).unwrap();
+        let Some(handle) = b.accept() else {
+            unreachable!("the stream is named on arrival")
+        };
+
+        // It owes bytes and the application lets it go: that is an abandon, not a graceful end.
+        assert!(b.write(handle.id, &payload(4096)) > 0);
+        b.close_stream(handle.id);
+        assert!(
+            b.streams.contains_key(&handle.id),
+            "a stream that owes bytes is held, not retired"
+        );
+        assert!(b.resets.is_empty(), "and the peer is not told yet");
+
+        let at = b
+            .streams
+            .get(&handle.id)
+            .and_then(|state| state.abandoned_at)
+            .unwrap()
+            + ABANDON_HOLD
+            + Duration::from_millis(1);
+        let _ = b.on_timeout(at);
+        assert!(!b.streams.contains_key(&handle.id), "the hold retires it");
+        assert!(
+            !b.resets.is_empty(),
+            "and the peer is told, so its own table does not keep a half-open stream"
+        );
+    }
+
     /// **A lane that keeps losing still carries its stream.**
     ///
     /// The floor one test down drops the opening and nothing else, which is a single accident. The

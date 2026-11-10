@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.267 §4.266 answered: the reset is queued, and the harness was hiding it (2026-11-10)
+
+The isolated test §4.266 asked for exists now and **passes**: an accepted stream that owes bytes when
+it closes stays in the table, no reset is queued yet, and the hold's expiry retires it **and** owes
+the peer a reset. So the state machine is correct and there was no defect — the three `Link` attempts
+were seeing something else.
+
+**What they were seeing**: `Link::pump` drives both ends, so the bytes the abandoning side "owed" left
+during the same pump pass. By the time the hold expired, nothing was owed, the close had become a
+graceful `fin`, and a `fin` is not a `reset` — which is why `resets` stayed empty and the stream left
+the table on the graceful path. The harness was right and the test's premise was wrong.
+
+**The isolation is what made it visible**, and it is also two facts worth having in the suite:
+
+- **A stream's lifetime is decided by what it owes, not by who closed it.** The hold exists because an
+  unacknowledged tail would otherwise keep a lane's buffer for the connection's life; a stream with
+  nothing owed does not need it.
+- **An accepted stream is named by the peer's odd number** — actually by the *dialer's* numbering, so
+  an acceptor refuses an even id outright. That was the other half of the three failures: my first
+  attempts used `id: 4` on an accepting connection, and the frame was rejected before any of the reset
+  logic ran.
+
+`114` tests now, no engine change. §4.266's question is closed.
+
 ### 4.266 An open coverage question: the receiving end of an abandoned stream (2026-11-10)
 
 Three attempts at a test for "the peer abandons a stream it owes bytes on, and this end learns it",
