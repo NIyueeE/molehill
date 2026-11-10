@@ -377,6 +377,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.214 The loss response is right and barely fires, which is the finding (2026-11-10)
+
+A′ — halve `cwnd` on a declared loss, at most once per smoothed round trip, floor two segments, slow start latched off
+— was implemented, with a `cuts` counter in the lane ledger so the same run could prove it engaged. Two design
+decisions came out of the unit suite before any bench time:
+
+- **A probe is not a loss.** The first version cut on every `on_timeout` that returned records, including the
+  probe branch, and `a_noise_stream_carries_a_hundred_round_trips` stalled at round 11: on a silent-but-healthy path
+  the timer probes, and charging the window for that collapses it. The cut now fires only when the expiry is
+  `Expiry::Loss`.
+- **One hole declared by two mechanisms is one cut**, which is what the per-round-trip limit is for.
+
+Measured on the cell the defect lives in (`rate100_shallow`, `bulk-1`, two measured rounds, stats on so the ledger
+exists):
+
+| arm | `throughput_gbps` | `dropped_packets` | `cuts` (max per lane, cumulative) |
+|---|---|---|---|
+| rathole | 0.0954 / 0.0955 | 17 / 16 | — |
+| frp | 0.0952 / 0.0952 | 17 / 16 | — |
+| molehill | **0.0827 / 0.0824** | **6 878 / 7 078** | **1** |
+| molehill twin | 0.0838 / 0.0825 | 1 867 / 7 030 | 1 |
+
+The primary misses by two orders of magnitude and the throughput guard (≥ 0.090) misses. **Reverted whole.**
+
+**But the `cuts` column is the result.** A lane runs for sixty seconds at ~1 700 packets per window and the rule fires
+**once in its whole life**. So the miss is not "the rule is wrong" — it is that **the loss signal arrives too rarely to
+steer the window at all** on this cell. The shaper overflows, the carrier does not notice, the window keeps whatever it
+had, and the next second overflows again. Every previous candidate on the declaration side (§4.186–§4.213) was trying to
+tune a signal that this cell barely generates.
+
+**What that points at.** A window that must be right *before* the first loss needs a signal that does not wait for one:
+either a delay-based bound (keep `cwnd` at the bandwidth-delay product the acknowledgements measure, and treat a growing
+queue as the brake), or an explicit ceiling from the path's own queue estimate. mhd has the RTT estimate already
+(`Rtt::min` is there for the window ceiling) and no delay-based control at all.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.213 The repair budget halves the drops and misses, and the reason points somewhere else (2026-11-10)
 
 The budget from §4.212 — repairs may have at most `cwnd/2` outstanding, counted apart from `flight`, never blocked —
