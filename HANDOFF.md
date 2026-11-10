@@ -377,6 +377,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.240 The loss response closes it: 64.5 drops against the baseline's 2 460, and more throughput (2026-11-10)
+
+The piece §4.239 said was missing, and the last of F2: **a declaration that is not a probe halves the
+window**, at most once per smoothed round trip, never below two segments. A probe still pays nothing —
+that rule is from §4.214 and it is the one that keeps a healthy lane from cutting itself; the epoch
+limit keeps one hole from costing a quarter, an eighth and a sixteenth of the pipe as each
+acknowledgement and then the timer report it.
+
+Six measured rounds, candidate and frozen baseline interleaved in one campaign, peers beside them:
+
+| arm | `throughput_gbps` median | `dropped_packets` median | the six drops |
+|---|---|---|---|
+| rathole | 0.0955 | 17 | 17, 17, 17, 17, 17, 16 |
+| frp | 0.0951 | 17 | 16, 18, 17, 16, 17, 39 |
+| baseline (`molehill~b`) | 0.0840 | **2 460** | 2 536, 7 605, 1 825, 2 173, 2 385, 6 868 |
+| candidate (`molehill`) | **0.0890** | **64.5** | 79, 83, 50, 38, 122, 31 |
+| candidate twin (`molehill~aa`) | 0.0897 | **35.5** | 35, 36, 27, 39, 42, 28 |
+
+**F3.1 is met on this cell.** The primary is a six-round median **≤ 100**: 64.5. The second half of it
+is ≤ 4 × the same-run peers (4 × 17 = 68): 64.5. The throughput guard is "no more than 10 % below the
+baseline": the candidate is **6 % above** it (0.0890 against 0.0840). The worst round is 122 drops
+where the baseline's worst is 7 605.
+
+**The bimodality collapsed.** §4.239 read 52, 80, 58 in three rounds and 2 442, 2 985, 2 444 in the
+other three, with the twin at 86–119. The loss response removed the bad mode: every round is now
+27–122, and the twin's six are 27–42 — a distribution, not two states.
+
+**Why now and not in §4.214.** The same rule was measured then and failed with 6 878/7 078 drops. It
+failed because the window did not bound the wire: `flight` was three to sixteen times `cwnd`, so
+halving the window halved a number that was not in charge. The three changes that made it real are
+§4.236 (the window moved to the send point), §4.237 (the prefix grows it) and §4.238 (slow start
+restarts under the pipe). The cut is the fourth and it needs the other three.
+
+**Not the whole of F3.** F3.2's other cells — `loss5`, `rate100`, `rate1000`, `bulk-n`, `loss1`,
+`loss1_deep`, `loss1_rate100`, `jitter`, `transport`, `transport-loss`, `capacity` — have not been
+measured in this campaign, and F4 has not started. What this entry establishes is that the known
+defect's primary and its throughput guard are met, in six rounds, against a frozen baseline.
+
 ### 4.239 Six rounds say the cell is bimodal, and half the rounds are still at the baseline's level (2026-11-10)
 
 The F3 shape, run once as a screening: six measured rounds, candidate and frozen baseline interleaved

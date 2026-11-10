@@ -1086,6 +1086,12 @@ pub(crate) struct Conn {
     round_at: Option<Instant>,
     /// The path's bandwidth-delay product as last measured, in bytes.
     bdp: u64,
+    /// When the window last paid for a loss, which is what makes one loss epoch cost one cut.
+    ///
+    /// A hole reported by several acknowledgements, or by the timer after them, is **one** loss:
+    /// halving once per report would halve the pipe several times for one dropped packet, which is
+    /// how a lossy path collapses. One cut per smoothed round trip is the rule (`HANDOFF.md` §4.240).
+    cut_at: Option<Instant>,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
     /// A close that waits for what is already queued to leave first.
@@ -1237,6 +1243,7 @@ impl Conn {
             round_acked: 0,
             round_at: None,
             bdp: 0,
+            cut_at: None,
             closed: None,
             close_after: None,
             keepalive_at: now + KEEPALIVE,
@@ -3563,13 +3570,14 @@ impl Conn {
         // is on the wire and not what is owed.
         self.note_retransmits(acked.lost.len());
         if !acked.lost.is_empty() {
-            // The path dropped something: its capacity has been found, and the
-            // window grows additively from here on. Nothing is cut — the loss
-            // itself is repaired by retransmission.
+            // The path dropped something. It is repaired by retransmission **and** paid for by
+            // the window: a loss is the one signal that says the wire was too wide, and until
+            // the window bounded the wire there was nothing to pay with (`HANDOFF.md` §4.236,
+            // §4.240). One hole, one cut — the epoch rule lives in `cut_window`.
             let declared = u64::try_from(acked.lost.len()).unwrap_or(u64::MAX);
             self.ledger.lost_by_threshold = self.ledger.lost_by_threshold.saturating_add(declared);
             self.totals.loss_threshold = self.totals.loss_threshold.saturating_add(declared);
-            self.slow_start = false;
+            self.cut_window(now);
         }
         for sent in acked.lost {
             if let Some(range) = sent.range {
@@ -3701,6 +3709,43 @@ impl Conn {
         }
     }
 
+    /// Pay for one declared loss: halve the window, at most once per round trip.
+    ///
+    /// **This is the half the carrier has never had.** Until the window bounded the wire
+    /// (`HANDOFF.md` §4.236) a cut could not matter — the flight was three to sixteen times the
+    /// window whatever the window said — and the earlier falsification (§4.214) measured a control
+    /// acting on something that was not in charge. With `flight ≤ cwnd` now an invariant of the
+    /// wire, an overshoot has no way back down except this one.
+    ///
+    /// The rules, and why each is what it is:
+    ///
+    /// - **A probe is not a loss.** The timer also fires to elicit an acknowledgement when nothing
+    ///   is stale; charging the window for that cuts a healthy lane, which is how a Noise stream
+    ///   stalled at its eleventh round trip (§4.214).
+    /// - **One cut per smoothed round trip.** A hole is reported by several acknowledgements and
+    ///   then by the timer; each of those is the same loss, and halving once per report is how a
+    ///   lossy path collapses.
+    /// - **Never below two segments.** A window of one packet cannot grow again without a lucky
+    ///   acknowledgement, and the floor is what keeps a lossy path moving.
+    fn cut_window(&mut self, now: Instant) {
+        let period = self
+            .recovery
+            .smoothed_rtt()
+            .unwrap_or(RTT_GRANULARITY)
+            .max(RTT_GRANULARITY);
+        if self
+            .cut_at
+            .is_some_and(|at| now.saturating_duration_since(at) < period)
+        {
+            return;
+        }
+        self.cut_at = Some(now);
+        self.slow_start = false;
+        let floor = 2 * MAX_STREAM_PAYLOAD as u64;
+        self.cwnd = (self.cwnd / 2).max(floor);
+        self.totals.cuts = self.totals.cuts.saturating_add(1);
+    }
+
     /// Retire streams whose owner is gone and whose bytes can no longer arrive.
     ///
     /// `settle` waits for the peer to acknowledge everything, which is right for a
@@ -3769,9 +3814,15 @@ impl Conn {
         }
         self.note_retransmits(lost.len());
         if !lost.is_empty() {
-            // A timer that re-sent the flight is a path that could not carry it:
-            // the capacity phase is over.
+            // A timer that found something stale is a path that could not carry it: the
+            // capacity phase is over and the window pays its half. **A probe is not a loss** —
+            // `Expiry::Timeout` means the timer fired with nothing stale and re-sent one range
+            // to elicit an acknowledgement, and charging the window for that cuts a healthy lane
+            // (`HANDOFF.md` §4.214, §4.240).
             self.slow_start = false;
+            if expiry == Expiry::Loss {
+                self.cut_window(now);
+            }
         }
         for sent in &lost {
             if let Some(range) = sent.range {
@@ -4701,6 +4752,81 @@ mod tests {
             !large.slow_start,
             "at or above the pipe the additive rule stands"
         );
+    }
+
+    /// One hole costs one cut, whatever number of reports it produces.
+    ///
+    /// A hole is declared by several acknowledgements and then by the timer; halving once per
+    /// report would take a quarter, an eighth and a sixteenth of the pipe for one dropped packet
+    /// (`HANDOFF.md` §4.240). The epoch is the smoothed round trip — one millisecond before any
+    /// sample exists, which is the interval the test uses.
+    #[test]
+    fn one_loss_epoch_costs_one_cut() {
+        let now = Instant::now();
+        let mut conn = Conn::new(9, true);
+        conn.cwnd = 100_000;
+        conn.cut_window(now);
+        assert_eq!(conn.cwnd, 50_000, "the first declaration halves the window");
+        conn.cut_window(now + Duration::from_micros(500));
+        assert_eq!(
+            conn.cwnd, 50_000,
+            "a second report inside the same round trip is the same loss"
+        );
+        conn.cut_window(now + Duration::from_millis(2));
+        assert_eq!(
+            conn.cwnd, 25_000,
+            "the next round trip can pay for a new loss"
+        );
+        assert_eq!(conn.totals.cuts, 2, "and the counter agrees");
+    }
+
+    /// The window never pays its way below two segments.
+    ///
+    /// A window of one packet cannot grow again without a lucky acknowledgement, so a path that
+    /// keeps losing would stop entirely — the floor is what keeps it moving.
+    #[test]
+    fn a_cut_stops_at_two_segments() {
+        let now = Instant::now();
+        let mut conn = Conn::new(9, true);
+        conn.cwnd = 3 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64;
+        conn.cut_window(now);
+        assert_eq!(
+            conn.cwnd,
+            2 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64,
+            "three segments halve to one and a half, and the floor is two"
+        );
+        conn.cut_window(now + Duration::from_millis(2));
+        assert_eq!(
+            conn.cwnd,
+            2 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64,
+            "and further cuts cannot take it lower"
+        );
+    }
+
+    /// A probe re-sends a range and pays nothing: it is not evidence of a loss.
+    ///
+    /// The timer fires early on a healthy path to elicit an acknowledgement, and charging the
+    /// window for that is what stalled a Noise stream at its eleventh round trip
+    /// (`HANDOFF.md` §4.214).
+    #[test]
+    fn a_probe_does_not_pay_for_a_loss() {
+        let now = Instant::now();
+        let mut link = Link::new();
+        let stream = link.a.open();
+        let bytes = payload(2_000);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        let mut buf = Vec::new();
+        while link.a.poll_transmit(now, &mut buf).is_some() {}
+        let before = link.a.cwnd;
+        // Nothing is stale yet: this is the timer firing early, which is a probe of a silent path.
+        let (expiry, probed) = link.a.on_timeout(now);
+        assert_eq!(expiry, Expiry::Timeout, "an early timer is a probe");
+        assert_eq!(probed, 1, "a probe re-sends one range");
+        assert_eq!(
+            link.a.cwnd, before,
+            "and the window does not pay for it: {before}"
+        );
+        assert_eq!(link.a.totals.cuts, 0);
     }
 
     /// The cumulative counters are not the interval ones.
