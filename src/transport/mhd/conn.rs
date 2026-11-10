@@ -170,6 +170,12 @@ const WINDOW_FLOOR: u64 = 256 * 1024;
 /// been five mebibytes — the flat ceiling this change exists to remove.
 const WINDOW_REFERENCE: u64 = 1_000;
 
+/// The shortest round trip this end will reason about: the estimator's own granularity.
+///
+/// The same one millisecond `recovery` floors its samples at, repeated here because the
+/// window's round-trip arithmetic needs it without borrowing the estimator.
+const RTT_GRANULARITY: Duration = Duration::from_millis(1);
+
 /// Why a frame could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rejected {
@@ -1064,11 +1070,22 @@ pub(crate) struct Conn {
     ///
     /// True until the path drops something: while it is, every acknowledged byte
     /// buys a byte of window (doubling per round trip). It latches off at the
-    /// first loss and never comes back — a path that has dropped is a path whose
-    /// capacity has been found.
+    /// first loss — a path that has dropped is a path whose capacity has been
+    /// found — and comes back **only while the window is under the path's own
+    /// bandwidth-delay product**, which is the restart `HANDOFF.md` §4.237 asks for:
+    /// a window that fell below the pipe has not found anything and must double again.
     slow_start: bool,
     /// Bytes acknowledged since the window last grew additively.
     acked_since_growth: u64,
+    /// Confirmed bytes since the last round-trip boundary, and when that boundary was.
+    ///
+    /// The estimator's raw material: bytes over one round trip is the delivery rate, and the
+    /// rate times the path's own length is the pipe the window has to reach before additive
+    /// growth makes sense (`HANDOFF.md` §4.237).
+    round_acked: u64,
+    round_at: Option<Instant>,
+    /// The path's bandwidth-delay product as last measured, in bytes.
+    bdp: u64,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
     /// A close that waits for what is already queued to leave first.
@@ -1217,6 +1234,9 @@ impl Conn {
             window_reported_at: Instant::now(),
             slow_start: true,
             acked_since_growth: 0,
+            round_acked: 0,
+            round_at: None,
+            bdp: 0,
             closed: None,
             close_after: None,
             keepalive_at: now + KEEPALIVE,
@@ -3603,6 +3623,16 @@ impl Conn {
             let bytes = u64::try_from(acked.bytes)
                 .unwrap_or(u64::MAX)
                 .saturating_add(prefix_confirmed);
+            // **The pipe is measured from this delivery, and slow start re-arms under it.**
+            // A loss latches slow start off, which is right on a path whose capacity has been
+            // found and wrong on one whose window is still far below it: the shallow cell's lane
+            // spent its whole stage growing one MSS per window from 13 KB, and delivered a third
+            // of the path for it (`HANDOFF.md` §4.237).
+            self.note_round_delivery(
+                now,
+                bytes,
+                self.recovery.smoothed_rtt().unwrap_or(RTT_GRANULARITY),
+            );
             if self.slow_start {
                 // Doubling stops at the ceiling and the additive rule takes
                 // over, because an unspaced burst that outruns the peer's
@@ -3632,6 +3662,43 @@ impl Conn {
         // will not overtake the data it follows.
         self.settle_finished();
         ack_timing.stop(&stats::PHASES.ack);
+    }
+
+    /// Fold one acknowledgement's confirmed bytes into the path's pipe, and re-arm slow start
+    /// while the window is still under it.
+    ///
+    /// The estimator is deliberately the simplest one that can be right: bytes confirmed over the
+    /// elapsed round trip is the delivery rate, and the rate times the path's own length
+    /// (`min_rtt`, the one estimate a queue cannot inflate) is the pipe. A window below that pipe
+    /// has not found the path's capacity, whatever a loss may have said, so doubling resumes until
+    /// it gets there — and the growth rule then hands over to additive, as before.
+    ///
+    /// Integer arithmetic throughout: a float here would need a cast per acknowledgement and buy
+    /// nothing a byte count needs (`HANDOFF.md` §4.237).
+    fn note_round_delivery(&mut self, now: Instant, bytes: u64, srtt: Duration) {
+        self.round_acked = self.round_acked.saturating_add(bytes);
+        let at = *self.round_at.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(at);
+        if elapsed < srtt.max(RTT_GRANULARITY) {
+            return;
+        }
+        let min = self.recovery.min_rtt().unwrap_or(srtt).max(RTT_GRANULARITY);
+        let elapsed_us = u64::try_from(elapsed.as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let min_us = u64::try_from(min.as_micros()).unwrap_or(u64::MAX).max(1);
+        // pipe = delivered / elapsed x min_rtt, in whole bytes.
+        self.bdp = u64::try_from(
+            u128::from(self.round_acked) * u128::from(min_us) / u128::from(elapsed_us),
+        )
+        .unwrap_or(u64::MAX);
+        self.round_acked = 0;
+        self.round_at = Some(now);
+        // **The restart.** Only while the window is under the pipe, and only when a loss has
+        // latched slow start off: a lane that is at or above its pipe keeps the additive rule.
+        if self.bdp > self.cwnd && !self.slow_start {
+            self.slow_start = true;
+        }
     }
 
     /// Retire streams whose owner is gone and whose bytes can no longer arrive.
@@ -4595,6 +4662,44 @@ mod tests {
         assert!(
             flight < written,
             "and the buffer still holds what the window kept back: flight {flight}, written {written}"
+        );
+    }
+
+    /// A window under the pipe doubles again; one at or above it stays additive.
+    ///
+    /// The restart `HANDOFF.md` §4.237 asks for, tested without a socket: one round trip's worth of
+    /// confirmed bytes over the path's own length is the pipe, and a loss's latch on slow start is
+    /// only right on a path whose capacity has actually been found.
+    #[test]
+    fn a_window_under_the_pipe_re_arms_slow_start() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(40);
+        // 64 KiB confirmed inside one 40 ms round trip: the pipe is 64 KiB.
+        let mut small = Conn::new(9, true);
+        small.slow_start = false;
+        small.cwnd = 13_490;
+        small.note_round_delivery(now, 0, rtt);
+        small.note_round_delivery(now + rtt, 64 * 1024, rtt);
+        assert_eq!(
+            small.bdp,
+            64 * 1024,
+            "the pipe is what was delivered in a round trip"
+        );
+        assert!(
+            small.slow_start,
+            "a window under the pipe has found nothing yet, so it doubles again"
+        );
+
+        // The same delivery with a window already above the pipe changes nothing.
+        let mut large = Conn::new(9, true);
+        large.slow_start = false;
+        large.cwnd = 200_000;
+        large.note_round_delivery(now, 0, rtt);
+        large.note_round_delivery(now + rtt, 64 * 1024, rtt);
+        assert_eq!(large.bdp, 64 * 1024);
+        assert!(
+            !large.slow_start,
+            "at or above the pipe the additive rule stands"
         );
     }
 

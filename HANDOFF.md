@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.238 The restart closes most of the gap: drops 77–90 in three arm-rounds of four (2026-11-10)
+
+F2's second half: a window that has fallen below the path's own bandwidth-delay product doubles
+again. The pipe is measured where delivery is already counted — bytes confirmed over one round
+trip, times `min_rtt` — in integer arithmetic, and the restart fires only while `cwnd` is under it,
+so a path whose capacity has genuinely been found keeps the additive rule.
+
+A/B against the frozen baseline, `rate100_shallow`, two measured rounds:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0953 / 0.0955 | 17 / 17 |
+| frp | 0.0950 / 0.0952 | 17 / 17 |
+| baseline (`molehill~b`) | 0.0849 / 0.0838 | **7 016 / 2 526** |
+| candidate (`molehill`) | **0.0869 / 0.0899** | **4 349 / 90** |
+| candidate twin (`molehill~aa`) | 0.0897 / 0.0898 | **88 / 77** |
+
+**Three of the four candidate arm-rounds sit at 77–90 drops against the peers' 17**, and all four
+are at or above the baseline's throughput. The fourth is 4 349, and it is the one thing this
+reading does not settle: it is a single arm-round, it is not the twin, and the cell's own noise on
+this metric has been large all along (§4.228: the twin read 2 616 and 7 379 in one campaign).
+
+**What changed, in the numbers:** before the restart the lane delivered 0.0295 Gbit/s with the
+window stuck at 295 KB — it reached the path's window in ~0.03 s and then crawled at one MSS per
+window. With the restart the same lane passes its pipe (`bdp` from a 40 ms path and ~10 MB/s is
+about 400 KB) and keeps doubling until it is there, so the throughput lands at the baseline's own
+level **and** the queue never fills.
+
+**Judgement deferred to F3, deliberately.** The plan's primary is `dropped_packets ≤ 100` as a
+six-round median, not a single arm-round, and its guard is throughput against the baseline. This
+entry records a candidate that looks like the fix, not a verdict.
+
 ### 4.237 The window moved to the send point: no drops, and two accounting defects exposed (2026-11-10)
 
 F2's first candidate, three changes, each one a consequence of §4.236:
