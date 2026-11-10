@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lane's first packet now reaches the peer.** The datagram batch was sized from
+  its *first* span and accepted a tail that was shorter, so the kernel split the
+  tail into fragments of the first span's length. A lane opens with a 17-byte credit
+  followed by a full segment, which therefore went out as thousands of 17-byte
+  fragments; the receiver refused them as malformed, **number zero of every lane
+  never arrived**, and the cumulative acknowledgement frontier — the only retirement
+  path that covers an old number — stayed at zero for the lane's whole life. The
+  batch now refuses a tail longer than its segment and the caller sends it whole.
+  Measured on the protocol harness: refusals 13 → 0, `first_seen` 0 on every lane,
+  and the frontier advancing 0 → 11 017 / 12 934 / 15 008.
 - **A staged cell that asked for bulk and carried nothing is a failure, not a fast
   stage.** Its latency is a measurement of an idle path, so a cell with
   `streams > 0` and exactly zero carried bytes now reports `ok=False` with that
