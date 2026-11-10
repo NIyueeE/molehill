@@ -377,6 +377,51 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.256 Limited transmit rescues the stall and the family is still three times slower (2026-11-10)
+
+The candidate §4.255 pointed at, built and measured: the window at the send point, the prefix growing
+it, **and one segment of slack** at both ends — `write` admits a segment past the window and the
+picker may send one beyond it, so a full-window lane with an empty buffer can still ask the path for
+an acknowledgement. That is TCP's limited transmit, and it works: the unit test that failed four ways
+(`five_percent_loss_on_a_fake_link_delivers_without_storming`, 98 477 of 131 072) now passes, and the
+whole suite is green at 109.
+
+**The bench says the family is still not usable**, on the two cells that decide it:
+
+| cell | arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|---|
+| `rate100_shallow` | baseline | **0.0832** | 4 519 |
+| | candidate | **0.0296** | **0** |
+| `loss1` | baseline | **1.453** | 427 |
+| | candidate | **0.1522** | 104 |
+
+The shallow cell's drops go to zero and its throughput to a third; `loss1` — which carried **zero
+bytes** in §4.249 and now carries 0.15 Gbit/s — is still **nine and a half times slower** than the
+baseline it has to beat. The pre-registered guard is "no more than 10 % below the baseline", so this
+fails both cells by a wide margin and is **reverted whole**.
+
+**Three attempts, one mechanism, three failures**, and the pattern is now sharp enough to state as a
+result rather than an excuse:
+
+| attempt | shallow | lossy |
+|---|---|---|
+| full series (§4.249) | 39–43 drops, **+7.7 %** | **zero bytes** on `loss1` |
+| subset (§4.255) | untested | 98 477 / 131 072 in the unit test |
+| subset + limited transmit | **0 drops, −64 %** | **0.15 against 1.45** |
+
+**The window cannot be moved to the send point in this design.** A window is only as large as what the
+path has confirmed, and the carrier's confirmation arrives as acknowledgements that the same window
+governs; every version of the move therefore trades the shallow cell's drops for a multiple of its
+throughput, or for its throughput entirely on a path that loses.
+
+**So the family is closed** — the third failure on one mechanism, by the standing rule — and the
+shallow cell's drops are a **known and bounded** defect again: 2–7 thousand drops against the peers'
+16, at 0.083 Gbit/s against their 0.095, with no storm, no wedge and every other cell at or above the
+baseline. That is what the engine does today, and the plan's D5 §五.7 therefore cannot mark 「mhd 定型」
+on this ground unless the human rules that the bounded defect is acceptable.
+
+**Reverted**: `src/` is byte-identical to `6ed32c1`; 109 tests pass.
+
 ### 4.255 The subset that survived every test breaks the 5 % one, and it is the collapse in miniature (2026-11-10)
 
 The subset §4.253 proposed — the window applied at the send point while `write` keeps its own bound,
