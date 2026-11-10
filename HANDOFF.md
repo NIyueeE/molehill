@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.269 The last item on the list: a full loss table refuses nothing (2026-11-10)
+
+`MAX_LOST` is 4096 declared-but-unreaped records. What happens at the cap was the last question on
+the correctness list, and the one with the worst failure mode: a `declare_lost` that *refused* when
+the table was full would be a packet sent and never repaired — invisible, because nothing else in the
+carrier would ever ask about it again.
+
+`the_declared_loss_set_stays_bounded` drives 4 160 losses through `on_sent` + `declare_lost` and
+asserts both halves: **every declaration is recorded** (no silent refusal) and **the set stays at or
+below `MAX_LOST`**, with the records it reaps going with it. `reap` runs *before* the insert, so the
+loss it is asked about now is the one that gets the room — which is the correct order and was worth
+pinning, because the opposite order passes a test that only counts.
+
+**116 tests.** No engine change.
+
+**The correctness list is now empty.** Five path shapes (§4.261–§4.268) and this bound were the places
+where a bug would have been invisible in every bench cell; six of them passed on the first honest
+test, and the two that did not (§4.252, §4.254) were the harness rather than the carrier. That is the
+strongest statement this record can make about the engine, and it was bought by testing the *test*
+first each time.
+
 ### 4.268 Four streams share a lossy lane without starving, and it is now pinned (2026-11-10)
 
 A lane has **one** repair queue and **one** window for all its streams, so a stream whose packets keep

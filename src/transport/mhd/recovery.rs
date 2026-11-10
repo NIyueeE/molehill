@@ -1779,4 +1779,40 @@ mod tests {
             "an unmeasured burst errs late, because re-sending it costs its width"
         );
     }
+
+    /// **The declared-loss set stays bounded, and a full table does not lose the newest loss.**
+    ///
+    /// `declare_lost` reaps before it records, so a lane under a long loss burst cannot grow the set
+    /// without limit — and, just as important, the loss it is asked about *now* is the one that gets
+    /// recorded rather than silently refused. A refusal would be a packet sent and never repaired,
+    /// which is the one failure this carrier has no other way to notice (`HANDOFF.md` §4.269).
+    #[test]
+    fn the_declared_loss_set_stays_bounded() {
+        let mut recovery = Recovery::new();
+        let now = Instant::now();
+        let range = SentRange {
+            stream: 4,
+            offset: 0,
+            len: 64,
+            fin: false,
+        };
+        let total = u32::try_from(MAX_LOST).unwrap_or(u32::MAX) + 64;
+        for number in 0..total {
+            recovery.on_sent(now, number, Some(range), false);
+            assert!(
+                recovery.declare_lost(now, number).is_some(),
+                "every loss asked about must be recorded, not refused: number {number}"
+            );
+        }
+        assert!(
+            recovery.lost.len() <= MAX_LOST,
+            "the set is bounded: {} entries",
+            recovery.lost.len()
+        );
+        assert!(
+            recovery.in_flight.len() <= MAX_LOST,
+            "and the records it kept go with it: {}",
+            recovery.in_flight.len()
+        );
+    }
 }
