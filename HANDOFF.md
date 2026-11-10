@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.271 The pacer now works to spec and still parks — the fault has moved from the gate to the ramp (2026-11-11)
+
+Rebuilt as a departure schedule with the two bugs of §4.270 fixed: **the slot is spent where the
+datagram is built** (`transmit_stream`, after the pick survives the key and seal checks, and only for
+non-repair picks), and the schedule is driven by the pump's own clock. The harness also learned to
+say when it is *not* pacing (`Link::new` switches it off, and a test that is about loss recovery no
+longer measures a paced lane by accident), and the loss pattern had to move its counter onto the link:
+counting inside one `pump_lossy` call meant the divisor was never reached once a pacer built about one
+datagram per pass — **the pattern dropped nothing and the test passed while testing nothing**.
+
+**And the pacer's own test passes now**: told to hold its floor of 512 KiB/s over a second of virtual
+time, a lane releases ~389 datagrams, measured, within the band. That is the first fair reading of a
+pacing mechanism in this record.
+
+**The bench then fails it the same way §4.260 failed:**
+
+| cell | baseline | candidate |
+|---|---|---|
+| `rate100_shallow` | 0.0822 / 2 078 drops | **0.0032 / 0 drops** |
+| `loss1` | 1.428 / 417 drops | **0.0032 / 97 drops** |
+
+Both collapse to **3.2 Mbit/s — the pacer's floor** — and stay there. So the gate is right and the
+*controller* is wrong: `pace_observe` sets the rate to 1.1 × what the path carried, the lane is sitting
+at the floor so it carries the floor, and the tenth-of-a-bit-per-round-trip climb is far too slow to
+escape an equilibrium it starts inside. The mechanism is still not disproven; the ramp is.
+
+**What that means for the question I was asked** — *is it unfixable?* — is now sharper than it was:
+the plumbing is done and measured (schedule, slot accounting, harness, self-test), and the remaining
+defect is a named piece of arithmetic with an obvious replacement: **grow like slow start until the
+first loss or queue signal (×2 a round trip), not ×1.1 from the floor**, which is the same rule the
+window already uses and the one thing every failed attempt never gave the rate.
+
+**Reverted** so the tree is not left worse: `src/` is byte-identical to `6ed32c1`, 116 tests pass.
+
 ### 4.270 Is it really unfixable? No — and the §4.260 dismissal was not fair (2026-11-11)
 
 Asked whether the shallow cell is closed for good, the honest answer is **no**, and the reason is
