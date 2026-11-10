@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.273 Three gate variants, one outcome: the drops fall and the rate lands at 39 % (2026-11-11)
+
+The refinement §4.272 pointed at: gate the ramp on whether the queue is **growing** rather than
+merely present, since a shaped path stands with a queue of its own and "smoothed above the minimum"
+is true almost always. Implemented, unit-tested (the ramp still climbs off the floor), measured.
+
+| cell | arm | throughput | drops |
+|---|---|---|---|
+| `rate100_shallow` | baseline | 0.0833 | 4 572 |
+| | candidate | **0.0329** | **71.5** (61 / 457 / 39 / 82) |
+| `loss1` | baseline | 1.348 | 500 |
+| | candidate | **0.0110** | 142 |
+
+**Three gates, three times the same shape.** Presence-only (§4.272), growth-only (this one), and the
+variant with no loss term all land between **46 and 72 drops at 39 % of the baseline's throughput**, and
+all three collapse `loss1` to about 0.011 Gbit/s. The consistency is the result: this pacer's shape —
+a rate led by delivery, damped by delay — costs about three fifths of the throughput on the one cell
+it fixes, and loses a lossy path entirely, **whichever way the gate is written**. Re-tuning the gate
+is not the missing piece.
+
+**What the numbers now say precisely**: the drops target is *reachable* (46–72 against the peers' 16,
+inside "at most four times"), the throughput cost is not acceptable, and the thing that would make
+both true at once is a **queue signal belonging to this lane** rather than to the path. In this design
+that means the receiver reporting something the sender cannot otherwise learn — a delivery rate, or a
+timestamp echo — which is a **wire addition**.
+
+**That is inside the fixed boundaries** — "wire changes only into the unreleased 6.0" is a permission,
+not a prohibition, and both ends are this repository. It is also a bigger change than one round:
+a frame field, both codecs, the interop cases, and the measurement. It is now the only lead that has
+not been tried, and it is the one every reading in §4.270–§4.273 points at.
+
+**Reverted**: `src/` is byte-identical to `6ed32c1`, 116 tests pass.
+
 ### 4.272 The doubling ramp meets the drops target for the first time — and pays 61 % of the throughput (2026-11-11)
 
 The one thing every earlier attempt never gave the rate: **it doubles per round trip until the path
