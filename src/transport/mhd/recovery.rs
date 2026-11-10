@@ -371,6 +371,11 @@ pub(crate) struct Recovery {
     silent_since: Option<Instant>,
     /// The backoff applied to the timer since the last acknowledgement.
     backoff: u32,
+    /// The highest number an acknowledgement has confirmed.
+    ///
+    /// RACK's evidence: a record below this was sent before traffic the path demonstrably carried,
+    /// so its absence is a hole rather than a queue (`HANDOFF.md` §4.243).
+    largest_acked: Option<u32>,
 }
 
 impl Recovery {
@@ -389,6 +394,7 @@ impl Recovery {
             silent: 0,
             silent_since: None,
             backoff: 0,
+            largest_acked: None,
         }
     }
 
@@ -693,6 +699,15 @@ impl Recovery {
                 newest = Some((sent.number, sent.time));
             }
         };
+        // **Everything below the frontier is evidence.** A block that says "every number under
+        // `below` has arrived" has confirmed traffic at least up to `below - 1`, whatever this end
+        // still holds, and RACK's question is only how far the path has demonstrably carried.
+        if ack.below > 0 {
+            let confirmed = ack.below - 1;
+            if self.largest_acked.is_none_or(|acked| confirmed > acked) {
+                self.largest_acked = Some(confirmed);
+            }
+        }
         // Everything the frontier names is delivered, however far back it is. That
         // is the step that retires a wide flight: with a bitmap alone, a
         // connection with ten thousand packets outstanding could only ever
@@ -737,6 +752,9 @@ impl Recovery {
         for number in acked {
             if let Some(sent) = self.take(number) {
                 note(&sent);
+                if self.largest_acked.is_none_or(|acked| sent.number > acked) {
+                    self.largest_acked = Some(sent.number);
+                }
                 if let Some(range) = sent.range {
                     result.bytes += usize::from(range.len);
                 }
@@ -801,11 +819,32 @@ impl Recovery {
             return (Expiry::Dead, all);
         }
         let delay = self.rtt.loss_delay();
+        // **A declaration needs evidence, or a real timeout.** Age alone is what made a clean
+        // loopback lane declare three to eight thousand losses a second while nothing was dropped
+        // (`HANDOFF.md` §4.243): a record two milliseconds old on a millisecond path is far past
+        // nine eighths of the smoothed round trip, and on a busy host that is ordinary scheduling,
+        // not loss. Two things can justify a declaration:
+        //
+        // - **Evidence** (RACK's rule): a packet sent *after* this one has been acknowledged, so the
+        //   path demonstrably carried the later traffic and this one is missing from it.
+        // - **The escape**: the record has outlived the retransmission timeout itself. That is the
+        //   timer's own notion of "too old", so it is reachable exactly where evidence is not — a
+        //   lone opening packet has nothing behind it that could ever be acknowledged, which is why
+        //   the handshake's floor exists at all (measured as a 502 ms open before it did).
+        let escape = self.rtt.rto(self.live <= SMALL_FLIGHT_PACKETS);
         let stale: Vec<u32> = self
             .in_flight
             .iter()
-            .filter(|(_, sent)| {
-                sent.lost_at.is_none() && now.saturating_duration_since(sent.time) > delay
+            .filter(|(number, sent)| {
+                if sent.lost_at.is_some() {
+                    return false;
+                }
+                let age = now.saturating_duration_since(sent.time);
+                if age <= delay {
+                    return false;
+                }
+                let evidenced = self.largest_acked.is_some_and(|acked| acked > **number);
+                evidenced || age >= escape
             })
             .map(|(number, _)| *number)
             .collect();

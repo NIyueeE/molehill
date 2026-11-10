@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.244 A declaration now needs evidence: 19 drops on the shallow cell and 8.8 % on the clean one (2026-11-10)
+
+The rule §4.243 named, implemented: the timer declares a record lost only when **a packet sent after
+it has been acknowledged** (RACK's evidence) **or** the record has outlived the retransmission
+timeout itself (the escape). The escape has to be the RTO and not a constant, because the one case
+with no possible evidence is the lone opening packet — nothing behind it will ever be acknowledged —
+and the handshake's cheap floor exists exactly for that (a rejected test caught this: with a flat
+200 ms escape the opening's 20 ms timer became a probe and stopped declaring).
+
+`largest_acked` is fed by both confirmation paths, since a block that says "everything below `below`
+has arrived" has confirmed traffic at least that far whether or not this end still holds the records.
+
+| cell | arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|---|
+| `rate100_shallow` | baseline | 0.0826 | 4 546 (2 052–7 074) |
+| | candidate | **0.0897** | **19.0 (44, 16, 22, 15)** |
+| | peers | 0.0953 | 17 |
+| clean `bulk-n` | baseline | 13.031 | 0 |
+| | candidate | **11.882 (11.607 / 12.158)** | 0 |
+
+**The shallow cell is now at the peers' order**: 16, 22 and 15 drops in three of four rounds with
+throughput 8.6 % above the baseline — against 2 052–7 074 drops for the baseline in the same
+campaign. The primary is met with room rather than on a median.
+
+**The clean cell improved from −10 % to −8.8 %** and is still a numeric regression, now inside the
+10 % materiality band the plan uses elsewhere but outside the guard's "not worse" wording. Its
+remaining cost is not the declarations any more (the twin, the same binary, reaches 12.10 against the
+baseline's 13.03), so the gap is the window itself on a path where the baseline ran eight round trips
+deep.
+
+**Committed**: the evidence rule with its `largest_acked` plumbing. The `bulk-n` guard stays open and
+is one measurement away from being decided.
+
 ### 4.243 The clean cell's ten percent is not the ceiling, and the two sides are measured (2026-11-10)
 
 Two runs to find out what `bulk-n` is paying for, and the answer is neither of the things the last
