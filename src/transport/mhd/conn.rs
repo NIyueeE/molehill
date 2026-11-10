@@ -3679,10 +3679,32 @@ mod tests {
         loss_every: usize,
         /// Datagrams the link has carried, for the pattern above.
         carried: usize,
+        /// Delay one datagram in every `reorder_every` by `REORDER_SPAN`, so it arrives after the
+        /// ones behind it; zero disables it.
+        ///
+        /// **A real path reorders** — a burst spread over two queues, a multipath shaper, a NIC's
+        /// completion order — and none of this carrier's rules had been exercised against one. A
+        /// dropped datagram is a different event: it is *absent*, and a rule that reasons about
+        /// "later packets" has to handle one that is merely late.
+        reorder_every: usize,
+        /// Datagrams the reordering pattern has counted.
+        reordered: usize,
     }
 
     impl Link {
         /// Whether this datagram is the one the pattern takes.
+        /// How much later a reordered datagram arrives: enough to put it behind the next two.
+        const REORDER_SPAN: Duration = Duration::from_millis(6);
+
+        /// Whether this datagram is the one the reordering pattern holds back.
+        fn reorders(&mut self) -> bool {
+            if self.reorder_every == 0 {
+                return false;
+            }
+            self.reordered = self.reordered.wrapping_add(1);
+            self.reordered.is_multiple_of(self.reorder_every)
+        }
+
         fn takes_this_one(&mut self) -> bool {
             if self.loss_every == 0 {
                 return false;
@@ -3705,6 +3727,8 @@ mod tests {
                 sent: Duration::ZERO,
                 loss_every: 0,
                 carried: 0,
+                reorder_every: 0,
+                reordered: 0,
             }
         }
 
@@ -3824,6 +3848,11 @@ mod tests {
                 }
                 while let Some(len) = self.a.poll_transmit(at, &mut buf) {
                     moved += 1;
+                    let late = if self.reorders() {
+                        Self::REORDER_SPAN
+                    } else {
+                        Duration::ZERO
+                    };
                     if self.takes_this_one() {
                         // The pattern took it: the peer never sees this datagram.
                         at += spacing;
@@ -3831,19 +3860,24 @@ mod tests {
                         continue;
                     }
                     self.pending_a
-                        .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
+                        .push_back((at + self.delay + late, buf[buf.len() - len..].to_vec()));
                     at += spacing;
                     progress = true;
                 }
                 while let Some(len) = self.b.poll_transmit(at, &mut buf) {
                     moved += 1;
+                    let late = if self.reorders() {
+                        Self::REORDER_SPAN
+                    } else {
+                        Duration::ZERO
+                    };
                     if self.takes_this_one() {
                         at += spacing;
                         progress = true;
                         continue;
                     }
                     self.pending_b
-                        .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
+                        .push_back((at + self.delay + late, buf[buf.len() - len..].to_vec()));
                     at += spacing;
                     progress = true;
                 }
@@ -4464,6 +4498,107 @@ mod tests {
     /// A dropped datagram costs a round trip and nothing else: the timer puts
     /// the missing range back in the queue and the reader still gets the stream.
     ///
+    /// **A reordering path carries the stream, and costs no repair it does not need.**
+    ///
+    /// One datagram in five arrives behind the two that followed it — the shape a burst spread over
+    /// two queues has. Nothing is dropped, so a carrier that cannot tell late from lost will declare
+    /// losses it never had and spend the window on repairs; this asserts both halves: the bytes
+    /// arrive whole, and the ledger records no byte sent twice.
+    #[test]
+    fn a_reordering_path_carries_the_stream_without_repairing() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        link.reorder_every = 5;
+        link.pump(start);
+        let stream = link.a.open();
+        let bytes = payload(24 * 1024);
+        let mut written = 0usize;
+        let mut clock = start;
+        let mut accepted = None;
+        let mut out = Vec::new();
+        for _ in 0..600 {
+            clock += Duration::from_millis(5);
+            link.pump(clock);
+            if written < bytes.len() {
+                written += link.a.write(stream.id, &bytes[written..]);
+            }
+            if accepted.is_none() {
+                accepted = link.b.accept();
+            }
+            if let Some(stream) = accepted {
+                out.extend_from_slice(&take(&mut link.b, stream.id));
+                if out.len() == bytes.len() && written == bytes.len() {
+                    break;
+                }
+            }
+        }
+        assert!(
+            link.reordered > 5,
+            "the pattern must have fired: only {} datagrams were counted",
+            link.reordered
+        );
+        let ledger = link.a.take_ledger();
+        assert_eq!(
+            out,
+            bytes,
+            "every byte arrives in order and whole: got {} of {} (repaired {} bytes, {} calls)",
+            out.len(),
+            bytes.len(),
+            ledger.sent_repair_bytes,
+            ledger.sent_packets
+        );
+        // **A probe may repeat a segment; a repair may not.** The carrier re-sends one range when the
+        // clock is stale and nothing else is worth sending, which is by design and costs a segment or
+        // two. What a reordering path must not do is *declare* losses it never had — that would spend
+        // the window on repairs, which is what the bound below catches.
+        assert!(
+            ledger.sent_repair_bytes <= 2 * MAX_STREAM_PAYLOAD as u64,
+            "a late datagram is not a lost one: {} bytes re-sent — {ledger}",
+            ledger.sent_repair_bytes
+        );
+    }
+
+    /// **Reordering and loss together still carry the stream.** A real path does both, and the two
+    /// interact: a rule that treats late as lost mints repairs, and a rule that treats lost as late
+    /// never repairs anything.
+    #[test]
+    fn a_path_that_reorders_and_loses_still_carries_the_stream() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        link.reorder_every = 5;
+        link.loss_every = 20;
+        link.pump(start);
+        let stream = link.a.open();
+        let bytes = payload(24 * 1024);
+        let mut written = 0usize;
+        let mut clock = start;
+        let mut accepted = None;
+        let mut out = Vec::new();
+        for _ in 0..800 {
+            clock += Duration::from_millis(5);
+            link.pump(clock);
+            if written < bytes.len() {
+                written += link.a.write(stream.id, &bytes[written..]);
+            }
+            if accepted.is_none() {
+                accepted = link.b.accept();
+            }
+            if let Some(stream) = accepted {
+                out.extend_from_slice(&take(&mut link.b, stream.id));
+                if out.len() == bytes.len() && written == bytes.len() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            out,
+            bytes,
+            "every byte arrives, in order and whole: got {} of {}",
+            out.len(),
+            bytes.len()
+        );
+    }
+
     /// **A lane that keeps losing still carries its stream.**
     ///
     /// The floor one test down drops the opening and nothing else, which is a single accident. The

@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.261 The carrier tolerates reordering, and now says so (2026-11-10)
+
+With the five control mechanisms closed, the round turned to a property none of them had touched:
+**this carrier had never been tested against a path that reorders.** Every loss test dropped a
+datagram — absence — and a late datagram is a different event: every rule that reasons about "later
+packets" has to tell one from the other.
+
+`Link` grew `reorder_every`: one datagram in five arrives six milliseconds behind the two that
+followed it, which is the shape a burst spread over two queues has. Two tests came with it, and the
+engine — unchanged, byte-identical to `6ed32c1` — passes both:
+
+- **`a_reordering_path_carries_the_stream_without_repairing`**: 24 KiB arrives whole and in order,
+  and the only bytes sent twice are **two segments of probe**, not repairs (`sent_repair_bytes` ≤
+  2 × `MAX_STREAM_PAYLOAD`, `dup=0` at the receiver). A carrier that confused late with lost would
+  have spent the window repairing a path that lost nothing, and the bound is what catches that.
+- **`a_path_that_reorders_and_loses_still_carries_the_stream`**: the same reordering *plus* one
+  datagram in twenty dropped. It completes. The two rules interact — one that treats late as lost
+  mints repairs, one that treats lost as late never repairs — and this is the first test where both
+  are exercised at once.
+
+**This is the first carrier-level property added since §4.250**, and it cost nothing: no engine
+change, two tests, one harness field. That is the shape of the work that is still available while the
+shallow cell's trade stands — the carrier's *correctness* under path shapes it has never seen, rather
+than its rate on the one it has.
+
 ### 4.260 The delivered-rate pacer throttles to a megabit, and the family has no survivors (2026-11-10)
 
 §4.259's prerequisite was met first: **the lossy pump now lets time pass between datagrams**
