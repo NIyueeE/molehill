@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.248 The repair queue is pruned; what starves is the prefix (2026-11-10)
+
+Two checks on §4.247's "the repair loop is next" hypothesis, and the hypothesis is wrong.
+
+**The repair queue is empty when it is sampled.** The loss5 lane's window line reads
+`worst_repairs=3026` (repairs sent for that stream) with `worst_repairs_pending=0` in every second
+sampled. A repair is queued, sent, and removed — `repair_sent` trims the range and drops the entry
+when the whole of it went out. So there is no re-send loop on the queue.
+
+**What is starving is the receive-side prefix.** Over the same seconds the busiest lane carries
+**1.3–2.1 MB/s** (17 Mbit/s) with `num=978 025` and `pfx=346 693` per second, while the reader's
+stream advances at **0.25–0.35 MB/s**. So the peer holds roughly five times more out-of-order data
+than it releases in order, and the cell measures exactly what the reader gets: 0.4 MB/s ≈ 3 Mbit/s,
+reported as 0.0023 Gbit/s.
+
+**Where that leaves F3′.** The number path is healthy (§4.247), the repair queue is healthy, and the
+lane is at its window (`flight == cwnd`). The gap is between what arrives and what the receive side
+*releases*: `advance_to`/`trim` in the receiving stream, which walks the frontier only when the hole
+below it is filled. The next measurement is on that side — how many ranges the receiver holds, how
+far above the prefix they extend, and whether a repair that lands actually closes the hole it was
+queued for — and it is a receive-path question, not a sender one.
+
+**Nothing committed for this entry.** The frontier fix of §4.247 stands; `loss5` stays open, and the
+next step is now specific enough to be a unit-level question rather than another bench campaign.
+
 ### 4.247 The frontier moves: one lost opening no longer pins the number path (2026-11-10)
 
 F3′'s first fix, and it is the receiver's, not the sender's: **a hole that outlives the ahead window
