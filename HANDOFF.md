@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.215 The delay ceiling barely binds either, so the window is not what fills the queue (2026-11-10)
+
+A″ — cap `cwnd` at the bandwidth-delay product (`Rtt::min × measured delivery rate`, gain 1.0), with a `held` counter
+so the same run could say whether it engaged — was implemented and measured on the shallow cell:
+
+| arm | `throughput_gbps` | `dropped_packets` | `held` (max per lane) |
+|---|---|---|---|
+| rathole | 0.0955 / 0.0956 | 16 / 16 | — |
+| frp | 0.0952 / 0.0953 | 16 / 16 | — |
+| molehill | 0.0852 / 0.0828 | **7 294 / 2 298** | **19** |
+| molehill twin | 0.0820 / 0.0824 | 1 737 / 6 868 | — |
+
+Primary misses by two orders, guard (≥ 0.090) misses. **Reverted whole.**
+
+**Three instruments now agree, and that is the result.** The loss halving fired **once** per lane (§4.214); the BDP cap
+held the window back on **19** acknowledgements in a whole lane (§4.215); the repair budget moved the drops half the
+distance and no further (§4.213). A `cwnd` that no controller can move is a `cwnd` that was never the binding
+constraint on this cell — the sender is not window-limited there, so shrinking the window neither helps nor is even
+felt.
+
+**What that leaves, stated as a hypothesis with a test.** If the sender is not limited by bytes in flight, it is limited
+by *how it posts*: the pump emits up to `SEND_RUN` (44) datagrams back to back in one pass, a ~59 KB burst, and a
+shallow shaper queue has to absorb all of it or drop the tail. TCP, which both peers use, paces by the acknowledgement
+clock and never hands a queue that shape. That is a different mechanism from every attempt so far — burst shaping, not
+window regulation — and it is testable in one cell in two minutes.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.214 The loss response is right and barely fires, which is the finding (2026-11-10)
 
 A′ — halve `cwnd` on a declared loss, at most once per smoothed round trip, floor two segments, slow start latched off
