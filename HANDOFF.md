@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.231 The peak-rate controller passes 106 of 107 tests and stops on one, by the rule (2026-11-10)
+
+A¹² as the last entry proposed it: pace at the **windowed peak** delivery rate (ten round trips, expiring), bound new
+data in flight at `2 × BDP` (`min_rtt × peak`), and cut the rate 15 % on a loss or a queueing delay, once a round trip.
+Repairs and probes exempt. That maximum is the estimator none of the eleven earlier mechanisms had — an average of what
+the lane was sending settles where it started, a peak of what arrived does not.
+
+**It compiles, and 106 of 107 tests pass.** The one that does not is
+`a_lost_opening_packet_is_re_sent_within_the_cheap_timer`, and it fails for a reason that is about the *harness*, not the
+controller: that test asserts `poll_timeout()` equals the retransmission floor, and `poll_timeout()` has, since §4.221,
+been `min(timer, credit refill)`. Reading `recovery.poll_timeout()` directly — the timer itself — returned a deadline at
+the current instant rather than 20 ms ahead, so the assertion still fails, and I do not yet know why: the timer should
+have been re-armed on the last send.
+
+**Four attempts on that one test, so by the standing rule this stops rather than becoming a fifth.** What is established:
+the controller's shape is right (peak rate, inflight cap, multiplicative cut); what is not is how a padded sender and the
+retransmission floor interact in the fake-clock harness — the same class of problem that took four rounds over the
+`pump` harness (§4.219–§4.223).
+
+**Nothing landed**: the tree is `83b33c1`'s state, 107 tests green, no controller in the engine. The next round should
+first give the recovery timer its own accessor for tests (`Retries::deadline()`), which makes that assertion independent
+of the schedule, and then re-run A¹² unchanged.
+
 ### 4.230 The path is not shallow: 40 ms of path, 2 MB of buffer, and a relative target still misses (2026-11-10)
 
 The instrument the last entry asked for, on the shallow cell with the send schedule in place and no controller:
