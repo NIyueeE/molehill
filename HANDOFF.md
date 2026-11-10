@@ -377,6 +377,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.239 Six rounds say the cell is bimodal, and half the rounds are still at the baseline's level (2026-11-10)
+
+The F3 shape, run once as a screening: six measured rounds, candidate and frozen baseline interleaved
+in one campaign, peers beside them.
+
+| arm | `throughput_gbps` median (six rounds) | `dropped_packets` median | the six |
+|---|---|---|---|
+| rathole | 0.095 | 16.5 | 17, 16, 17, 16, 17, 16 |
+| frp | 0.095 | 16 | 16, 16, 17, 16, 18, 15 |
+| baseline (`molehill~b`) | 0.084 | **6 891** | 7 320, 7 536, 7 400, 1 867, 2 390, 6 463 |
+| candidate (`molehill`) | **0.090** | **1 261** | 2 442, 2 985, **52**, 2 444, **80**, **58** |
+| candidate twin (`molehill~aa`) | 0.090 | **105** | 100, 91, 86, 2 235, 110, 119 |
+
+**Throughput is above the baseline** (0.090 against 0.084, +7 %), so the fix does not buy drops with
+rate. **The drops median is 1 261 against a target of 100**, so the primary is not met — and the
+distribution says why it is not met in the way a median normally would:
+
+- the candidate's six rounds are **bimodal**: three at 52–80, three at 2 442–2 985;
+- the twin, the *same binary* on another port, sits at 86–119 in five of six and 2 235 in one.
+
+So the carrier has two behaviours on this cell, one at the peers' order and one twenty times worse,
+and which one a round gets is decided by something other than the code. The baseline, by contrast, is
+consistently at 1 867–7 536: it has *one* behaviour, and it is the bad one.
+
+**The mechanism the two-mode shape points at is the one still missing: nothing cuts the window on a
+loss.** Until §4.236 the window never bounded the wire, so a cut could not have mattered and the
+earlier falsification (§4.214: 6 878/7 078 drops) measured a control acting on something that was
+not in charge. Now that `flight ≤ cwnd` holds, a window that has doubled past the pipe has no way
+back down except the ramp's own termination, and a burst of the shaper's 100 packets is what the
+overshoot costs.
+
+**Next, therefore, is the plan's own default candidate** (`MHD-FINALIZATION-PLAN.md` F2.1): halve
+`cwnd` on a declaration that is not a probe, at most once per round trip, floor two segments — and
+measure whether the bimodality collapses to the good mode.
+
+**Not a verdict on the candidate.** F3 requires all its guards, and this run measured one cell.
+
 ### 4.238 The restart closes most of the gap: drops 77–90 in three arm-rounds of four (2026-11-10)
 
 F2's second half: a window that has fallen below the path's own bandwidth-delay product doubles
