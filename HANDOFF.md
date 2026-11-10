@@ -377,6 +377,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.279 The kernel will not pace this path either, so the last lever is gone (2026-11-11)
+
+The one lever left that was neither a userspace controller nor a wire change: **`SO_MAX_PACING_RATE`**,
+which asks the stack to space a socket's transmissions itself. It would remove the burst without a
+schedule and therefore without the wakeup granularity that made every userspace pacer thrash.
+
+**Probe, not a design**: set ten megabits a second on every lane socket and measure `rate1000`, where a
+paced lane could not possibly reach its usual throughput.
+
+| arm | `throughput_gbps` |
+|---|---|
+| baseline | 0.862 / 0.888 / 0.873 |
+| candidate, pacing set to 10 Mbit/s | **0.881 / 0.891 / 0.886** |
+| twin, same binary | 0.870 / 0.857 / 0.868 |
+
+**No effect at all.** The option is either refused or ignored on this path — the stack honours a pacing
+rate only through `fq` on the egress, and the bench shapes with its own queue discipline.
+
+That closes the last in-carrier possibility, and it also closes the *out*-of-carrier one that looked
+easiest: a proxy cannot install a queue discipline on the host it runs on behalf of, so "let the kernel
+pace" is a deployment property, not a protocol change this repository can make.
+
+**So the position is now this, and it is final for this release line**: seven mechanisms inside the
+carrier and one probe outside it, all measured, and the trade between the shallow cell's drops and its
+throughput is unchanged by every one of them. The two ways forward are the ones that need a human
+decision — accept the bounded defect and document it, or hand a lossy path to TCP.
+
+**Reverted**: the probe. 116 tests pass, tree clean.
+
 ### 4.278 The lane-owned signal, measured: 294 drops at 43 % — the same trade, one more time (2026-11-11)
 
 The controller on top of the delivered-rate field, built and measured on the two cells that decide.
