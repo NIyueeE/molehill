@@ -377,6 +377,50 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.241 The clean cell pays for the fix, and the reason is the timer cutting a one-millisecond path (2026-11-10)
+
+The first guard F3.2 runs, and it does not pass: `bulk-n` on a clean path.
+
+| arm | `throughput_gbps` | `mean_carried_packet_b` | `wire_per_visitor_byte` |
+|---|---|---|---|
+| baseline (`molehill~b`) | 12.937 / 12.926 | 28 715 / 28 866 | 1.038 / 1.040 |
+| candidate | **11.200 / 11.466** | 25 933 / 25 740 | 1.074 / 1.067 |
+
+−12 %, which is past the 10 % materiality and past the guard's "not worse than the same-method
+baseline". A second run with a no-runt rule in the picker (send a segment only when the whole of it
+fits) changed nothing — `mean_carried_packet_b` stayed at 26 247 / 25 484 — so the small-packet
+hypothesis was wrong and that change was reverted rather than kept for its plausibility.
+
+**The cause is in the window line, not in the packets.** Four lanes of a clean `bulk-n` stage:
+
+```
+cwnd=262144  ceiling=262144  flight=59356..178068  srtt_us=1008..1235  total_cuts=216..288
+```
+
+- `cwnd` is pinned at `window_ceiling()` — 262 144, one hop — and `flight` is **well below it**, so
+  the wire is not window-limited on this cell at all.
+- `srtt` is about **1 ms**, so `loss_delay` is 9/8 of that, **1.2 ms**. Any record older than 1.2 ms
+  when the timer fires is declared stale, which on a loopback path with eight lanes is routine
+  scheduling jitter.
+- `total_cuts` is **216 to 288 per lane in a seven-second stage** — the loss response halving a clean
+  path about thirty-five times a second, with slow start's restart (`bdp > cwnd`) doubling it back.
+  A sawtooth between half the window and the ceiling is what costs the 12 %.
+
+**So the same defect the loss response fixes on the shallow cell, it creates on a fast one**: the
+timer's declaration is not evidence, and a cut that trusts it pays for jitter. §4.206 identified this
+and its two-part answer — evidence plus an escape hatch — was never usable because the window did not
+bound the wire and the probe was the only thing that could unblock a lane. That is no longer true:
+acks retire whole records now, so a declaration that waits for a later packet's acknowledgement is
+safe, and the escape hatch is only for a genuinely silent path.
+
+**The next change is therefore in `Recovery::on_timeout`, not in the window**: a record is stale-lost
+only when a **later-sent packet has been acknowledged** (RACK's rule), or when its age passes a bound
+this carrier already trusts for a real timeout (`MIN_RTO`, 200 ms) — the escape hatch. The cut then
+only pays for losses the path actually proved.
+
+**Nothing committed for this entry**: the no-runt change was measured, did not move the number, and
+was reverted. The candidate of §4.240 stands as committed; its clean-cell guard is open.
+
 ### 4.240 The loss response closes it: 64.5 drops against the baseline's 2 460, and more throughput (2026-11-10)
 
 The piece §4.239 said was missing, and the last of F2: **a declaration that is not a probe halves the
