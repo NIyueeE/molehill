@@ -377,6 +377,48 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.253 The minimal window change does not reproduce the collapse at unit scale (2026-11-10)
+
+The forward control §4.252 proposed: put back **only** the window at the send point — the picker
+gating new data on `flight + want ≤ cwnd`, and `write` no longer consulting the window — and see
+whether the two loss tests catch it.
+
+**They do not. All 109 tests pass**, including `a_lane_that_keeps_losing_still_completes_the_stream`
+(lost opening plus five percent continuing loss, both directions) and the 32 KiB payload that
+distinguishes a stall from a slow start.
+
+So the collapse that condemned the whole series on the bench — `loss1` carrying **zero bytes** in
+three rounds of three (§4.249) — is **not reachable from this change alone at unit scale**. It needs
+something the harness does not have. Three candidates, in the order they can be checked:
+
+1. **The credit path.** The reverted `write` was bounded by `credit.min(held)` minus `OPEN_RESERVE`,
+   and on the bench the peer's credit frame is one datagram that the loss box can take. If the credit
+   never arrives, `write` returns zero for ever — which is exactly "carried nothing", not "carried
+   slowly". The unit harness sends its credit on a link with a delay and never loses it, because
+   `pump(start)` runs before the loss pattern is armed.
+2. **The pool.** A bench arm runs a pool of lanes and the stream lands on one of them; the unit test
+   has one lane and one stream.
+3. **The shaping.** `loss1` is 1 % loss **and** a 10 ms delay with a 1 000-packet queue; the unit link
+   is 5 ms each way and drops one in twenty.
+
+**The cheap way to tell them apart is not another unit test**: arm the loss pattern *before* the
+opening exchange and give the harness a credit frame it can lose. That is a small extension of
+`Link` — a `loss_every` that is armed from construction rather than after `pump(start)` — and it is
+the next measurement. If the credit hypothesis is right, the fix is a credit that is retransmitted
+like data rather than sent once, and that is a defect older than the whole fourth plan.
+
+**That probe was run, and the credit is not the answer.** With the pattern armed *before* the opening
+exchange — so the credit frame is one of the casualties — the baseline engine carries the transfer
+to **32 376 of 32 768 bytes** and stops: 392 bytes short, with `flight = buffered = 392`, one partial
+segment still in the table after twenty seconds of virtual time. So a lost credit is survivable
+(the peer re-advertises), and what the probe found instead is a **tail that never retires**: the last
+partial segment is in flight, no acknowledgement of it ever arrives, and the loop's budget runs out
+before the timer rescues it. That is a narrower defect than the one the bench showed, and it is not
+the zero-byte collapse.
+
+**Nothing committed**: the diagnostic change was reverted, the engine is byte-identical to
+`6ed32c1`, 109 tests pass.
+
 ### 4.252 §4.251 was wrong: the 24 282 bytes were a partial `write`, not a stall (2026-11-10)
 
 The discipline this stage keeps re-learning, applied to itself: **check the artifact, not the record
