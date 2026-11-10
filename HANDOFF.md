@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.276 §4.275's diagnosis is refuted: the constants *are* derived, so the panic is unexplained (2026-11-11)
+
+The search §4.275 pointed at — "the buffer that stages a packet's header is sized from something that
+did not follow the ack's growth" — was run, and it is wrong:
+
+- `MAX_STREAM_PAYLOAD = MAX_DATAGRAM - HEAD - ACK - STREAM` and `MAX_SEALED_PAYLOAD = MAX_STREAM_PAYLOAD
+  - SEAL_TAG`, both **derived**. Growing `ACK` by four shrinks the payload by four, and a full
+  acknowledgement-carrying packet is still exactly `MAX_DATAGRAM`.
+- `MHD_OVERHEAD = HEAD + ACK`, also derived.
+- `Frame::extra()` does not mention `ACK` at all.
+- The run buffer is `Vec::with_capacity(SEND_RUN * MAX_DATAGRAM)` and grows on push, so a reserved
+  capacity cannot be overrun by construction.
+
+So the panic at `udp_batch.rs` is **not** a stale constant, and the honest state is that its cause is
+unknown. My §4.275 named a mechanism with more confidence than the evidence carried — the second time
+in this record that a plausible reading was promoted to a diagnosis before it was checked (§4.252,
+§4.254 are the others).
+
+**What the next attempt must do first**, and it is one command: apply the four-byte ack growth and run
+`cargo test --lib pump::lane_tests::a_stream_carries_a_hundred_round_trips` with `RUST_BACKTRACE=1`,
+then read the *span offsets and lengths* in the frame that panicked. Guessing produced two wrong
+diagnoses; a backtrace is one command.
+
+**Reverted**: `src/` is byte-identical to `6ed32c1`, 116 tests pass, tree clean.
+
 ### 4.275 The wire field's real blocker is the staging buffer, not the GSO rule (2026-11-11)
 
 §4.274 named two ways past the batching and preferred the smaller: **shrink the stream payload by
