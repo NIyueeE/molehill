@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.217 A pacer at the measured rate zeroes the drops by zeroing the traffic (2026-11-10)
+
+A⁗ — a token bucket at the **measured** delivery rate, gating new data only, repairs and probes exempt — was
+implemented with a `paced` counter, and it took two runs to learn what it says:
+
+| run | arm | `throughput_gbps` | `dropped_packets` | `paced` |
+|---|---|---|---|---|
+| first | molehill + twin | **no result: every round failed** ("iperf3 … Connection reset by peer") | — | ~990 |
+| second (with a 256 KiB/s floor) | molehill | **0.0004 / 0.0006** | **0 / 0** | — |
+| | rathole | 0.0956 / 0.0954 | 17 / 17 | — |
+| | frp | 0.0952 / 0.0950 | 15 / 16 | — |
+
+**The first run's failure was a bug, not a verdict**: a rate measured over a window in which nothing was confirmed is
+zero, and pacing to zero parks the lane — every product round died on iperf3's control connection. A floor of 256 KiB/s
+fixed the stall, and then the second run said the real thing.
+
+**The drops are zero because almost nothing is sent.** Throughput is 0.0006 Gbit/s — a hundred and fifty times below the
+guard — against the peers' 0.095. The primary metric is met in the most useless way possible, which is why the guard
+exists.
+
+**And the reason is structural, not a tuning issue**: the bucket refills at the rate the acknowledgements *measured*,
+and those acknowledgements measured the rate the bucket allowed. **A pacer whose input is its own output locks in
+whatever it started with** — here, the floor. It can never ramp up, because ramping up requires sending faster than the
+measurement, and the measurement is the limit.
+
+**So the input has to be a target, not a reading.** The window already is one: `cwnd / smoothed_rtt` is the rate a lane's
+own window implies, it grows when the window grows, and pacing at it splits a window over its round trip instead of
+firing it in one burst. That is the next pre-registration (A⁵), and it is a genuinely different rule from A⁗ even though
+both are token buckets.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.216 The burst budget fails too, and the arithmetic says why: the carrier sends 135 Mbit/s into a 100 Mbit/s pipe (2026-11-10)
 
 A‴ — cap each pass at `min(44, max(4, cwnd/(4·MSS)))` datagrams — was implemented and measured on the shallow cell:
