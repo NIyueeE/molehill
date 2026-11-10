@@ -377,6 +377,46 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.274 The receiver's delivery report: designed, wired, and blocked by the GSO batching (2026-11-11)
+
+The lead every reading in §4.270–§4.273 pointed at, attempted. The design: **the receiver reports the
+rate at which this connection's bytes are arriving**, four bytes added to the ack block, and the
+sender paces a tenth above it with a tenth of deadband.
+
+It is the right signal by construction: the sender's own send rate is its own choice, and the round
+trip it measures carries whatever queue the path holds for everything else — only the receiving end
+sees arrivals. It also cannot park below the delivery rate, because the delivery rate *is* the
+measurement.
+
+**Built and unit-tested:**
+
+- the field in `wire::Ack`, in both codecs, with the round-trip case carrying a non-zero value so a
+  decode that dropped it would fail;
+- receiver-side accounting: bytes arriving per window, the window sized to one round trip and
+  clamped to 5–100 ms, the rate published in every acknowledgement;
+- sender-side control: **follow** the report (a tenth above, a tenth of deadband), with the doubling
+  ramp covering the time before the first report arrives;
+- `the_pace_follows_the_peers_delivery_report` passes: a report of 4 MiB/s moves the rate to 4.4, and
+  a report a fifth lower brings it down.
+
+**And it breaks the GSO batching.** Four extra bytes make an ack-carrying packet larger than the
+packets before it in the same run, and `udp_batch.rs` sizes every segment from the *first* span:
+"range end index 1079 out of range for slice of length 1075". That is the same family as the
+historical B defect (§4.210, fixed in `27c9793`), reached from the other side — the batch accepts a
+shorter tail, not a longer one.
+
+**So the wire change needs one of two things first**, and both are small and neither is this round:
+
+1. **Split the run when a packet is larger than the first** — a change in `src/transport/udp_batch.rs`,
+   which KCP also uses, so it wants its own measurement;
+2. **Size the stream payload four bytes down when an acknowledgement rides along**, so no packet in a
+   run is ever larger than a plain one — local to this carrier, and the smaller change.
+
+**Reverted**, so the tree is not left mid-change: `src/` is byte-identical to `6ed32c1`, 116 tests
+pass. The design and the two ways to unblock it are recorded here, which is the whole of what this
+round produced — and it is more than the previous six had, because the signal is now known to be
+the right one rather than hoped to be.
+
 ### 4.273 Three gate variants, one outcome: the drops fall and the rate lands at 39 % (2026-11-11)
 
 The refinement §4.272 pointed at: gate the ramp on whether the queue is **growing** rather than
