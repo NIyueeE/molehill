@@ -1086,7 +1086,12 @@ pub(crate) struct Conn {
     round_at: Option<Instant>,
     /// The path's bandwidth-delay product as last measured, in bytes.
     bdp: u64,
-    /// When the window last paid for a loss, which is what makes one loss epoch cost one cut.
+    /// The highest number in flight when the window last paid for a loss.
+    ///
+    /// TCP's `recover`: a declaration at or below it belongs to the episode already paid for, so one
+    /// flight costs one cut however many reports it produces (`HANDOFF.md` §4.241).
+    recover: Option<u32>,
+    /// When the window last paid for a loss, for the stats line.
     ///
     /// A hole reported by several acknowledgements, or by the timer after them, is **one** loss:
     /// halving once per report would halve the pipe several times for one dropped packet, which is
@@ -1243,6 +1248,7 @@ impl Conn {
             round_acked: 0,
             round_at: None,
             bdp: 0,
+            recover: None,
             cut_at: None,
             closed: None,
             close_after: None,
@@ -2745,7 +2751,17 @@ impl Conn {
             .checked_div(WINDOW_REFERENCE)
             .unwrap_or(1)
             .max(1);
-        WINDOW_FLOOR.saturating_mul(hops).min(MAX_CWND)
+        let calibrated = WINDOW_FLOOR.saturating_mul(hops).min(MAX_CWND);
+        // **And never less than two of the pipe this end has measured.** The calibration is
+        // 256 KiB per millisecond of path, which is right on the shaped cells and far too narrow
+        // on a fast one: a clean lane carrying 1.6 GB/s over a 1 ms round trip needs 1.6 MB in
+        // flight, and the calibration allows 256 KiB — measured as the window pinned at the
+        // ceiling while the wire sat at 80 % of the baseline (`HANDOFF.md` §4.241). Two
+        // bandwidth-delay products is BBR's own bound on what may be in flight, so this raises the
+        // ceiling to what the path can hold and no further; the cut still brings the window down
+        // when the path disagrees.
+        let measured = self.bdp.saturating_mul(2).min(MAX_CWND);
+        calibrated.max(measured)
     }
 
     /// Move the cursor past the stream that was just served, wrapping to the
@@ -3577,7 +3593,10 @@ impl Conn {
             let declared = u64::try_from(acked.lost.len()).unwrap_or(u64::MAX);
             self.ledger.lost_by_threshold = self.ledger.lost_by_threshold.saturating_add(declared);
             self.totals.loss_threshold = self.totals.loss_threshold.saturating_add(declared);
-            self.cut_window(now);
+            // The episode is named by the highest number this report covers: every declaration up
+            // to a cut's own mark is the same flight.
+            let highest = acked.lost.iter().map(|sent| sent.number).max().unwrap_or(0);
+            self.cut_window(now, highest);
         }
         for sent in acked.lost {
             if let Some(range) = sent.range {
@@ -3722,23 +3741,22 @@ impl Conn {
     /// - **A probe is not a loss.** The timer also fires to elicit an acknowledgement when nothing
     ///   is stale; charging the window for that cuts a healthy lane, which is how a Noise stream
     ///   stalled at its eleventh round trip (§4.214).
-    /// - **One cut per smoothed round trip.** A hole is reported by several acknowledgements and
-    ///   then by the timer; each of those is the same loss, and halving once per report is how a
-    ///   lossy path collapses.
+    /// - **One cut per flight, not one per report and not one per round trip.** A time-based epoch
+    ///   was the first rule here and it is wrong at both ends: on a 40 ms path one cut per round
+    ///   trip is far too eager once reordering is normal, and on a 1 ms path it allows a thousand
+    ///   cuts a second — measured on the clean cell as `total_cuts` 216–288 per lane in seven
+    ///   seconds, which is a sawtooth between half the ceiling and the ceiling (`HANDOFF.md`
+    ///   §4.241). The rule that is standard because it is dimension-free is TCP's: after a
+    ///   reduction, nothing more is cut until an acknowledgement passes the highest number that was
+    ///   in flight when the reduction happened. One flight, one cut.
     /// - **Never below two segments.** A window of one packet cannot grow again without a lucky
     ///   acknowledgement, and the floor is what keeps a lossy path moving.
-    fn cut_window(&mut self, now: Instant) {
-        let period = self
-            .recovery
-            .smoothed_rtt()
-            .unwrap_or(RTT_GRANULARITY)
-            .max(RTT_GRANULARITY);
-        if self
-            .cut_at
-            .is_some_and(|at| now.saturating_duration_since(at) < period)
-        {
+    fn cut_window(&mut self, now: Instant, highest_lost: u32) {
+        // A loss at or below the mark belongs to the episode already paid for.
+        if self.recover.is_some_and(|recover| highest_lost <= recover) {
             return;
         }
+        self.recover = Some(self.recovery.last_number());
         self.cut_at = Some(now);
         self.slow_start = false;
         let floor = 2 * MAX_STREAM_PAYLOAD as u64;
@@ -3821,7 +3839,8 @@ impl Conn {
             // (`HANDOFF.md` §4.214, §4.240).
             self.slow_start = false;
             if expiry == Expiry::Loss {
-                self.cut_window(now);
+                let highest = lost.iter().map(|sent| sent.number).max().unwrap_or(0);
+                self.cut_window(now, highest);
             }
         }
         for sent in &lost {
@@ -4754,29 +4773,34 @@ mod tests {
         );
     }
 
-    /// One hole costs one cut, whatever number of reports it produces.
+    /// One flight costs one cut, whatever number of reports it produces.
     ///
     /// A hole is declared by several acknowledgements and then by the timer; halving once per
     /// report would take a quarter, an eighth and a sixteenth of the pipe for one dropped packet
-    /// (`HANDOFF.md` §4.240). The epoch is the smoothed round trip — one millisecond before any
-    /// sample exists, which is the interval the test uses.
+    /// (`HANDOFF.md` §4.240). The boundary is TCP's `recover`: a cut records the highest number in
+    /// flight, and every later declaration at or below that mark is the same episode. A
+    /// time-based boundary was tried first and is wrong at both ends — a thousand cuts a second on
+    /// a 1 ms path (`HANDOFF.md` §4.241).
     #[test]
-    fn one_loss_epoch_costs_one_cut() {
+    fn one_flight_costs_one_cut() {
         let now = Instant::now();
         let mut conn = Conn::new(9, true);
         conn.cwnd = 100_000;
-        conn.cut_window(now);
+        // Five packets have left; the report that pays covers number four.
+        for _ in 0..5 {
+            let _ = conn.recovery.next_number();
+        }
+        conn.cut_window(now, 4);
         assert_eq!(conn.cwnd, 50_000, "the first declaration halves the window");
-        conn.cut_window(now + Duration::from_micros(500));
+        conn.cut_window(now, 3);
         assert_eq!(
             conn.cwnd, 50_000,
-            "a second report inside the same round trip is the same loss"
+            "a later report about the same flight is the same loss"
         );
-        conn.cut_window(now + Duration::from_millis(2));
-        assert_eq!(
-            conn.cwnd, 25_000,
-            "the next round trip can pay for a new loss"
-        );
+        // A new packet has left, so a declaration above the mark is a new episode.
+        let _ = conn.recovery.next_number();
+        conn.cut_window(now, 6);
+        assert_eq!(conn.cwnd, 25_000, "a new flight can pay for a new loss");
         assert_eq!(conn.totals.cuts, 2, "and the counter agrees");
     }
 
@@ -4789,13 +4813,17 @@ mod tests {
         let now = Instant::now();
         let mut conn = Conn::new(9, true);
         conn.cwnd = 3 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64;
-        conn.cut_window(now);
+        for _ in 0..3 {
+            let _ = conn.recovery.next_number();
+        }
+        conn.cut_window(now, 2);
         assert_eq!(
             conn.cwnd,
             2 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64,
             "three segments halve to one and a half, and the floor is two"
         );
-        conn.cut_window(now + Duration::from_millis(2));
+        let _ = conn.recovery.next_number();
+        conn.cut_window(now, 3);
         assert_eq!(
             conn.cwnd,
             2 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64,

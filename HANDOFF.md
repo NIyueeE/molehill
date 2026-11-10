@@ -377,6 +377,49 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.242 Flight-scoped cuts and a pipe-aware ceiling: 41.5 drops with 7 % more throughput (2026-11-10)
+
+Two changes after §4.241's reading, and both are consequences of what it measured.
+
+**1. A cut is scoped to its flight, not to a clock.** The first rule was one cut per smoothed round
+trip. That is wrong at both ends: on a 40 ms path it halves again for what is one episode, and on a
+1 ms path it allows a thousand cuts a second — measured on the clean cell as `total_cuts` 216–288 per
+lane in seven seconds. The rule that is standard because it is dimension-free is TCP's `recover`: a
+cut records the highest number in flight, and a later declaration at or below that mark belongs to the
+episode already paid for. One flight, one cut.
+
+**2. The ceiling may not be narrower than the pipe this end has measured.** `window_ceiling()` is
+256 KiB per millisecond of path, which is right on the shaped cells and six times too narrow on a
+clean one: a lane moving 1.6 GB/s over a 1 ms round trip needs 1.6 MB in flight, and the calibration
+allows 256 KiB — measured as `cwnd` pinned at `ceiling` while the wire sat at 80 % of the baseline.
+It is now `max(calibration, 2 × bdp)`, and two bandwidth-delay products is BBR's own bound on what
+may be in flight. The cut still brings the window down when the path disagrees.
+
+Measured on both cells, candidate and frozen baseline interleaved:
+
+| cell | arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|---|
+| `rate100_shallow` | baseline | 0.0837 (0.083–0.085) | 2 474 (1 819–7 154) |
+| | candidate | **0.0897 (0.090 × 4)** | **41.5 (39, 41, 43, 42)** |
+| | peers | 0.0954 | 16.5 |
+| clean `bulk-n` | baseline | 12.713 (12.462 / 12.964) | 0 |
+| | candidate | **11.415 (11.695 / 11.136)** | 0 |
+
+**The shallow cell is now the best reading it has ever had**: 39–43 drops in four consecutive
+rounds — a distribution, not a bimodality — with throughput four times at 0.090, which is **7 % above
+the baseline** and within 6 % of the peers. The primary (`≤ 100`, and `≤ 4 × peers` = 66) is met with
+margin on every round rather than on a median.
+
+**The clean cell is still 10 % down** (11.415 against 12.713), which is exactly the materiality
+boundary and therefore still a regression against the plan's guard. Raising the ceiling to twice the
+pipe recovered half of the 19 % it was before this change, so the direction is right and the remaining
+gap is a different cost — the clean lane is also declaring 5 232 losses a second (2 % of its packets)
+at `loss=0t/5232m`, which is reordering on a loopback path and is what the flight-scoped cut now
+prices at one per flight rather than one per round trip.
+
+**Committed**: both changes, with the tests that pin them (one flight, one cut; the floor; a probe
+pays nothing). The `bulk-n` guard stays open and is the next measurement's subject.
+
 ### 4.241 The clean cell pays for the fix, and the reason is the timer cutting a one-millisecond path (2026-11-10)
 
 The first guard F3.2 runs, and it does not pass: `bulk-n` on a clean path.
