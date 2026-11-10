@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.272 The doubling ramp meets the drops target for the first time — and pays 61 % of the throughput (2026-11-11)
+
+The one thing every earlier attempt never gave the rate: **it doubles per round trip until the path
+first asks for less**. That plus the departure schedule of §4.271, measured on both decisive cells.
+
+| cell | arm | throughput | drops |
+|---|---|---|---|
+| `rate100_shallow` | baseline | 0.0836 | 7 226 |
+| | **candidate** | **0.0325** | **46.5** (76 / 188 / 17 / 0) |
+| `loss1` | baseline | 1.429 | 438 |
+| | candidate | **0.0115** | 232 |
+
+**The drops target is met, for the first time in this record.** 46.5 against the peers' 16 is inside
+"≤ 4 × the peers", and the baseline's 7 226 is two orders away. Nothing else has ever come close
+without collapsing somewhere else.
+
+**And it costs 61 % of the throughput on that cell, and everything on `loss1`.** The reason is the
+same wall the delay-driven attempt hit (§4.258), now with a working ramp in front of it: the only
+signal this carrier has for "stop doubling" is `smoothed > min_rtt + min_rtt/4`, and on a shaped path
+whose queue fluctuates that is true most round trips. So the ramp stops almost immediately on `loss1`
+and backs off once a round trip until it is at the floor, while on the shallow cell it stops at the
+right place and holds the drops down.
+
+**That is the sharpest statement of the whole problem this record has**: the carrier can find the
+right rate, and it gets there by watching a delay signal that cannot tell *this lane's* queue from a
+path that always has one. Everything else — the schedule, the slot accounting, the ramp, the harness —
+is now built and measured. What is missing is a **queue signal that belongs to this lane**, which in
+this design means either a rate sample the receiver reports back or a timestamp echo — a wire change,
+and therefore 6.0 business.
+
+**Reverted**: `src/` is byte-identical to `6ed32c1`, 116 tests pass.
+
 ### 4.271 The pacer now works to spec and still parks — the fault has moved from the gate to the ramp (2026-11-11)
 
 Rebuilt as a departure schedule with the two bugs of §4.270 fixed: **the slot is spent where the
