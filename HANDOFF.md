@@ -377,6 +377,57 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.235 The fourth plan's baseline is frozen (2026-11-10)
+
+The fourth plan's F0.3 step, done before any measurement so that every later A/B has something honest to compare against:
+
+| fact | value |
+|---|---|
+| commit | `6ed32c1edf86366f47f3e0e34c936fb5c22286d1` (`docs(handoff): the probe cycle buys back the throughput and not one drop`) |
+| build | `cargo build --release`, working tree clean |
+| sha256 | `3977737a0d953313bf47ec5b0c741845b396a50b2769fe91b59f2b6879c2367e` |
+| path | `/home/dsh/tmp/mhd-baseline-6ed32c1` |
+
+**This binary is the baseline for every A/B from here on**, through `just bench run --binary-b
+/home/dsh/tmp/mhd-baseline-6ed32c1 --ab-arm <arm>`, which runs both builds interleaved in one campaign. A/A noise is
+measured with **the baseline's own second copy**, never with a candidate's twin — the mistake §4.234 records.
+
+There is no controller in this engine: it is the same engine as `27c9793` (B's fix) plus documentation, which is what
+makes it the right "does the fix regress anything" reference.
+
+### 4.234 Three of the third plan's conclusions are withdrawn, and why (2026-11-10)
+
+Before the fourth plan starts, three readings it was built on do not say what they were taken to say. The measurements
+stand; the conclusions do not.
+
+**1. The `SendLedger` is a per-second interval, not a lifetime total.** `pump.rs`'s once-a-second window line calls
+`Conn::take_ledger()`, which is `std::mem::take`: every field in it is cleared as it is read. So `cuts=1`, `held=19` and
+`paced≈2100` are counts **within that second**, and "the loss response fired once in a lane's whole life" (§4.214) and
+"the BDP cap engaged 19 times" (§4.215) are misreadings of a one-second sample. **Withdrawn with them:** the conclusions
+"this carrier has no clock" (§4.218) and "the loss signal is too sparse to steer anything" (§4.214). Re-summing the
+per-second lines of the same runs gives 2 486 / 2 352 for `cuts` over three rounds of the shallow cell and 74 for `held`
+on one lane of one round — orders of magnitude away from the numbers those conclusions rested on.
+
+**2. `molehill~aa` is not an unmodified baseline.** It is a *second instance of the same binary* on another port: an
+A/A noise control, which is exactly what it is good for and all it is good for. Several verdicts used it as the
+"does not regress" guard (§4.226, §4.227, §4.231–§4.233), which compares a candidate with itself and cannot detect a
+regression at all. **Those verdicts are void** and the cells have to be re-measured against a real baseline build
+(`--binary-b`).
+
+**3. The experiments that failed carried implementation defects of their own.** The peak estimator had no growth and sat
+on the 256 KiB/s floor (§4.232); the ramp and the cut shared one timestamp so the cut never fired (§4.232); a probe was
+charged as a loss, stalling a Noise round trip at 11 (§4.214); a bucket refilled at its own measured output locked at
+the floor (§4.217); the harness clock ran 22 seconds ahead of the test's `now` (§4.224); `next_a` pushed the clock past
+the retransmission deadline it was measuring (§4.231). **What those rounds refute is those implementations.** They are
+not evidence that the mechanism families are unusable, and the third plan read them that way.
+
+**What survives as evidence:** the path facts measured with the read-only instrument (§4.230: `min_us ≈ 40 100` against
+`srr_us 204 718–311 698`, `cwnd` 376–407 KB, `rate100_shallow`'s qdisc limit of 100 packets), the attributed drop
+location (§4.228: `mhbsrv/v-srv2` qdisc, i.e. the tunnel leg's egress), and every number whose method was sound.
+
+**The fourth plan's response** is not another candidate: it is to stop guessing, add **cumulative** counters beside the
+interval ones, and let one read-only attribution run choose the place to fix (`MHD-FINALIZATION-PLAN.md`, F1).
+
 ### 4.233 The probe cycle buys back the throughput and not one drop (2026-11-10)
 
 A¹³: A¹²'s peak estimator, inflight cap and multiplicative cut, plus the one piece not yet tried — a **probe cycle**.
