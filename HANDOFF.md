@@ -377,6 +377,42 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.252 §4.251 was wrong: the 24 282 bytes were a partial `write`, not a stall (2026-11-10)
+
+The discipline this stage keeps re-learning, applied to itself: **check the artifact, not the record
+of it.** §4.251 claimed the baseline engine stalls at 24 282 of 32 768 bytes under continuing loss,
+and put that number in a plan row. It does not.
+
+The test's first line was
+
+```rust
+assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+```
+
+and **that** is what failed, at 24 282 = 18 × 1 349: eighteen segments, which is what the peer's
+credit minus the opening reserve allowed in one call. `write` is partial by design — a reader writes
+what fits and comes back — so the test was asserting something the API never promised, and the
+"stall" was the assertion's own arithmetic. The transfer never got a chance to be measured.
+
+**Written the way a reader writes** — write what fits, pump, write again — the same lane, the same
+one-datagram-in-twenty loss in both directions, the same lost opening, completes all 32 KiB in
+**well under a second** of virtual time. The engine is the baseline; nothing was fixed.
+
+**So what stands and what does not:**
+
+- **Not established**: that the baseline engine stalls under continuing loss. The premise F3′ was
+  given in §4.251 — "the defect is in the engine the plan started from" — is **withdrawn**.
+- **Still established**: the reverted candidate carried **zero bytes** on the `loss1` cell in three
+  rounds of three (§4.249). That reading came from the bench, not from this test, and it is what
+  condemned the window work.
+- **Now pinned**: `a_lane_that_keeps_losing_still_completes_the_stream` passes, is no longer ignored,
+  and is the floor any next candidate must clear.
+
+**The lesson is the one in the plan's own discipline line**, and this is the second time it has
+caught a false finding inside a week (§4.234 was the first): a test that fails is evidence about the
+test until the failure is read. Here the failure was in the first statement of the test, and I read
+its number as a property of the engine.
+
 ### 4.251 The stall is in the baseline engine, and it fits in a ten-millisecond test (2026-11-10)
 
 §4.250's floor was one dropped opening. This is the hardened version: the same link drops **one

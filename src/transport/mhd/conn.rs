@@ -4445,15 +4445,15 @@ mod tests {
     /// [`SELF::loss_every`] around a lost opening and requires the same completion inside the same
     /// budget.
     ///
-    /// **It fails on the baseline engine, which is the finding.** At one datagram in twenty, both
-    /// directions, a 32 KiB transfer stops at **24 282 bytes and stays there**: the same number
-    /// after six seconds of virtual time and after twenty. So the defect F3′ exists for is not the
-    /// window work's invention — it is in the engine the plan started from, and this test is where
-    /// it can be seen in milliseconds instead of an eight-second bench cell.
+    /// **It passes on the baseline engine, and its first version said otherwise for a reason that
+    /// was the test's own.** That version asserted one whole write and failed at 24 282 of 32 768 —
+    /// eighteen segments the opening reserve let through, not a stall: a write is partial by design,
+    /// bounded by the peer's credit and by this engine's buffer, and a reader comes back for the
+    /// rest. Written the way a reader writes, the transfer completes in well under a second of
+    /// virtual time (`HANDOFF.md` §4.252).
     ///
-    /// Ignored while it fails, deliberately: a red suite hides every other failure, and an ignored
-    /// test with a number in its reason is a better record than a deleted one.
-    #[ignore = "F3': a lane stalls at 24 282 of 32 768 bytes under 5 % continuing loss"]
+    /// What it pins is therefore a floor the baseline already meets: a lane that loses its opening
+    /// and then keeps losing still finishes. The next candidate has to keep clearing it.
     #[test]
     fn a_lane_that_keeps_losing_still_completes_the_stream() {
         let start = Instant::now();
@@ -4461,7 +4461,12 @@ mod tests {
         link.pump(start);
         let stream = link.a.open();
         let bytes = payload(32 * 1024);
-        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        // **A write is partial by design** — the peer's credit and this end's buffer both bound it —
+        // so the test writes what fits and comes back, which is what a reader does. The first
+        // version of this test asserted one whole write and failed on the *write*, not on the wire:
+        // its 24 282 bytes were 18 segments the opening reserve let through, not a stall
+        // (`HANDOFF.md` §4.252).
+        let mut written = 0usize;
         // One datagram in twenty, both directions, from the first one onwards: the opening is among
         // the casualties and the loss never stops. The payload is chosen so the pattern certainly
         // fires — a test whose loss never happens would pass by carrying everything cleanly, which
@@ -4474,12 +4479,15 @@ mod tests {
         for _ in 0..4000 {
             clock += Duration::from_millis(5);
             link.pump(clock);
+            if written < bytes.len() {
+                written += link.a.write(stream.id, &bytes[written..]);
+            }
             if accepted.is_none() {
                 accepted = link.b.accept();
             }
             if let Some(stream) = accepted {
                 out.extend_from_slice(&take(&mut link.b, stream.id));
-                if out.len() == bytes.len() {
+                if out.len() == bytes.len() && written == bytes.len() {
                     break;
                 }
             }
@@ -4496,9 +4504,26 @@ mod tests {
         assert_eq!(
             out,
             bytes,
-            "and carry every byte within twenty seconds of virtual time: got {} of {}",
+            "and carry every byte within twenty seconds of virtual time: got {} of {} — \
+             sender cwnd {} flight {} buffered {} live {} repair-pending {} unacked {} base {}",
             out.len(),
-            bytes.len()
+            bytes.len(),
+            link.a.cwnd,
+            link.a.recovery.flight_bytes(),
+            link.a.buffered,
+            link.a.recovery.table_stats().0,
+            link.a
+                .streams
+                .get(&stream.id)
+                .map_or(0, |state| state.send.repairs_pending()),
+            link.a
+                .streams
+                .get(&stream.id)
+                .map_or(0, |state| state.send.unacked()),
+            link.a
+                .streams
+                .get(&stream.id)
+                .map_or(0, |state| state.send.base()),
         );
     }
 
