@@ -377,6 +377,44 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.270 Is it really unfixable? No — and the §4.260 dismissal was not fair (2026-11-11)
+
+Asked whether the shallow cell is closed for good, the honest answer is **no**, and the reason is
+uncomfortable: one of the five mechanisms was judged on numbers that could not have described it.
+
+**§4.260's pacer measured 0.0006–0.0013 Gbit/s against a floor it sets for itself at 512 KiB/s
+(≈4 Mbit/s).** A mechanism running *below its own floor* has not been tested; its implementation has
+been. Dismissing the family on that reading was my error, and it is the same error this record already
+caught twice (§4.252, §4.254) — a number read as a property of the mechanism when it was a property of
+the code around it.
+
+**So the pacer was rebuilt as a departure schedule and measured first.** Instead of a bucket topped up
+by elapsed time (the arithmetic that can drift silently), it keeps one instant and one gap: a datagram
+may leave at `pace_next_at` at the earliest, and the next slot is that instant plus the gap. A test asks
+it to hold 512 KiB/s and counts what leaves in a second of virtual time.
+
+**That test found a real bug, then found a second one, and both are the reason the earlier attempts
+looked like the mechanism failing:**
+
+1. **Slots were spent by passes that carried no data.** `next_stream_range` runs on *every* pass,
+   including the acknowledgement-only ones, and the first version consumed a slot whenever it was
+   *asked*. A lane builds several acknowledgement passes for every data one, so a rate of 388
+   datagrams a second released **54** — the mechanism throttled to a seventh of what it was told,
+   which is precisely the §4.260 signature.
+2. **Consuming the slot only for a datagram that carries data fixed that and overran the other way**:
+   the same second then released **960**, so the gate is not holding at the departure boundary either
+   — the consumption point and the place the pump's clock actually advances are not the same instant,
+   and a per-slot schedule cannot be driven by a clock that only moves when a packet is built.
+
+**Where that leaves the question**: the arithmetic of the schedule is exact (the connector reports
+exactly the rate it was told to hold), the gating is not yet right, and the mechanism itself has still
+never been judged on a fair reading. That is a *bug to finish*, not a wall — and it is the first time in
+this record that the remaining work is a specific, localised defect rather than a direction to search.
+
+**Nothing committed in the engine**: the work in progress was reverted, 116 tests pass. The two bugs
+above are written down because they are the map: the slot must be consumed at the moment a datagram is
+handed to the socket, not when a pass asks, and the schedule must be driven by the pump's own clock.
+
 ### 4.269 The last item on the list: a full loss table refuses nothing (2026-11-10)
 
 `MAX_LOST` is 4096 declared-but-unreaped records. What happens at the cap was the last question on
