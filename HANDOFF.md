@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.263 The soak passes: no wedge, no leak, and a drift the twin shares (2026-11-10)
+
+§4.257 left the soak undone because nothing had landed. It was run anyway, on the unchanged engine,
+because "every guard with evidence" is what F4 is for — and it is the one gate that can only be
+answered by the clock. **69 minutes, 24 samples, both arms.**
+
+| | `molehill` | twin `molehill~aa` |
+|---|---|---|
+| `wedge_count` | **0** | **0** |
+| `drift_rss_mib_per_min` | **0.1238** | 1.2996 |
+| `drift_fds_per_min` | 0.0844 | 0.1489 |
+| `drift_threads_per_min` | **−0.0068** | −0.0068 |
+| `rss_peak_mib` | 128–140 | 149–167 |
+| `fds_peak` | 55–63 | 55–62 |
+
+**Zero wedges, no thread growth, and a drift the twin shares** — the twin reads ten times the RSS drift
+of the candidate while running the same bytes, so the number is the run's noise, not the carrier's
+leak. Both are far below the model's own floors, which is why the run reports no failures.
+
+**One caveat, from the runner itself**: on `soak|clean#2` the `mean_carried_packet_b` difference is
+15.6 % against a 5 % floor, and the tool says about 38 rounds would be needed to resolve it. That is a
+statement about the experiment's power on a single round, not about the engine, and it is recorded
+rather than rounded away.
+
+**F4 is therefore complete on the baseline engine**: `just check`, `interop`, `l3-accept`, integrations
+3 × 22/22 on both carriers, the striped cell 20/20, the soak above, and `capacity` as the one guard
+that is bimodal on either arm (§4.257).
+
 ### 4.262 Two boundaries the suite had never crossed: the number wrap and the half-close (2026-11-10)
 
 Continuing the correctness work §4.261 started, on two properties that were simply not covered.
