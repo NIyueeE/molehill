@@ -3795,6 +3795,27 @@ mod tests {
             loop {
                 let mut progress = false;
                 let mut buf = Vec::new();
+                // **The timer, which the harness used to never run.** A real pump calls
+                // `on_timeout` whenever the connection's own deadline has passed; this one only ever
+                // called `poll_transmit`, so no test of a lost *last* packet could pass — the record
+                // sat in the flight table for ever and it looked like a protocol defect
+                // (`HANDOFF.md` §4.254). Both directions are driven, in the order their deadlines
+                // fall due.
+                for _ in 0..64 {
+                    let due = self.a.poll_timeout();
+                    if due.is_some_and(|due| due <= at) {
+                        let _ = self.a.on_timeout(at);
+                        progress = true;
+                        continue;
+                    }
+                    let due = self.b.poll_timeout();
+                    if due.is_some_and(|due| due <= at) {
+                        let _ = self.b.on_timeout(at);
+                        progress = true;
+                        continue;
+                    }
+                    break;
+                }
                 while let Some(len) = self.a.poll_transmit(at, &mut buf) {
                     moved += 1;
                     if self.takes_this_one() {
@@ -4458,6 +4479,10 @@ mod tests {
     fn a_lane_that_keeps_losing_still_completes_the_stream() {
         let start = Instant::now();
         let mut link = Link::new();
+        // **Armed before the opening exchange**, so the credit frame and the stream's own naming are
+        // both at risk — which is what a real path does and what a pattern armed after `pump(start)`
+        // never tested (`HANDOFF.md` §4.254).
+        link.loss_every = 20;
         link.pump(start);
         let stream = link.a.open();
         let bytes = payload(32 * 1024);
@@ -4471,7 +4496,6 @@ mod tests {
         // the casualties and the loss never stops. The payload is chosen so the pattern certainly
         // fires — a test whose loss never happens would pass by carrying everything cleanly, which
         // is the hollow shape this suite has been caught by before.
-        link.loss_every = 20;
         link.pump_dropping_one(start);
         let mut clock = start;
         let mut accepted = None;

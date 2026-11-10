@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.254 The harness never ran the timer, so "the tail never retires" was the harness (2026-11-10)
+
+§4.253's tail — 392 bytes in flight after twenty seconds of virtual time, `flight = buffered = 392`,
+never retired — is the **harness**, not the carrier. `Link::pump` called `poll_transmit` and
+`on_datagram` and nothing else: the retransmission timer, which a real pump runs whenever the
+connection's own deadline passes, **was never called**. A record waiting for the timer therefore sat
+in the flight table for ever, and any test whose last packet was lost would have shown the same
+"defect".
+
+**The harness now runs it**, for both directions, whenever `poll_timeout()` says the deadline has
+passed — which is exactly what `spawn_sender`/`spawn_receiver` do in production. The suite takes
+55 s instead of 18 s and all 109 tests pass with it.
+
+**And the loss test got harsher, because it now can.** `loss_every` is armed **before** the opening
+exchange, so the credit frame and the stream's own naming are among the casualties — the case a
+pattern armed after `pump(start)` could never reach. It passes: a lane that loses its opening, its
+credit and one datagram in twenty in both directions still carries 32 KiB.
+
+**Two self-corrections in two rounds** (§4.252 and this one), both of the same shape: a test's number
+read as a property of the engine. The pattern is worth naming in the plan — before a unit-level
+finding becomes a plan row, the *harness* has to be shown capable of the thing being tested: the
+timer, the loss, the partial write.
+
 ### 4.253 The minimal window change does not reproduce the collapse at unit scale (2026-11-10)
 
 The forward control §4.252 proposed: put back **only** the window at the send point — the picker
