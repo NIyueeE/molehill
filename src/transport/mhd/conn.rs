@@ -3731,11 +3731,16 @@ mod tests {
         fn pump_lossy(&mut self, now: Instant, drop_every: usize) -> usize {
             let mut moved = 0;
             let mut dropped = 0;
+            // **Time passes between datagrams here too.** A pump that polls at one instant is a
+            // sender emitting everything at once, and a pacer cannot be exercised against that any
+            // more than a timeout rule can (`HANDOFF.md` §4.204, §4.259).
+            let mut at = now;
             loop {
                 let mut progress = false;
                 let mut buf = Vec::new();
-                while let Some(len) = self.a.poll_transmit(now, &mut buf) {
+                while let Some(len) = self.a.poll_transmit(at, &mut buf) {
                     let datagram = buf[buf.len() - len..].to_vec();
+                    at += Self::SPACING;
                     moved += 1;
                     dropped += 1;
                     if dropped % drop_every != 0 {
@@ -3743,8 +3748,9 @@ mod tests {
                     }
                     progress = true;
                 }
-                while let Some(len) = self.b.poll_transmit(now, &mut buf) {
+                while let Some(len) = self.b.poll_transmit(at, &mut buf) {
                     let datagram = buf[buf.len() - len..].to_vec();
+                    at += Self::SPACING;
                     moved += 1;
                     dropped += 1;
                     if dropped % drop_every != 0 {
@@ -3753,11 +3759,11 @@ mod tests {
                     progress = true;
                 }
                 while let Some(datagram) = self.a_to_b.pop_front() {
-                    self.b.on_datagram(now, &datagram).unwrap();
+                    self.b.on_datagram(at, &datagram).unwrap();
                     progress = true;
                 }
                 while let Some(datagram) = self.b_to_a.pop_front() {
-                    self.a.on_datagram(now, &datagram).unwrap();
+                    self.a.on_datagram(at, &datagram).unwrap();
                     progress = true;
                 }
                 if !progress {
