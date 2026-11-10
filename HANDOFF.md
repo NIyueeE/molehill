@@ -377,6 +377,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.222 The credit works and the harness has four send loops that each give up (2026-11-10)
+
+Applied the saved patch and probed it before touching any test. One `pump` on an 8 KB transfer, with the schedule in:
+
+```
+moved=14  sent=8000 rep=0(0%) pkt=6 ack=8000 num=8000 paced=8  accept=true
+```
+
+**The schedule works**: the whole transfer completes in one pump, the credit engaged eight times, and the stream is
+named. So the rule is not the problem — and that probe is the reason the rest of this round is a harness story.
+
+The failure is that **the harness sends from four different loops** and every one of them gives up on the first `None`:
+
+| loop | what it does when the credit says "not yet" |
+|---|---|
+| `pump_spaced` | waits for a pending arrival, else advances 1 ms — the only one that recovers |
+| `next_a` / `next_b` | was `poll_transmit` once and return `None`; a wait loop was added, and the count moved 8 → 10 |
+| `pump_dropping_one` (send side) | same, then routed through `next_a` |
+| `pump_dropping_one` (ack side) | was `poll_transmit` once; routing it through `next_b` made it *worse* (10 failures) |
+
+**Two rounds of whack-a-mole moved the count 8 → 10 → 8**, which is the signal to stop: the fix is not four patches, it
+is **one** send helper (`Link::send_until(id, want)`) that every loop calls, and rewriting the eight tests on top of
+it. That is a harness refactor, and bundling it with the rule is how the last four rounds of this stage went wrong.
+
+**Committed: nothing.** The tree is `a02df07`'s state, 107 tests green. The schedule remains `/tmp/schedule-credit.patch`
+and the next round starts with the harness refactor, not with the rule.
+
 ### 4.221 The schedule is a credit bucket now, the suite terminates, six tests assert the old contract (2026-11-10)
 
 The slot arithmetic from §4.220 was the wrong shape: a slot that advances per *packet* still lets a pass overdraw it into
