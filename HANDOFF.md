@@ -377,6 +377,47 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.258 The pacer parks on a lossy path, and the delay signal is why (2026-11-10)
+
+The fourth mechanism, and the first that does not touch the window: **a rate**, held in a token
+bucket, gating new data at the picker while repairs and probes pass untouched. Bucket two segments,
+starting full — an empty bucket can never send a lane's first packet, which cost a suite run to
+learn. The rate starts at what the opening window supports over `min_rtt`, doubles once per round
+trip while the path shows no queue, cuts when it does.
+
+**Unit suite: 109 green.** The whole family of harness bugs it exposed is worth keeping: the lossy
+pump now counts **data** datagrams rather than every datagram, because with one data packet per pass
+and its acknowledgement behind it a one-in-twenty pattern takes only acknowledgements — the test
+passed while testing nothing (`pump_lossy`, and a matching `loss_data_every` on `Link`).
+
+**Bench, two variants, both fail:**
+
+| cell | arm | `throughput_gbps` | drops |
+|---|---|---|---|
+| `loss1` | baseline | **1.441** | 448 |
+| | cut on loss **or** queue | 0.0304 | 265 |
+| | cut on queue **only** | **0.0304** | 232 |
+| `rate100_shallow` | baseline | 0.0832 | 6 788 |
+| | cut on loss **or** queue | 0.0821 | **3 274** |
+| | cut on queue **only** | 0.0816 | 5 500 |
+
+Removing the loss cut changes nothing on `loss1` — the two variants are identical to three digits —
+so the collapse is the **queue gate itself**, not the loss response: the rate doubles, a smoothed
+round trip above `min_rtt + min_rtt/4` cuts it, and on a shaped path whose queue fluctuates the gate
+closes most round trips, parking the rate near where it started. 3.8 MB/s against the path's 181.
+
+The shallow cell's drops improved once (6 788 → 3 274) and not the second time (5 500), and neither
+is within two orders of the peers' 17, so there is no version of this worth keeping.
+
+**Reverted whole.** The plan's guard is "not below the baseline on any lossy cell", and `loss1` is
+thirty times below it; that is not a tuning gap, it is the delay signal being unable to tell a
+standing queue from a path that always has one — the same wall the third plan hit in §4.230–§4.231.
+
+**Two families are now closed by measurement rather than by opinion**: the window moved to the send
+point (§4.249, §4.255, §4.256) and the rate derived from delay (§4.259). Both fail on the same cell
+in the same direction, and the second one shows why the first was never going to work either — on
+this path shape, "is there a queue?" answers yes most of the time.
+
 ### 4.257 F4's mechanical close-out on the baseline engine, and capacity is bimodal (2026-11-10)
 
 With the window family closed and the tree byte-identical to `6ed32c1`, the fourth plan's §七 regression
