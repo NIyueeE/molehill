@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.223 Two changes cut the failures 8 → 3, and the last three are declarations, not pacing (2026-11-10)
+
+Rather than rewrite the harness's four send loops, two changes to the schedule itself:
+
+1. **The credit is a run-sized burst allowance** (44 segments, not 2). The *rate* is the deadline's job: the pump wakes
+   at `pace_due` and then empties a run. A two-segment credit made a wake build two packets and park the rest, which is
+   a rate limiter with a two-packet burst — and against a harness that pumps once, that is indistinguishable from a
+   stall.
+2. **A lane paces only after its window has grown past its opening size.** The first window is how a lane discovers the
+   path; it has no rate to pace against, and holding it back slows the discovery it depends on.
+
+**The failing count went 8 → 3**, and the remaining three are not about pacing at all:
+
+```
+a_loss_re_sends_the_hole_and_not_what_follows_it:
+  the first frame re-sent is the hole itself: left: None
+a_prefix_over_a_declared_loss_counts_those_bytes_as_late:
+  both records are stale: left: 0 right: 2
+a_two_dropped_datagrams_in_one_window_are_both_recovered
+```
+
+All three drive declaration by hand — they send a few records, then call `on_timeout` or poll for a repair at a fixed
+instant — and under the schedule **the records they expect to be in flight were never built**: `declared == 0` means the
+table was empty, not that the timer was early. That is now a question about *when* those tests send, per test.
+
+**Committed: nothing.** The tree is `a02df07`'s state, 107 tests green; the improved patch (297 lines, the two changes
+above included) is `/tmp/schedule-credit.patch`. The remaining work is three tests, each deciding what it is for.
+
 ### 4.222 The credit works and the harness has four send loops that each give up (2026-11-10)
 
 Applied the saved patch and probed it before touching any test. One `pump` on an 8 KB transfer, with the schedule in:
