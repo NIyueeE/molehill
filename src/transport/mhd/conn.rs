@@ -3826,6 +3826,15 @@ mod tests {
                             at = at.max(due);
                             waited += 1;
                         }
+                        // **Nothing in flight and nothing built: let the clock move.** A paced
+                        // sender answers `None` until its next packet is due, so a harness that
+                        // only ever asks at one instant would sit still for ever. This is the
+                        // virtual-time equivalent of a pump that wakes at the deadline
+                        // (`HANDOFF.md` §4.219).
+                        _ if waited < 4096 => {
+                            at += Duration::from_millis(1);
+                            waited += 1;
+                        }
                         _ => return moved,
                     }
                 }
