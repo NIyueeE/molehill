@@ -377,6 +377,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.265 The kernel send buffer is not the lever either, and the cell's own noise is the story (2026-11-10)
+
+The last unmeasured thing on the send side: the socket's send buffer, thirty-two megabytes, which
+lets a lane hand the qdisc everything it has before anything blocks. A quarter of a megabyte makes
+the send path wait instead, and a wait shows up as queueing delay rather than as a drop — which is
+the right direction for this project's first priority.
+
+**Measured on `rate100_shallow`, four rounds, baseline interleaved:**
+
+| arm | throughput | drops |
+|---|---|---|
+| baseline (32 MiB buffer) | 0.08345 | 2 054 (1 885 / 2 465 / 1 927 / 2 182) |
+| candidate (256 KiB) | 0.0825 | 2 480 (2 364 / 2 104 / 7 389 / 2 596) |
+| twin, same binary | 0.0833 | 2 416 |
+
+**The candidate sits on its own twin to within the noise**, so the buffer moved nothing. That is a
+result about the *cell* as much as about the change — and it is the most useful reading of the whole
+day: **this cell's drops range from two thousand to seven thousand five hundred round to round** on
+the same binary against the same baseline, and every "improvement" or "regression" of a few thousand
+in this record is inside that range. The peers' sixteen is not inside it; that gap is real and no
+lever in this carrier closes it.
+
+Reverted, because a neutral result does not justify a product behaviour change whose effect on the
+throughput cells was never measured. The engine is byte-identical to `6ed32c1`, 113 tests pass.
+
+**The ledger of levers, now complete on the send side**: window geometry (§4.249, §4.255, §4.256),
+rate from delay (§4.258), rate from delivery (§4.260), burst size (§4.264), kernel send buffer (this
+one). Every one is either worse or neutral, and the last two say why the others could not win: the
+carrier is not dropping because of how it shapes its own sending — it is dropping because it sends at
+the path's rate into a buffer that is smaller than the path's bandwidth-delay product.
+
 ### 4.264 The burst size is already at its optimum, and the curve is steep on both sides (2026-11-10)
 
 Six controllers failed because they adjust *how much* may be outstanding. `SEND_RUN` — how many
