@@ -1938,7 +1938,6 @@ impl Conn {
             wire::Ack {
                 stream: self.arrived_stream,
                 prefix: self.arrived_prefix,
-                delivered: 0,
                 ..block
             }
         });
@@ -5543,7 +5542,6 @@ mod tests {
             bits: 0,
             stream: stream.id,
             prefix: 4000,
-            delivered: 0,
         };
         conn.apply_ack(now, block, false);
 
@@ -5887,7 +5885,6 @@ mod tests {
                 bits: 0,
                 stream: stream.id,
                 prefix: len,
-                delivered: 0,
             },
             false,
         );
@@ -5937,7 +5934,6 @@ mod tests {
                 bits: 0,
                 stream: stream.id,
                 prefix: len,
-                delivered: 0,
             },
             false,
         );

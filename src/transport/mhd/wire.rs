@@ -77,7 +77,7 @@ pub(crate) const HEAD: usize = 9;
 /// duplicates and reordering, so it is the one field a stalled number frontier
 /// cannot corrupt. It rides every packet, which costs twelve bytes: 0.86 % of a
 /// full datagram.
-pub(crate) const ACK: usize = 32;
+pub(crate) const ACK: usize = 28;
 /// stream id + offset + length.
 pub(crate) const STREAM: usize = 14;
 /// the connection-wide credit, absolute.
@@ -190,8 +190,6 @@ pub(crate) struct Ack {
     /// acknowledgement costs nothing permanent — the next one carries a value
     /// at least as large.
     pub(crate) prefix: u64,
-    /// What the path is delivering to this end, in bytes per second.
-    pub(crate) delivered: u32,
 }
 
 impl Ack {
@@ -309,7 +307,6 @@ impl AckSet {
                 // connection knows which stream it last took bytes for.
                 stream: 0,
                 prefix: 0,
-                delivered: 0,
             }),
             None => None,
         }
@@ -445,8 +442,7 @@ pub(crate) fn encode(
         buf[at + 4..at + 8].copy_from_slice(&block.below.to_le_bytes());
         buf[at + 8..at + 16].copy_from_slice(&block.bits.to_le_bytes());
         buf[at + 16..at + 20].copy_from_slice(&block.stream.to_le_bytes());
-        buf[at + 20..at + 28].copy_from_slice(&block.prefix.to_le_bytes());
-        buf[at + 28..at + ACK].copy_from_slice(&block.delivered.to_le_bytes());
+        buf[at + 20..at + ACK].copy_from_slice(&block.prefix.to_le_bytes());
         at += ACK;
     }
     match frame {
@@ -549,11 +545,10 @@ pub(crate) fn encode_stream(
         out.extend_from_slice(&block.bits.to_le_bytes());
         out.extend_from_slice(&block.stream.to_le_bytes());
         out.extend_from_slice(&block.prefix.to_le_bytes());
-        // **The delivery report closes the block here too.** This encoder writes the layout by hand
-        // while `encode` writes it by offset, and a field added to one and not the other makes every
-        // stream packet claim four bytes more than it holds — measured as a span overrunning the
-        // run buffer by exactly four (`HANDOFF.md` §4.277).
-        out.extend_from_slice(&block.delivered.to_le_bytes());
+        // **This layout is written twice** — here, field by field, and in `encode`, by offset. A
+        // field added to one and not the other makes every stream packet claim four bytes more than
+        // it holds, which shows up as a span overrunning the send run and cost two wrong diagnoses
+        // (§4.275, §4.276) before a backtrace named this line (§4.277). Keep the two in step.
     }
     out.extend_from_slice(&stream.to_le_bytes());
     out.extend_from_slice(&offset.to_le_bytes());
@@ -638,9 +633,8 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
         let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
         let bits = u64::from_le_bytes(array);
         let stream = bytes(at + 16..at + 20)?;
-        let slice = buf.get(at + 20..at + 28).ok_or(Malformed)?;
+        let slice = buf.get(at + 20..at + ACK).ok_or(Malformed)?;
         let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
-        let delivered = bytes(at + 28..at + ACK)?;
         at += ACK;
         Some(Ack {
             largest,
@@ -648,7 +642,6 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
             bits,
             stream,
             prefix: u64::from_le_bytes(array),
-            delivered,
         })
     } else {
         None
@@ -750,7 +743,6 @@ mod tests {
             // still pass every other test with it.
             stream: 42,
             prefix: 9_000_000_000,
-            delivered: 1_234_567,
         };
         let data = [1u8, 2, 3, 4, 5];
         let cases = [
