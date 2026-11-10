@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.228 D4 after the fix: the deficit is consistent, small, and on every rate cell (2026-11-10)
+
+All six cells on the current binary (B's `send_gso` fix in, all ten mechanisms reverted), one campaign after another in a
+single sitting, two measured rounds each:
+
+| cell | molehill | twin (`molehill~aa`) | peers | verdict |
+|---|---|---|---|---|
+| `loss5` (`--scale 2`) | **0.2521 / 0.2567** | 0.2708 / 0.2345 | 0.0556 / 0.2534 | **below the 0.3628 guard** — and so is the twin |
+| `rate100_shallow` | 0.0838 / 0.0855, drops **2 153 / 2 892** | 0.0831 / 0.0837, 7 916 / 2 093 | 0.0952–0.0955, **16 / 17** | −11 % throughput, drops ×150 |
+| `rate100` | 0.0856 / 0.0865 | 0.0866 / 0.0867 | 0.0952–0.0955 | −10 % |
+| `rate1000` | **0.8702 / 0.8763** | 0.8819 / 0.8830 | 0.954 / 0.957 | −8.7 % |
+| `bulk-n` (clean) | **12.263 / 13.049** | 12.890 / 12.888 | rathole 28.5 / 27.7 | at the 13.10 floor, twin too |
+| `loss1` | 1.481 / 1.3908 | 1.343 / 1.4054 | frp 1.11, rathole 4.3 | at the twin |
+| `jitter` | 0.8545 / 0.6991 | 0.7635 / 0.8071 | frp 0.89 | mixed, one arm-round failed |
+| `transport` | open **3 µs**, first byte **60–76 µs**, recovery **3–5 µs**, errors **0** | same | — | unchanged from §4.211 |
+
+**Three findings, and the first one is what the stage needed.**
+
+1. **On every rate cell the carrier is 8–11 % below TCP, and consistently so** — 0.0856 against 0.0954 at `rate100`,
+   0.8702 against 0.9561 at `rate1000`, 0.0838 against 0.0955 at the shallow cell. That is a small, uniform deficit, not
+   the 20 % the D4 record carried and not the "does not reproduce" some cells were marked. It is the number to beat.
+2. **`loss5` reads 0.2521/0.2567 today against 0.425/0.542/0.467 in §4.211, on the same engine** — and the twin fell with
+   it (0.2708/0.2345 against §4.211's 0.420–0.515). Both arms of a same-run pair moved together, so this is the machine
+   and the sitting, not the code; the cell is **not settled** and its guard (0.3628) is not met in this sitting by either
+   arm.
+3. **The shallow cell's drops are 2 153/2 892 today, not the 6 878/7 078 §4.214 recorded**, with the twin at 7 916 on one
+   round. The defect is real but its size is not stable across sittings either.
+
+**What this means for D4's charter.** The cells that hold are `transport` (exactly), `loss1` (at the twin) and `bulk-n`
+(at the floor, twin too); the cells that are uniformly behind are the three rate cells, by 8–11 %; the two anisotropic
+ones (`loss5`, `jitter`) are outside their guards *in this sitting for every arm*, which is a property of the sitting
+before it is a property of the carrier.
+
+**Not committed: nothing changed in the engine.** This entry is the D4 record.
+
 ### 4.227 A⁸ judged against the same-run twin fails too, and `loss5` fails harder (2026-11-10)
 
 A⁸ changes the threshold, not the mechanism, so A⁷'s binary answers it on both cells. Shallow cell, against the criteria as
