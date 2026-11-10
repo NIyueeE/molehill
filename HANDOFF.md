@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.220 The schedule is authorised, its arithmetic is fixed, and five tests are left (2026-11-10)
+
+The human authorised option ① — the schedule — so this round did the two halves the last one named.
+
+**The harness half is landed** (`a02df07`): `pump` advances virtual time a millisecond at a time when nothing was built
+and nothing is in flight, bounded, so a sender that answers "not yet" is waited for rather than declared quiet. All 107
+tests pass with it and the engine unchanged.
+
+**The rule half is written and its arithmetic is fixed.** The first version put the slot *ahead* by one spacing on
+every call — `sent_at + spacing` — which wedges: a pass asks, is refused, asks again, and the slot never comes back.
+**A hang, not a failure**, which is why the suite had to be killed twice. The correct rule is that the slot is *virtual
+send time*: it starts at the first send and advances **exactly one spacing per packet actually sent**, never ahead of
+the work. A pass then emits the number of segments the elapsed time has earned and stops, which is what a paced sender
+is.
+
+**With that fixed, five connection tests fail and nothing hangs**, and they fail for one reason that is now precise:
+they poll `poll_transmit` themselves, in a loop with a single `now`, so the schedule gives them two packets where they
+expect nine. They need a harness helper that keeps polling with an advancing clock (`drain_a(now, want)`), not a
+different schedule.
+
+**Not committed in the engine**: the schedule, with the five tests still red, would put an unverified rule in the tree.
+The tree is `a02df07`'s state, 107 tests green, and the remaining work is one helper and five tests.
+
 ### 4.219 The send schedule compiles and cannot be tested yet, which is the honest stopping point (2026-11-10)
 
 The step the seven failures point at — a **schedule** rather than a budget: `Conn` keeps `sent_at`, computes `next_due` as one
