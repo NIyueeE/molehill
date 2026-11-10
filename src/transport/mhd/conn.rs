@@ -4599,6 +4599,127 @@ mod tests {
         );
     }
 
+    /// **A half-closed stream still carries the other direction.**
+    ///
+    /// One end says it has nothing more to send; the other is still writing. That is the ordinary
+    /// shape of a request and a response, and it is the one place where "finished" and "retired"
+    /// must not be the same word: a stream retired on its first `fin` loses everything the other
+    /// direction had left, and the reader would see a short answer rather than an error.
+    #[test]
+    fn a_half_closed_stream_still_carries_the_other_direction() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        link.pump(start);
+        let stream = link.a.open();
+        let request = payload(4 * 1024);
+        let mut written = 0usize;
+        let mut clock = start;
+        let mut accepted = None;
+        let mut got = Vec::new();
+        let mut finished = false;
+        // The request, then the `fin`: this end has nothing more to say.
+        for _ in 0..200 {
+            clock += Duration::from_millis(5);
+            link.pump(clock);
+            if written < request.len() {
+                written += link.a.write(stream.id, &request[written..]);
+            } else if !finished {
+                link.a.finish(stream.id);
+                finished = true;
+            }
+            if accepted.is_none() {
+                accepted = link.b.accept();
+            }
+            if let Some(stream) = accepted {
+                got.extend_from_slice(&take(&mut link.b, stream.id));
+                if got.len() == request.len() && finished {
+                    break;
+                }
+            }
+        }
+        assert_eq!(got, request, "the request arrives whole before the answer");
+
+        // The answer, written *after* the other direction closed.
+        let answer = payload(3 * 1024);
+        let mut replied = 0usize;
+        let mut out = Vec::new();
+        let Some(peer) = accepted else {
+            unreachable!("the request was read, so the stream is named")
+        };
+        for _ in 0..200 {
+            clock += Duration::from_millis(5);
+            if replied < answer.len() {
+                replied += link.b.write(peer.id, &answer[replied..]);
+            }
+            link.pump(clock);
+            out.extend_from_slice(&take(&mut link.a, stream.id));
+            if out.len() == answer.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            out,
+            answer,
+            "the half that closed still reads: got {} of {}",
+            out.len(),
+            answer.len()
+        );
+    }
+
+    /// **The packet numbers wrap, and the stream survives it.**
+    ///
+    /// The number is a `u32` on the wire: after four billion packets it goes back to zero, and every
+    /// place that compares two numbers — the cumulative frontier, the sixty-four-number bitmap, the
+    /// retirement walk, the stall filter — meets the boundary exactly once per connection. Nothing in
+    /// this suite had ever crossed it, and a comparison written as `number > ack.largest` is correct
+    /// everywhere except here. Both ends start eight numbers below the wrap so the transfer crosses
+    /// it within the first few packets.
+    #[test]
+    fn the_packet_numbers_wrap_without_losing_a_stream() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        let below = u32::MAX - 2;
+        link.a.recovery.seed_number(below);
+        link.b.recovery.seed_number(below);
+        link.b.acks.seed_below(below);
+        link.pump(start);
+        let stream = link.a.open();
+        let bytes = payload(8 * 1024);
+        let mut written = 0usize;
+        let mut clock = start;
+        let mut accepted = None;
+        let mut out = Vec::new();
+        for _ in 0..600 {
+            clock += Duration::from_millis(5);
+            link.pump(clock);
+            if written < bytes.len() {
+                written += link.a.write(stream.id, &bytes[written..]);
+            }
+            if accepted.is_none() {
+                accepted = link.b.accept();
+            }
+            if let Some(stream) = accepted {
+                out.extend_from_slice(&take(&mut link.b, stream.id));
+                if out.len() == bytes.len() && written == bytes.len() {
+                    break;
+                }
+            }
+        }
+        assert!(
+            link.a.recovery.last_number() < 64,
+            "the transfer must have crossed the wrap: last number {}",
+            link.a.recovery.last_number()
+        );
+        assert_eq!(
+            out,
+            bytes,
+            "every byte arrives across the wrap: got {} of {} (below now {})",
+            out.len(),
+            bytes.len(),
+            link.b.acks.below()
+        );
+    }
+
     /// **A lane that keeps losing still carries its stream.**
     ///
     /// The floor one test down drops the opening and nothing else, which is a single accident. The

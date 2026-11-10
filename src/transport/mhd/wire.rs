@@ -231,6 +231,15 @@ impl AckSet {
     /// How many out-of-order numbers one receiver may remember.
     const AHEAD: usize = 256;
 
+    /// Start the frontier just below the wrap, for a test that walks the numbers through it.
+    #[cfg(test)]
+    pub(crate) fn seed_below(&mut self, below: u32) {
+        self.below = below;
+        self.largest = None;
+        self.bits = 0;
+        self.gaps.clear();
+    }
+
     /// Record that this packet number arrived. Answers whether it was news.
     pub(crate) fn insert(&mut self, number: u32) -> bool {
         if number < self.below {

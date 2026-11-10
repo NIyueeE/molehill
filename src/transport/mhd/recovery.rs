@@ -383,6 +383,16 @@ impl Recovery {
     }
 
     /// Reserve the next packet number, whether or not it is tracked.
+    /// Start numbering just below the wrap, so a test can walk the numbers through it.
+    ///
+    /// The counter is a `u32` and the wire carries it as one: after four billion packets it wraps,
+    /// and every comparison against it — the cumulative frontier, the sixty-four-number bitmap, the
+    /// retirement loop — has to survive that. Nothing in the suite had ever crossed the boundary.
+    #[cfg(test)]
+    pub(crate) fn seed_number(&mut self, next: u32) {
+        self.next = next;
+    }
+
     pub(crate) fn next_number(&mut self) -> u32 {
         let number = self.next;
         self.next = self.next.wrapping_add(1);

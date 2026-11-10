@@ -377,6 +377,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.262 Two boundaries the suite had never crossed: the number wrap and the half-close (2026-11-10)
+
+Continuing the correctness work §4.261 started, on two properties that were simply not covered.
+
+**The packet number is a `u32` on the wire**, and it wraps once per connection after four billion
+packets. Every comparison against it — the cumulative frontier, the sixty-four-number bitmap, the
+retirement walk, `number > ack.largest` — is correct everywhere except there. Both ends are now
+seeded eight numbers below the wrap (test-only `Recovery::seed_number` and `AckSet::seed_below`), an
+8 KiB transfer crosses it in the first few packets, and it **passes**: every byte arrives, the
+frontier ends above zero, and nothing is declared lost on the way through. That is coverage the
+carrier did not have, and it cost a helper on each side.
+
+**A half-closed stream still carries the other direction**, which is the ordinary shape of a request
+and a response. One end writes 4 KiB and sends `fin`; the other, *after* that `fin`, writes 3 KiB
+back; the closed end reads it. It passes — so "finished" and "retired" are not the same word in this
+engine, which is the property that would have been silent if it were wrong: a stream retired on its
+first `fin` loses the answer and the reader sees a short reply rather than an error.
+
+**Neither found a defect**, and that is worth as much as finding one: both are places where a bug
+would be invisible in the bench cells (a 4 GiB transfer is not in any scenario; a request/response
+stream is not what `bulk-1` measures) and would surface only in a long-lived connection or a real
+workload. `113` tests now, no engine change.
+
+**What is left on this list**: `MAX_LOST` (4096 records) overflowing, a remote reset while bytes are
+still in flight, and `fin` after `reset`. Each is a unit-level question with the harness as it
+stands.
+
 ### 4.261 The carrier tolerates reordering, and now says so (2026-11-10)
 
 With the five control mechanisms closed, the round turned to a property none of them had touched:
