@@ -139,21 +139,6 @@ fn opening(state: &StreamState) -> bool {
 /// flight, which is what keeps the recovery table proportional to the
 /// bandwidth-delay product instead of to the credit window.
 const INITIAL_CWND: u64 = 10 * MAX_STREAM_PAYLOAD as u64;
-/// The slowest the send schedule may release bytes.
-const PACE_FLOOR_BPS: f64 = 256.0 * 1024.0;
-/// The shortest round trip the schedule will pace against.
-const PACE_GRANULARITY: Duration = Duration::from_millis(1);
-/// How long a delivery-rate sample covers before it may seed the schedule.
-const RATE_WINDOW_MS: u64 = 100;
-/// Credits the schedule may bank.
-///
-/// **A whole run, because the rate is the deadline's job, not the credit's.** The pump wakes at
-/// [`Conn::pace_due`] and then empties a run; if the credit were two segments it would build two
-/// packets per wake and leave the rest parked, which is a rate limiter with a 2-packet burst —
-/// measured as six connection tests failing on a harness that pumps once
-/// (`HANDOFF.md` §4.222). With a run's worth of credit, one wake sends one run and the next wake is
-/// one rate-period later.
-const CREDIT_CAP: f64 = 44.0;
 
 /// The most the congestion window may grow to.
 ///
@@ -650,8 +635,6 @@ pub(crate) struct SendLedger {
     probes: u64,
     /// Bytes the window grew by since the last report.
     grown: u64,
-    /// Segments withheld because the send schedule had no credit: proof it engaged.
-    paced: u64,
     /// Writes refused by each bound. `aged` is the flight-age gate, which refuses a
     /// lane that has done nothing wrong except fall behind on acknowledgements;
     /// `buffer` is the ceiling this end's own `MAX_BUFFERED` put on bytes the peer
@@ -727,7 +710,7 @@ impl std::fmt::Display for SendLedger {
         write!(
             f,
             "sent={} rep={}({}%) pkt={} ack={} num={} pfx={} late={} \
-             loss={}t/{}m probe={} grow={} paced={} refus={}w/{}b/{}c/{}a \
+             loss={}t/{}m probe={} grow={} refus={}w/{}b/{}c/{}a \
              stop={}none/{}quiet/{}closed/{}other recv={} dup={}",
             self.sent_bytes,
             self.sent_repair_bytes,
@@ -741,7 +724,6 @@ impl std::fmt::Display for SendLedger {
             self.lost_by_timer,
             self.probes,
             self.grown,
-            self.paced,
             self.refused_window,
             self.refused_buffer,
             self.refused_credit,
@@ -1065,17 +1047,6 @@ pub(crate) struct Conn {
     slow_start: bool,
     /// Bytes acknowledged since the window last grew additively.
     acked_since_growth: u64,
-    /// The send schedule's credit, in segments, and when it was last topped up.
-    ///
-    /// **This is the clock the carrier never had** (`HANDOFF.md` §4.218): a packet of new data
-    /// leaves only when there is credit, and credit accrues with elapsed time at
-    /// [`Self::schedule_rate`]. Repairs and probes are exempt — they exist to unblock the peer and
-    /// the clock, and withholding them would keep the lane waiting on itself.
-    credits: f64,
-    credits_at: Option<Instant>,
-    rate_bytes: u64,
-    rate_at: Option<Instant>,
-    rate_bps: Option<f64>,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
     /// A close that waits for what is already queued to leave first.
@@ -1222,13 +1193,6 @@ impl Conn {
             cwnd: INITIAL_CWND,
             window_reported_at: Instant::now(),
             slow_start: true,
-            // A full bucket at the start: a lane may always open, and its first pass may empty a
-            // run. The rate lives in the deadline, not in the credit.
-            credits: CREDIT_CAP,
-            credits_at: None,
-            rate_bytes: 0,
-            rate_at: None,
-            rate_bps: None,
             acked_since_growth: 0,
             closed: None,
             close_after: None,
@@ -1764,17 +1728,10 @@ impl Conn {
         if self.closed.is_some() {
             return None;
         }
-        let base = match self.recovery.poll_timeout() {
-            Some(timer) => timer.min(self.keepalive_at),
-            None => self.keepalive_at,
-        };
-        // **When credit is what holds a packet back, its refill is the deadline**, or a paced lane
-        // would sleep to the retransmission timer over a wait of a few hundred microseconds.
-        let waiting = self.streams.values().any(|state| state.send.has_unsent());
-        if !waiting {
-            return Some(base);
+        match self.recovery.poll_timeout() {
+            Some(timer) => Some(timer.min(self.keepalive_at)),
+            None => Some(self.keepalive_at),
         }
-        Some(base.min(self.pace_due(Instant::now())))
     }
 
     /// Append the next datagram to `out`, answering its length.
@@ -2082,7 +2039,7 @@ impl Conn {
             repair,
         }) = ({
             let picking = stats::enabled().then(std::time::Instant::now);
-            let picked = self.next_stream_range(now);
+            let picked = self.next_stream_range();
             if let Some(at) = picking {
                 self.pick_us = self
                     .pick_us
@@ -2546,15 +2503,12 @@ impl Conn {
     /// vector of ids: a packet is built for every pass, and allocating a list of
     /// every live stream per packet is a cost that grows with the connection's
     /// width.
-    fn next_stream_range(&mut self, now: Instant) -> Option<Pick> {
+    fn next_stream_range(&mut self) -> Option<Pick> {
         if self.streams.is_empty() {
             self.unsent_at = None;
             return None;
         }
         let cursor = self.cursor;
-        // **The schedule gates new data only**, decided here because the credit is mutable state
-        // the closure cannot touch.
-        let may_send_new = self.take_credit(now);
         let eligible = |(id, state): (&u32, &StreamState)| {
             // `Finished` ends the peer's *write* direction, not the stream: the
             // other direction is still ours to use (that is what half-close
@@ -2573,17 +2527,16 @@ impl Conn {
                     repair: true,
                 });
             }
-            if !may_send_new || !state.send.has_unsent() {
-                return None;
-            }
-            let offset = state.send.next_offset();
-            let unsent = state.send.unacked();
-            let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
-            Some(Pick {
-                id: *id,
-                offset,
-                len: want,
-                repair: false,
+            state.send.has_unsent().then(|| {
+                let offset = state.send.next_offset();
+                let unsent = state.send.unacked();
+                let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
+                Pick {
+                    id: *id,
+                    offset,
+                    len: want,
+                    repair: false,
+                }
             })
         };
         self.streams
@@ -2673,70 +2626,6 @@ impl Conn {
     /// keeps the window it always had; a loopback lane — whose estimate is the
     /// estimator's own one-millisecond granularity — keeps a quarter of a
     /// mebibyte.
-    /// Fold confirmed bytes into the delivery-rate estimate the schedule uses.
-    fn measure_rate(&mut self, now: Instant, bytes: u64) {
-        self.rate_bytes = self.rate_bytes.saturating_add(bytes);
-        let since = self.rate_at.get_or_insert(now);
-        let elapsed = now.saturating_duration_since(*since);
-        if elapsed < Duration::from_millis(RATE_WINDOW_MS) {
-            return;
-        }
-        let seconds = elapsed.as_secs_f64();
-        if seconds > 0.0 {
-            let sample = f64::from(u32::try_from(self.rate_bytes).unwrap_or(u32::MAX)) / seconds;
-            self.rate_bps = Some(match self.rate_bps {
-                Some(previous) => previous * 0.5 + sample * 0.5,
-                None => sample,
-            });
-        }
-        self.rate_bytes = 0;
-        self.rate_at = Some(now);
-    }
-
-    /// Segments per second the schedule releases at: the larger of what the window implies and
-    /// what the path has delivered, never below a floor.
-    ///
-    /// **The maximum is the point.** A rate from the window alone locks while the window is small;
-    /// a rate from the delivery alone locks at whatever it started with — both measured and both
-    /// fatal (`HANDOFF.md` §4.217, §4.218). The maximum cannot lock: the delivered half is non-zero
-    /// once anything has arrived, and the window half grows with the window.
-    fn schedule_rate(&self) -> f64 {
-        let window = self.recovery.smoothed_rtt().map_or(0.0, |smoothed| {
-            let seconds = smoothed.max(PACE_GRANULARITY).as_secs_f64();
-            f64::from(u32::try_from(self.cwnd).unwrap_or(u32::MAX)) / seconds
-        });
-        let rate = window.max(self.rate_bps.unwrap_or(0.0)).max(PACE_FLOOR_BPS);
-        rate / f64::from(u32::try_from(MAX_STREAM_PAYLOAD).unwrap_or(u32::MAX))
-    }
-
-    /// Top the credit up and answer whether a segment may leave now.
-    fn take_credit(&mut self, now: Instant) -> bool {
-        // **A lane paces only after its window has grown past its opening size.** The first window
-        // is how a lane discovers the path at all — it has no rate to pace against, and holding it
-        // back would make the discovery slower than the thing it measures. From the second window
-        // on, the rate is known and the schedule applies.
-        if self.cwnd <= INITIAL_CWND {
-            return true;
-        }
-        let at = self.credits_at.get_or_insert(now);
-        let elapsed = now.saturating_duration_since(*at).as_secs_f64();
-        self.credits = (self.credits + self.schedule_rate() * elapsed).min(CREDIT_CAP);
-        self.credits_at = Some(now);
-        if self.credits >= 1.0 {
-            self.credits -= 1.0;
-            return true;
-        }
-        self.ledger.paced = self.ledger.paced.saturating_add(1);
-        false
-    }
-
-    /// When the schedule's credit will reach one segment again, for the pump's deadline.
-    fn pace_due(&self, now: Instant) -> Instant {
-        let missing = (1.0 - self.credits).max(0.001);
-        let wait = Duration::from_secs_f64(missing / self.schedule_rate());
-        now + wait
-    }
-
     pub(crate) fn window_ceiling(&self) -> u64 {
         // The **minimum** round trip, not the smoothed one: a ceiling derived from a
         // queued estimate raises its own ceiling, and the lane then latches into a
@@ -3603,7 +3492,6 @@ impl Conn {
         // additive — one packet per window acknowledged — and the window is
         // never cut: a loss is repaired by retransmission, not paid for by
         // halving the pipe for a round trip.
-        self.measure_rate(now, u64::try_from(acked.bytes).unwrap_or(u64::MAX));
         let before = self.cwnd;
         if acked.progress {
             let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
@@ -3800,44 +3688,19 @@ mod tests {
         }
 
         /// Poll one datagram from `a`, stamped a spacing after the previous one.
-        /// The instant the sender has actually reached.
-        ///
-        /// **The harness's virtual clock runs ahead of the test's `now`** — every poll advances it a
-        /// spacing, and every wait for credit advances it further. A test that drives the timer with
-        /// its own `now` therefore talks about records that were sent *in the future*, which is how
-        /// three tests failed with `flight = 2000` and nothing stale (`HANDOFF.md` §4.225).
-        fn wire_clock(&self, now: Instant) -> Instant {
-            now + self.sent
-        }
-
         fn next_a(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<usize> {
-            // A paced sender answers "nothing yet" until its credit refills, so a harness that
-            // asks once and gives up sees one or two packets where it used to see a whole run —
-            // the reason six tests failed when the schedule was first tried (`HANDOFF.md` §4.220).
-            // This keeps asking and lets virtual time pass, which is what the pump does.
-            // **Bounded in time, not in iterations.** The schedule's slowest release is one
-            // segment per floor-rate slot (about five milliseconds), so a hundred of them covers a
-            // refused sender without pushing the harness clock minutes ahead of the test's.
-            for _ in 0..100 {
-                if let Some(len) = self.a.poll_transmit(now + self.sent, buf) {
-                    self.sent += Self::SPACING;
-                    return Some(len);
-                }
-                self.sent += Duration::from_millis(1);
-            }
-            None
+            let at = now + self.sent;
+            let len = self.a.poll_transmit(at, buf)?;
+            self.sent += Self::SPACING;
+            Some(len)
         }
 
         /// The same for `b`.
         fn next_b(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<usize> {
-            for _ in 0..4096 {
-                if let Some(len) = self.b.poll_transmit(now + self.sent, buf) {
-                    self.sent += Self::SPACING;
-                    return Some(len);
-                }
-                self.sent += Duration::from_millis(1);
-            }
-            None
+            let at = now + self.sent;
+            let len = self.b.poll_transmit(at, buf)?;
+            self.sent += Self::SPACING;
+            Some(len)
         }
 
         /// Move everything both ends want to send and drop every `drop_every`th
@@ -5235,7 +5098,7 @@ mod tests {
         // The cursor is advanced the way a served packet does it, landing past
         // every live id — the state the bench logged.
         conn.cursor = younger.id + 2;
-        let Some(pick) = conn.next_stream_range(Instant::now()) else {
+        let Some(pick) = conn.next_stream_range() else {
             unreachable!("a stream owing bytes must be found")
         };
         assert_eq!(pick.id, younger.id, "the walk wrapped to the only stream");
@@ -5245,7 +5108,7 @@ mod tests {
         // And the same after the cursor has been moved by a real serve.
         conn.advance_cursor();
         assert!(
-            conn.next_stream_range(Instant::now()).is_some(),
+            conn.next_stream_range().is_some(),
             "still found after the cursor moved: cursor={}",
             conn.cursor
         );
@@ -5466,11 +5329,7 @@ mod tests {
         }
         // The timer gives up on both records; nothing is pumped, so nothing is
         // re-sent and the ledger's send side stays where it was.
-        // The timer is driven at the instant the sender has reached, not at the test's `now`:
-        // the harness clock has advanced past it (`Link::wire_clock`).
-        let (_, declared) = link
-            .a
-            .on_timeout(link.wire_clock(now) + Duration::from_secs(2));
+        let (_, declared) = link.a.on_timeout(now + Duration::from_secs(2));
         assert_eq!(declared, 2, "both records are stale");
 
         let len = u64::try_from(bytes.len()).unwrap();
