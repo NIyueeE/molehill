@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.277 Found it: the ack layout was written twice, and only one of them grew (2026-11-11)
+
+The backtrace the last entry asked for, and it named the line: **`udp_batch.rs:218`, the `Span::Staged`
+arm** — `&buf[off..off + len]` with `off + len = 1079` against a run buffer of 1075. So a staged span
+claimed **exactly four bytes more than the packet held**, which is the ack's growth and nothing else.
+
+The cause is duplication. `wire::encode` writes the ack block **by offset** and `wire::encode_stream`
+writes the same block **field by field**:
+
+```rust
+out.extend_from_slice(&block.largest.to_le_bytes());   // 4
+out.extend_from_slice(&block.below.to_le_bytes());     // 4
+out.extend_from_slice(&block.bits.to_le_bytes());      // 8
+out.extend_from_slice(&block.stream.to_le_bytes());    // 4
+out.extend_from_slice(&block.prefix.to_le_bytes());    // 8   — 28 bytes
+```
+
+`head` reserves `HEAD + ACK` (32 now) and `total` is what `encode_stream` returns, so every
+acknowledgement-carrying **stream** packet claimed four bytes it never wrote. Control packets were
+fine, which is why only stream traffic panicked, and why the packet's `len` field — written from the
+frame's own arithmetic — looked correct while the *packet* was four bytes short.
+
+**Fixed** by writing the delivery report in `encode_stream` as well, and **116 tests pass** with the
+wire field in place. The two false diagnoses before this one (§4.275, §4.276) were both guesses about
+*where*; the backtrace took one command and named the line.
+
+**Committed**: the field, both encoders, the round-trip case that carries a non-zero value, and a
+comment at the hand-written layout saying why it must be kept in step. This is a 6.0 wire change, and
+6.0 is unreleased — the boundary permits exactly this.
+
+**Next**: the controller on top of it — the receiver's accounting, the follow-and-ramp pacer — and then
+the two cells that decide whether a lane-owned signal does what six path-owned ones could not.
+
 ### 4.276 §4.275's diagnosis is refuted: the constants *are* derived, so the panic is unexplained (2026-11-11)
 
 The search §4.275 pointed at — "the buffer that stages a packet's header is sized from something that
