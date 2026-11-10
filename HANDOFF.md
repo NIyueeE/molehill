@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.259 A pacer that cannot park, and the harness that cannot run it (2026-11-10)
+
+The fifth mechanism, designed against §4.258's failure rather than in spite of it: **the rate is
+what the path has been carrying, times 1.1** — no ramp, no queue signal, no cut on loss. By
+construction it cannot park below the delivery rate, which is what killed the delay-driven pacer; it
+can only fail to improve. Its target is the burst: six segments at once overflow a shaper's buffer,
+one at a time does not.
+
+**It cannot be tested yet, and that is the finding.** The suite goes from four failures to four
+different failures to four, depending on whether the bucket holds one segment or two: every test that
+polls `poll_transmit` in a loop with a frozen clock is a test a pacer cannot pass, and the set of
+those tests shifts as the bucket's shape changes. This is not the mechanism being wrong — the harness
+models the *wire* in time (one `Link::SPACING` per datagram) but not the *sender*: a caller may poll a
+thousand times at one instant, which no real pump ever does.
+
+**So the prerequisite is a harness change, not a protocol one**: the direct-poll helpers have to
+advance time per datagram the way `pump_spaced` already does, and then a pacer's refill is a thing the
+suite can exercise. That is a bounded piece of work — seven `poll_transmit` sites in the test module —
+and it is the next step, ahead of any sixth mechanism, because without it every pacing design is
+unmeasurable at unit level and has to be judged on bench alone (which is how three attempts got as far
+as they did before failing on a different cell).
+
+**Reverted**: the engine is byte-identical to `6ed32c1`, 109 tests pass. The mechanism is recorded here
+with its design intact, because it is the one of the five that cannot fail by construction — and it is
+worth finishing the harness to find out whether that matters.
+
 ### 4.258 The pacer parks on a lossy path, and the delay signal is why (2026-11-10)
 
 The fourth mechanism, and the first that does not touch the window: **a rate**, held in a token
