@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.245 The `loss5` campaign ran for 93 minutes and produced no verdict (2026-11-10)
+
+F3.2's biggest guard, run exactly as the plan words it — `cost`, `--condition loss5`, `--scale 2`,
+six measured rounds, candidate and frozen baseline interleaved, peers beside them. **It is not a
+measurement**, for three reasons that all have to be fixed before it is re-run:
+
+| arm | `throughput_gbps` | rounds that produced a number |
+|---|---|---|
+| rathole | 1.731 | 6 |
+| frp | 0.3039 | 6 |
+| baseline (`molehill~b`) | 0.2194 | **4** |
+| candidate twin (`molehill~aa`) | 0.4405 | **5** |
+| candidate | **0.5958** | **3** |
+
+1. **The arms do not share their rounds.** The candidate produced three numbers out of six and the
+   baseline four, so the two medians describe different subsets of the same campaign. A median over
+   three rounds is not comparable with a median over four, and nothing here may be quoted as a
+   comparison.
+2. **`mhd_lane_dup_pct` is absent on every arm.** The plan's row asks for it on this cell, but the
+   metric's declared workloads are `("staged",)` — the `cost` scenario cannot produce it. The row is
+   self-contradictory and has to say which cell answers which half.
+3. **`rtt_p99_ms` does have readings**, and the candidate's are better: median 1 334 ms against the
+   baseline's 2 206 and frp's 1 992, inside the 1 412 ms guard. That one number survives.
+
+**Why the samples went missing** is the known shape: `cost` with a 120 s stage under 5 % loss is the
+worst case for the external tool's own connection, and the runner records an absent sample rather
+than a wrong one. The earlier `loss5` work used `bulk-1` and never saw this, which is why the
+campaign's cost was estimated at minutes and took an hour and a half.
+
+**The fix is in the plan, not the engine**: split the row into `bulk-1` (`--scale 2`) for throughput
+and tail, and a `staged` cell for `mhd_lane_dup_pct`, and record which rounds each arm actually
+produced before quoting a median. Nothing was committed from this run.
+
 ### 4.244 A declaration now needs evidence: 19 drops on the shallow cell and 8.8 % on the clean one (2026-11-10)
 
 The rule §4.243 named, implemented: the timer declares a record lost only when **a packet sent after
