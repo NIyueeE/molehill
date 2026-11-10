@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.251 The stall is in the baseline engine, and it fits in a ten-millisecond test (2026-11-10)
+
+§4.250's floor was one dropped opening. This is the hardened version: the same link drops **one
+datagram in twenty, in both directions, from the first one on**, and the transfer is 32 KiB.
+
+**It fails, on the engine the fourth plan started from.** The transfer stops at **24 282 of 32 768
+bytes** — and it is the same number after six seconds of virtual time as after twenty, so it is a
+stall, not a budget. A lane that keeps losing finishes three quarters of its stream and then sends
+nothing that arrives.
+
+Three things follow, and they change the shape of F3′:
+
+1. **The defect the fourth plan's window work was blamed for was not its invention.** The reverted
+   candidate is gone and this still happens: a single lane under continuing loss can end up carrying
+   nothing more, and no window rule caused it.
+2. **It reproduces in milliseconds.** The bench's `loss1` cell carries 1.4 Gbit/s, which is why this
+   was invisible: eight lanes, a long stage, and the metrics are medians over a window — one stalled
+   lane among eight is a number, not a failure. A ten-millisecond unit test with one lane says the
+   opposite thing about the same engine.
+3. **The test is committed ignored, with its number in the reason** (`#[ignore = "F3': a lane stalls
+   at 24 282 of 32 768 bytes under 5 % continuing loss"]`). A red suite hides every other failure,
+   and an ignored test that names its number is a better record than a deleted one — it runs with
+   `--ignored` the moment someone wants to see it.
+
+**What to look at first, in order**: whether the sender still has bytes to send (`buffered`) or has
+sent everything it can and is waiting on the peer; whether the peer holds the missing range out of
+order and cannot release it; and whether the repair for the last hole is queued at all. The three are
+distinguishable from the harness in one run each, and the stall's plateau is what makes it tractable
+— the state is frozen, so it can be read rather than inferred.
+
+**Nothing else changed**: the engine is byte-identical to `6ed32c1`, 108 tests pass, and the plan's
+F3′ row now points here.
+
 ### 4.250 The invariant is pinned: a lost opening must still carry the stream (2026-11-10)
 
 §4.249's ship-wreck has one executable lesson, and it is now a test rather than a paragraph.

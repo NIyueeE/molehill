@@ -3671,6 +3671,25 @@ mod tests {
         /// simultaneously, and a rule that reasons about how long a packet has been
         /// outstanding cannot be exercised against that (`HANDOFF.md` §4.204).
         sent: Duration,
+        /// Drop one datagram in every `loss_every`, in both directions; zero disables it.
+        ///
+        /// A link that loses its opening and then nothing is not a lossy link — it is a single
+        /// accident. The cells that broke the fourth plan's window work all kept losing
+        /// (`HANDOFF.md` §4.249), so the harness has to be able to say so.
+        loss_every: usize,
+        /// Datagrams the link has carried, for the pattern above.
+        carried: usize,
+    }
+
+    impl Link {
+        /// Whether this datagram is the one the pattern takes.
+        fn takes_this_one(&mut self) -> bool {
+            if self.loss_every == 0 {
+                return false;
+            }
+            self.carried = self.carried.wrapping_add(1);
+            self.carried.is_multiple_of(self.loss_every)
+        }
     }
 
     impl Link {
@@ -3684,6 +3703,8 @@ mod tests {
                 b_to_a: VecDeque::new(),
                 delay: Self::DELAY,
                 sent: Duration::ZERO,
+                loss_every: 0,
+                carried: 0,
             }
         }
 
@@ -3775,17 +3796,28 @@ mod tests {
                 let mut progress = false;
                 let mut buf = Vec::new();
                 while let Some(len) = self.a.poll_transmit(at, &mut buf) {
+                    moved += 1;
+                    if self.takes_this_one() {
+                        // The pattern took it: the peer never sees this datagram.
+                        at += spacing;
+                        progress = true;
+                        continue;
+                    }
                     self.pending_a
                         .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
                     at += spacing;
-                    moved += 1;
                     progress = true;
                 }
                 while let Some(len) = self.b.poll_transmit(at, &mut buf) {
+                    moved += 1;
+                    if self.takes_this_one() {
+                        at += spacing;
+                        progress = true;
+                        continue;
+                    }
                     self.pending_b
                         .push_back((at + self.delay, buf[buf.len() - len..].to_vec()));
                     at += spacing;
-                    moved += 1;
                     progress = true;
                 }
                 while let Some((due, _)) = self.pending_a.front() {
@@ -4405,6 +4437,71 @@ mod tests {
     /// A dropped datagram costs a round trip and nothing else: the timer puts
     /// the missing range back in the queue and the reader still gets the stream.
     ///
+    /// **A lane that keeps losing still carries its stream.**
+    ///
+    /// The floor one test down drops the opening and nothing else, which is a single accident. The
+    /// cells that broke the fourth plan's window work kept losing — `loss1` at one percent, three
+    /// rounds of zero bytes (`HANDOFF.md` §4.249) — so this one drops one datagram in
+    /// [`SELF::loss_every`] around a lost opening and requires the same completion inside the same
+    /// budget.
+    ///
+    /// **It fails on the baseline engine, which is the finding.** At one datagram in twenty, both
+    /// directions, a 32 KiB transfer stops at **24 282 bytes and stays there**: the same number
+    /// after six seconds of virtual time and after twenty. So the defect F3′ exists for is not the
+    /// window work's invention — it is in the engine the plan started from, and this test is where
+    /// it can be seen in milliseconds instead of an eight-second bench cell.
+    ///
+    /// Ignored while it fails, deliberately: a red suite hides every other failure, and an ignored
+    /// test with a number in its reason is a better record than a deleted one.
+    #[ignore = "F3': a lane stalls at 24 282 of 32 768 bytes under 5 % continuing loss"]
+    #[test]
+    fn a_lane_that_keeps_losing_still_completes_the_stream() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        link.pump(start);
+        let stream = link.a.open();
+        let bytes = payload(32 * 1024);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+        // One datagram in twenty, both directions, from the first one onwards: the opening is among
+        // the casualties and the loss never stops. The payload is chosen so the pattern certainly
+        // fires — a test whose loss never happens would pass by carrying everything cleanly, which
+        // is the hollow shape this suite has been caught by before.
+        link.loss_every = 20;
+        link.pump_dropping_one(start);
+        let mut clock = start;
+        let mut accepted = None;
+        let mut out = Vec::new();
+        for _ in 0..4000 {
+            clock += Duration::from_millis(5);
+            link.pump(clock);
+            if accepted.is_none() {
+                accepted = link.b.accept();
+            }
+            if let Some(stream) = accepted {
+                out.extend_from_slice(&take(&mut link.b, stream.id));
+                if out.len() == bytes.len() {
+                    break;
+                }
+            }
+        }
+        assert!(
+            link.carried > 20,
+            "the loss pattern must have fired: only {} datagrams were carried",
+            link.carried
+        );
+        assert!(
+            accepted.is_some(),
+            "a lane that keeps losing must still name the stream"
+        );
+        assert_eq!(
+            out,
+            bytes,
+            "and carry every byte within twenty seconds of virtual time: got {} of {}",
+            out.len(),
+            bytes.len()
+        );
+    }
+
     /// **A lane whose first packet is lost still carries its stream.**
     ///
     /// This is the invariant the fourth plan's window work broke and died on (`HANDOFF.md`
