@@ -946,6 +946,17 @@ impl Recovery {
         self.lost.len()
     }
 
+    /// Seed a **standing queue**: the minimum the path's own length, the smoothed estimate above it.
+    ///
+    /// The window's loss response asks whether a queue is standing (`HANDOFF.md` §4.246), so a test
+    /// that wants a cut has to give it the two numbers that answer the question.
+    #[cfg(test)]
+    pub(crate) fn seed_queue(&mut self, min: Duration, smoothed: Duration) {
+        self.rtt.min = Some(min);
+        self.rtt.smoothed = Some(smoothed);
+        self.rtt.latest = Some(smoothed);
+    }
+
     /// Something arrived from the peer: the run of silent timers is over.
     fn heard(&mut self) {
         self.backoff = 0;

@@ -3759,9 +3759,26 @@ impl Conn {
     ///   in flight when the reduction happened. One flight, one cut.
     /// - **Never below two segments.** A window of one packet cannot grow again without a lucky
     ///   acknowledgement, and the floor is what keeps a lossy path moving.
+    /// - **A loss with no queue behind it is not this carrier's congestion.** A five-percent-loss
+    ///   path drops one packet in twenty at random, and halving once per flight there halves the
+    ///   window every round trip until it sits on the floor — measured as 0.0020 Gbit/s against the
+    ///   baseline's 0.0769 on the `loss5` cell (`HANDOFF.md` §4.246). The signal that separates the
+    ///   two cases is the one this carrier already measures: congestion stands in a queue, so the
+    ///   smoothed round trip is above the path's own length. BBR's rule is the same one — loss
+    ///   without queueing is not a capacity signal — and this is the carrier's own version of it.
     fn cut_window(&mut self, now: Instant, highest_lost: u32) {
         // A loss at or below the mark belongs to the episode already paid for.
         if self.recover.is_some_and(|recover| highest_lost <= recover) {
+            return;
+        }
+        // **And only when a queue says the path is the one asking.** Without a minimum round trip
+        // there is nothing to compare against, and a lane that has never sampled one has not yet
+        // filled anything, so a first loss is not treated as congestion.
+        let queued = match (self.recovery.smoothed_rtt(), self.recovery.min_rtt()) {
+            (Some(smoothed), Some(min)) => smoothed > min + min / 4,
+            _ => false,
+        };
+        if !queued {
             return;
         }
         self.recover = Some(self.recovery.last_number());
@@ -4794,6 +4811,10 @@ mod tests {
         let now = Instant::now();
         let mut conn = Conn::new(9, true);
         conn.cwnd = 100_000;
+        // A path with a standing queue: 80 ms smoothed over a 40 ms minimum is what a loss has to
+        // show before the window pays for it (`HANDOFF.md` §4.246).
+        conn.recovery
+            .seed_queue(Duration::from_millis(40), Duration::from_millis(80));
         // Five packets have left; the report that pays covers number four.
         for _ in 0..5 {
             let _ = conn.recovery.next_number();
@@ -4821,6 +4842,8 @@ mod tests {
         let now = Instant::now();
         let mut conn = Conn::new(9, true);
         conn.cwnd = 3 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64;
+        conn.recovery
+            .seed_queue(Duration::from_millis(40), Duration::from_millis(80));
         for _ in 0..3 {
             let _ = conn.recovery.next_number();
         }

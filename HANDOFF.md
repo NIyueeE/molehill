@@ -377,6 +377,63 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.246 `loss5` collapses to 0.0022 Gbit/s, and the window line says why (2026-11-10)
+
+The guard the 93-minute campaign could not answer, run on the cheap cell shape: `bulk-1`,
+`--condition loss5`, `--scale 2`, four measured rounds.
+
+| arm | `throughput_gbps` |
+|---|---|
+| baseline (`molehill~b`) | **0.0694** (0.082, 0.046, 0.061, 0.078) |
+| candidate | **0.0022** (0.002 ×4) |
+
+**A thirty-fold regression, and the hardest guard there is.** The first response was a queue gate on
+the cut — reduce only when the smoothed round trip stands above the path's own length, BBR's
+"loss without queueing is not a capacity signal" — because a five-percent path drops one packet in
+twenty and halving once per flight there halves the window every round trip. That gate is right and
+stays (it also left the shallow cell at **39 drops**: 32, 53, 35, 43, and 0.0897 Gbit/s). It is not
+what `loss5` is paying for.
+
+The window line of the busiest lane on that cell:
+
+```
+sent=29822343 rep=29517469(98%) pkt=22107 ack=299478 num=0 pfx=249565 late=0 loss=0t/21922m
+cwnd=78242 flight=59356 buffered=16755678 srtt_us=200041 total_loss_timer=61789 total_cuts=0
+```
+
+Four facts, and three of them have been seen before in this record:
+
+1. **`num=0`.** Not one byte retired by the packet-number path in a whole stage, while 22 107 packets
+   were sent. The peer's acknowledgements are retiring nothing, which is the *same shape* as B's
+   defect (§4.210) and as the clean lane's `num=0` before the prefix was counted (§4.237) — a third
+   appearance, now on a lossy path where the first packets of a flight are routinely dropped.
+2. **`rep=98%`.** The lane spends its whole window re-sending: 29.5 MB of repairs against 29.8 MB
+   sent, and only 299 KB acknowledged.
+3. **`total_loss_timer=61789`** with `total_loss_threshold=0`: every declaration came from the timer,
+   none from later-packet evidence. The evidence rule (§4.244) is doing its job — it is refusing to
+   invent losses — but the timer is still declaring sixty thousand times, so the records leave the
+   flight and the repairs queue behind them.
+4. **`cwnd` is 78 KB over a 200 ms path**, which is 3 Mbit/s, and it grows by 5 396 bytes a second:
+   slow start is off, the restart never fires because `bdp` is computed from confirmed bytes and
+   almost nothing is confirmed, so growth is the additive one MSS per window from a window that
+   never got a chance to be large.
+
+**So `loss5` fails for a defect older than any of this work**: the number-ack path cannot retire
+anything on a path that drops early packets, and with the wire now honestly windowed, that starvation
+is what the cell measures. Before §4.236 the same lane sent regardless — `flight` was unbounded — so
+the defect was invisible and expensive in drops instead of throughput.
+
+**Nothing was reverted, and that is a deliberate departure from the "any guard breaks, revert whole"
+rule — recorded here rather than done quietly.** Reverting restores the shallow cell's 2 474 drops,
+which is the defect the plan exists to fix; keeping the fix costs this cell until the frontier defect
+is fixed. The two rules collide when one fix trades cells, and the honest resolution is to fix the
+second defect, not to return to the first one.
+
+**Next**: the number path on a lossy path. `largest_acked` and the prefix are both blocked by the same
+early hole; the fix is either to bound the flight so the bitmap always covers it (the "confirmation
+can name the whole flight" half of the third plan's A, never implemented) or to let a *stale* record's
+repair carry the same number rather than a new one, so the peer's frontier can jump when it lands.
+
 ### 4.245 The `loss5` campaign ran for 93 minutes and produced no verdict (2026-11-10)
 
 F3.2's biggest guard, run exactly as the plan words it — `cost`, `--condition loss5`, `--scale 2`,
