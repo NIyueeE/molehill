@@ -377,6 +377,47 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.218 The window-rate pacer fails the same way, and seven mechanisms now agree (2026-11-10)
+
+A⁵ — refill the bucket at `cwnd / smoothed_rtt` instead of at the measured rate — was implemented, with the bucket
+starting full, an idle lane exempt, and the pump's timer taught to wake for a refill. Two unit-test lessons came first
+(a bucket starting empty can never send its first packet; an idle lane must never be paced), and then the cell:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0954 / 0.0955 | 16 / 17 |
+| frp | 0.0953 / 0.0952 | 16 / 220 |
+| molehill | **0.0008 / 0.0008** | **0 / 0** |
+| molehill twin | 0.0006 / 0.0008 | 0 / 0 |
+
+**The drops are zero again because the traffic is nearly zero** — a hundred times below the guard. Reverted whole.
+
+**Seven mechanisms have now been measured on this cell and none of them moved the drops into the peers' range**:
+
+| # | mechanism | result |
+|---|---|---|
+| 1 | repairs inside the window | falsified at the unit level (waits for room only the repair can make) |
+| 2 | repair budget `cwnd/2`, never blocking | drops halved, throughput fell |
+| 3 | halve `cwnd` on a declared loss | fires **once** per lane |
+| 4 | BDP ceiling (`Rtt::min × rate`) | engages **19** times per lane |
+| 5 | per-pass burst budget | no change: bounds a burst, not a rate |
+| 6 | pacer at the measured rate | locks at its floor (input is its own output) |
+| 7 | pacer at `cwnd/srtt` | near-zero throughput, zero drops |
+
+**What that pattern says, and it is not "try an eighth".** Every controller this carrier has — or could have without a
+redesign — derives its rate from its own window; pacing by that rate throttles the acks that would grow the window, and
+the lane settles a hundred times below the path. Meanwhile the *unpaced* carrier sends **135 Mbit/s into a 100 Mbit/s
+pipe** (§4.216), because nothing in it is a function of time. The two facts are the same fact: **this carrier has no
+clock. It sends whenever the pump runs, and it grows its window only on acknowledgements.** A controller bolted onto
+that either never engages (the window ones) or locks at zero (the rate ones).
+
+**Conclusion handed over, per the plan's own rule.** The shallow-queue defect is not a missing knob: it needs the send
+path rebuilt around a clock — a schedule the pump reads (when the next packet is due) rather than a budget it checks —
+which is a redesign of the pump and the window together, not another rule on top of them. That is beyond what this
+stage's pre-registrations allow, and the seven measurements above are the case for it.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.217 A pacer at the measured rate zeroes the drops by zeroing the traffic (2026-11-10)
 
 A⁗ — a token bucket at the **measured** delivery rate, gating new data only, repairs and probes exempt — was
