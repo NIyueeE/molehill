@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.264 The burst size is already at its optimum, and the curve is steep on both sides (2026-11-10)
+
+Six controllers failed because they adjust *how much* may be outstanding. `SEND_RUN` — how many
+datagrams one pass hands the kernel — adjusts *how it is delivered*, which is the one thing on the
+send side that is neither a window nor a rate. Forty-four datagrams is sixty kilobytes in one
+syscall: forty-three per cent of a hundred-megabit shaper's eleven-millisecond buffer, from one lane.
+
+**Both directions were measured, and both are worse.**
+
+| `SEND_RUN` | `rate100_shallow` throughput | drops | baseline, same round |
+|---|---|---|---|
+| **8** | 0.0791 | **15 380** | 0.0830 / 2 676 |
+| **44** (as shipped) | 0.0830 | **4 852** | — |
+| **88** | 0.0464 | **124 600** | 0.0837 / 7 274 |
+
+Smaller is three times worse and larger is twenty-five times worse, with throughput falling in both
+directions. The shape is worth recording because it is not the one intuition suggests: eight datagrams
+per flush wakes the pump five times as often, the pump falls behind, and the queue that builds is
+larger than the one a big burst would have made; eighty-eight hands over a hundred and twenty
+kilobytes at once and overruns the buffer outright.
+
+**So `44` is at the optimum of its own parameter, and the shallow cell's drops are not a burst-size
+problem.** That closes the last cheap lever on the send side: the window, the rate, the ramp, the
+delay signal and the burst have each been measured, and the trade between drops and throughput stands
+where it did.
+
+**Reverted**: the engine is byte-identical to `6ed32c1`, 113 tests pass.
+
 ### 4.263 The soak passes: no wedge, no leak, and a drift the twin shares (2026-11-10)
 
 §4.257 left the soak undone because nothing had landed. It was run anyway, on the unchanged engine,
