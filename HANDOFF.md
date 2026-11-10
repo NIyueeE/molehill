@@ -377,6 +377,46 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.229 The queue target stops the drops by stopping the traffic, and its estimate is the flaw (2026-11-10)
+
+A⁹ pre-registered a queue-target controller: `queue = (smoothed_rtt − min_rtt) × delivery rate`, trimmed proportional
+toward 32 KiB and grown 2 % a round trip below it, with the rate — not the window — as the controlled variable. It passes
+its suite, and on the shallow cell:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0954 / 0.0955 | 16 / 16 |
+| frp | 0.0951 / 0.0952 | 17 / 16 |
+| molehill (A⁹) | **0.0233 / 0.0245** | **0 / 0** |
+| molehill twin | 0.0235 / 0.0004 | 0 / 86 |
+
+**The drops are gone and so is the throughput** — 0.023 against a 0.095 path and against today's 0.083. Its own guard
+(the same-run twin) passes, but a three-and-a-half-fold throughput regression is a new defect, not a fix, so it is not
+landed.
+
+**The doubling start makes it worse in the right direction and still not enough.** With `×2` while no trim has happened:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| molehill | **0.0358 / 0.0331** | **404 / 465** |
+| molehill twin | 0.0462 / 0.0481 | 113 / 126 |
+
+Drops fall from 2 153 to 404 and throughput rises from 0.023 to 0.036 — still 2.6 times below the path.
+
+**Both runs print the diagnosis.** The ledger's `trim=NqPEAK` field reads `trim=3 q3122136` on one lane: **the queue
+estimate reached 3.1 MB against a 32 KiB target.** An estimate two orders of magnitude out means the controller is
+steering by the wrong number, and the arithmetic says why: if `min_rtt` is sampled small on this path, then
+`smoothed_rtt − min_rtt ≈ smoothed_rtt`, so the "queue" becomes the **whole bandwidth-delay product** (2.5 MB, §4.225)
+rather than the queue on top of it. A queue estimate built from a minimum that small cannot distinguish "the path is
+empty" from "the path is full".
+
+**That is the next thing to fix, and it is a measurement problem inside the controller**: `min_rtt` needs to be the
+minimum over a window long enough to be a path property (and floored), or the estimate needs a second anchor — the
+delivery rate is already there, the missing piece is a trustworthy `min_rtt`. Until that is right, every queue-driven
+trim is steering by a number that is the BDP in disguise.
+
+**Reverted whole** — the tree is `ae049e8`'s state with no controller in it, 107 tests green.
+
 ### 4.228 D4 after the fix: the deficit is consistent, small, and on every rate cell (2026-11-10)
 
 All six cells on the current binary (B's `send_gso` fix in, all ten mechanisms reverted), one campaign after another in a
