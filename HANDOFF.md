@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.268 Four streams share a lossy lane without starving, and it is now pinned (2026-11-10)
+
+A lane has **one** repair queue and **one** window for all its streams, so a stream whose packets keep
+being declared lost can spend the lane on itself. Every multiplexed measurement in this record has
+been on a clean or a shaped path (`a_multiplexed_stream_carries_four_streams_without_losing_bytes`
+runs four streams through the real pump, and drops nothing); none had four streams competing **under
+drops**.
+
+`four_streams_share_a_lossy_lane_without_starving` puts four 6 KiB streams on one lane with one
+datagram in forty dropped and asserts two things: **all four finish**, and **when the first one
+finishes, every other has at least a quarter of its bytes**. Both hold — so the carrier's repair queue
+is not first-come-first-served to the point of starvation, which is the property a single-queue design
+is most likely to break and the one no measurement would have shown on a clean path.
+
+**115 tests**, no engine change.
+
+**Where the coverage now stands** after this run of correctness work (§4.261–§4.268): reordering with
+and without loss, the `u32` number wrap, half-close in both directions, an abandoned accepted stream
+and its reset, and four streams under drop contention. Each was a place where a defect would have been
+invisible in every bench cell, and none found one.
+
 ### 4.267 §4.266 answered: the reset is queued, and the harness was hiding it (2026-11-10)
 
 The isolated test §4.266 asked for exists now and **passes**: an accepted stream that owes bytes when

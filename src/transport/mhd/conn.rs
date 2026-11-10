@@ -4777,6 +4777,76 @@ mod tests {
         );
     }
 
+    /// **Four streams share a lossy lane without one of them starving the others.**
+    ///
+    /// The carrier has one repair queue and one window for a whole lane, so a stream whose packets
+    /// keep being declared lost can spend the lane on itself. Every multiplexed measurement in this
+    /// record has been on a clean or a *shaped* path; none had four streams competing under drops.
+    /// The assertion is the anti-starvation property: when the first stream finishes, every other
+    /// one must already have at least a quarter of its bytes.
+    #[test]
+    fn four_streams_share_a_lossy_lane_without_starving() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        link.loss_every = 40;
+        link.pump(start);
+        let bytes = payload(6 * 1024);
+        let ids: Vec<u32> = (0..4).map(|_| link.a.open().id).collect();
+        let mut written = [0usize; 4];
+        let mut got = [0usize; 4];
+        let mut accepted: Vec<Option<u32>> = vec![None; 4];
+        let mut clock = start;
+        let mut first_done_at = None;
+        let mut shares_at_first = [0usize; 4];
+        for _ in 0..4000 {
+            clock += Duration::from_millis(5);
+            link.pump(clock);
+            for (index, id) in ids.iter().enumerate() {
+                if written[index] < bytes.len() {
+                    written[index] += link.a.write(*id, &bytes[written[index]..]);
+                }
+            }
+            while let Some(handle) = link.b.accept() {
+                if let Some(slot) = ids.iter().position(|id| *id == handle.id) {
+                    accepted[slot] = Some(handle.id);
+                }
+            }
+            for (index, id) in ids.iter().enumerate() {
+                if accepted[index].is_some() {
+                    let step = take(&mut link.b, *id);
+                    got[index] += step.len();
+                }
+            }
+            if first_done_at.is_none() && got.contains(&bytes.len()) {
+                first_done_at = Some(clock);
+                shares_at_first = got;
+            }
+            if got.iter().all(|have| *have == bytes.len())
+                && written.iter().all(|w| *w == bytes.len())
+            {
+                break;
+            }
+        }
+        assert!(
+            first_done_at.is_some(),
+            "the loss pattern must let the lane deliver: {got:?} of {}",
+            bytes.len()
+        );
+        assert_eq!(
+            got,
+            [bytes.len(); 4],
+            "every stream finishes on a lossy lane"
+        );
+        let floor = bytes.len() / 4;
+        for (index, share) in shares_at_first.iter().enumerate() {
+            assert!(
+                *share >= floor,
+                "stream {index} had {share} bytes when the first finished: one stream may not \
+                 spend the lane on itself"
+            );
+        }
+    }
+
     /// **A lane that keeps losing still carries its stream.**
     ///
     /// The floor one test down drops the opening and nothing else, which is a single accident. The
