@@ -377,6 +377,47 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.249 The window re-architecture is reverted whole: it carries nothing on a lossy path (2026-11-10)
+
+Two guards were opened by §4.246 and I ran the rest of F3.2 before deciding what to do about them. The
+answer decided itself:
+
+| cell | arm | `throughput_gbps` | bytes carried |
+|---|---|---|---|
+| `loss1` (1 % loss, 10 ms) | baseline | 1.39 / 1.44 / 1.46 | 900 MB |
+| | candidate | **0.0000 in every round** | **0 bytes** |
+| `jitter` (20 ± 10 ms) | baseline | 0.78 / 0.90 / 0.82 | 478–568 MB |
+| | candidate | **0.036–0.062** | 20–39 MB |
+| `loss5` | baseline | 0.0738 | — |
+| | candidate | 0.0023 | — |
+| `transport` | both | — | identical: open 2–4 µs, first byte 65–75 µs, recovery 2–5 µs, 0 errors |
+
+**The candidate carries zero bytes on a one-percent-loss path.** Not slowly — not at all, in three
+rounds of three, with the twin (the same binary) agreeing. A carrier that does that is not a carrier
+with a guard problem; it is a broken transport on the most ordinary lossy link there is.
+
+**So the whole F2 series is reverted**, `src/` restored to `6ed32c1`, and the evidence kept:
+
+- the shallow cell's fix goes with it — its 39–43 drops return to the baseline's ~2 474;
+- the counters of F1 (`9fdc625`) and the receiver's frontier abandonment (`75cdef5`) go too, because
+  they were built on the same engine and re-landing them means re-landing the window with them;
+- `loss1` and `jitter` come back immediately, measured after the revert: `loss1` **1.407 / 1.496**
+  against the baseline's 1.185 / 1.413, `jitter` **0.887 / 0.814** against 0.814 / 0.702. Both are
+  at or above the baseline, which is the state the tree was in before this work.
+
+**What the failure teaches, and it is the third time this stage has learned it**: an architecture in
+which *the wire is only as fast as the confirmations* has to guarantee that confirmations keep coming
+when the path loses packets. Every change here assumed they would. The frontier abandonment addressed
+one way they stop (§4.247) and moved that number from 0 to 978 KB/s, and it was not enough: at 1 %
+loss the lane still sends nothing, which means something else in the chain — the stream open, the
+repair queue, or the reader — stops before the first acknowledgement ever arrives.
+
+**Nothing is claimed for the candidate.** Its one good cell is recorded, and it is not shippable.
+The next attempt must start from the fact this one establishes: **no window rule reaches the wire if
+a lane that has lost its first packet can send nothing at all**, and the measurement to make first is
+of that lane — one opening packet dropped by the harness's own box, and what the sender does for the
+next second — not another bench campaign across six cells.
+
 ### 4.248 The repair queue is pruned; what starves is the prefix (2026-11-10)
 
 Two checks on §4.247's "the repair loop is next" hypothesis, and the hypothesis is wrong.

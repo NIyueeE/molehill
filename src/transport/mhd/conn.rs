@@ -170,21 +170,6 @@ const WINDOW_FLOOR: u64 = 256 * 1024;
 /// been five mebibytes — the flat ceiling this change exists to remove.
 const WINDOW_REFERENCE: u64 = 1_000;
 
-/// The shortest round trip this end will reason about: the estimator's own granularity.
-///
-/// The same one millisecond `recovery` floors its samples at, repeated here because the
-/// window's round-trip arithmetic needs it without borrowing the estimator.
-const RTT_GRANULARITY: Duration = Duration::from_millis(1);
-
-/// How many of the path's own bandwidth-delay products the window may reach.
-///
-/// Two is BBR's `cwnd_gain` and the number the shallow cell was measured at (§4.242: 39–43
-/// drops in four rounds). Four was tried on the clean cell as the experiment between the two —
-/// deeper, to keep a fast pump busy — and moved nothing: 11.653 Gbit/s against the baseline's
-/// 13.051, the same −10 % the gain of two gives (`HANDOFF.md` §4.243). So the ceiling is not what
-/// costs the clean cell, and the smaller number stays.
-const PIPE_GAIN: u64 = 2;
-
 /// Why a frame could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rejected {
@@ -318,6 +303,8 @@ pub(crate) struct StreamHandle {
 /// end's application, and nothing this connection sends will move it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
+    /// This end's congestion window had no room in flight.
+    Window,
     /// The peer's advertised credit had no room for new bytes.
     Credit,
     /// `MAX_BUFFERED` had no room: the bytes are queued and unacknowledged, so the
@@ -674,28 +661,6 @@ pub(crate) struct SendLedger {
     recv_duplicate_bytes: u64,
 }
 
-/// Counters that never reset, beside the interval ones.
-///
-/// [`SendLedger`] is cleared every second by
-/// [`Conn::take_ledger`], so every field in it is a *rate*. Comparing one of those
-/// against a shaper's cumulative `qdisc dropped` counter is invalid across a reset,
-/// and doing it produced the misreading `HANDOFF.md` §4.234 withdraws. These are the
-/// same events counted for the whole stage, and the window line prints them with a
-/// `total_` prefix so the two can never be confused again.
-#[derive(Debug, Default, Clone, Copy)]
-struct Totals {
-    /// Loss declarations by the verdict that named them.
-    loss_threshold: u64,
-    loss_timer: u64,
-    /// Timer probes: a re-send that is **not** a loss declaration.
-    probes: u64,
-    /// Times the congestion window was cut for a loss (`HANDOFF.md` §4.236).
-    cuts: u64,
-    /// Stream bytes posted, split by whether the range had been sent before.
-    sent_new: u64,
-    sent_repair: u64,
-}
-
 impl SendLedger {
     /// A packet carrying `len` stream bytes, `repair` if the range had been sent.
     fn note_sent(&mut self, len: usize, repair: bool) {
@@ -877,8 +842,6 @@ pub(crate) struct Conn {
     /// useful as *this* lane's series, and the process-wide totals this file used
     /// to lean on cannot be divided back into lanes (`HANDOFF.md` §4.179).
     ledger: SendLedger,
-    /// Cumulative control counters: see [`Totals`] for why they sit beside the ledger.
-    totals: Totals,
     /// Acknowledgements this end applied and attached, for the window line.
     acks_applied: u64,
     acks_attached: u64,
@@ -1079,33 +1042,11 @@ pub(crate) struct Conn {
     ///
     /// True until the path drops something: while it is, every acknowledged byte
     /// buys a byte of window (doubling per round trip). It latches off at the
-    /// first loss — a path that has dropped is a path whose capacity has been
-    /// found — and comes back **only while the window is under the path's own
-    /// bandwidth-delay product**, which is the restart `HANDOFF.md` §4.237 asks for:
-    /// a window that fell below the pipe has not found anything and must double again.
+    /// first loss and never comes back — a path that has dropped is a path whose
+    /// capacity has been found.
     slow_start: bool,
     /// Bytes acknowledged since the window last grew additively.
     acked_since_growth: u64,
-    /// Confirmed bytes since the last round-trip boundary, and when that boundary was.
-    ///
-    /// The estimator's raw material: bytes over one round trip is the delivery rate, and the
-    /// rate times the path's own length is the pipe the window has to reach before additive
-    /// growth makes sense (`HANDOFF.md` §4.237).
-    round_acked: u64,
-    round_at: Option<Instant>,
-    /// The path's bandwidth-delay product as last measured, in bytes.
-    bdp: u64,
-    /// The highest number in flight when the window last paid for a loss.
-    ///
-    /// TCP's `recover`: a declaration at or below it belongs to the episode already paid for, so one
-    /// flight costs one cut however many reports it produces (`HANDOFF.md` §4.241).
-    recover: Option<u32>,
-    /// When the window last paid for a loss, for the stats line.
-    ///
-    /// A hole reported by several acknowledgements, or by the timer after them, is **one** loss:
-    /// halving once per report would halve the pipe several times for one dropped packet, which is
-    /// how a lossy path collapses. One cut per smoothed round trip is the rule (`HANDOFF.md` §4.240).
-    cut_at: Option<Instant>,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
     /// A close that waits for what is already queued to leave first.
@@ -1204,7 +1145,6 @@ impl Conn {
             repairs_at_base: 0,
             repairs_above: 0,
             ledger: SendLedger::default(),
-            totals: Totals::default(),
             acks_applied: 0,
             acks_attached: 0,
             issued: 0,
@@ -1254,11 +1194,6 @@ impl Conn {
             window_reported_at: Instant::now(),
             slow_start: true,
             acked_since_growth: 0,
-            round_acked: 0,
-            round_at: None,
-            bdp: 0,
-            recover: None,
-            cut_at: None,
             closed: None,
             close_after: None,
             keepalive_at: now + KEEPALIVE,
@@ -1364,15 +1299,12 @@ impl Conn {
         // The congestion window is the second bound, and it is what the flight —
         // and therefore the recovery table — is actually sized by.
         let credit = self.send_credit.saturating_sub(self.written);
+        let window = self.cwnd.saturating_sub(self.recovery.flight_bytes());
         // The buffer ceiling is the third bound: a byte stays buffered until an
         // acknowledgement moves its stream's frontier past it, and a frontier
         // that stalls must cost the writer a wait rather than unbounded memory.
         let held = MAX_BUFFERED.saturating_sub(self.buffered);
-        // **Not the window.** The congestion window is applied when a packet is built
-        // (`next_stream_range`), which is where TCP applies it and the only place it can be
-        // an invariant of the wire (`HANDOFF.md` §4.236). Gating the buffer here instead
-        // meant the window was checked against a flight that the pump then grew.
-        let room = credit.min(held);
+        let room = credit.min(window).min(held);
         // The fourth bound, and the one this cycle needed: **the flight may not
         // outlive the retransmission timer.** A carrier that lets a flight grow
         // past the timeout supposed to find a hole inside it is asking two
@@ -1416,13 +1348,8 @@ impl Conn {
         // see — credit 11.7 MB, buffer 28 MB. The reserve has to be a *lane*
         // budget an opening can spend, not a share of whatever is left, or it
         // reserves nothing exactly when it is needed.
-        // **The reserve is the peer's credit's, now that the window has its own.** A bulk
-        // stream stops one reserve short so a stream opening behind it can always write its
-        // handshake; the window's own overdraw for an opening lives at the send point
-        // (`next_stream_range`, `HANDOFF.md` §4.236). A write is bounded by the credit and by
-        // this end's buffer, and by nothing else.
         let room = if opening(state) {
-            credit.min(held)
+            credit.min(window.saturating_add(OPEN_RESERVE)).min(held)
         } else {
             room.saturating_sub(OPEN_RESERVE)
         };
@@ -1454,14 +1381,12 @@ impl Conn {
             // order of the comparisons is the tie-break, and `credit` still wins a
             // three-way tie, so the long-standing counter keeps its old meaning for
             // the two cases it could already tell apart.
-            // **Two bounds, because a write now has two.** The window refuses packets,
-            // not writes: it is consulted in `next_stream_range` (`HANDOFF.md` §4.236),
-            // so `Refusal::Window` is no longer produced here — `refused_window` staying
-            // at zero is the instrument saying so.
             let refusal = if refused_by_age {
                 Refusal::Aged
-            } else if credit <= held {
+            } else if credit <= window && credit <= held {
                 Refusal::Credit
+            } else if window <= held {
+                Refusal::Window
             } else {
                 Refusal::Buffer
             };
@@ -1479,6 +1404,9 @@ impl Conn {
                 Refusal::Credit => {
                     self.ledger.refused_credit = self.ledger.refused_credit.saturating_add(1);
                 }
+                Refusal::Window => {
+                    self.ledger.refused_window = self.ledger.refused_window.saturating_add(1);
+                }
             }
             // By bound **and** by class: an opening stream that is refused is the
             // arrival path paying for the bulk spine, and the reserve exists to make
@@ -1490,6 +1418,7 @@ impl Conn {
                 (Refusal::Buffer, _) => "buffer",
                 (Refusal::Credit, true) => "credit_opening",
                 (Refusal::Credit, false) => "credit",
+                (Refusal::Window, _) => "window",
             });
             // What the recovery table is holding when the age gate refuses. A
             // record that is neither acknowledged nor declared lost never leaves
@@ -1516,11 +1445,8 @@ impl Conn {
                 tracing::debug!(
                     stream,
                     credit,
+                    window,
                     held,
-                    // Kept on the line for the reader who is asking why an opening was
-                    // refused: the window no longer refuses writes, so a non-zero
-                    // `flight` above `cwnd` here means the lane is waiting on the peer or
-                    // on this end's buffer (`HANDOFF.md` §4.236).
                     flight = self.recovery.flight_bytes(),
                     cwnd = self.cwnd,
                     offered = bytes.len(),
@@ -2283,21 +2209,11 @@ impl Conn {
             // several datagrams (a selector byte, then the message), and losing
             // any of them costs the arrival its latency.
             !state.acknowledged,
-            // And whether the range had already been on the wire: the flight is split
-            // by this, because "full of repairs" and "full of new data" are different
-            // defects (`HANDOFF.md` §4.236).
-            repair,
         );
         // What this packet cost the wire, and whether the range was new: the pair
         // is the whole of the "is the lane re-sending itself" question, and it is
         // recorded here because this is the one place a data packet leaves.
         self.ledger.note_sent(len, repair);
-        let len_bytes = u64::try_from(len).unwrap_or(u64::MAX);
-        if repair {
-            self.totals.sent_repair = self.totals.sent_repair.saturating_add(len_bytes);
-        } else {
-            self.totals.sent_new = self.totals.sent_new.saturating_add(len_bytes);
-        }
         if let Some(state) = self.streams.get_mut(&id) {
             if repair {
                 // The range is on the wire again; what is still owed stays
@@ -2538,9 +2454,7 @@ impl Conn {
                 len: 0,
                 fin: true,
             }),
-            // A finish-only packet carries no bytes of the opening, and it is queued
-            // from the finish list rather than from the repair queue.
-            false,
+            // A finish-only packet carries no bytes of the opening.
             false,
         );
         self.ack_pending = false;
@@ -2595,24 +2509,6 @@ impl Conn {
             return None;
         }
         let cursor = self.cursor;
-        // **The congestion window applies where bytes leave, not where they arrive**
-        // (`HANDOFF.md` §4.236). Admission is the peer's credit and this end's buffer
-        // ceiling; how much of that buffer may be on the wire at once is this. Until it
-        // was here, the window gated `write` and nothing re-checked it at `poll_transmit`,
-        // so bytes admitted while the flight was momentarily small were emitted later
-        // with a flight three to sixteen times the window — measured, and the reason every
-        // window-side controller looked like it never engaged.
-        let flight = self.recovery.flight_bytes();
-        let room = usize::try_from(self.cwnd.saturating_sub(flight)).unwrap_or(usize::MAX);
-        // An opening may overdraw the window by the reserve, for the reason the write path
-        // used to: the window can be full while a stream that has never been acknowledged
-        // still has to start, and a bulk run must not be able to spend this budget.
-        let opening_room = usize::try_from(
-            self.cwnd
-                .saturating_add(OPEN_RESERVE)
-                .saturating_sub(flight),
-        )
-        .unwrap_or(usize::MAX);
         let eligible = |(id, state): (&u32, &StreamState)| {
             // `Finished` ends the peer's *write* direction, not the stream: the
             // other direction is still ours to use (that is what half-close
@@ -2631,30 +2527,16 @@ impl Conn {
                     repair: true,
                 });
             }
-            if !state.send.has_unsent() {
-                return None;
-            }
-            let offset = state.send.next_offset();
-            let unsent = state.send.unacked();
-            // A window with no room sends nothing new; one with less room than a segment
-            // sends what fits rather than stalling until the next acknowledgement.
-            let room = if state.acknowledged {
-                room
-            } else {
-                opening_room
-            };
-            let want = usize::try_from(unsent)
-                .unwrap_or(0)
-                .min(MAX_STREAM_PAYLOAD)
-                .min(room);
-            if want == 0 {
-                return None;
-            }
-            Some(Pick {
-                id: *id,
-                offset,
-                len: want,
-                repair: false,
+            state.send.has_unsent().then(|| {
+                let offset = state.send.next_offset();
+                let unsent = state.send.unacked();
+                let want = usize::try_from(unsent).unwrap_or(0).min(MAX_STREAM_PAYLOAD);
+                Pick {
+                    id: *id,
+                    offset,
+                    len: want,
+                    repair: false,
+                }
             })
         };
         self.streams
@@ -2760,16 +2642,7 @@ impl Conn {
             .checked_div(WINDOW_REFERENCE)
             .unwrap_or(1)
             .max(1);
-        let calibrated = WINDOW_FLOOR.saturating_mul(hops).min(MAX_CWND);
-        // **And never less than the pipe this end has measured.** The calibration is 256 KiB per
-        // millisecond of path, which is right on the shaped cells and far too narrow on a fast one:
-        // a clean lane carrying 1.6 GB/s over a 1 ms round trip needs megabytes in flight, and the
-        // calibration allows 256 KiB — measured as the window pinned at the ceiling while the wire
-        // sat at 80 % of the baseline (`HANDOFF.md` §4.241). [`PIPE_GAIN`] bandwidth-delay products
-        // raises the ceiling to what the path can hold; the cut still brings the window down when
-        // the path disagrees.
-        let measured = self.bdp.saturating_mul(PIPE_GAIN).min(MAX_CWND);
-        calibrated.max(measured)
+        WINDOW_FLOOR.saturating_mul(hops).min(MAX_CWND)
     }
 
     /// Move the cursor past the stream that was just served, wrapping to the
@@ -3117,26 +2990,6 @@ impl Conn {
             self.recovery.flight_bytes(),
             self.slow_start,
             self.acked_since_growth,
-        )
-    }
-
-    /// The cumulative counters and the flight split, for the window line.
-    ///
-    /// Returns `(totals, new_flight, repair_flight)`. The totals never reset; the two
-    /// flight numbers are the instant's split, which is what says whether a full wire
-    /// is repairs or new data (`HANDOFF.md` §4.236).
-    pub(crate) fn totals_state(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
-        let flight = self.recovery.flight_bytes();
-        let repair = self.recovery.flight_repair_bytes();
-        (
-            self.totals.loss_threshold,
-            self.totals.loss_timer,
-            self.totals.probes,
-            self.totals.cuts,
-            self.totals.sent_new,
-            self.totals.sent_repair,
-            flight.saturating_sub(repair),
-            repair,
         )
     }
 
@@ -3546,16 +3399,12 @@ impl Conn {
         // range acknowledged behind that hole then waits on a key the frontier
         // walk never reaches. The prefix only ever grows, so it frees those
         // bytes without needing the hole to be filled.
-        // The bytes this acknowledgement's prefix confirmed, kept for the growth rule
-        // below: the prefix is a delivery signal in its own right (`HANDOFF.md` §4.237).
-        let mut prefix_confirmed = 0u64;
         if ack.prefix > 0
             && let Some(state) = self.streams.get_mut(&ack.stream)
         {
             let moved = state.send.advance_to(ack.prefix);
             state.acknowledged = true;
             self.buffered = self.buffered.saturating_sub(moved);
-            prefix_confirmed = moved;
             // The prefix moves the same frontier the number path does, so its
             // delivery is counted the same way and only once.
             self.ledger.note_delivered(moved);
@@ -3594,17 +3443,14 @@ impl Conn {
         // is on the wire and not what is owed.
         self.note_retransmits(acked.lost.len());
         if !acked.lost.is_empty() {
-            // The path dropped something. It is repaired by retransmission **and** paid for by
-            // the window: a loss is the one signal that says the wire was too wide, and until
-            // the window bounded the wire there was nothing to pay with (`HANDOFF.md` §4.236,
-            // §4.240). One hole, one cut — the epoch rule lives in `cut_window`.
-            let declared = u64::try_from(acked.lost.len()).unwrap_or(u64::MAX);
-            self.ledger.lost_by_threshold = self.ledger.lost_by_threshold.saturating_add(declared);
-            self.totals.loss_threshold = self.totals.loss_threshold.saturating_add(declared);
-            // The episode is named by the highest number this report covers: every declaration up
-            // to a cut's own mark is the same flight.
-            let highest = acked.lost.iter().map(|sent| sent.number).max().unwrap_or(0);
-            self.cut_window(now, highest);
+            // The path dropped something: its capacity has been found, and the
+            // window grows additively from here on. Nothing is cut — the loss
+            // itself is repaired by retransmission.
+            self.ledger.lost_by_threshold = self
+                .ledger
+                .lost_by_threshold
+                .saturating_add(u64::try_from(acked.lost.len()).unwrap_or(u64::MAX));
+            self.slow_start = false;
         }
         for sent in acked.lost {
             if let Some(range) = sent.range {
@@ -3647,27 +3493,8 @@ impl Conn {
         // never cut: a loss is repaired by retransmission, not paid for by
         // halving the pipe for a round trip.
         let before = self.cwnd;
-        // **Both confirmation paths grow the window.** The number block and the byte prefix
-        // confirm the same thing — bytes the peer holds — and only the first used to grow it,
-        // because the prefix was added to free the flight and the window was thought to be its
-        // own signal (`HANDOFF.md` §4.108). With the window now applied at the send point
-        // (§4.236) that omission is fatal: a lane whose number block stalls — measured as
-        // `num=0` with `pfx=330 505` and `grow=0` — keeps delivering bytes and never opens its
-        // window, so it runs for ever at the one window it started with (`HANDOFF.md` §4.237).
-        if acked.progress || prefix_confirmed > 0 {
-            let bytes = u64::try_from(acked.bytes)
-                .unwrap_or(u64::MAX)
-                .saturating_add(prefix_confirmed);
-            // **The pipe is measured from this delivery, and slow start re-arms under it.**
-            // A loss latches slow start off, which is right on a path whose capacity has been
-            // found and wrong on one whose window is still far below it: the shallow cell's lane
-            // spent its whole stage growing one MSS per window from 13 KB, and delivered a third
-            // of the path for it (`HANDOFF.md` §4.237).
-            self.note_round_delivery(
-                now,
-                bytes,
-                self.recovery.smoothed_rtt().unwrap_or(RTT_GRANULARITY),
-            );
+        if acked.progress {
+            let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
             if self.slow_start {
                 // Doubling stops at the ceiling and the additive rule takes
                 // over, because an unspaced burst that outruns the peer's
@@ -3697,96 +3524,6 @@ impl Conn {
         // will not overtake the data it follows.
         self.settle_finished();
         ack_timing.stop(&stats::PHASES.ack);
-    }
-
-    /// Fold one acknowledgement's confirmed bytes into the path's pipe, and re-arm slow start
-    /// while the window is still under it.
-    ///
-    /// The estimator is deliberately the simplest one that can be right: bytes confirmed over the
-    /// elapsed round trip is the delivery rate, and the rate times the path's own length
-    /// (`min_rtt`, the one estimate a queue cannot inflate) is the pipe. A window below that pipe
-    /// has not found the path's capacity, whatever a loss may have said, so doubling resumes until
-    /// it gets there — and the growth rule then hands over to additive, as before.
-    ///
-    /// Integer arithmetic throughout: a float here would need a cast per acknowledgement and buy
-    /// nothing a byte count needs (`HANDOFF.md` §4.237).
-    fn note_round_delivery(&mut self, now: Instant, bytes: u64, srtt: Duration) {
-        self.round_acked = self.round_acked.saturating_add(bytes);
-        let at = *self.round_at.get_or_insert(now);
-        let elapsed = now.saturating_duration_since(at);
-        if elapsed < srtt.max(RTT_GRANULARITY) {
-            return;
-        }
-        let min = self.recovery.min_rtt().unwrap_or(srtt).max(RTT_GRANULARITY);
-        let elapsed_us = u64::try_from(elapsed.as_micros())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let min_us = u64::try_from(min.as_micros()).unwrap_or(u64::MAX).max(1);
-        // pipe = delivered / elapsed x min_rtt, in whole bytes.
-        self.bdp = u64::try_from(
-            u128::from(self.round_acked) * u128::from(min_us) / u128::from(elapsed_us),
-        )
-        .unwrap_or(u64::MAX);
-        self.round_acked = 0;
-        self.round_at = Some(now);
-        // **The restart.** Only while the window is under the pipe, and only when a loss has
-        // latched slow start off: a lane that is at or above its pipe keeps the additive rule.
-        if self.bdp > self.cwnd && !self.slow_start {
-            self.slow_start = true;
-        }
-    }
-
-    /// Pay for one declared loss: halve the window, at most once per round trip.
-    ///
-    /// **This is the half the carrier has never had.** Until the window bounded the wire
-    /// (`HANDOFF.md` §4.236) a cut could not matter — the flight was three to sixteen times the
-    /// window whatever the window said — and the earlier falsification (§4.214) measured a control
-    /// acting on something that was not in charge. With `flight ≤ cwnd` now an invariant of the
-    /// wire, an overshoot has no way back down except this one.
-    ///
-    /// The rules, and why each is what it is:
-    ///
-    /// - **A probe is not a loss.** The timer also fires to elicit an acknowledgement when nothing
-    ///   is stale; charging the window for that cuts a healthy lane, which is how a Noise stream
-    ///   stalled at its eleventh round trip (§4.214).
-    /// - **One cut per flight, not one per report and not one per round trip.** A time-based epoch
-    ///   was the first rule here and it is wrong at both ends: on a 40 ms path one cut per round
-    ///   trip is far too eager once reordering is normal, and on a 1 ms path it allows a thousand
-    ///   cuts a second — measured on the clean cell as `total_cuts` 216–288 per lane in seven
-    ///   seconds, which is a sawtooth between half the ceiling and the ceiling (`HANDOFF.md`
-    ///   §4.241). The rule that is standard because it is dimension-free is TCP's: after a
-    ///   reduction, nothing more is cut until an acknowledgement passes the highest number that was
-    ///   in flight when the reduction happened. One flight, one cut.
-    /// - **Never below two segments.** A window of one packet cannot grow again without a lucky
-    ///   acknowledgement, and the floor is what keeps a lossy path moving.
-    /// - **A loss with no queue behind it is not this carrier's congestion.** A five-percent-loss
-    ///   path drops one packet in twenty at random, and halving once per flight there halves the
-    ///   window every round trip until it sits on the floor — measured as 0.0020 Gbit/s against the
-    ///   baseline's 0.0769 on the `loss5` cell (`HANDOFF.md` §4.246). The signal that separates the
-    ///   two cases is the one this carrier already measures: congestion stands in a queue, so the
-    ///   smoothed round trip is above the path's own length. BBR's rule is the same one — loss
-    ///   without queueing is not a capacity signal — and this is the carrier's own version of it.
-    fn cut_window(&mut self, now: Instant, highest_lost: u32) {
-        // A loss at or below the mark belongs to the episode already paid for.
-        if self.recover.is_some_and(|recover| highest_lost <= recover) {
-            return;
-        }
-        // **And only when a queue says the path is the one asking.** Without a minimum round trip
-        // there is nothing to compare against, and a lane that has never sampled one has not yet
-        // filled anything, so a first loss is not treated as congestion.
-        let queued = match (self.recovery.smoothed_rtt(), self.recovery.min_rtt()) {
-            (Some(smoothed), Some(min)) => smoothed > min + min / 4,
-            _ => false,
-        };
-        if !queued {
-            return;
-        }
-        self.recover = Some(self.recovery.last_number());
-        self.cut_at = Some(now);
-        self.slow_start = false;
-        let floor = 2 * MAX_STREAM_PAYLOAD as u64;
-        self.cwnd = (self.cwnd / 2).max(floor);
-        self.totals.cuts = self.totals.cuts.saturating_add(1);
     }
 
     /// Retire streams whose owner is gone and whose bytes can no longer arrive.
@@ -3850,23 +3587,14 @@ impl Conn {
         let declared = u64::try_from(lost.len()).unwrap_or(u64::MAX);
         if expiry == Expiry::Timeout {
             self.ledger.probes = self.ledger.probes.saturating_add(declared);
-            self.totals.probes = self.totals.probes.saturating_add(declared);
         } else {
             self.ledger.lost_by_timer = self.ledger.lost_by_timer.saturating_add(declared);
-            self.totals.loss_timer = self.totals.loss_timer.saturating_add(declared);
         }
         self.note_retransmits(lost.len());
         if !lost.is_empty() {
-            // A timer that found something stale is a path that could not carry it: the
-            // capacity phase is over and the window pays its half. **A probe is not a loss** —
-            // `Expiry::Timeout` means the timer fired with nothing stale and re-sent one range
-            // to elicit an acknowledgement, and charging the window for that cuts a healthy lane
-            // (`HANDOFF.md` §4.214, §4.240).
+            // A timer that re-sent the flight is a path that could not carry it:
+            // the capacity phase is over.
             self.slow_start = false;
-            if expiry == Expiry::Loss {
-                let highest = lost.iter().map(|sent| sent.number).max().unwrap_or(0);
-                self.cut_window(now, highest);
-            }
         }
         for sent in &lost {
             if let Some(range) = sent.range {
@@ -4723,200 +4451,6 @@ mod tests {
     /// zero. A leak here is not a slow number — it is the ceiling behind §4.50,
     /// where one abandoned stream's unacknowledged tail refused every later stream
     /// on the lane for the lane's whole life.
-    /// The window bounds the wire, and no longer the buffer.
-    ///
-    /// This is the invariant the shallow cell was missing (`HANDOFF.md` §4.236): bytes admitted
-    /// to the buffer while the flight was small used to be emitted later with a flight many
-    /// times the window, because nothing re-checked the window at `poll_transmit`. The buffer
-    /// may hold more than a window — that is the peer's credit's business — and the wire may not.
-    #[test]
-    fn the_wire_carries_no_more_than_the_window() {
-        let now = Instant::now();
-        let mut link = Link::new();
-        link.pump(now);
-        let stream = link.a.open();
-        let bytes = payload(64 * 1024);
-        let written = link.a.write(stream.id, &bytes);
-        let written = u64::try_from(written).unwrap();
-        let cwnd = link.a.cwnd;
-        assert!(
-            written > cwnd,
-            "the buffer takes more than one window: {written}"
-        );
-        let mut buf = Vec::new();
-        for _ in 0..4096 {
-            if link.a.poll_transmit(now, &mut buf).is_none() {
-                break;
-            }
-        }
-        let flight = link.a.recovery.flight_bytes();
-        assert!(
-            flight <= cwnd.saturating_add(OPEN_RESERVE),
-            "the wire must not exceed the window (with the opening's reserve): flight {flight}, cwnd {cwnd}"
-        );
-        assert!(
-            flight < written,
-            "and the buffer still holds what the window kept back: flight {flight}, written {written}"
-        );
-    }
-
-    /// A window under the pipe doubles again; one at or above it stays additive.
-    ///
-    /// The restart `HANDOFF.md` §4.237 asks for, tested without a socket: one round trip's worth of
-    /// confirmed bytes over the path's own length is the pipe, and a loss's latch on slow start is
-    /// only right on a path whose capacity has actually been found.
-    #[test]
-    fn a_window_under_the_pipe_re_arms_slow_start() {
-        let now = Instant::now();
-        let rtt = Duration::from_millis(40);
-        // 64 KiB confirmed inside one 40 ms round trip: the pipe is 64 KiB.
-        let mut small = Conn::new(9, true);
-        small.slow_start = false;
-        small.cwnd = 13_490;
-        small.note_round_delivery(now, 0, rtt);
-        small.note_round_delivery(now + rtt, 64 * 1024, rtt);
-        assert_eq!(
-            small.bdp,
-            64 * 1024,
-            "the pipe is what was delivered in a round trip"
-        );
-        assert!(
-            small.slow_start,
-            "a window under the pipe has found nothing yet, so it doubles again"
-        );
-
-        // The same delivery with a window already above the pipe changes nothing.
-        let mut large = Conn::new(9, true);
-        large.slow_start = false;
-        large.cwnd = 200_000;
-        large.note_round_delivery(now, 0, rtt);
-        large.note_round_delivery(now + rtt, 64 * 1024, rtt);
-        assert_eq!(large.bdp, 64 * 1024);
-        assert!(
-            !large.slow_start,
-            "at or above the pipe the additive rule stands"
-        );
-    }
-
-    /// One flight costs one cut, whatever number of reports it produces.
-    ///
-    /// A hole is declared by several acknowledgements and then by the timer; halving once per
-    /// report would take a quarter, an eighth and a sixteenth of the pipe for one dropped packet
-    /// (`HANDOFF.md` §4.240). The boundary is TCP's `recover`: a cut records the highest number in
-    /// flight, and every later declaration at or below that mark is the same episode. A
-    /// time-based boundary was tried first and is wrong at both ends — a thousand cuts a second on
-    /// a 1 ms path (`HANDOFF.md` §4.241).
-    #[test]
-    fn one_flight_costs_one_cut() {
-        let now = Instant::now();
-        let mut conn = Conn::new(9, true);
-        conn.cwnd = 100_000;
-        // A path with a standing queue: 80 ms smoothed over a 40 ms minimum is what a loss has to
-        // show before the window pays for it (`HANDOFF.md` §4.246).
-        conn.recovery
-            .seed_queue(Duration::from_millis(40), Duration::from_millis(80));
-        // Five packets have left; the report that pays covers number four.
-        for _ in 0..5 {
-            let _ = conn.recovery.next_number();
-        }
-        conn.cut_window(now, 4);
-        assert_eq!(conn.cwnd, 50_000, "the first declaration halves the window");
-        conn.cut_window(now, 3);
-        assert_eq!(
-            conn.cwnd, 50_000,
-            "a later report about the same flight is the same loss"
-        );
-        // A new packet has left, so a declaration above the mark is a new episode.
-        let _ = conn.recovery.next_number();
-        conn.cut_window(now, 6);
-        assert_eq!(conn.cwnd, 25_000, "a new flight can pay for a new loss");
-        assert_eq!(conn.totals.cuts, 2, "and the counter agrees");
-    }
-
-    /// The window never pays its way below two segments.
-    ///
-    /// A window of one packet cannot grow again without a lucky acknowledgement, so a path that
-    /// keeps losing would stop entirely — the floor is what keeps it moving.
-    #[test]
-    fn a_cut_stops_at_two_segments() {
-        let now = Instant::now();
-        let mut conn = Conn::new(9, true);
-        conn.cwnd = 3 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64;
-        conn.recovery
-            .seed_queue(Duration::from_millis(40), Duration::from_millis(80));
-        for _ in 0..3 {
-            let _ = conn.recovery.next_number();
-        }
-        conn.cut_window(now, 2);
-        assert_eq!(
-            conn.cwnd,
-            2 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64,
-            "three segments halve to one and a half, and the floor is two"
-        );
-        let _ = conn.recovery.next_number();
-        conn.cut_window(now, 3);
-        assert_eq!(
-            conn.cwnd,
-            2 * crate::transport::mhd::wire::MAX_STREAM_PAYLOAD as u64,
-            "and further cuts cannot take it lower"
-        );
-    }
-
-    /// A probe re-sends a range and pays nothing: it is not evidence of a loss.
-    ///
-    /// The timer fires early on a healthy path to elicit an acknowledgement, and charging the
-    /// window for that is what stalled a Noise stream at its eleventh round trip
-    /// (`HANDOFF.md` §4.214).
-    #[test]
-    fn a_probe_does_not_pay_for_a_loss() {
-        let now = Instant::now();
-        let mut link = Link::new();
-        let stream = link.a.open();
-        let bytes = payload(2_000);
-        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
-        let mut buf = Vec::new();
-        while link.a.poll_transmit(now, &mut buf).is_some() {}
-        let before = link.a.cwnd;
-        // Nothing is stale yet: this is the timer firing early, which is a probe of a silent path.
-        let (expiry, probed) = link.a.on_timeout(now);
-        assert_eq!(expiry, Expiry::Timeout, "an early timer is a probe");
-        assert_eq!(probed, 1, "a probe re-sends one range");
-        assert_eq!(
-            link.a.cwnd, before,
-            "and the window does not pay for it: {before}"
-        );
-        assert_eq!(link.a.totals.cuts, 0);
-    }
-
-    /// The cumulative counters are not the interval ones.
-    ///
-    /// `take_ledger` is `mem::take`, so everything it returns is a per-second rate. The
-    /// totals beside it must survive that reset: comparing a rate against a shaper's
-    /// cumulative `qdisc dropped` is the misreading `HANDOFF.md` §4.234 withdraws.
-    #[test]
-    fn the_cumulative_totals_survive_the_interval_ledger() {
-        let now = Instant::now();
-        let mut link = Link::new();
-        let stream = link.a.open();
-        let bytes = payload(4_000);
-        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
-        let mut buf = Vec::new();
-        let mut sent = 0;
-        while link.a.poll_transmit(now, &mut buf).is_some() {
-            sent += 1;
-        }
-        assert!(sent > 0, "the opening flight leaves");
-        let first = link.a.totals_state();
-        assert!(first.4 > 0, "new stream bytes are counted cumulatively");
-        let _ = link.a.take_ledger();
-        let second = link.a.totals_state();
-        assert_eq!(
-            first.4, second.4,
-            "taking the interval ledger must not reset the totals"
-        );
-        assert_eq!(first.0 + first.1, second.0 + second.1);
-    }
-
     #[test]
     fn a_finished_exchange_leaves_nothing_counted() {
         let now = Instant::now();
@@ -5731,7 +5265,7 @@ mod tests {
     /// is pinned here. The block in this test says nothing at all, which is what a
     /// hole in a *different* stream produces.
     #[test]
-    fn a_prefix_confirmation_retires_bytes_and_grows_the_window() {
+    fn a_prefix_confirmation_retires_bytes_without_growing_the_window() {
         let now = Instant::now();
         let mut link = Link::new();
         let stream = link.a.open();
@@ -5772,13 +5306,8 @@ mod tests {
             ledger.acked_bytes, len,
             "and the two paths together counted each byte once"
         );
-        // **The prefix grows the window, and it must.** It confirms the same thing the
-        // number block does — bytes the peer holds — and a lane whose number block has
-        // stalled would otherwise deliver for ever at the window it started with, which is
-        // exactly what the shallow cell measured (`HANDOFF.md` §4.237: `num=0`, `pfx=330 505`,
-        // `grow=0`). Growth no longer needs the number block to move.
-        assert_eq!(ledger.grown, len, "the prefix path grows the window");
-        assert_eq!(link.a.cwnd, before + len, "by the bytes it confirmed");
+        assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
+        assert_eq!(link.a.cwnd, before, "the window is exactly where it was");
     }
 
     /// A prefix that covers a declared loss confirms those bytes, and says they were late.

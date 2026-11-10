@@ -269,25 +269,6 @@ impl AckSet {
             }
         } else if self.gaps.len() < Self::AHEAD {
             self.gaps.insert(number);
-        } else if let Some(&oldest) = self.gaps.first() {
-            // **One lost packet must not pin the frontier for ever.** A gap that survives while
-            // `AHEAD` later numbers have arrived is not reordering; it is a packet this receiver
-            // will never see, and holding `below` back on it makes every number more than
-            // sixty-four behind `largest` unretirable — the sender's cumulative step cannot cross
-            // it and its bitmap cannot reach it. Measured on a five-percent-loss path as `num=0`
-            // for a whole stage, with 98 % of what the lane sent being repairs
-            // (`HANDOFF.md` §4.246). So the oldest hole is **abandoned**: the frontier jumps past
-            // it and the numbers that were waiting behind it retire.
-            //
-            // Nothing is lost by abandoning it. If that packet arrives later it is below `below`
-            // and ignored here, and its stream bytes are dropped by offset as a duplicate — which
-            // is what the repair of the same range would have been anyway.
-            self.gaps.remove(&oldest);
-            self.below = oldest.wrapping_add(1);
-            while self.gaps.remove(&self.below) {
-                self.below = self.below.wrapping_add(1);
-            }
-            self.gaps.insert(number);
         }
         fresh
     }
@@ -827,36 +808,6 @@ mod tests {
         assert_eq!(len, HEAD + STREAM + 5);
         let packet = decode(&buf[..len]).unwrap();
         assert_eq!(packet.ack, None);
-    }
-
-    /// A hole that outlives the ahead window is abandoned, so it cannot pin the frontier.
-    ///
-    /// The receiver's `below` is the sender's only cumulative retirement path: a number more than
-    /// sixty-four behind `largest` is outside the bitmap and below the frontier is the only way it
-    /// can be retired. One lost opening packet therefore used to freeze the sender's frontier for
-    /// the whole stage — measured as `num=0` with 98 % repairs on a five-percent-loss path
-    /// (`HANDOFF.md` §4.246). Now the oldest gap is given up when `AHEAD` later numbers have
-    /// arrived, which is not reordering by any measure this carrier accepts.
-    #[test]
-    fn a_hole_that_outlives_the_ahead_window_is_abandoned() {
-        // The control: a handful of later numbers is reordering, and the frontier waits.
-        let mut waited = AckSet::default();
-        for number in 1..=10 {
-            waited.insert(number);
-        }
-        assert_eq!(waited.below(), 0, "ten later numbers are still reordering");
-
-        // One lost opening and `AHEAD` numbers behind it: the frontier moves past the hole.
-        let mut abandoned = AckSet::default();
-        let ahead = u32::try_from(AckSet::AHEAD).unwrap_or(u32::MAX);
-        for number in 1..=(ahead + 1) {
-            abandoned.insert(number);
-        }
-        assert!(
-            abandoned.below() > 1,
-            "the frontier must not be pinned by one lost packet: below {}",
-            abandoned.below()
-        );
     }
 
     /// The bitmap remembers what arrived below the largest number, in any order.

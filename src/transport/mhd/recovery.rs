@@ -189,13 +189,6 @@ pub(crate) struct Sent {
     /// Keying that on [`Recovery::live`] instead made the exemption work only on
     /// an idle lane — the one place an opening is never lost.
     pub(crate) opening: bool,
-    /// Whether this packet carried a range that had already been sent once.
-    ///
-    /// Kept per record so the flight can be split: "the wire is full of repairs" and
-    /// "the wire is full of new data" are different defects, and the interval ledger's
-    /// `rep=` share cannot say what is **in flight** at a given moment (`HANDOFF.md`
-    /// §4.236).
-    pub(crate) repair: bool,
 }
 
 impl Recovery {
@@ -360,8 +353,6 @@ pub(crate) struct Recovery {
     live: usize,
     /// Stream bytes the table holds, kept exact by [`Self::retire`].
     flight_bytes: u64,
-    /// Of those, the ones a repair carried: the split the attribution run reads.
-    flight_repair_bytes: u64,
     rtt: Rtt,
     /// When the timer should fire, if anything is in flight.
     timer: Option<Instant>,
@@ -371,11 +362,6 @@ pub(crate) struct Recovery {
     silent_since: Option<Instant>,
     /// The backoff applied to the timer since the last acknowledgement.
     backoff: u32,
-    /// The highest number an acknowledgement has confirmed.
-    ///
-    /// RACK's evidence: a record below this was sent before traffic the path demonstrably carried,
-    /// so its absence is a hole rather than a queue (`HANDOFF.md` §4.243).
-    largest_acked: Option<u32>,
 }
 
 impl Recovery {
@@ -388,13 +374,11 @@ impl Recovery {
             lost: BTreeSet::new(),
             live: 0,
             flight_bytes: 0,
-            flight_repair_bytes: 0,
             rtt: Rtt::default(),
             timer: None,
             silent: 0,
             silent_since: None,
             backoff: 0,
-            largest_acked: None,
         }
     }
 
@@ -454,11 +438,6 @@ impl Recovery {
 
     pub(crate) fn flight_bytes(&self) -> u64 {
         self.flight_bytes
-    }
-
-    /// The repair share of the flight, in bytes: what is on the wire again.
-    pub(crate) fn flight_repair_bytes(&self) -> u64 {
-        self.flight_repair_bytes
     }
 
     /// Retire every record the peer's byte prefix has already confirmed.
@@ -528,11 +507,7 @@ impl Recovery {
     /// path removes it: an acknowledgement, a loss declaration, or a probe.
     fn retire(&mut self, sent: &Sent) {
         if let Some(range) = sent.range {
-            let len = u64::from(range.len);
-            self.flight_bytes = self.flight_bytes.saturating_sub(len);
-            if sent.repair {
-                self.flight_repair_bytes = self.flight_repair_bytes.saturating_sub(len);
-            }
+            self.flight_bytes = self.flight_bytes.saturating_sub(u64::from(range.len));
         }
     }
 
@@ -626,7 +601,6 @@ impl Recovery {
         number: u32,
         range: Option<SentRange>,
         opening: bool,
-        repair: bool,
     ) {
         let sent = Sent {
             number,
@@ -634,13 +608,9 @@ impl Recovery {
             range,
             lost_at: None,
             opening,
-            repair,
         };
         if let Some(range) = range {
             self.flight_bytes += u64::from(range.len);
-            if repair {
-                self.flight_repair_bytes += u64::from(range.len);
-            }
             self.in_flight.insert(number, sent);
             self.live += 1;
         }
@@ -699,15 +669,6 @@ impl Recovery {
                 newest = Some((sent.number, sent.time));
             }
         };
-        // **Everything below the frontier is evidence.** A block that says "every number under
-        // `below` has arrived" has confirmed traffic at least up to `below - 1`, whatever this end
-        // still holds, and RACK's question is only how far the path has demonstrably carried.
-        if ack.below > 0 {
-            let confirmed = ack.below - 1;
-            if self.largest_acked.is_none_or(|acked| confirmed > acked) {
-                self.largest_acked = Some(confirmed);
-            }
-        }
         // Everything the frontier names is delivered, however far back it is. That
         // is the step that retires a wide flight: with a bitmap alone, a
         // connection with ten thousand packets outstanding could only ever
@@ -752,9 +713,6 @@ impl Recovery {
         for number in acked {
             if let Some(sent) = self.take(number) {
                 note(&sent);
-                if self.largest_acked.is_none_or(|acked| sent.number > acked) {
-                    self.largest_acked = Some(sent.number);
-                }
                 if let Some(range) = sent.range {
                     result.bytes += usize::from(range.len);
                 }
@@ -819,32 +777,11 @@ impl Recovery {
             return (Expiry::Dead, all);
         }
         let delay = self.rtt.loss_delay();
-        // **A declaration needs evidence, or a real timeout.** Age alone is what made a clean
-        // loopback lane declare three to eight thousand losses a second while nothing was dropped
-        // (`HANDOFF.md` §4.243): a record two milliseconds old on a millisecond path is far past
-        // nine eighths of the smoothed round trip, and on a busy host that is ordinary scheduling,
-        // not loss. Two things can justify a declaration:
-        //
-        // - **Evidence** (RACK's rule): a packet sent *after* this one has been acknowledged, so the
-        //   path demonstrably carried the later traffic and this one is missing from it.
-        // - **The escape**: the record has outlived the retransmission timeout itself. That is the
-        //   timer's own notion of "too old", so it is reachable exactly where evidence is not — a
-        //   lone opening packet has nothing behind it that could ever be acknowledged, which is why
-        //   the handshake's floor exists at all (measured as a 502 ms open before it did).
-        let escape = self.rtt.rto(self.live <= SMALL_FLIGHT_PACKETS);
         let stale: Vec<u32> = self
             .in_flight
             .iter()
-            .filter(|(number, sent)| {
-                if sent.lost_at.is_some() {
-                    return false;
-                }
-                let age = now.saturating_duration_since(sent.time);
-                if age <= delay {
-                    return false;
-                }
-                let evidenced = self.largest_acked.is_some_and(|acked| acked > **number);
-                evidenced || age >= escape
+            .filter(|(_, sent)| {
+                sent.lost_at.is_none() && now.saturating_duration_since(sent.time) > delay
             })
             .map(|(number, _)| *number)
             .collect();
@@ -946,17 +883,6 @@ impl Recovery {
         self.lost.len()
     }
 
-    /// Seed a **standing queue**: the minimum the path's own length, the smoothed estimate above it.
-    ///
-    /// The window's loss response asks whether a queue is standing (`HANDOFF.md` §4.246), so a test
-    /// that wants a cut has to give it the two numbers that answer the question.
-    #[cfg(test)]
-    pub(crate) fn seed_queue(&mut self, min: Duration, smoothed: Duration) {
-        self.rtt.min = Some(min);
-        self.rtt.smoothed = Some(smoothed);
-        self.rtt.latest = Some(smoothed);
-    }
-
     /// Something arrived from the peer: the run of silent timers is over.
     fn heard(&mut self) {
         self.backoff = 0;
@@ -992,44 +918,6 @@ mod tests {
     )]
     use super::*;
 
-    /// The flight knows which of its bytes are repairs.
-    ///
-    /// "The wire is full of repairs" and "the wire is full of new data" are different
-    /// defects, and one total cannot tell them apart (`HANDOFF.md` §4.236). Both
-    /// retirement paths have to keep the split exact, because a split that drifts is
-    /// worse than none: it would be read as an attribution.
-    #[test]
-    fn the_flight_split_counts_repairs_apart_from_new_data() {
-        let start = Instant::now();
-        let mut recovery = Recovery::new();
-        recovery.on_sent(start, 1, Some(range(0)), false, false);
-        recovery.on_sent(start, 2, Some(range(100)), false, true);
-        assert_eq!(recovery.flight_bytes(), 200, "both are on the wire");
-        assert_eq!(
-            recovery.flight_repair_bytes(),
-            100,
-            "and exactly one of them is a repair"
-        );
-        // The cumulative path retires both, and the split must come back with it.
-        let acked = recovery.on_ack(
-            start + Duration::from_millis(10),
-            Ack {
-                largest: 2,
-                below: 3,
-                bits: 0,
-                stream: 0,
-                prefix: 0,
-            },
-        );
-        assert_eq!(acked.bytes, 200);
-        assert_eq!(recovery.flight_bytes(), 0);
-        assert_eq!(
-            recovery.flight_repair_bytes(),
-            0,
-            "a retired repair leaves the repair total"
-        );
-    }
-
     fn range(offset: u64) -> SentRange {
         SentRange {
             stream: 1,
@@ -1041,7 +929,7 @@ mod tests {
 
     fn send_one(recovery: &mut Recovery, now: Instant, offset: u64) -> u32 {
         let number = recovery.next_number();
-        recovery.on_sent(now, number, Some(range(offset)), false, false);
+        recovery.on_sent(now, number, Some(range(offset)), false);
         number
     }
 
@@ -1162,7 +1050,7 @@ mod tests {
 
         // The repair: the same byte range, a new number.
         let repair = recovery.next_number();
-        recovery.on_sent(start, repair, Some(range(0)), false, false);
+        recovery.on_sent(start, repair, Some(range(0)), false);
         assert_eq!(
             recovery.flight_bytes(),
             100,
@@ -1301,7 +1189,7 @@ mod tests {
         let mut recovery = Recovery::new();
         for i in 0..u32::try_from(MAX_LOST).unwrap() + 16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)), false, false);
+            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)), false);
             let _ = recovery.declare_lost(start, number);
         }
         assert!(
@@ -1486,12 +1374,12 @@ mod tests {
         let mut recovery = Recovery::new();
         for step in 1u64..=16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(step * 100)), false, false);
+            recovery.on_sent(start, number, Some(range(step * 100)), false);
         }
         assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
         let at = start + Duration::from_millis(10);
         let number = recovery.next_number();
-        recovery.on_sent(at, number, Some(range(0)), true, false);
+        recovery.on_sent(at, number, Some(range(0)), true);
         let waited = recovery
             .poll_timeout()
             .unwrap()
@@ -1588,7 +1476,7 @@ mod tests {
         let mut recovery = Recovery::new();
         for step in 1u64..=16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(step * 100)), false, false);
+            recovery.on_sent(start, number, Some(range(step * 100)), false);
         }
         assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
         let waited = recovery
@@ -1724,7 +1612,7 @@ mod tests {
             // is what the kill rule counts.
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range, sent.opening, sent.repair);
+                recovery.on_sent(now, number, sent.range, sent.opening);
             }
         }
         assert_eq!(
@@ -1850,7 +1738,7 @@ mod tests {
             let (_, resent) = recovery.on_timeout(now);
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range, sent.opening, sent.repair);
+                recovery.on_sent(now, number, sent.range, sent.opening);
             }
         }
         assert_eq!(waits[0], MIN_RTO_SMALL_FLIGHT, "the first step is cheap");
