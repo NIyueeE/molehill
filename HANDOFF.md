@@ -377,6 +377,45 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.216 The burst budget fails too, and the arithmetic says why: the carrier sends 135 Mbit/s into a 100 Mbit/s pipe (2026-11-10)
+
+A‴ — cap each pass at `min(44, max(4, cwnd/(4·MSS)))` datagrams — was implemented and measured on the shallow cell:
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0957 / 0.0954 | 16 / 16 |
+| frp | 0.0951 / 0.0950 | 17 / 16 |
+| molehill | 0.0840 / 0.0785 | **3 111 / 4 417** |
+| molehill twin | 0.0821 / 0.0836 | 1 973 / 2 621 |
+
+Primary misses (needs ≤ 100) and the throughput guard misses too. **Reverted whole.**
+
+**And the ledger from the same cell says exactly what is wrong** (§4.211's run, per lane, per second):
+
+```
+sent=16926295 rep=635379(3%) pkt=12551 ack=9305795
+```
+
+**16.9 MB posted in one second is 135 Mbit/s through a 100 Mbit/s shaper.** The carrier is not merely a little over; it is
+a third over, all second, and the difference is dropped and then re-sent — which is a loop that never converges because
+nothing in it ever asks the sender to slow down.
+
+**Why the per-pass cap did not fix it**: a budget per pass bounds a *burst*, not a *rate*. The pump runs pass after pass
+with no gap, so four datagrams per pass at pump speed is the same throughput as forty-four. **Pacing is a function of
+time, and nothing in this carrier is a function of time.**
+
+**And why the BDP ceiling did not fix it either** (§4.215): on a 200 ms path at 100 Mbit/s the bandwidth-delay product is
+**2.5 MB**, and the shaper's queue is a few dozen kilobytes. A window of one BDP is therefore a window a hundred times
+the queue — correct for a path with a deep buffer, ruinous on a shallow one. `Rtt::min` times the rate is the *path's*
+capacity, not the *queue's*, and the two are not the same number here.
+
+**The mechanism that is missing is a pacer**: a token bucket at the measured delivery rate, so the sender's rate is a
+function of time and of the path, not of how fast the pump happens to loop. That is a different mechanism from all five
+tried so far (window gate, repair budget, loss halving, BDP cap, per-pass burst), and it is the one the arithmetic above
+points at directly.
+
+**Committed: nothing.** The tree is §4.211's state, 107 tests green.
+
 ### 4.215 The delay ceiling barely binds either, so the window is not what fills the queue (2026-11-10)
 
 A″ — cap `cwnd` at the bandwidth-delay product (`Rtt::min × measured delivery rate`, gain 1.0), with a `held` counter
