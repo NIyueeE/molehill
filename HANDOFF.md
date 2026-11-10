@@ -377,6 +377,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.233 The probe cycle buys back the throughput and not one drop (2026-11-10)
+
+A¹³: A¹²'s peak estimator, inflight cap and multiplicative cut, plus the one piece not yet tried — a **probe cycle**.
+Every eight round trips the inflight allowance rises to `3 × BDP` for one round trip; if the delivery peak rose by more
+than 2 % the higher peak is kept, and if it did not the ceiling falls 2 % and the allowance returns to `2 × BDP`.
+
+| arm | `throughput_gbps` | `dropped_packets` |
+|---|---|---|
+| rathole | 0.0953 / 0.0955 | 17 / 17 |
+| frp | 0.0951 / 0.0955 | 16 / 17 |
+| molehill (A¹³) | **0.0821 / 0.0833** | **1 546 / 2 310** |
+| molehill twin | 0.0828 / 0.0817 | 7 583 / 1 234 |
+
+**The throughput is back to the twin's level** — the probe cycle did its job — and **the drops are unchanged**, still two
+orders above the peers' 16. The controller engages (`cut2=10…11`). Reverted whole.
+
+**Fourteen mechanisms, and the pattern is now quantitative rather than suggestive.** On this cell the carrier does one of
+two things: send at about 0.082 Gbit/s and take 1 500–2 900 drops, or send at about 0.023 Gbit/s and take none. Every
+control tried lands on that line, and the line is the shaper's: at 100 Mbit/s a 2 MB buffer holds 160 ms, and the
+carrier's own round trip on this path is five to eight times its minimum (§4.230).
+
+**So the defect cannot be closed by a control law inside this architecture**, and the honest recommendation is to record
+it as known and bounded: the throughput cost against TCP is 8–11 % (§4.228), the drops do not storm (§4.211), and
+`transport`, `loss1`, `bulk-n`, the integrations and the striped cell all hold. The alternative is a different data path
+(a per-lane kernel pacing facility, or a TCP fallback that engages on loss-heavy paths), which is a project of its own and
+outside this stage's boundaries.
+
+**Reverted whole**: the tree is `4f0d8d2`'s state, 107 tests green.
+
 ### 4.232 The peak-rate controller runs and lands at minus thirty percent drops for minus three percent throughput (2026-11-10)
 
 A¹² again, with the harness fixed (§4.231) and with the two defects its first run exposed corrected:
