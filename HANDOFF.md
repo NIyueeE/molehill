@@ -377,6 +377,50 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.260 The delivered-rate pacer throttles to a megabit, and the family has no survivors (2026-11-10)
+
+§4.259's prerequisite was met first: **the lossy pump now lets time pass between datagrams**
+(`9afdc99`), so a timed rule can be exercised at unit level at all. With that in place the fifth
+mechanism — rate = delivered × 1.1, bucket two segments, no ramp, no queue signal, no cut on loss —
+was re-applied, and it got much further: **108 of 109 tests pass**, one accounting assertion apart
+(`a_loss_re_sends_the_hole_and_not_what_follows_it` counts three segments re-sent where it expects
+one).
+
+**The bench ends it:**
+
+| cell | arm | `throughput_gbps` | drops |
+|---|---|---|---|
+| `rate100_shallow` | baseline | **0.0830** | 4 852 |
+| | candidate | **0.0006** | **0** |
+| `loss1` | baseline | **1.412** | 464 |
+| | candidate | **0.0013** | **86** |
+
+Zero drops on both cells and **one hundredth of the throughput**. The mechanism does what it says —
+it never sends faster than the path carried — and the implementation throttles far below its own
+floor (0.6–1.3 Mbit/s against a 512 KiB/s floor), which is a bug I can see the shape of and cannot fix
+in this round: the bucket's refill is driven from `pace_at`, which every picker call resets, so a
+burst of calls that all refuse leaves almost no elapsed time to earn tokens from.
+
+**Reverted.** `src/` is byte-identical to `6ed32c1`, 109 tests pass.
+
+**Five mechanisms, five failures, and no survivor:**
+
+| mechanism | shallow | lossy |
+|---|---|---|
+| window at the send point (§4.249) | 39–43 drops, +7.7 % | zero bytes |
+| subset (§4.255) | untested | 98 477 / 131 072 |
+| subset + limited transmit (§4.256) | 0 drops, −64 % | 0.15 against 1.45 |
+| delay-driven rate (§4.258) | no change | 0.0304 against 1.44 |
+| delivered-rate (§4.260) | 0 drops, −99 % | 0.0013 against 1.41 |
+
+Every one of them buys drops with throughput, and the exchange rate is terrible — the best was 0 drops
+for two thirds of the rate. **That is now the finding, not the failure**: on this path shape, the
+carrier's drops are the price of its throughput, and no controller in the five tried breaks that
+trade. Changing the trade needs something outside all five — a path signal the carrier does not have
+(the shaper's own queue depth), a send path that can be shaped without being asked (kernel pacing), or
+a decision to route a lossy path another way — and each of those is either outside the fixed
+boundaries or a new wire capability.
+
 ### 4.259 A pacer that cannot park, and the harness that cannot run it (2026-11-10)
 
 The fifth mechanism, designed against §4.258's failure rather than in spite of it: **the rate is
