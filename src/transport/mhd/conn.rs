@@ -4404,6 +4404,64 @@ mod tests {
 
     /// A dropped datagram costs a round trip and nothing else: the timer puts
     /// the missing range back in the queue and the reader still gets the stream.
+    ///
+    /// **A lane whose first packet is lost still carries its stream.**
+    ///
+    /// This is the invariant the fourth plan's window work broke and died on (`HANDOFF.md`
+    /// §4.249): with the window applied at the send point, a lane that lost its opening carried
+    /// **zero bytes** on a one-percent-loss path, in every round, while the baseline carried nine
+    /// hundred megabytes. The engine is back to the baseline and this test pins what any future
+    /// candidate has to preserve: the *first datagram* of a stream goes missing, and the transfer
+    /// still completes.
+    ///
+    /// The time budget is the point of the test as much as the completion is. A lane that recovers
+    /// from a lost opening in a couple of retransmission timers is a lane; one that recovers after
+    /// the stage has ended is the ship-wreck §4.249 measured, and both would pass a test that only
+    /// checked the bytes eventually arrived.
+    #[test]
+    fn a_lost_opening_still_completes_the_stream() {
+        let start = Instant::now();
+        let mut link = Link::new();
+        link.pump(start);
+        let stream = link.a.open();
+        let bytes = payload(4096);
+        assert_eq!(link.a.write(stream.id, &bytes), bytes.len());
+
+        // The opening itself goes missing: the peer never learns the stream exists.
+        link.pump_dropping_one(start);
+        assert!(
+            link.b.accept().is_none(),
+            "the dropped opening is the stream's only naming"
+        );
+
+        // Drive the link in real time until the stream arrives and finishes. Two seconds of
+        // virtual time is generous against a 20 ms handshake floor and mean against a stall.
+        let mut clock = start;
+        let mut accepted = None;
+        let mut out = Vec::new();
+        for _ in 0..400 {
+            clock += Duration::from_millis(5);
+            link.pump(clock);
+            if accepted.is_none() {
+                accepted = link.b.accept();
+            }
+            if let Some(stream) = accepted {
+                out.extend_from_slice(&take(&mut link.b, stream.id));
+                if out.len() == bytes.len() {
+                    break;
+                }
+            }
+        }
+        assert!(
+            accepted.is_some(),
+            "a lane that lost its opening must still name the stream"
+        );
+        assert_eq!(
+            out, bytes,
+            "and carry every byte of it within two seconds of virtual time"
+        );
+    }
+
     #[test]
     fn a_dropped_datagram_is_recovered_without_losing_a_stream() {
         let now = Instant::now();

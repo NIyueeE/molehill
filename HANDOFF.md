@@ -377,6 +377,24 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.250 The invariant is pinned: a lost opening must still carry the stream (2026-11-10)
+
+§4.249's ship-wreck has one executable lesson, and it is now a test rather than a paragraph.
+`a_lost_opening_still_completes_the_stream` drops **the first datagram of a stream** — the one that
+names it — and requires the transfer to complete **within two seconds of virtual time**. The budget
+is half the point: a lane that recovers in a couple of retransmission timers is a lane, and one that
+recovers after the stage has ended is exactly what §4.249 measured, and a test that only checked the
+bytes eventually arrived would pass both.
+
+The baseline engine passes it (108 tests, one more than before). The reverted candidate would not
+have: on `loss1` it carried zero bytes in three rounds of three, which is this test's failure at
+eight-second scale.
+
+**What it does not prove.** It is one stream on one link with one dropped datagram at time zero; it
+says nothing about a lane that loses its opening *and* keeps losing, which is the `loss1` case. So it
+is a floor, not the guard the next candidate needs — but it is a floor that can be run in
+milliseconds, and the next candidate has to clear it before any campaign is worth running.
+
 ### 4.249 The window re-architecture is reverted whole: it carries nothing on a lossy path (2026-11-10)
 
 Two guards were opened by §4.246 and I ran the rest of F3.2 before deciding what to do about them. The
