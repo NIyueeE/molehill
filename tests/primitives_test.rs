@@ -76,6 +76,44 @@ fn bench_per_kib<F: FnMut()>(name: &str, bytes: usize, body: F) -> f64 {
     ns
 }
 
+/// The carrier's sealing call, priced on the implementation `mhd` uses today.
+///
+/// Different crate, same shape as the `ring` rows above: in place, detached
+/// tag, no allocation on the call — which is what makes the rows comparable
+/// rather than two different benchmarks. The carrier's sealing switch
+/// (`MOLEHILL_MHD_SEAL`) is off by default, so this is the number that decides
+/// whether it can be turned on: §4.70 measured 6.2 µs per 1 387-byte packet on
+/// this path, which is an order of magnitude above a hardware `ChaCha20`.
+#[cfg(feature = "mhd")]
+fn bench_carrier_aead() {
+    use chacha20poly1305::aead::{AeadInOut, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    println!("== the carrier's own AEAD (chacha20poly1305, as `mhd` seals) ==");
+    let key = ChaCha20Poly1305::new(&Key::from([7u8; 32]));
+    let nonce = Nonce::from(NONCE);
+    let ad = [0x33u8; 64];
+    let mut plain = vec![0u8; DATAGRAM];
+    let mut tag = [0u8; 16];
+    bench_per_kib("seal 1400 in place (detached)", DATAGRAM, || {
+        let written = key
+            .encrypt_inout_detached(&nonce, &ad, plain.as_mut_slice().into())
+            .expect("a key and a buffer this call owns");
+        tag.copy_from_slice(&written);
+        black_box(&tag);
+    });
+    let mut sealed = vec![0u8; DATAGRAM];
+    let sealed_tag = key
+        .encrypt_inout_detached(&nonce, &ad, sealed.as_mut_slice().into())
+        .expect("a key and a buffer this call owns");
+    bench_per_kib("open 1400 in place (detached)", DATAGRAM, || {
+        black_box(
+            key.decrypt_inout_detached(&nonce, &ad, sealed.as_mut_slice().into(), &sealed_tag)
+                .is_ok(),
+        );
+    });
+}
+
 #[test]
 #[ignore = "a cost table, not an assertion; run it with `just primitives`"]
 fn primitives() {
@@ -191,6 +229,46 @@ fn primitives() {
         black_box(&big);
         big.truncate(RECORD);
     });
+
+    // AES-GCM on the same core: the alternative for a sealing path that has to
+    // run per packet. This host reports `aes` and `pclmulqdq`, so the hardware
+    // backend is what runs.
+    println!("== the same host, AES-256-GCM (ring) ==");
+    let aes = LessSafeKey::new(
+        UnboundKey::new(&ring::aead::AES_256_GCM, &[9u8; 32]).expect("a 32-byte key"),
+    );
+    let mut block = vec![0u8; DATAGRAM];
+    bench_per_kib("seal 1400 in place (AES-256-GCM)", DATAGRAM, || {
+        aes.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(NONCE),
+            Aad::empty(),
+            &mut block,
+        )
+        .expect("a buffer with room for the tag");
+        black_box(&block);
+        block.truncate(DATAGRAM);
+    });
+    let mut sealed_aes = block.clone();
+    aes.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(NONCE),
+        Aad::empty(),
+        &mut sealed_aes,
+    )
+    .expect("a buffer with room for the tag");
+    let mut opened_aes = vec![0u8; sealed_aes.len()];
+    bench_per_kib("open 1400 in place (AES-256-GCM)", DATAGRAM, || {
+        opened_aes.copy_from_slice(&sealed_aes);
+        aes.open_in_place(
+            Nonce::assume_unique_for_key(NONCE),
+            Aad::empty(),
+            &mut opened_aes,
+        )
+        .expect("a tag this key wrote");
+        black_box(&opened_aes);
+    });
+
+    #[cfg(feature = "mhd")]
+    bench_carrier_aead();
 
     println!("== containers and clocks ==");
     let mut tree: std::collections::BTreeMap<u64, bytes::Bytes> = std::collections::BTreeMap::new();

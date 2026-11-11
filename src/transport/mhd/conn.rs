@@ -2360,11 +2360,10 @@ impl Conn {
             stats::note_rejected("unsealed_no_key");
             return Err(Rejected::Unsealed);
         };
-        let mut opened = data.to_vec();
-        if !cipher.open(u64::from(packet.number), packet.ad, &mut opened, tag) {
+        let Some(opened) = cipher.open(u64::from(packet.number), packet.ad, data, tag) else {
             stats::note_unsealed();
             return Err(Rejected::Unsealed);
-        }
+        };
         Ok((std::borrow::Cow::Owned(opened), fresh))
     }
 

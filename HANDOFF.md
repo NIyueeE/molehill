@@ -377,6 +377,80 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.282 Sealing is on by default: the handshake leaves the arrival path (2026-11-11)
+
+P1 of the fifth plan, and the first change in this record whose headline number is a latency
+**improvement** measured on the product rather than a trade.
+
+**What changed.** `sealing_enabled()` defaults to true (`MOLEHILL_MHD_SEAL=0` is the hatch); the
+carrier's AEAD moved from RustCrypto's ChaCha20-Poly1305 to **`ring`'s AES-256-GCM**; and
+`StreamCipher::open` now returns the plaintext instead of opening in place, which removes the caller's
+`to_vec` and joins the payload with its tag inside the one allocation it already made.
+
+**Why the AEAD had to move first: it was the whole cost.** `tests/primitives_test.rs` prices three
+implementations on this host, 1 400 bytes in place:
+
+| implementation | seal | open |
+|---|---|---|
+| RustCrypto ChaCha20-Poly1305 (what the carrier used) | 2 805 ns | 1 946 ns |
+| `ring` ChaCha20-Poly1305 | 1 017 ns | 972 ns |
+| **`ring` AES-256-GCM** (what the carrier uses now) | **671 ns** | **667 ns** |
+
+`bulk-n` on a clean path, six rounds, one binary, the switch the only difference:
+
+| arm | throughput | CPU |
+|---|---|---|
+| sealing off | 11.30 / 11.67 Gbit/s | 1.02 s/Gbit |
+| sealing on, old AEAD | 6.28 / 6.23 | 1.51 |
+| **sealing on, AES-256-GCM** | **9.78 / 9.81** | **1.06** |
+
+85 % of the unsealed throughput, at CPU parity — the 3.13× §4.70 recorded was mostly the
+implementation, not the idea.
+
+**The arrival path, read from the product's own open line** (`mhd stream opened and acknowledged … us=
+hs_us=`), not inferred from a cell:
+
+| | opens | open p50 | open p99 | handshake p50 |
+|---|---|---|---|---|
+| sealing off | 19 221 (`churn-16`) | 1 222 µs | 1 979 µs | 1 221 µs |
+| **sealing on** | 19 221 | **150 µs** | **258 µs** | **11 µs** |
+| sealing off, under bulk (`cost`, clean) | 7 125 | 1 414 µs | **41 215 µs** | — |
+| **sealing on, under bulk** | 6 901 | **211 µs** | **9 086 µs** | — |
+
+The last two rows are the §4.90 defect: the pairing tail *was* the stream's own open. It is now an
+order of magnitude smaller under the same load.
+
+**What a visitor sees.** `cost` on `clean` (bulk + interactive + UDP + churn), two measured rounds each:
+
+| arm | interactive p99 | p50 | throughput |
+|---|---|---|---|
+| sealing off | 48.34 / 28.88 ms | 3.51 / 2.98 ms | 9.09 / 8.92 Gbit/s |
+| **sealing on** | **7.43 / 8.68 ms** | **1.54 / 1.53 ms** | 7.89 / 7.82 |
+
+A 3.3–5.5× tail improvement for 13 % of the throughput — the trade the standing priority asks for, and
+the first time this record can state one without a guard breach.
+
+**The cells that did not move, stated as such.** `churn-16` reads p99 8.08 → **7.26 ms** (rate
+2 254 → 2 427/s) with sealing, against the TCP carrier's 6.66 ms and 2 607/s in its own file: better,
+not parity, and the remaining gap is not the handshake. `rr-16` reads 1.59 against TCP's 1.34 ms and
+**is identical with sealing off** (1.62), so that gap is not this change. Both are cross-file readings,
+each with its own A/A pair; they are directional at the percent level those floors resolve.
+
+**The four-stripe deadlock did not reproduce.** Eleven runs of the shape that produced it on 2026-11-04
+(sealed 3/6): six `striped_data_channels` and five full integration suites, 22/22 each, the last two
+with sealing as the default. That is not a root cause and the switch stays for exactly that reason —
+but a recurrence can now be isolated to one variable. The suite also got faster with the handshake
+gone: **124 s → 87 s** for the same 22 tests on the debug build.
+
+**A methodology trap, paid for once.** The first churn comparison of this change read "no difference"
+— because `target/release/molehill` had not been rebuilt after the default flip, so both arms ran the
+old binary. Rebuilt, the same comparison reads 8× at the median. **Build, then run, then read the
+binary's hash** (AGENTS.md §10): a benchmark run against a stale binary measures a tree that no longer
+exists.
+
+**Committed**: the AEAD switch, the open-path signature, the default flip, the docs that state the new
+per-lane forward-secrecy boundary, and the primitives rows that price the three candidates.
+
 ### 4.281 The two carriers, measured on the leg the carrier crosses: the tail is mhd's, the throughput is not (2026-11-11)
 
 The comparison the fifth plan pre-registered, run for the first time with both arms on the right leg.

@@ -23,9 +23,19 @@
 //! What this trades away is stated where the design is: forward secrecy moves
 //! from per stream to per lane. What it must **not** trade away is the secret
 //! itself — see [`LaneRoot`] for why the transcript hash alone is not a root.
+//!
+//! ## The AEAD is AES-256-GCM, and the choice is measured
+//!
+//! The first implementation used `ChaCha20-Poly1305` through the `RustCrypto`
+//! crate, at **2 805 ns** a 1 400-byte packet seal (and 1 946 to open) on the
+//! host this repository is measured on; `tests/primitives_test.rs` prices all
+//! three candidates side by side. `ring`'s `AES-256-GCM` runs the same packet in
+//! **671 ns** (667 to open), through AES-NI, and its hardware backend is picked
+//! at run time — a host without the instructions still works. Sealing costs
+//! throughput because it runs once per packet, so the cheapest call that still
+//! authenticates a packet is the one that makes the lane-root design affordable.
 
-use chacha20poly1305::aead::{AeadInOut, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 
 /// The tag every sealed packet carries.
 pub(super) const TAG: usize = 16;
@@ -66,7 +76,7 @@ impl Direction {
 
 /// One direction of one stream.
 pub(super) struct StreamCipher {
-    aead: ChaCha20Poly1305,
+    aead: LessSafeKey,
 }
 
 impl std::fmt::Debug for StreamCipher {
@@ -98,10 +108,12 @@ impl StreamCipher {
         if hk.expand(&info, &mut key).is_err() {
             return None;
         }
-        let aead = ChaCha20Poly1305::new(&Key::from(key));
+        let aead = UnboundKey::new(&AES_256_GCM, &key)
+            .ok()
+            .map(LessSafeKey::new);
         // The stack copy is wiped; the cipher keeps its own expanded schedule.
         key.fill(0);
-        Some(Self { aead })
+        aead.map(|aead| Self { aead })
     }
 
     /// The nonce one packet uses: its own number, which the header carries.
@@ -114,7 +126,7 @@ impl StreamCipher {
     fn nonce(packet: u64) -> Nonce {
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&packet.to_be_bytes());
-        Nonce::from(nonce)
+        Nonce::assume_unique_for_key(nonce)
     }
 
     /// Seal `plain` in place, answering the tag the caller appends.
@@ -125,22 +137,40 @@ impl StreamCipher {
     pub(super) fn seal(&self, packet: u64, ad: &[u8], plain: &mut [u8]) -> Option<[u8; TAG]> {
         let tag = self
             .aead
-            .encrypt_inout_detached(&Self::nonce(packet), ad, plain.into())
+            .seal_in_place_separate_tag(Self::nonce(packet), Aad::from(ad), plain)
             .ok()?;
         let mut out = [0u8; TAG];
-        out.copy_from_slice(&tag);
+        out.copy_from_slice(tag.as_ref());
         Some(out)
     }
 
-    /// Open `cipher` in place against `tag`, answering whether it verified.
-    pub(super) fn open(&self, packet: u64, ad: &[u8], cipher: &mut [u8], tag: &[u8]) -> bool {
-        let Ok(tag) = <&[u8; TAG]>::try_from(tag) else {
-            return false;
-        };
-        let tag = (*tag).into();
-        self.aead
-            .decrypt_inout_detached(&Self::nonce(packet), ad, cipher.into(), &tag)
-            .is_ok()
+    /// Open `cipher` against `tag`, answering the plaintext it authenticated.
+    ///
+    /// The tag is a slice of its own on this end — the header carries it, not
+    /// the payload — and the backend wants it appended, so the two are joined
+    /// once into the buffer this returns. That is the same single allocation
+    /// the caller used to make with `to_vec`, moved here so the join and the
+    /// open are one pass rather than two.
+    pub(super) fn open(
+        &self,
+        packet: u64,
+        ad: &[u8],
+        cipher: &[u8],
+        tag: &[u8],
+    ) -> Option<Vec<u8>> {
+        if tag.len() != TAG {
+            return None;
+        }
+        let mut opened = Vec::with_capacity(cipher.len() + TAG);
+        opened.extend_from_slice(cipher);
+        opened.extend_from_slice(tag);
+        let len = self
+            .aead
+            .open_in_place(Self::nonce(packet), Aad::from(ad), &mut opened)
+            .ok()?
+            .len();
+        opened.truncate(len);
+        Some(opened)
     }
 }
 
@@ -239,8 +269,11 @@ mod tests {
         let Some(tag) = send.seal(42, ad, &mut buf) else {
             unreachable!("sealing into a sized buffer cannot fail")
         };
-        assert!(recv.open(42, ad, &mut buf, &tag), "own tag opens");
-        assert_eq!(&buf, b"the quick brown fox", "the plaintext comes back");
+        assert_eq!(
+            recv.open(42, ad, &buf, &tag).as_deref(),
+            Some(&b"the quick brown fox"[..]),
+            "own tag opens and the plaintext comes back"
+        );
     }
 
     /// Two streams of one lane do not share a key, in either direction.
@@ -264,18 +297,17 @@ mod tests {
                 unreachable!("sealing into a sized buffer cannot fail")
             };
             for (other, (d, s)) in cases.iter().enumerate() {
-                let mut buf = sealed;
                 let Some(recv) = StreamCipher::derive(&root, *d, *s) else {
                     unreachable!("a 32-byte derivation cannot fail")
                 };
-                let opened = recv.open(1, b"h", &mut buf, &tag);
+                let opened = recv.open(1, b"h", &sealed, &tag);
                 assert_eq!(
-                    opened,
+                    opened.is_some(),
                     index == other,
                     "{direction:?}/{stream} must not open {d:?}/{s}'s packet"
                 );
-                if opened {
-                    assert_eq!(&buf, b"payload", "the plaintext must come back");
+                if let Some(plain) = opened {
+                    assert_eq!(plain.as_slice(), b"payload", "the plaintext must come back");
                 }
             }
         }
@@ -294,8 +326,7 @@ mod tests {
         let Some(tag) = a.seal(1, b"h", &mut buf) else {
             unreachable!("sealing into a sized buffer cannot fail")
         };
-        let mut buf = *b"payload";
-        assert!(!b.open(1, b"h", &mut buf, &tag));
+        assert!(b.open(1, b"h", b"payload", &tag).is_none());
     }
 
     /// The header is authenticated: the same bytes under another number, or
@@ -312,14 +343,13 @@ mod tests {
         let Some(tag) = send.seal(10, b"stream=9 len=7", &mut buf) else {
             unreachable!("sealing into a sized buffer cannot fail")
         };
-        let mut buf = *b"payload";
         assert!(
-            !recv.open(11, b"stream=9 len=7", &mut buf, &tag),
+            recv.open(11, b"stream=9 len=7", b"payload", &tag).is_none(),
             "another packet number must not open"
         );
-        let mut buf = *b"payload";
         assert!(
-            !recv.open(10, b"stream=11 len=7", &mut buf, &tag),
+            recv.open(10, b"stream=11 len=7", b"payload", &tag)
+                .is_none(),
             "another header must not open"
         );
     }
@@ -341,13 +371,15 @@ mod tests {
         for byte in 0..plain.len() {
             let mut tampered = sealed;
             tampered[byte] ^= 0x01;
-            assert!(!recv.open(1, b"h", &mut tampered, &tag), "byte {byte}");
+            assert!(recv.open(1, b"h", &tampered, &tag).is_none(), "byte {byte}");
         }
         for byte in 0..TAG {
             let mut bad = tag;
             bad[byte] ^= 0x01;
-            let mut buf = sealed;
-            assert!(!recv.open(1, b"h", &mut buf, &bad), "tag byte {byte}");
+            assert!(
+                recv.open(1, b"h", &sealed, &bad).is_none(),
+                "tag byte {byte}"
+            );
         }
     }
 
@@ -365,8 +397,7 @@ mod tests {
             unreachable!("sealing into a sized buffer cannot fail")
         };
         let short = &tag[..TAG - 1];
-        let mut buf = *b"payload";
-        assert!(!recv.open(1, b"h", &mut buf, short));
+        assert!(recv.open(1, b"h", &buf, short).is_none());
     }
 
     /// Both halves of the handshake reach the root, and neither replaces it.
@@ -405,9 +436,8 @@ mod tests {
             let Some(recv) = other.stream(Direction::ToServer, 1) else {
                 unreachable!("a 32-byte derivation cannot fail")
             };
-            let mut buf = sealed;
             assert!(
-                !recv.open(1, b"h", &mut buf, &tag),
+                recv.open(1, b"h", &sealed, &tag).is_none(),
                 "{what} must not open this lane's stream packet"
             );
         }
@@ -416,22 +446,19 @@ mod tests {
         let Some(same) = base.stream(Direction::ToServer, 1) else {
             unreachable!("a 32-byte derivation cannot fail")
         };
-        let mut buf = sealed;
-        assert!(same.open(1, b"h", &mut buf, &tag), "own tag opens");
-        let mut buf = sealed;
+        assert!(same.open(1, b"h", &sealed, &tag).is_some(), "own tag opens");
         let Some(back) = base.stream(Direction::ToClient, 1) else {
             unreachable!("a 32-byte derivation cannot fail")
         };
         assert!(
-            !back.open(1, b"h", &mut buf, &tag),
+            back.open(1, b"h", &sealed, &tag).is_none(),
             "the other direction is another key"
         );
-        let mut buf = sealed;
         let Some(next) = base.stream(Direction::ToServer, 3) else {
             unreachable!("a 32-byte derivation cannot fail")
         };
         assert!(
-            !next.open(1, b"h", &mut buf, &tag),
+            next.open(1, b"h", &sealed, &tag).is_none(),
             "the next stream is another key"
         );
     }

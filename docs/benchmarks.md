@@ -1021,7 +1021,7 @@ The figures that shaped a TCP-versus-KCP axis are published history in
 longer be built, and they are not a baseline. What compares today is the table
 each scenario prints, tool against the control arm of the same run.
 
-### What a fresh connection costs, per carrier (2026-11-02)
+### What a fresh connection costs, per carrier (2026-11-11)
 
 The one axis where the two carriers are not close. Measured with
 `MOLEHILL_DATA_CARRIER` pinning one per run, the same binary both times, over the
@@ -1031,21 +1031,20 @@ across many requests):
 
 | | `churn-16` `mhd` | `churn-16` TCP | `rr-16` `mhd` | `rr-16` TCP |
 |---|---|---|---|---|
-| round trip, p50 | 2.47 ms | 2.25 ms | 0.46 ms | 0.44 ms |
-| round trip, p99 | **21.04 ms** | **2.58 ms** | 1.32 ms | 1.34 ms |
-| completed per second | 3 469 | 6 705 | 29 820 | 31 520 |
+| round trip, p50 | 6.45 ms | 6.01 ms | 0.60 ms | 0.52 ms |
+| round trip, p99 | **7.26 ms** | **6.66 ms** | **1.59 ms** | **1.34 ms** |
+| completed per second | 2 427 | 2 607 | 23 900 | 27 745 |
 
-So the carriers are **at parity wherever a connection is reused** — `rr-16` agrees
-to within 2 % on the tail and 5 % on the rate — and they separate by a factor of eight
-on the tail when every request needs a new connection. The cell's rate is sixteen
-connections **a second**, so this is not contention: about one request in a hundred pays
-twenty milliseconds where TCP's worst hundredth pays two and a half. The median is level
-with TCP's, and the cell's multi-second outliers were a separate defect, fixed. The cause is
-structural rather than a tuning error: every visitor channel runs its **own Noise
-handshake** before its first byte can move, while a TCP tunnel runs one handshake
-and multiplexes every stream inside it. A visitor's channel open costs 2 648 µs,
-of which 1 818 µs is that handshake; everything after it is at parity, and the
-first byte follows the pairing in 12 µs.
+So the carriers are **within nine percent** on the tail when every request needs a new
+connection, and **within twenty percent** on the cell that reuses one — at nine and
+thirteen percent of the rate. The arrival cell pays a stream open, and that open is a
+key derivation rather than a handshake: a lane's first stream runs the Noise KK, and
+every later stream on it seals with a key derived from the lane root. Measured on the
+product's own open line, the handshake phase is **11 µs** and a channel open under a
+bulk transfer costs **211 µs at the median and 9 ms at the ninety-ninth percentile**.
+
+Those are cross-run readings, each with its own A/A pair inside it, so they are
+directional at the percent level the two files' floors resolve.
 
 ### Where mhd wins, and where it loses (2026-11-07)
 

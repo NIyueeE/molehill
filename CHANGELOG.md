@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An `mhd` stream no longer pays a Noise handshake of its own.** A lane's first
+  stream runs the KK handshake and its secret becomes the lane root; every later
+  stream on that lane seals with a key derived from `(root, direction, stream id)`.
+  The handshake phase of a channel open falls from 1 221 µs to **11 µs**, a channel
+  open under a bulk transfer from p50 1 414 µs / p99 41 ms to **211 µs / 9 ms**, and
+  the mixed clean cell's interactive p99 from 29–48 ms to **7.4–8.7 ms** — for 13 %
+  of the clean-path throughput. Forward secrecy on this carrier is now per lane
+  rather than per stream; `MOLEHILL_MHD_SEAL=0` turns the path off for one process.
+- **The carrier's AEAD is AES-256-GCM through `ring`**, at **671 ns** for a
+  1 400-byte packet against 2 805 ns for the ChaCha20-Poly1305 it replaces, which is
+  what makes sealing affordable: `bulk-n` on a clean path reads 85 % of its unsealed
+  throughput instead of 54 %.
 - **The carrier comparison states its leg.** The mhd-versus-TCP tables in
   `docs/benchmarks.md` and its Chinese mirror now say that every row but `clean`
   was measured with the condition on the *visitor* leg, so those rows price a
