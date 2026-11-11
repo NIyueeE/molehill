@@ -377,6 +377,55 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.299 The interactive tail is the same without any loss, and the send queue is milliseconds (2026-11-11)
+
+The separating experiment §4.298 pre-registered cost nothing but a run: the same `cost` cell on `rtt100`
+(100 ms each way, **no loss**, same queue limit) against `loss5`.
+
+| cell | interactive p50 | interactive p99 |
+|---|---|---|
+| `loss5` (5 % loss) | 600–618 ms | 1 064–2 003 ms across rounds |
+| **`rtt100` (no loss)** | **601 / 602 / 618 / 601 ms** | **601 / 1 091 / 1 840 / 4 179 ms** |
+
+**The tail is identical without a single packet lost** — median to the millisecond, p99 up to 4.2 s. So on this
+cell:
+
+1. **It is not loss.** A loss-free path produces the same seconds.
+2. **It is not the shaper's queue.** The same evidence bundle reports `backlog_p` 255–2 104 packets, which at
+   these rates is tens of milliseconds.
+3. **It is not the tool's send queue.** The product's own dwell histogram (write → packet, sampled every second
+   under `MOLEHILL_MHD_STATS`) reads **`dwell_max_us` ≤ 9.7 ms** across the run — three orders of magnitude
+   below the 400 ms that separates the measured median from the path's round trip.
+
+**What that leaves is the receive side**, and the counters for it are not printed: `Conn::ready_for` and
+`RecvBuf::ready_for` exist (how long bytes have waited for a reader) and the lane reads them, but the window
+line carries no ready field, so no run has shown that number. Until it does, "the client's reader is late" and
+"the client's pump is late" are indistinguishable, and the 600 ms median on a 200 ms path is unexplained by
+anything measured so far.
+
+**What this means for P3**: its two mechanisms were aimed at loss (§4.296, §4.297) and the target is
+loss-free — which is why neither could ever have moved it. The next step is an instrument, not a mechanism:
+print the reader-ready wait per stream in the window line, run `rtt100` once, and read it.
+
+**That instrument already existed, and it points at the server's reader.** The window line carries
+`ready_ms` — how long the stream with the most held bytes has been waiting for its reader — and the stats run
+from the six-round campaign holds the reading:
+
+| side | `ready_ms` over 1 s | maximum |
+|---|---|---|
+| server | **51 of 3 380 window lines** | **12 855 ms** |
+| client | 0 (three samples of 1–4 ms) | 4 ms |
+
+So on a loss-free cell with a 200 ms path, the **server's own reader waits up to thirteen seconds** in one and
+a half percent of the seconds, while the client never waits at all. That is the scale and the shape of the
+interactive tail, and it is not the network, the shaper, the send queue or the loss path: it is *this* end's
+`read` being held.
+
+**The next question is one step narrower**: which stream, and held by what — the visitor socket's write
+(backpressure from a visitor that is not reading) or bytes that never arrived. Both are visible in the same
+window line (`ready_ms` beside `recv_*` and the stream's `worst_*` fields); no new instrument is needed, just
+one run with the stream id printed beside it.
+
 ### 4.298 The queue does not explain the tail either, and §4.296's "ninety percent" is withdrawn (2026-11-11)
 
 §4.296 ended with a sentence that the data does not support: "a 1.5–2 s interactive tail on a path whose round
