@@ -377,6 +377,45 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.296 P3's first mechanism never fired, and the tail it aimed at is a queue rather than a repair RTT (2026-11-11)
+
+**Reverted** (`60a6e4f`). The small-flight duplicate from `183f972` is gone, with its counter and tests, because
+the measurement says it was inert: **280 ledger seconds on each end of the mixed cell, `small_dups=0`
+throughout**. It could not have had an effect, and a mechanism that never fires is a corpse rather than a
+candidate.
+
+**Why it never fired, which is the useful part.** Its own guards close the only door it had. The clock resets
+whenever the peer's byte prefix advances, so the mechanism can only fire on a stream that has made *no*
+progress for a full round trip — and in that state the loss path has almost always queued a repair for the
+same range, or sent one within the round trip, and both of those are skip conditions (they were added in
+§4.289 after the same duplicate showed up in a unit test). A two-packet flight that loses one packet is
+therefore handled by the ordinary loss rules before the tail mechanism is allowed to act. This is the second
+tail mechanism to end up inert for this reason; the prefix rescue never fired either (`stall_rescues=0`,
+§4.289).
+
+**And the cell it was written for is a queue, not a repair-RTT problem.** The corrected six-round A/B
+(P3 binary, its twin, and the pre-P3 build as `~b`, all from a freshly built release with its hash printed in
+the same command) reads:
+
+| arm | interactive p99, six rounds (ms) | median | throughput median |
+|---|---|---|---|
+| P3 | 1 871, 2 329, 1 225, 1 381, 2 246, 2 134 | **2 003** | 0.582 |
+| twin | 2 229, 1 668, 3 217, 1 745, 1 143 | 1 745 | 0.507 |
+| `~b` (pre-P3) | 4 523, 1 617, 2 722, 1 695, 601 | 1 695 | 0.576 |
+
+The arms differ by less than their own scatter (601 to 4 523 in one arm), so nothing is claimed — but the
+number that matters is the *level*: a 1.5–2 s interactive tail on a path whose round trip is 200 ms is
+ninety percent queueing. Duplicating a packet removes a repair round trip; it cannot remove a second and a
+half of standing queue. **The premise of P3 as the plan words it — "spend bandwidth to buy the tail" — does
+not fit the cell it was aimed at.**
+
+**What that leaves for the tail.** Either the target moves to the cells where the tail *is* a repair delay
+(the `rtt100`/`jitter` families, where the queue is shallow by construction), or the question becomes the
+queue itself — which is a sender-rate and queue-discipline question, not a redundancy question. Both are
+different plans from this one.
+
+**Committed**: the revert, the corrected six-round A/B as context, and this record.
+
 ### 4.295 The provenance rule bit a second time: a thirty-five minute A/B measured a binary without the change (2026-11-11)
 
 P3's small-flight duplicate was written, tested and committed (`183f972`), and then the six-round A/B meant to
