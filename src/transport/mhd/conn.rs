@@ -3511,6 +3511,32 @@ impl Conn {
         Ok(())
     }
 
+    /// Open the window on `bytes` of confirmed delivery.
+    ///
+    /// Two phases, the way every transport that has to find a path's capacity does it. Until the path has
+    /// dropped something, every acknowledged byte buys a byte of window, so the flight doubles once per
+    /// round trip. After a loss it is additive — one payload per window acknowledged — and the window is
+    /// never cut: a loss is repaired by retransmission, not paid for by halving the pipe.
+    ///
+    /// Its own function because two acknowledgement paths feed it now: a retirement by packet number
+    /// (`Acked::bytes`) and a byte-prefix advance when the number path paid nothing.
+    fn grow_window(&mut self, bytes: u64) {
+        if self.slow_start {
+            // Doubling stops at the ceiling and the additive rule takes over, because an unspaced burst
+            // that outruns the peer's buffer costs the connection its liveness (see [`WINDOW_FLOOR`]).
+            self.cwnd = self.cwnd.saturating_add(bytes).min(self.window_ceiling());
+        } else {
+            self.acked_since_growth += bytes;
+            if self.acked_since_growth >= self.cwnd {
+                self.acked_since_growth = 0;
+                self.cwnd = self
+                    .cwnd
+                    .saturating_add(MAX_STREAM_PAYLOAD as u64)
+                    .min(self.window_ceiling());
+            }
+        }
+    }
+
     /// Apply the peer's acknowledgement: retire what it covers, rewind what
     /// it reports lost, and open the window on the progress it proves.
     fn apply_ack(&mut self, now: Instant, ack: wire::Ack, sampled: bool) {
@@ -3594,6 +3620,22 @@ impl Conn {
             // first (they carried the flight total), `late` the second.
             self.ledger.note_retired(freed, true, false);
             self.ledger.note_retired(late, true, true);
+            // **The bytes the number path cannot pay for.** On a lane whose
+            // cumulative frontier is pinned by one lost packet number, every
+            // confirmation arrives as a prefix advance and none as a number
+            // retirement — so `Acked::bytes` stays zero, `Acked::progress` stays
+            // false, and the growth block below never runs. Measured as a lane
+            // frozen at `INITIAL_CWND` for 122 s while it posted twenty times what
+            // it delivered (`HANDOFF.md` §4.181). The prefix is the acknowledgement
+            // that cannot stall, so its bytes are as good evidence of delivery as a
+            // number, and they buy the window here.
+            //
+            // Only when the number path paid nothing this time: otherwise the same
+            // byte could grow the window twice, once as a record and once as a
+            // prefix advance.
+            if acked.bytes == 0 && (freed > 0 || late > 0) {
+                self.grow_window(freed.saturating_add(late));
+            }
         }
         // A loss only rewinds the send point: the bytes are still in the
         // buffer, so the next pass carries them again from the same offset.
@@ -3654,23 +3696,7 @@ impl Conn {
         // halving the pipe for a round trip.
         let before = self.cwnd;
         if acked.progress {
-            let bytes = u64::try_from(acked.bytes).unwrap_or(u64::MAX);
-            if self.slow_start {
-                // Doubling stops at the ceiling and the additive rule takes
-                // over, because an unspaced burst that outruns the peer's
-                // buffer costs the connection its liveness (see
-                // [`WINDOW_FLOOR`]).
-                self.cwnd = self.cwnd.saturating_add(bytes).min(self.window_ceiling());
-            } else {
-                self.acked_since_growth += bytes;
-                if self.acked_since_growth >= self.cwnd {
-                    self.acked_since_growth = 0;
-                    self.cwnd = self
-                        .cwnd
-                        .saturating_add(MAX_STREAM_PAYLOAD as u64)
-                        .min(self.window_ceiling());
-                }
-            }
+            self.grow_window(u64::try_from(acked.bytes).unwrap_or(u64::MAX));
         }
         // What the window actually gained, beside how many bytes were confirmed:
         // the two together say whether growth is one packet per window (as the
@@ -6045,14 +6071,16 @@ mod tests {
         );
     }
 
-    /// The byte prefix retires records, and the window does not grow from it.
+    /// The byte prefix retires records, and now the window grows from it.
     ///
-    /// The prefix is the second confirmation path, and today it is *not* part of
-    /// `Acked::bytes`, so those bytes free the flight without buying window. Whether
-    /// that is right is a measurement — the ledger reports the two paths apart so the
-    /// question can be answered — but the behaviour must not change by accident, so it
-    /// is pinned here. The block in this test says nothing at all, which is what a
-    /// hole in a *different* stream produces.
+    /// The prefix is the second confirmation path, and a lane whose cumulative frontier is pinned by one
+    /// lost packet number confirms *everything* through it: `Acked::bytes` stays zero, `progress` stays
+    /// false, and before this change the growth block never ran. Measured as a lane frozen at
+    /// `INITIAL_CWND` for 122 s while posting twenty times what it delivered (`HANDOFF.md` §4.181); the
+    /// question that entry left open is answered here in the code, and the cell measures the answer.
+    ///
+    /// The guard is what keeps a byte from paying twice: growth from the prefix only when the number path
+    /// paid nothing for this acknowledgement.
     #[test]
     fn a_prefix_confirmation_retires_bytes_without_growing_the_window() {
         let now = Instant::now();
@@ -6096,8 +6124,11 @@ mod tests {
             ledger.acked_bytes, len,
             "and the two paths together counted each byte once"
         );
-        assert_eq!(ledger.grown, 0, "the prefix path does not grow the window");
-        assert_eq!(link.a.cwnd, before, "the window is exactly where it was");
+        assert!(
+            link.a.cwnd > before,
+            "the prefix path grows the window: {} stayed at {before}",
+            link.a.cwnd
+        );
     }
 
     /// A prefix that covers a declared loss confirms those bytes, and says they were late.

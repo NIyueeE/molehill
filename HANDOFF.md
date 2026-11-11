@@ -377,6 +377,42 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.291 The window now grows from the byte prefix, and the cell says the window was not the limit (2026-11-11)
+
+**First, a correction to §4.290**: the frozen window it described was not a new observation. §4.181 recorded it
+three days earlier as a **bistable per-lane collapse** with five facts — `cwnd` at `INITIAL_CWND` for 122 s,
+`grow=0`, `acked_since_growth=0`, twenty bytes posted per byte delivered, and no record retired by number — and
+§4.180 had already written down the mechanism and left the question open: **`confirm_prefix` retires records
+without their bytes reaching `Acked::bytes`**, so on a lane whose cumulative frontier is pinned by one lost
+packet number, no acknowledgement ever buys window.
+
+**This change answers that question in code.** When an acknowledgement's number path pays nothing and its prefix
+advances, the freed bytes now buy the window exactly as a retirement by number does (`Conn::grow_window`, called
+from both paths). The guard is that one acknowledgement cannot pay for the same byte twice.
+
+**It took effect, and that is measured in the product, not asserted.** Two rounds of `loss5` with the carrier's
+own ledger on: `cwnd` reaches **108 621 / 128 736 / 164 943 / 170 307 / 186 399 / 219 924** bytes, where before
+the change it never left 13 410. The bistable freeze is gone.
+
+**And the cell did not move.** `loss5` tunnel-leg `bulk-1`, six rounds, A/A in the file:
+
+| arm | rounds (Gbit/s) | median |
+|---|---|---|
+| molehill | 0.0167, 0.0629, 0.0632, 0.0697, 0.0745, 0.0764 | **0.0665** |
+| molehill~aa | 0.0231, 0.0423, 0.0537, 0.0544, 0.0667, 0.0861 | 0.0541 |
+
+That is the same level the cell had before the change (0.0659 / 0.0745 two entries ago), and `bulk-n` on a
+clean path is unchanged at **10.13 / 10.19 Gbit/s**. So the window was **not** what limited this cell: with the
+window demonstrably open to 220 KB, the lane still carries ~0.067 Gbit/s.
+
+**What that leaves, and it is a different list than before.** The remaining limit is whatever keeps a lane with
+an open window at a sixteenth of the path: the repair loop itself (a third of the wire), the loss declaration
+that feeds it, or the path's own drops. The window family is now genuinely closed — not by argument but by
+changing the growth law and watching the cell not care.
+
+**Committed**: `grow_window` as its own function, the second call site with its guard, the test that pinned the
+old behaviour rewritten to pin the new one, and this record.
+
 ### 4.290 The window on a lossy 200 ms path sits at its initial value, and `flight` reads zero while packets are being built (2026-11-11)
 
 The window line from the `loss5` rounds this session, read for the first time as a series rather than as a
