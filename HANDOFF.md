@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.290 The window on a lossy 200 ms path sits at its initial value, and `flight` reads zero while packets are being built (2026-11-11)
+
+The window line from the `loss5` rounds this session, read for the first time as a series rather than as a
+presence check:
+
+```
+cwnd=13410 flight=0 slow_start=false acked_since_growth=0 ceiling=262144 srtt_us=0
+```
+
+Three numbers matter.
+
+1. **`cwnd=13410` is the initial window** (`INITIAL_CWND` = ten payloads) and it does not move across the
+   rounds. `slow_start=false` says why: slow start latches off at the first loss, and from then on the window
+   grows by one packet per window of acknowledged bytes. On a 200 ms path that is ~1 % per round trip, so
+   reaching a megabyte takes thousands of round trips — a ten-second cell cannot see it. **The growth law is
+   additive on exactly the paths this carrier is built for**, which is the same shape the earlier window
+   family tried to change and could not without breaking lossy delivery (§4.249).
+2. **`srtt_us=0` on that lane**: no round-trip sample has ever been taken there, so every timer on it is
+   running on `INITIAL_RTO` rather than on the path.
+3. **`flight=0` in a second where hundreds of packets were built** (the same line carries `packets=` for the
+   interval). Either the sample lands on an idle pass, or the flight accounting is not counting what the
+   lane sends — and the second case would explain why the window never binds and why the repair share can
+   reach a third of the wire without the controller noticing.
+
+**Pre-registered before it runs**, and it is a counter question, not a cell question:
+
+- **Measure**: in one window line, `flight`, `packets` built, `numbers_issued_per_s` and `flight_packets`
+  for the same second, on a lane that is demonstrably carrying bulk. If `flight` is 0 while `packets` is in
+  the hundreds, the accounting is broken and everything the window claims is void.
+- **If it is a sampling artifact**, the next number is `cwnd` over the cell's ten seconds: flat at 13 410
+  means the growth law, not the accounting, is what bounds the lane — and that is a design question
+  (the plan's §八 non-stationarity argument) rather than a bug.
+- **Pass/rollback**: this is instrumentation-only; no behaviour changes with it.
+
 ### 4.289 The stalled-prefix rescue was firing on a healthy stream, and the test that caught it is worth keeping (2026-11-11)
 
 The rescue from §4.285 had no guard against duplicating what the loss path was already doing. Two conditions
