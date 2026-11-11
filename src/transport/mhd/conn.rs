@@ -123,21 +123,6 @@ pub(crate) const ABANDON_HOLD: Duration = Duration::from_secs(30);
 /// duplicate stream fast enough to hang a 32 KiB unit test.
 const STALL_REPAIR_ATTEMPTS: u8 = 5;
 
-/// The largest flight a stream may have and still be duplicated on purpose.
-///
-/// An interactive stream is one or two packets; eight payloads is a generous
-/// bound that still excludes anything the bulk path carries, which is what keeps
-/// the mechanism from turning into a duplicate stream on a transfer. Measured
-/// against `loss5`, where the bulk stream's flight is megabytes.
-const SMALL_FLIGHT_BYTES: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
-
-/// How many copies a small flight may be given without the peer making progress.
-///
-/// Eight round trips is far longer than any interactive flow waits, and it is a
-/// hard stop rather than a backoff: the ninth copy of a range nobody acknowledged
-/// cannot be the one that arrives when the first eight did not.
-const SMALL_FLIGHT_ATTEMPTS: u8 = 8;
-
 /// A gap long enough to count as a tail event rather than scheduling noise.
 ///
 /// The pre-registration in HANDOFF §4.62 is stated against 200 µs: the gap is 5–7 µs at
@@ -327,19 +312,6 @@ struct StreamState {
     /// stream and the rescue waits. Only when that path goes quiet — the loss
     /// record was reaped, so nothing re-queues the range — does it fire.
     repair_at: Option<Instant>,
-    /// When this stream's small flight was last duplicated on purpose.
-    ///
-    /// See `Conn::duplicate_small_flights`: an interactive stream gets one extra
-    /// copy a round trip rather than waiting for a timer built for bulk.
-    small_resend_at: Option<Instant>,
-    /// How many copies that mechanism made without the prefix moving since.
-    ///
-    /// Bounded like the stalled-prefix rescue, and for a sharper reason: an
-    /// interactive stream that has been re-sent eight times without a single
-    /// acknowledgement is not a stream a ninth copy rescues, and an unbounded
-    /// rescue in a unit harness grew the link's queues until the test process was
-    /// killed. Cleared whenever the peer's prefix advances.
-    small_dups_since_progress: u8,
     /// How many times that rescue has fired without the prefix moving since.
     ///
     /// It backs the hold off and stops it: a peer that answers nothing is not a
@@ -924,12 +896,6 @@ pub(crate) struct Conn {
     /// fires hundreds of times a second on a lossy lane. Reading the rescue's rate
     /// out of it is what made §4.289 wrong — the two are now separate numbers.
     stall_rescues: u64,
-    /// Times a small flight was duplicated a round trip after it went out.
-    ///
-    /// The interactive tail's own number: it says whether the mechanism is working
-    /// at all before any cell is read, and its cost is visible as the difference
-    /// between `sent` and the stream bytes the peer confirms.
-    small_dups: u64,
     /// What this lane sent, what the peer confirmed, and why it stopped.
     ///
     /// Per lane, and reset once a second by the window line: the numbers are only
@@ -1239,7 +1205,6 @@ impl Conn {
             repairs_at_base: 0,
             repairs_above: 0,
             stall_rescues: 0,
-            small_dups: 0,
             ledger: SendLedger::default(),
             acks_applied: 0,
             acks_attached: 0,
@@ -1931,86 +1896,12 @@ impl Conn {
         }
     }
 
-    /// Re-send a **small** stream's hole one round trip after it went out.
-    ///
-    /// An interactive stream is one or two packets deep. Waiting for the carrier's
-    /// own loss rules costs the interactive tail its whole budget: the packet
-    /// threshold needs three later arrivals (which a two-packet flight never has)
-    /// and the timer waits nine eighths of the round trip *and backs off*. For a
-    /// flight this small the cheaper trade is to send the bytes again: a duplicate
-    /// costs one datagram, and the stream is small precisely because nobody wants
-    /// to wait.
-    ///
-    /// Bounded three ways so it cannot become a duplicate stream: only while the
-    /// stream's unacknowledged bytes fit in [`SMALL_FLIGHT_BYTES`], at most one
-    /// copy per round trip, and never while a repair the loss path queued is still
-    /// owed. The bulk path (§4.292) is untouched by construction — its flight is
-    /// far above the bound.
-    fn duplicate_small_flights(&mut self, now: Instant) {
-        let Some(rtt) = self.recovery.smoothed_rtt() else {
-            return;
-        };
-        let gap = rtt.max(Duration::from_millis(5));
-        for state in self.streams.values_mut() {
-            if state.reset.is_some() {
-                continue;
-            }
-            let base = state.send.base();
-            let outstanding = state.send.next_offset().saturating_sub(base);
-            if outstanding == 0 || outstanding > SMALL_FLIGHT_BYTES {
-                state.small_resend_at = None;
-                state.small_dups_since_progress = 0;
-                continue;
-            }
-            if state.send.has_repair() {
-                continue;
-            }
-            // The loss path has re-sent something for this stream within a round
-            // trip: it is already covering the hole, and a second copy on top of it
-            // is the duplicate the rescue learned to avoid (§4.289).
-            if state
-                .repair_at
-                .is_some_and(|at| now.saturating_duration_since(at) < gap)
-            {
-                continue;
-            }
-            let Some(at) = state.small_resend_at else {
-                // Start the clock; the flight has not been waiting yet.
-                state.small_resend_at = Some(now);
-                continue;
-            };
-            if now.saturating_duration_since(at) < gap {
-                continue;
-            }
-            // Bounded: a stream the peer has not acknowledged through eight copies
-            // is not a stream a ninth copy rescues, and an unbounded version of this
-            // grew a unit harness's queues until the process was killed.
-            if state.small_dups_since_progress >= SMALL_FLIGHT_ATTEMPTS {
-                continue;
-            }
-            let want = usize::try_from(outstanding)
-                .unwrap_or(usize::MAX)
-                .min(wire::MAX_STREAM_PAYLOAD);
-            if state.send.available(base, want) == 0 {
-                continue;
-            }
-            state.small_resend_at = Some(now);
-            state.small_dups_since_progress = state.small_dups_since_progress.saturating_add(1);
-            state.send.repair(base, want);
-            self.small_dups = self.small_dups.saturating_add(1);
-        }
-    }
-
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
         let before = self.built;
         // **Before the pick.** A prefix that has stopped moving is a hole whose
         // record may already be forgotten, so nothing else will ever queue it
         // again (see `StreamState::prefix_at`).
         self.repair_stalled_prefixes(now);
-        // **And the small flight's own copy**, on a shorter clock: an interactive
-        // stream has no bytes to spare waiting for a timer that is tuned for a
-        // bulk transit (`HANDOFF.md` §4.294).
-        self.duplicate_small_flights(now);
         // **One pass that found the idle write still queued.** Incremented before
         // the build, so a pass that carries it counts as one rather than zero.
         if self.idle_queued.is_some() {
@@ -3043,11 +2934,6 @@ impl Conn {
         self.stall_rescues
     }
 
-    /// How many small flights were duplicated on purpose on this lane.
-    pub(crate) fn small_dups(&self) -> u64 {
-        self.small_dups
-    }
-
     pub(crate) fn last_ack_prefix(&self) -> u64 {
         self.last_ack_prefix
     }
@@ -3715,11 +3601,6 @@ impl Conn {
             // gone.
             state.prefix_at = Some(now);
             state.prefix_retries = 0;
-            // The stream is making progress, so there is no tail to protect: the
-            // small-flight copy starts its clock from the next quiet round trip
-            // (`Conn::duplicate_small_flights`).
-            state.small_resend_at = None;
-            state.small_dups_since_progress = 0;
             self.buffered = self.buffered.saturating_sub(moved);
             // The prefix moves the same frontier the number path does, so its
             // delivery is counted the same way and only once.
@@ -5301,63 +5182,6 @@ mod tests {
             state.prefix_retries,
             super::STALL_REPAIR_ATTEMPTS,
             "the rescue fires, and stops at its bound"
-        );
-    }
-
-    /// A small flight is copied a round trip later, and a bulk flight is not.
-    ///
-    /// The mechanism is the interactive tail's own: two packets have no third
-    /// arrival to prove a loss with, and the carrier's timer is tuned for bulk. The
-    /// cost has to stay invisible to a transfer, which the second half of this test
-    /// pins.
-    #[test]
-    fn a_small_flight_is_duplicated_and_a_bulk_flight_is_not() {
-        let now = Instant::now();
-        let mut small = Link::new();
-        small.a.recovery.seed_rtt(Duration::from_millis(100));
-        let stream = small.a.open().id;
-        let body = payload(2_000);
-        assert_eq!(small.a.write(stream, &body), body.len());
-        let mut out = Vec::new();
-        let mut at = now;
-        while small.a.poll_transmit(at, &mut out).is_some() {
-            out.clear();
-        }
-        let before = small.a.small_dups();
-        at += Duration::from_millis(150);
-        while small.a.poll_transmit(at, &mut out).is_some() {
-            out.clear();
-        }
-        assert!(
-            small.a.small_dups() > before,
-            "an unacknowledged small flight is copied a round trip later"
-        );
-
-        let mut bulk = Link::new();
-        bulk.a.recovery.seed_rtt(Duration::from_millis(100));
-        let stream = bulk.a.open().id;
-        let body = payload(64 * 1024);
-        // A partial write is the design: the window admits what it can, and all
-        // this test needs is a flight above the small-flight bound.
-        let written = bulk.a.write(stream, &body);
-        assert!(
-            written > usize::try_from(super::SMALL_FLIGHT_BYTES).unwrap_or(0),
-            "the bulk write must leave more outstanding than the bound: {written}"
-        );
-        let mut at = now;
-        while bulk.a.poll_transmit(at, &mut out).is_some() {
-            out.clear();
-        }
-        for _ in 0..5 {
-            at += Duration::from_millis(150);
-            while bulk.a.poll_transmit(at, &mut out).is_some() {
-                out.clear();
-            }
-        }
-        assert_eq!(
-            bulk.a.small_dups(),
-            0,
-            "a bulk flight is never duplicated on purpose"
         );
     }
 
