@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.297 P3's second attempt breaks exactly-once, and the carrier cannot tell which streams deserve redundancy (2026-11-11)
+
+The first attempt failed by being inert (§4.296). The second tried the opposite: duplicate a new-data range **at
+send time** whenever the stream's flight fits in eight payloads, so the mechanism fires by construction instead
+of waiting for a stall. It ran, and **eight unit tests failed immediately**:
+
+```
+a_clean_transfer_sends_each_byte_once_and_counts_it_once
+a_duplicate_range_is_counted_as_a_duplicate
+a_loss_re_sends_the_hole_and_not_what_follows_it
+a_lost_opening_still_completes_the_stream
+a_prefix_confirmation_retires_bytes_without_growing_the_window
+a_prefix_over_a_declared_loss_counts_those_bytes_as_late
+a_reordering_path_carries_the_stream_without_repairing
+five_percent_loss_on_a_fake_link_delivers_without_storming
+```
+
+Every one of them is a **contract** the carrier promises and its tests pin: a healthy transfer sends each byte
+once, a repair is counted once, a reordering path does not repair, five percent loss does not storm. Size-based
+duplication violates all of them at once, because in a unit harness every stream is small — and in the product
+"small" is not a property the carrier has any way to confirm as "interactive".
+
+**That is the finding, and it is structural rather than a bug.** The carrier sees streams, not intentions: a
+two-packet bulk request and a two-packet interactive request are the same thing to it. Redundancy on that signal
+either (a) never fires, because the loss path gets there first (§4.296), or (b) fires on everything small,
+including the healthy transfer the exactly-once tests describe. **A redundancy policy needs a stream class, and
+the product does not have one** — adding one would be a configuration or API change, which this plan forbids.
+
+**Reverted again; tree clean, 122 mhd tests green.** The plan's P3 section now records both attempts and the
+missing classification, and its FEC branch stays unstarted. What remains for the tail is the other re-scope the
+plan lists: the queue itself, which is a sending-rate and scheduling question rather than a redundancy one.
+
 ### 4.296 P3's first mechanism never fired, and the tail it aimed at is a queue rather than a repair RTT (2026-11-11)
 
 **Reverted** (`60a6e4f`). The small-flight duplicate from `183f972` is gone, with its counter and tests, because
