@@ -1050,7 +1050,11 @@ first byte follows the pairing in 12 µs.
 ### Where mhd wins, and where it loses (2026-11-07)
 
 The carrier question has an answer per path condition, and it is not one carrier. Same binary, same
-round, `--scenarios timeline`, one arm per carrier with `MOLEHILL_DATA_CARRIER` pinning each:
+round, `--scenarios timeline`, one arm per carrier with `MOLEHILL_DATA_CARRIER` pinning each.
+
+**Every row but `clean` was measured with the condition on the visitor leg** — the leg the carrier
+does not cross. Those rows therefore describe *a visitor-side impairment with a clean carrier path*,
+not the carrier on an impaired path:
 
 | cell | what the condition is | mhd p99 | TCP p99 | mhd Gbit/s | TCP Gbit/s | verdict |
 |---|---|---|---|---|---|---|
@@ -1061,30 +1065,30 @@ round, `--scenarios timeline`, one arm per carrier with `MOLEHILL_DATA_CARRIER` 
 | `jitter` | 20 ms ± jitter | **118.0** | **171.8** | 4.02 | **5.82** | mixed — mhd's tail, TCP's throughput |
 | `loss5` | 5 % loss | **1 454.9** | **2 100.8** | **1.11** | **0.30** | **mhd**, both axes |
 
-**Read it as one sentence**: mhd's own recovery beats a TCP carrier inside a tunnel once the path loses
-enough to make the kernel stack collapse — at 5 % loss it hands over **3.7× the throughput and a 31 %
-tighter tail** — and it loses everywhere the path is clean, by **4× on the tail**, because a new
-visitor channel's handshake queues behind the bulk already in its shared UDP sockets while a TCP
-tunnel gives every channel its own connection. The crossover sits **between 1 % and 5 % loss**: at 1 %
-the carriers agree on latency and TCP is 27 % ahead on throughput.
+**Read it as one sentence.** In that shape, mhd's own recovery beats a TCP carrier inside a tunnel once
+the shaped leg loses enough to make the kernel stack collapse — at 5 % loss it hands over **3.7× the
+throughput and a 31 % tighter tail** — and it loses everywhere the path is clean, by **4× on the
+tail**, because a new visitor channel pays a Noise handshake of its own (1 129 µs at the median,
+168 ms in the worst second) while a TCP tunnel folds that step into the connection it already has.
 
-So the honest statement for an operator is not "one carrier is better". It is: **on a lossy path mhd
-is the better first carrier; on a clean path TCP is.** The default tries mhd and falls back to TCP when
-a session cannot be established — which is a statement about *establishment*, not about *which is
-faster*, and those are different questions. A deployment that expects packet loss should prefer mhd; a
-deployment on a datacentre or a well-provisioned link should prefer TCP, and the `clean` row is the
-reason.
+**The 5 % ratio does not travel to the leg the carrier crosses.** That row shaped the visitor leg; the
+carrier's own path was clean, so what it prices is the composition, not the carrier's behaviour on a
+lossy path. Two later runs measured the carrier's own leg (`--condition-leg tunnel`): mhd alone reads
+**0.074–0.174 Gbit/s** there against 1.19 with nothing shaped, and **the TCP carrier has not been run
+on that leg at all** — so no ratio between the two carriers exists on the path they share. Producing
+one is a matter of running the same cell twice with `MOLEHILL_DATA_CARRIER` pinning each arm, which is
+how every row above was gathered.
 
-Three things this table does **not** say. It does not compare either carrier against other tools — that
+So the honest statement for an operator is not "one carrier is better". It is: **which carrier is
+faster is a property of the path, and exactly one row above compares them where neither is impaired** —
+`clean`, where the TCP carrier's tail is four times tighter. The default tries mhd and falls back to
+TCP when a session cannot be established, which is a statement about *establishment*, not about speed.
+
+Two things this table does **not** say. It does not compare either carrier against other tools — that
 is the sweep's job, and on the same `clean` cell the peers measured 1.02–1.09 ms at p50 against both
 molehill carriers' 2.63–2.82 (§"The carrier axis is a path condition now" above explains why the pool
-pays that). It does not establish the `loss5` ratio: that row was gathered with the condition on the
-**visitor** leg, which is the leg the carrier does not cross, and a later run of the same binary and
-method on the carrier's own leg read the TCP side at **1.16 Gbit/s** against the 0.30 above — a factor
-of four, so "3.7×" is one run's number rather than a ratio this model can resolve. The row stays as the
-published record it is; the carrier axis is being re-measured on the leg the carrier actually crosses
-(`--condition-leg tunnel`). And it is loopback in a container: the loss and jitter cells are shaped, the
-clean one is not, so `clean` is a lower bound on what a real path does to both carriers.
+pays that). And it is loopback in a container: the loss and jitter cells are shaped, the clean one is
+not, so `clean` is a lower bound on what a real path does to both carriers.
 
 ### Warm and cold
 

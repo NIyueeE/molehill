@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number with no explanation is the shape a dead probe, a lost route and a bug in
   the analysis all produce.
 
+### Changed
+
+- **The carrier comparison states its leg.** The mhd-versus-TCP tables in
+  `docs/benchmarks.md` and its Chinese mirror now say that every row but `clean`
+  was measured with the condition on the *visitor* leg, so those rows price a
+  visitor-side impairment rather than a carrier on an impaired path, and the
+  lossy-path advantage claim is gone: the two carriers had never been compared on
+  the leg they share, and the first such run (5 % loss, 100 ms, `bulk-1`) has the
+  TCP carrier 1.6× ahead on throughput with mhd's interactive tail 20–30 % tighter.
+  `docs/configuration.md` says the same in one row.
+
 ### Fixed
 
 - **A lane's first packet now reaches the peer.** The datagram batch was sized from

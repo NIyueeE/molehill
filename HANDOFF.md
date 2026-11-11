@@ -377,6 +377,110 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.281 The two carriers, measured on the leg the carrier crosses: the tail is mhd's, the throughput is not (2026-11-11)
+
+The comparison the fifth plan pre-registered, run for the first time with both arms on the right leg.
+Same binary (`1729eaf`, sha256 `01e84d9f…`), same fingerprint, two runs differing only in
+`MOLEHILL_DATA_CARRIER` (the pin is recorded in each result's `molehill_switches`), `--condition loss5
+--condition-leg tunnel`, A/A twin in every file.
+
+**`bulk-1`, 10-second samples, six measured rounds:**
+
+| arm | throughput median (Gbit/s) | tunnel-link bytes / visitor byte | drops | one round |
+|---|---|---|---|---|
+| mhd | **0.0659 / 0.0745** (main / twin) | 1.32–1.36 | 1 147–1 334 | **round 5 carried 0 bytes in a 10.2 s window** |
+| TCP carrier | **0.1062 / 0.1068** | 0.99 | 375–441 | no stall |
+
+**`cost` (six streams: bulk, interactive, UDP, churn), two rounds:**
+
+| arm | interactive p99 (ms) | p50 (ms) | throughput (Gbit/s) | CPU (s/Gbit) |
+|---|---|---|---|---|
+| mhd | **2 085 / 2 337** | **604 / 603** | 0.31 | 4.8–5.3 |
+| TCP carrier | 2 510 / 3 444 | 646 / 820 | **0.46–0.54** | **0.58** |
+
+**Three findings, and the first one ends an assumption the record has carried since 2026-11-07.**
+
+1. **On the carrier's own leg at 5 % loss, the TCP carrier carries 1.6× what mhd carries**, with three
+   times fewer drops and no stall. The published "mhd wins on a lossy path" is a visitor-leg shape
+   (§4.166's own leg caveat); on the leg the carrier crosses it is not true today. The correctness of
+   the *design* is not what fails here — the implementation is: mhd spends **32–36 % of its tunnel-link
+   bytes on repairs** (1.32–1.36 wire bytes per visitor byte against TCP's 0.99) and still delivers
+   less. That is §4.247's prefix problem, priced.
+2. **What mhd does win is the interactive tail** — p99 20–30 % tighter and p50 lower on the mixed cell —
+   at 1.6× the throughput and 8× the CPU. Under the standing priority (latency > throughput > CPU)
+   that is the right *direction* of trade and a much smaller margin than the documentation claimed.
+3. **One of six bulk rounds carried nothing at all.** iperf's own report: `bytes_sent = 0`,
+   `bytes_received = 0`, a 13.8 s wall time, no socket error, drops recorded by the qdisc. A 10-second
+   silence is a liveness defect, not a throughput one, and it outranks the 1.6× gap: a carrier that
+   occasionally carries nothing cannot be described as slow.
+
+**A methodology trap this run paid for.** The `smoke` profile's 3-second samples with `omit 1` give the
+**opposite** answer on the same cell — mhd 0.036 against TCP 0.0084 — because three seconds is mostly
+TCP's slow start. The 10-second shape is the one that measures the path; the short one measures
+startup. Any future carrier comparison on a high-RTT lossy cell must use it.
+
+**What changed in the tree.** `docs/benchmarks.md` / `.zh.md` and `docs/configuration.md` / `.zh.md` no
+longer claim a lossy-path advantage: they state that only the `clean` row compares the two carriers
+where neither is impaired, and that the TCP carrier has never been run on the carrier's own leg — which
+this entry now has, once. `MHD-FINALIZATION-PLAN.md` (fifth version, untracked) carries the readings as
+its denominator and moves the throughput criterion from "≥0.5 Gbit/s" to the three-step ladder the data
+supports: kill the stall, beat 0.106, then push repairs from 32–36 % down.
+
+**Baseline binary frozen**: commit `1729eaf`, sha256 `01e84d9f3ea4fc0d…`, at
+`/home/dsh/tmp/mhd-baseline-1729eaf`; the `6ed32c1` copy is kept for the older A/B record. Artifacts
+under `/home/dsh/tmp/p03*-loss5-*` (both carriers, raw iperf JSON per round, one directory per arm).
+
+### 4.280 The plan changes its criterion: the defect we priced was the wrong one (2026-11-11)
+
+The fourth plan's main criterion was `rate100_shallow`'s `dropped_packets`. It is retired, and the
+reason is not that the defect turned out to be small — it is that **the metric was not priced against
+anything a user feels**. On that cell the drops run 2 200–7 200 across sittings while throughput sits
+at 0.083–0.0855 Gbit/s and does not move with them (§4.228 and every later round). Three times the
+drops, the same goodput, no matching p99. It is a hygiene number: it says how much the host's queue is
+being abused, not what a visitor experiences.
+
+**What replaces it.** Latency first, per the standing priority (delays > throughput > CPU/memory):
+the mixed-workload interactive `rtt_p99_ms` on `clean`, `loss1` and `loss5` **on the leg the carrier
+actually crosses** (`--condition-leg tunnel`), with bulk throughput as a floor rather than a target.
+The full criterion set is `MHD-FINALIZATION-PLAN.md` (fifth version), which is deliberately untracked.
+
+**Why the old criterion could not be fixed by trying harder.** Seven mechanisms were measured against
+it and all seven were congestion-control shaped — window geometry, slow-start restart, loss response,
+flight accounting, evidence rules, queue gating, a delivered-rate ramp — and the two that moved the
+number paid 57–100 % of the throughput for it (§4.249–§4.279). The one change in that whole series
+that was **not** a congestion controller, the receiver's frontier abandonment, is also the only one
+that moved anything real: `num` 0 → 978 KB/s and 61 789 → 12 timer-declared losses on a 5 % path
+(§4.247). That asymmetry is the finding: the bottleneck was never where the controller lived.
+
+**The two bottlenecks that are measured, and neither is a controller.**
+
+1. **A visitor's open.** `open_channel` (one Noise KK per stream) is **1 129 µs at p50 and 168 ms in
+   the worst second**, 99.9 % of the pairing wait, while the carrier's own send path spends 25 µs
+   (§4.84, §4.90). The remedy is already in the tree, tested and inert: a stream keyed from the lane
+   root needs no handshake, measured at **1 771 µs → 14 µs** and `churn-16` p99 **9.74 → 3.59 ms**.
+2. **The repair prefix.** On a 5 %-loss tunnel leg the lane moves 1.3–2.1 MB/s and the application sees
+   a few hundred KB/s: a hole that is re-sent every pass does not fill (§4.247). 5 % loss should cost
+   5 % of the bandwidth; it costs 85–94 %.
+
+**Decision: lane-root sealing is unfrozen.** It was frozen for two reasons, and the fifth plan records
+both as bugs rather than as design boundaries — a four-stripe deadlock that is not root-caused (stall
+signature `written ≫ next`, `credit_blocked=false`, `retransmits=0`), and 3.13× per-packet cost whose
+6.2 µs ChaCha20-Poly1305 call §4.70 itself calls an order of magnitude above what the cipher should
+cost. The user's ruling re-prices CPU and memory from target to budget; the plan therefore reopens it
+with two hard conditions (striped 20/20 and four-stripe runs without the deadlock) and keeps the
+switch, so a failure is one variable away from the current behaviour.
+
+**Two designs I nearly re-proposed, already refuted — recorded so the next reader does not.** Class
+aware scheduling inside the lane (§4.87: the wait is not in the picker; the handshake's packets leave
+this end immediately and what they wait behind is bytes the kernel already accepted), and a depth-1
+reserve per service (§4.87's arithmetic: covering the p99 needs depth ≈ 4, which is the depth §4.20
+had already measured as "the belt is fed faster than it is consumed"). Both belong to the same
+mistake: fixing a queue that is not where the wait is.
+
+**Nothing is committed for the engine in this entry**: the plan document, the criterion set and the
+sealing reversal are decisions, and the first measurement they require — the TCP carrier's own arm on
+the tunnel leg, which has never been run — is pre-registered in the plan.
+
 ### 4.279 The kernel will not pace this path either, so the last lever is gone (2026-11-11)
 
 The one lever left that was neither a userspace controller nor a wire change: **`SO_MAX_PACING_RATE`**,
