@@ -281,6 +281,9 @@ fn report_window(shared: &Arc<Shared>) {
             // is the ordinary loss path, so the rescue's rate cannot be read out
             // of it (`HANDOFF.md` §4.289).
             stall_rescues = conn.stall_rescues(),
+            // The interactive tail's own number: an extra copy a round trip for a
+            // flight small enough to be an interactive stream (`HANDOFF.md` §4.294).
+            small_dups = conn.small_dups(),
             parked_writers = conn
                 .parked_writers(now, std::time::Duration::from_millis(50))
                 .0,
