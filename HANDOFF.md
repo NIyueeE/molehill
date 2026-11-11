@@ -377,10 +377,63 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
-### 4.286 The stall is a receive-side collapse, not a bookkeeping one (2026-11-11)
+### 4.287 The bench scored a round that carried nothing as a zero, and both arms proved it (2026-11-11)
 
-The number that reframes P2 comes from the sender's own stall line on a 5 %-loss lane, two of them ten
-seconds apart:
+While hunting the rare stall, one round came back with **0.0 Gbit/s on both arms at once** — mhd and its
+own twin. Two independent instances of one binary do not stall together by carrier logic, so the artifacts
+were read: `sum_sent = 0`, `sum_received = 0` in both arms' iperf JSON, and the iperf3 **sink's** own log
+agreeing that it received nothing for the whole ten seconds. The connection was established and the tool
+forwarded not one byte.
+
+The bench recorded that as a valid sample of `throughput_gbps = 0`. It is not a measurement: averaged in,
+it reads as the worst sample of the run, and it is one of the rows that made the earlier campaigns look
+like a carrier that stalls at random. **`_iperf_cell` now fails a bulk sample whose client sent no bytes**
+with a typed reason — the same rule `_reject_empty_stage` already applied to a staged cell, extended to the
+standalone path where the bulk measurement *is* the cell. The benchmarks page states the rule in both
+languages, and `just bench-selfcheck` is green.
+
+**What survives the reclassification.** The stalls that matter are not the zeros; they are the rounds
+where the two instances of one binary disagree by an order of magnitude in the same round:
+
+| round | slow arm | its bytes | twin's bytes, same round | ratio |
+|---|---|---|---|---|
+| `p4b-1` round 3 | molehill 0.0064 Gbit/s | 7.6 MB | 106.0 MB | 14× |
+| `p4b-1` round 4 | molehill 0.0056 Gbit/s | 4.7 MB | 115.5 MB | 25× |
+
+Both arms sent bytes, so neither is a harness failure, and the stalled-prefix rescue did not prevent
+either. That is the phenomenon still to explain, and the next measurement is the one §4.286 pre-registered
+in its corrected form: diff the slow arm's per-second ledger against the fast arm's in the same round,
+where every other variable — host, clock, path, shape — is already equal.
+
+**And a third campaign settles what the zeros were.** In `p4b-3`, round 2, one arm read 0.0 while its twin
+read 0.0808 — and that arm's own artifact says `sum_sent = 0`, `sum_received = 0`. So **every zero-throughput
+sample this work has seen is an iperf-level zero, in three campaigns and both shapes**: the client opened
+the connection, ran the ten seconds, and put nothing on it. The fifth plan's P2 wording — "kill the
+ten-second zero-byte round" — was therefore partly aimed at a **harness** event, and the bench now refuses
+to score it. What remains genuinely unexplained is the arm-versus-twin near-zero, which is a factor of 15–25
+rather than an absolute silence.
+
+**A same-round ledger diff, for the next round's starting point.** From `p2-stall`'s round 3, where the twin
+read 0.0051 and molehill 0.0504 on the same host, same shape, same clock:
+
+| arm | `cycle=` passes | packets built | last lane `datagrams_total` |
+|---|---|---|---|
+| molehill (fast) | 62 272 | 79 120 | sent 629 / received 608 |
+| twin (slow) | 60 213 | **27 408** | sent 16 340 / received 6 482 |
+
+The slow arm built **a third** of the packets and sent 2.5× more datagrams than the peer acknowledged. That
+is a lane burning its capacity on repairs — the same 32–36 % signature §4.281 priced, at its worst — and it
+is where the next diff starts: the same count, per second, on both arms, with the window and the repair
+share beside it.
+
+### 4.286 The stall is not explained by the bookkeeping, and one reading of this entry was wrong (2026-11-11)
+
+**Correction, same day.** This entry first read two `mhd stalled` lines as the stall's signature. They were
+not: they came from a round that carried **0.0504 Gbit/s** while the same round's *other* arm was the slow
+one (0.0051), and `mhd stalled` is a routine per-second line that fires whenever a packet has been
+unacknowledged for 200 ms. What follows keeps the numbers and drops that inference.
+
+The lines, from the sender's own log in a normal round:
 
 ```
 worst_stream=7 worst_stream_unsent=4261140 worst_stream_retransmits=503
@@ -391,43 +444,34 @@ worst_stream=7 worst_stream_unsent=10671142 worst_stream_retransmits=17563
              recv_below=26 recv_largest=462 ...
 ```
 
-Read as one sentence: **the sender has put 66.9 MB on the wire, re-sent 17 563 packets, and the peer still
-reports that nothing below number 26 has arrived.** That is not "a hole nobody re-sends" — the hole is
-re-sent thousands of times. It is not the window either (`credit_blocked=false`, `unsent_ms=0`). What it
-says is that **the datagrams are not reaching the far end at all**, in a proportion that a five-percent
-loss rule cannot produce.
+What they do establish is **the steady state the plan is trying to fix**: the sender put 66.9 MB on the wire
+in ten seconds, **17 563 of its packets were re-sent**, and the peer's cumulative frontier sat at 26 while
+its largest reached 462 — a frontier lag of over four hundred numbers, and a repair share around a third,
+exactly what §4.281 priced. They establish nothing about the ten-second silence, which is a separate and
+much rarer event.
 
-The same round's totals point the same way, though they are **not a same-lane pair** and are quoted as a
-lead rather than a reading: the receiver-side lane logged **72 992 datagrams received** while a sender-side
-lane logged **975 sent** in its own second. The two ends of one round do not agree on what crossed, and the
-disagreement is orders of magnitude rather than percent — which is what makes the drop question the next
-measurement instead of another repair.
+**What the rare event actually looks like, and it is real.** Three campaigns of the same cell, same binary,
+A/A in each file:
 
-**So the last two increments were treating a symptom.** The ack runs (§4.284) and the stalled-prefix
-rescue (§4.285) both assume the far end is holding bytes but cannot say which; what the numbers say is that
-the far end is holding almost nothing because its input is being dropped. The rescue bound is still right
-for the case it covers, and the runs still cost nothing, but neither can move a cell whose traffic is
-being discarded before it arrives.
+| campaign | the slow arm's round | its bytes | the twin's bytes, **same round** |
+|---|---|---|---|
+| 1 | 0.0064 (molehill) | 7.6 MB | 106.0 MB |
+| 1 | 0.0056 (molehill) | 4.7 MB | 115.5 MB |
+| 2 | 0.0 (both arms) | 0 B | 0 B |
 
-**The mechanism that fits, and is now the pre-registered experiment.** A stalled reader stops draining the
-userspace stream buffer, the pump keeps reading the socket into it, and the socket's own receive queue then
-overflows — where UDP drops silently. The carrier's credit is `WINDOW` (16 MB) of *userspace* bytes and
-says nothing about the kernel queue, so the sender has no reason to slow down and every datagram, repair
-included, is dropped at the same rate. The one packet that would unblock the reader is discarded with the
-rest, which is exactly the ten-second silence.
+The first two rows are a **15–25× difference between two instances of one build inside one round**, so they
+are a genuine carrier-side or host-side stall — and the stalled-prefix rescue (§4.285) did **not** prevent
+them. The third row is a different animal entirely: both arms, and the sink's own log, carried nothing, which
+is a harness event recorded as a zero; the bench now refuses to score it (`HANDOFF.md` §4.287), and after
+that classification the row is a failure, not a 0 Gbit/s sample.
 
-**Pre-registered, before it runs:**
+**So the next measurement narrows, and it is cheap**: diff the per-second ledger of the **slow** arm against
+the **fast** arm *in the same round* — same host, same clock, same shape. What differs between two instances
+of one binary is the answer, and it is either a lane the path treated badly (and then the path counters say
+so) or the process (and then CPU, descheduling or a stalled task says so). Nothing about the carrier's
+control law can be concluded from an arm-vs-twin difference that is this large until that diff exists.
 
-- **Measure**: on the stalled lane, the receiver socket's drop counter (`/proc/net/udp`'s `drops` column,
-  or `SO_RXQ_OVFL`) sampled once a second beside the pump's read rate and the userspace buffer's held
-  bytes. **Pass**: drops account for more than half of what arrived during the stall. **If they do not**,
-  the traffic is being lost on the path and the next question is the namespace counters, not the code.
-- **Then, only with that number**: make the advertised credit a function of what the receiver can actually
-  drain — the socket queue and the userspace buffer together — so a reader that stops turns into a slower
-  sender rather than a black hole. That is flow control, not a controller, and it is the one place the
-  "user-space protocol sees all its own state" advantage has not been used at all.
-
-**Nothing committed for the engine this round**: this is a diagnosis with a pre-registered next step.
+**Nothing committed for the engine this round.**
 
 ### 4.285 A stalled prefix is re-sent from its own frontier, and the cell still cannot say whether it helped (2026-11-11)
 

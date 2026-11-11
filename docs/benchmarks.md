@@ -131,6 +131,13 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   topology, ports and backend with no tool in the path. Without it a slow probe
   and a slow tunnel are the same reading, which is why the model always reports
   a tool arm *against its own control* rather than on its own.
+- **A sample that carried nothing is a failure, not a zero.** A bulk cell whose
+  client reports zero bytes sent measured an idle path: the number says nothing
+  about throughput, and averaged in as `0 Gbit/s` it reads as the worst sample
+  of the run instead of as no sample at all. The model fails it with that
+  reason — a staged cell loses only its bulk metric, a standalone one loses the
+  cell — because "the tool carried nothing" and "the tool carried nothing well"
+  must not print the same number.
 - **A run states its whole method before its first sample.** The results file
   carries a fingerprint over the topology, the conditions and timelines, the
   scenarios and their *resolved* parameters, the instrument cadences and the

@@ -649,6 +649,30 @@ def _iperf_cell(
             unavailable={"throughput_gbps": {"reason": "no bulk spine: streams = 0"}},
             evidence=_evidence(spot.ctx, spot.window, {}),
         )
+    if result.get("bytes_sent") == 0:
+        # A standalone bulk run that dialed a stream and moved no byte is a
+        # **failure**, not a zero — the same rule `_reject_empty_stage` applies to
+        # a staged cell, and for the same reason: a reader cannot tell "0 Gbit/s"
+        # from "this path was never measured". Measured 2026-11-11: two arms of
+        # one round both reported zero bytes sent *and* zero received, the sink's
+        # own log agreeing, while the same binary carried 0.06 to 0.09 Gbit/s in the
+        # neighbouring rounds. Averaged in as zeros, that round read as a carrier
+        # stall; classified, it reads as what it is (`HANDOFF.md` §4.287).
+        reason = "the client sent no bytes: the sample measured an idle path"
+        if not lenient:
+            return Cell(
+                cell=spot.cell,
+                ok=False,
+                reason=reason,
+                evidence=_evidence(
+                    spot.ctx,
+                    spot.window,
+                    {"artifact": result.get("artifact"), "exit": result.get("exit")},
+                ),
+            )
+        built = _counter_cell(spot, metrics, {"artifact": result.get("artifact")})
+        built.evidence["iperf_failure"] = reason
+        return built
     extra = {
         "bytes_sent": result.get("bytes_sent"),
         "bytes_received": result.get("bytes_received"),
