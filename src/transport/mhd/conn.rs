@@ -1360,7 +1360,13 @@ impl Conn {
         // The congestion window is the second bound, and it is what the flight —
         // and therefore the recovery table — is actually sized by.
         let credit = self.send_credit.saturating_sub(self.written);
-        let window = self.cwnd.saturating_sub(self.recovery.flight_bytes());
+        // **Data, not the repairs.** A repair storm used to hold the whole
+        // window: every re-send of a range the path keeps dropping sat in
+        // `flight_bytes`, so the writer had no room for bytes the peer had never
+        // seen — measured as a third of the wire being repairs while the
+        // application carried a sixteenth of the path (`HANDOFF.md` §4.281). The
+        // window now bounds new data, and the repairs share what is left.
+        let window = self.cwnd.saturating_sub(self.recovery.data_flight_bytes());
         // The buffer ceiling is the third bound: a byte stays buffered until an
         // acknowledgement moves its stream's frontier past it, and a frontier
         // that stalls must cost the writer a wait rather than unbounded memory.
@@ -2354,6 +2360,9 @@ impl Conn {
             // several datagrams (a selector byte, then the message), and losing
             // any of them costs the arrival its latency.
             !state.acknowledged,
+            // A range already sent once is a repair, and repairs are not what the
+            // window admits (`HANDOFF.md` §4.292).
+            repair,
         );
         // What this packet cost the wire, and whether the range was new: the pair
         // is the whole of the "is the lane re-sending itself" question, and it is
@@ -2600,6 +2609,8 @@ impl Conn {
                 fin: true,
             }),
             // A finish-only packet carries no bytes of the opening.
+            false,
+            // Nor is it a repair: it carries no payload to charge a window for.
             false,
         );
         self.ack_pending = false;

@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.292 The window stops paying for repairs, and every cell moves at once (2026-11-11)
+
+**The change.** Admission was `cwnd - flight_bytes`, and `flight_bytes` counted **repairs**. So a lane whose
+re-sends kept being dropped held the window with the same bytes sent again and again, and the writer had no
+room for data the peer had never seen: the repair share and the goodput were fighting over one budget. Now
+`Recovery` tracks `repair_flight_bytes` separately (`Sent::repair`, set where a packet leaves), admission
+counts **data only**, and repairs share whatever is left. This is the plan's "repair budget" item, arrived at
+from the measurement rather than from the design.
+
+**It is the first change in this record that moves every cell in the same direction.**
+
+| cell | before | after |
+|---|---|---|
+| `loss5` tunnel-leg `bulk-1`, 6 rounds, A/A | **0.0665 / 0.0541 Gbit/s** | **0.1270 / 0.1317** |
+| `rate100_shallow` `bulk-1`, 12 rounds | 0.083–0.0855 Gbit/s, **2 200–7 200 drops** | **0.0932**, **14–18 drops** |
+| `bulk-n` clean | 10.13 / 10.19 Gbit/s | 10.28 |
+| repair share, aggregate over a round | 25.2 % | **13.5 %** |
+
+The `loss5` file's own A/A floor for throughput is **9.87 %**, and the change is a factor of **1.9** — well
+outside it and outside any cross-run caveat. The shallow cell is the old plan's defect, and it is not merely
+improved: twelve rounds read 0.0932–0.0933 with 14–18 drops, where the same cell used to drop two thousand
+packets and carry 0.083. **The drops were the repair storm all along** — not the sender's rate, which is what
+seven mechanisms and one kernel probe were aimed at (§4.249–§4.279).
+
+**One round in the `loss5` file is `null`, and that is the other fix working.** It is a zero-byte iperf sample
+— the harness event §4.287 classified — and the bench now records it as a failure instead of a 0 Gbit/s
+sample. No carrier-side near-zero appeared in the six rounds.
+
+**What this does not say.** The window is not "solved": its size still follows the growth law, and §4.291
+showed that growing it changed nothing on this cell. What changed here is **what the window is spent on**, and
+that was never measured before because the two populations were one number.
+
+**Committed**: `Sent::repair`, `repair_flight_bytes`, `Recovery::data_flight_bytes`, the admission change, the
+call sites, and this record.
+
 ### 4.291 The window now grows from the byte prefix, and the cell says the window was not the limit (2026-11-11)
 
 **First, a correction to §4.290**: the frozen window it described was not a new observation. §4.181 recorded it
