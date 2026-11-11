@@ -305,6 +305,13 @@ struct StreamState {
     /// past it and the repair queue never held it. Measured as a ten-second
     /// silence whose wire was 97 % repairs of one range (`HANDOFF.md` §4.285).
     prefix_at: Option<Instant>,
+    /// When a repair for this stream last went on the wire.
+    ///
+    /// The stalled-prefix rescue must not duplicate what the loss path is already
+    /// doing: while a repair is being sent on any cadence, something covers the
+    /// stream and the rescue waits. Only when that path goes quiet — the loss
+    /// record was reaped, so nothing re-queues the range — does it fire.
+    repair_at: Option<Instant>,
     /// How many times that rescue has fired without the prefix moving since.
     ///
     /// It backs the hold off and stops it: a peer that answers nothing is not a
@@ -1837,7 +1844,26 @@ impl Conn {
             if state.prefix_retries >= STALL_REPAIR_ATTEMPTS {
                 continue;
             }
-            let base_hold = (rtt + rtt / 2).max(Duration::from_millis(20));
+            // Two round trips, not one and a half, and nowhere to fire if the
+            // stream already owes a repair: the rescue exists for the range
+            // **nothing** is re-sending, so a stream whose repair queue is not
+            // empty has another path covering it. Without that guard the rescue
+            // fired a hundred-odd times a second on a 5 %-loss lane — its counter
+            // in the window line said so — which is a duplicate stream, not a
+            // rescue.
+            if state.send.has_repair() {
+                continue;
+            }
+            // Something else is already re-sending this stream: the loss path
+            // queued a range within the last round trip, so the rescue's case —
+            // a hole nothing covers — has not happened yet.
+            if state
+                .repair_at
+                .is_some_and(|at| now.saturating_duration_since(at) < rtt)
+            {
+                continue;
+            }
+            let base_hold = (rtt + rtt).max(Duration::from_millis(250));
             let hold = base_hold * (1u32 << u32::from(state.prefix_retries.min(3)));
             if now.saturating_duration_since(at) < hold {
                 continue;
@@ -2332,6 +2358,7 @@ impl Conn {
                 // forgotten because the send point moved past it.
                 state.send.repair_sent(offset, len);
                 state.repairs_sent = state.repairs_sent.saturating_add(1);
+                state.repair_at = Some(now);
             } else {
                 state.send.mark_sent(len);
                 if !state.send.has_unsent() {

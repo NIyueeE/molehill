@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.289 The stalled-prefix rescue was firing on a healthy stream, and the test that caught it is worth keeping (2026-11-11)
+
+The rescue from §4.285 had no guard against duplicating what the loss path was already doing. Two conditions
+were added: it does not fire while the stream owes a repair, and it does not fire within one round trip of
+a repair this stream actually sent (`StreamState::repair_at`, stamped where `repair_sent` trims the queue).
+The hold also has a floor now — `max(2 × RTT, 250 ms)` — because a *fixed* virtual clock in the unit harness
+was enough to make it fire there.
+
+**The regression test said so before the measurement did.** `a_loss_re_sends_the_hole_and_not_what_follows_it`
+went from 1 341 to 2 682 bytes re-sent: one lost datagram had started costing two. That test exists to pin
+"a loss costs the hole and not the stream", and it caught the rescue adding a duplicate within a burst whose
+virtual clock advanced a few milliseconds. With the guards it passes again, and the rescue's own test still
+passes — 200 polls over ten seconds of virtual time leave the counter at exactly its bound.
+
+**What could not be read.** Whether the guards cut the firing rate on a real lane: `repairs_at_base` is
+printed in the window line, which carries **no lane id**, and four lanes interleave in one log, so a
+per-lane series cannot be reconstructed from the text. The last stats run shows values between 551 and 675
+in that field, and whether that is twelve fires a second on one lane or one fire on each of a hundred
+streams is exactly what the line cannot say. **Next instrumentation**: put the lane id in the window line,
+the way the stall line already does — then the firing rate is a subtraction, not a guess.
+
+**Committed**: the two guards, the floor, and nothing else. The rescue's effect on the lossy cell remains
+unmeasured, and no throughput claim is made for it.
+
 ### 4.288 The integration suite is flaky for a few seconds after a bench campaign (2026-11-11)
 
 Two integration tests failed in the check chain immediately after three back-to-back `loss5` campaigns, and
