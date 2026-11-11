@@ -377,6 +377,19 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.288 The integration suite is flaky for a few seconds after a bench campaign (2026-11-11)
+
+Two integration tests failed in the check chain immediately after three back-to-back `loss5` campaigns, and
+then passed **three runs in a row** (22/22 each, 83–88 s) with no code change. The suite binds fixed ports
+(2333–2340) and spawns real server/client processes; the bench tears its namespaces down but its tool
+processes and their sockets can outlive the campaign by seconds, so a run started straight after one can
+find a port occupied. `pgrep -fa "[m]olehill|[i]perf3"` was empty by the time the failure was investigated.
+
+**Rule for next time**: after a bench campaign, wait for the tool processes to disappear (`pgrep`) before
+running `just check` or the integration suite. A red suite in that window is evidence about the previous
+campaign's teardown, not about the tree — and a green re-run with no code change is how to tell the two
+apart. The push gate hit the same failure and refused the push, which is the gate doing its job.
+
 ### 4.287 The bench scored a round that carried nothing as a zero, and both arms proved it (2026-11-11)
 
 While hunting the rare stall, one round came back with **0.0 Gbit/s on both arms at once** — mhd and its
