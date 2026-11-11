@@ -123,6 +123,12 @@ pub(crate) const ABANDON_HOLD: Duration = Duration::from_secs(30);
 /// duplicate stream fast enough to hang a 32 KiB unit test.
 const STALL_REPAIR_ATTEMPTS: u8 = 5;
 
+/// Held bytes below this make a stream small enough to be an interactive flow.
+///
+/// Only the window line uses it: the tail's reading has to skip bulk streams, and
+/// size is the only signal this end has (`HANDOFF.md` §4.300).
+const SMALL_STREAM_HELD: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
+
 /// A gap long enough to count as a tail event rather than scheduling noise.
 ///
 /// The pre-registration in HANDOFF §4.62 is stated against 200 µs: the gap is 5–7 µs at
@@ -3087,6 +3093,22 @@ impl Conn {
         self.streams
             .get(&stream)
             .and_then(|s| s.recv.ready_for(now))
+    }
+
+    /// The longest a **small** stream's held bytes have waited for a reader.
+    ///
+    /// `ready_for` above answers for one stream the caller names, and the window
+    /// line uses it on the stream with the biggest backlog — which in a mixed cell
+    /// is always bulk, so that reading says nothing about the interactive tail
+    /// (`HANDOFF.md` §4.300). This picks the worst wait among streams small enough
+    /// to be interactive, which is the number the tail question needs.
+    pub(crate) fn small_ready_wait(&self, now: Instant) -> Option<(u32, Duration)> {
+        self.streams
+            .iter()
+            .filter(|(_, state)| state.reset.is_none())
+            .filter(|(_, state)| state.recv.held() <= SMALL_STREAM_HELD)
+            .filter_map(|(&id, state)| state.recv.ready_for(now).map(|waited| (id, waited)))
+            .max_by_key(|(_, waited)| *waited)
     }
 
     /// How many streams have had unread bytes for longer than `threshold`.

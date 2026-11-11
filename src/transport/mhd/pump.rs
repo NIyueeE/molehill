@@ -242,6 +242,14 @@ fn report_window(shared: &Arc<Shared>) {
             .map_or((0, 0), |(id, waited)| {
                 (id, u64::try_from(waited.as_millis()).unwrap_or(u64::MAX))
             });
+        // **The tail's own reading.** `worst_ready_ms` above keys on the biggest
+        // backlog, which in a mixed cell is bulk by construction; this one keys on
+        // streams small enough to be interactive, and is the number the interactive
+        // tail question actually needs (`HANDOFF.md` §4.300).
+        let (small_ready_stream, small_ready_ms) =
+            conn.small_ready_wait(now).map_or((0, 0), |(id, waited)| {
+                (id, u64::try_from(waited.as_millis()).unwrap_or(u64::MAX))
+            });
         // The stream that is furthest behind, once a second: at a stall the lane's
         // own numbers are healthy — nothing unsent, nothing unacknowledged — and the
         // question is which stream stopped and where its cursor sits. The stall line
@@ -325,6 +333,8 @@ fn report_window(shared: &Arc<Shared>) {
             backlog_bytes = backlog.total,
             worst_stream,
             worst_ready_ms,
+            small_ready_stream,
+            small_ready_ms,
             // The ceiling the window is actually allowed to reach, and the
             // round trip it is derived from: a queue that inflates the estimate
             // would raise its own ceiling, and that feedback has to be visible

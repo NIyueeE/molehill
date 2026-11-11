@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.300 `ready_ms` was the bulk stream, and even the diagnosis needs the class the product does not have (2026-11-11)
+
+**Correction to §4.299.** Its `ready_ms` reading (51 of 3 380 seconds over one second, max 12 855 ms) is
+computed from `backlog.worst` — the stream with the most *held* bytes — and the same line names it: streams
+**27**, `next = written = 705 501 485`, `unsent = 9 100 234`, `retransmits = 415 594`. That is a **705 MB bulk
+stream**, and a reader that waits seconds on bulk is the visitor socket draining at the visitor's rate. The
+reading was correct and about the wrong stream: it says nothing about the interactive tail.
+
+**A second reading, keyed on small streams.** The window line now carries `small_ready_ms` — the worst reader
+wait among streams holding eight payloads or fewer — beside the stream's id. On the same no-loss `rtt100`
+cell, two rounds:
+
+| `small_ready_ms` | count |
+|---|---|
+| over 1 s | **295 of 3 932 window lines (7.5 %)** |
+| maximum | **39 225 ms** |
+
+So small streams' unread bytes sit for **tens of seconds** on a path with no loss and a 200 ms round trip.
+
+**And that reading has the same defect in a different form.** "Holds eight payloads or fewer" does not mean
+"interactive": a **stalled bulk stream** whose reader is blocked drains down to a few held bytes and then
+looks exactly like an interactive one for as long as it stays blocked. Without a class the carrier cannot tell
+the two apart — which is the same wall P3's mechanisms hit (§4.297), now on the *diagnosis* side as well.
+
+**So the position is this, and it is where the autonomous work stops.** The tail is (a) independent of loss,
+(b) not the shaper's queue, (c) not the send queue, and (d) associated with readers holding bytes for seconds —
+but every attempt to say *which* streams is blocked by a missing stream class, and every mechanism that would
+use it needs the same class. **That class is a product decision, not an implementation detail**: an internal
+"this stream tolerates duplicates / is latency-critical" marking, assigned by the layer above (which does know,
+because it knows the service and the flow), is the missing piece.
+
+**Committed**: the `small_ready_ms` instrument, which is worth keeping for the day the class exists, and this
+record.
+
 ### 4.299 The interactive tail is the same without any loss, and the send queue is milliseconds (2026-11-11)
 
 The separating experiment §4.298 pre-registered cost nothing but a run: the same `cost` cell on `rtt100`
