@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.283 Re-landing the frontier abandonment fails the lossy-stream tests: it loses bytes, not just numbers (2026-11-11)
+
+P2's first candidate was the cheapest one on the plan: put `75cdef5` back. It was re-landed on today's tree
+exactly as it was written — the `AckSet::insert` branch that gives up the oldest gap when `AHEAD` later
+numbers have arrived, plus its regression test — and the two tests that carry a stream through a lossy lane
+failed:
+
+```
+four_unsealed_streams_carry_frames_through_loss  FAILED  conn.rs:4121
+four_sealed_streams_carry_frames_through_loss    FAILED  conn.rs:4135
+```
+
+**Why, and it is not a test artifact.** The number frontier is the sender's only *cumulative* retirement
+path: jumping `below` past a hole tells the sender that every range the abandoned packet carried was
+delivered. It was not. The receiver has the number out of the way but not the bytes, the sender has retired
+the range and will never re-send it, and the stream's prefix stops at that offset for the rest of its life.
+§4.247's sentence — "its stream bytes are dropped by offset as the duplicate they are" — only holds in the
+case where the packet *does* arrive later. When it is genuinely lost, abandoning the number destroys data.
+
+So the frontier bug is real (`num=0` with 98 % repairs on a 5 % path, §4.246) and **this is not its fix**.
+What a receiver needs is a way to say "these numbers arrived, that one did not, and I still owe you those
+bytes" — an acknowledgement that can *name* a hole, which the current 28-byte block cannot: one cumulative
+frontier, a sixty-four-number bitmap, and nothing between `below` and `largest − 64`.
+
+**Reverted**, tree clean, 119 mhd tests green.
+
+**Next, pre-registered as a wire change for the unreleased 6.0** (not started, and not to be started
+before its own measurement): carry either **two or three received ranges** (start, length in packet
+numbers) or **the offset of the oldest missing stream range** in the acknowledgement block. The first lets
+the sender retire any number in the flight and makes the frontier's distance irrelevant; the second lets the
+receiver abandon a number hole *and* ask for exactly the bytes it lost. The measurement that decides
+between them is the same one the plan already pre-registers for P2: the lossy lane's `num` rate, repair
+share, prefix advance and the cell's throughput, with the ack overhead counted (a range pair is 8 bytes of
+the 1 400-byte datagram).
+
 ### 4.282 Sealing is on by default: the handshake leaves the arrival path (2026-11-11)
 
 P1 of the fifth plan, and the first change in this record whose headline number is a latency
