@@ -377,6 +377,58 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.286 The stall is a receive-side collapse, not a bookkeeping one (2026-11-11)
+
+The number that reframes P2 comes from the sender's own stall line on a 5 %-loss lane, two of them ten
+seconds apart:
+
+```
+worst_stream=7 worst_stream_unsent=4261140 worst_stream_retransmits=503
+             worst_stream_next=4341241 worst_stream_written=4341241
+             recv_below=26 recv_largest=462 ...
+worst_stream=7 worst_stream_unsent=10671142 worst_stream_retransmits=17563
+             worst_stream_next=66867625 worst_stream_written=66867625
+             recv_below=26 recv_largest=462 ...
+```
+
+Read as one sentence: **the sender has put 66.9 MB on the wire, re-sent 17 563 packets, and the peer still
+reports that nothing below number 26 has arrived.** That is not "a hole nobody re-sends" — the hole is
+re-sent thousands of times. It is not the window either (`credit_blocked=false`, `unsent_ms=0`). What it
+says is that **the datagrams are not reaching the far end at all**, in a proportion that a five-percent
+loss rule cannot produce.
+
+The same round's totals point the same way, though they are **not a same-lane pair** and are quoted as a
+lead rather than a reading: the receiver-side lane logged **72 992 datagrams received** while a sender-side
+lane logged **975 sent** in its own second. The two ends of one round do not agree on what crossed, and the
+disagreement is orders of magnitude rather than percent — which is what makes the drop question the next
+measurement instead of another repair.
+
+**So the last two increments were treating a symptom.** The ack runs (§4.284) and the stalled-prefix
+rescue (§4.285) both assume the far end is holding bytes but cannot say which; what the numbers say is that
+the far end is holding almost nothing because its input is being dropped. The rescue bound is still right
+for the case it covers, and the runs still cost nothing, but neither can move a cell whose traffic is
+being discarded before it arrives.
+
+**The mechanism that fits, and is now the pre-registered experiment.** A stalled reader stops draining the
+userspace stream buffer, the pump keeps reading the socket into it, and the socket's own receive queue then
+overflows — where UDP drops silently. The carrier's credit is `WINDOW` (16 MB) of *userspace* bytes and
+says nothing about the kernel queue, so the sender has no reason to slow down and every datagram, repair
+included, is dropped at the same rate. The one packet that would unblock the reader is discarded with the
+rest, which is exactly the ten-second silence.
+
+**Pre-registered, before it runs:**
+
+- **Measure**: on the stalled lane, the receiver socket's drop counter (`/proc/net/udp`'s `drops` column,
+  or `SO_RXQ_OVFL`) sampled once a second beside the pump's read rate and the userspace buffer's held
+  bytes. **Pass**: drops account for more than half of what arrived during the stall. **If they do not**,
+  the traffic is being lost on the path and the next question is the namespace counters, not the code.
+- **Then, only with that number**: make the advertised credit a function of what the receiver can actually
+  drain — the socket queue and the userspace buffer together — so a reader that stops turns into a slower
+  sender rather than a black hole. That is flow control, not a controller, and it is the one place the
+  "user-space protocol sees all its own state" advantage has not been used at all.
+
+**Nothing committed for the engine this round**: this is a diagnosis with a pre-registered next step.
+
 ### 4.285 A stalled prefix is re-sent from its own frontier, and the cell still cannot say whether it helped (2026-11-11)
 
 Two things this round: the safety net the ten-second silence needed, and the counter that says the ack
