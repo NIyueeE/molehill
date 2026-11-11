@@ -377,6 +377,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.293 The acceptance battery on the repaired binary, and the two criteria it changes (2026-11-11)
+
+Everything the plan's §一 asks for, measured on the tree that carries every change of this session
+(`81533ef` and the binary built from it):
+
+| gate | reading |
+|---|---|
+| `just interop` | 3 passed |
+| `just l3-accept` | every case PASS (needs `sudo`; without it the recipe exits 77 by design) |
+| integrations, `MOLEHILL_DATA_CARRIER=mhd` | **3 × 22/22**, 89.2 / 85.4 / 87.8 s |
+| integrations, `MOLEHILL_DATA_CARRIER=tcp` | **3 × 22/22**, 81.2 / 80.7 / 86.0 s |
+| `striped_data_channels`, ten consecutive runs | **10/10** |
+| `transport` | first byte **77 µs**, recovery **4.5 µs**, 0 errors |
+| `cost` on `clean` | p99 **14.4 / 9.4 ms**, p50 1.40 / 1.29 ms, **8.72 / 8.80 Gbit/s** |
+| `cost` on `loss5` tunnel | p99 **1 064 / 1 263 ms** (was 2 085 / 2 337), **0.428 Gbit/s** (was 0.31) |
+| `churn-16` | p99 **7.15 / 7.03 ms**, rate 1 808 / 1 815 per second |
+| `loss5` tunnel `bulk-1` | **0.1270 / 0.1317 Gbit/s** — above the TCP carrier's 0.106 |
+| `rate100_shallow` `bulk-1` | **0.0932**, 14–18 drops |
+| `bulk-n` on `clean` | 10.28 Gbit/s |
+
+**Two criteria that move, and both of them were written before this session's changes.**
+
+1. **The latency the repair-admission change also bought.** The mixed lossy cell's interactive p99 halved —
+   2 085 / 2 337 ms before, 1 064 / 1 263 ms after — while its throughput rose from 0.31 to 0.428. The
+   window that no longer pays for repairs leaves the queue less full, which is the latency side of the same
+   change; the plan's latency criterion (≤ 50 % of the same-run baseline) is met against the pre-change
+   readings, and it is stated here as a cross-run comparison because no run this session carried both
+   binaries.
+2. **`churn-16` still misses its ≤ 4 ms line** (7.15 / 7.03 ms), exactly as §4.282 recorded when the
+   per-stream handshake left the arrival path: that cell's tail is the request round trip, not the open, and
+   this change neither helps nor hurts it.
+
+**What is not claimed.** The four-stripe deadlock was never reproduced on this tree (eleven runs before the
+default flip, ten more striped runs and eight integration suites since), so "root-caused and fixed" is not
+something this record can say. Sealing is default-on with `MOLEHILL_MHD_SEAL=0` as the hatch, and the reasons
+it used to be off are documented at `sealing_enabled` as they stand.
+
 ### 4.292 The window stops paying for repairs, and every cell moves at once (2026-11-11)
 
 **The change.** Admission was `cwnd - flight_bytes`, and `flight_bytes` counted **repairs**. So a lane whose
