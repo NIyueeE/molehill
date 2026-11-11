@@ -113,6 +113,16 @@ pub(crate) const OPEN_RESERVE: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
 /// has been abandoned for longer than all of those is one nobody is waiting for.
 pub(crate) const ABANDON_HOLD: Duration = Duration::from_secs(30);
 
+/// How many times one stream's stalled prefix is re-sent before the rescue stops.
+///
+/// The rescue exists for the case nothing else covers: a hole whose recovery
+/// record was forgotten, so no path re-sends its bytes. One attempt a round trip
+/// with the hold doubling is enough to clear a genuinely lost packet — five
+/// attempts is roughly a second of a 200 ms path, and a peer that has answered
+/// nothing for that long is not answering. Unbounded, the rescue produced a
+/// duplicate stream fast enough to hang a 32 KiB unit test.
+const STALL_REPAIR_ATTEMPTS: u8 = 5;
+
 /// A gap long enough to count as a tail event rather than scheduling noise.
 ///
 /// The pre-registration in HANDOFF §4.62 is stated against 200 µs: the gap is 5–7 µs at
@@ -285,6 +295,23 @@ struct StreamState {
     /// declarations grow while this stands still is owed bytes that nothing picks,
     /// and the difference is invisible in every other counter.
     repairs_sent: u32,
+    /// When the peer's byte prefix for this stream last moved, or its last send.
+    ///
+    /// The prefix is the one acknowledgement that cannot stall — it names the
+    /// contiguous bytes the peer holds — so a prefix that stops moving while the
+    /// send point is ahead of it means a hole nothing is filling. Nothing else
+    /// notices that case: a lost packet's record is forgotten after `LOST_HOLD`,
+    /// and a range no record names is never re-sent, because the send point is
+    /// past it and the repair queue never held it. Measured as a ten-second
+    /// silence whose wire was 97 % repairs of one range (`HANDOFF.md` §4.285).
+    prefix_at: Option<Instant>,
+    /// How many times that rescue has fired without the prefix moving since.
+    ///
+    /// It backs the hold off and stops it: a peer that answers nothing is not a
+    /// peer this end can fix by sending more, and an unbounded rescue is an
+    /// unbounded duplicate stream — the first version of this loop made a
+    /// thirty-two-kilobyte test hang rather than finish.
+    prefix_retries: u8,
 }
 
 /// One open stream the connection is holding.
@@ -621,6 +648,15 @@ pub(crate) struct SendLedger {
     /// the accounting question, `pfx` being the path that does *not* grow the window.
     acked_by_number: u64,
     acked_by_prefix: u64,
+    /// Of `acked_by_number`, the records a **received run** named.
+    ///
+    /// A number more than sixty-four behind `largest` can retire no other way:
+    /// the cumulative frontier is pinned by whatever hole sits below it, and the
+    /// bitmap cannot reach that far. So this counter is the one that says whether
+    /// the two runs in the acknowledgement block are doing work on a lossy path,
+    /// and `retired_by_run_bytes` is how much wire they saved from being re-sent.
+    retired_by_run: u64,
+    retired_by_run_bytes: u64,
     /// Of those, the ones whose record had already been declared lost.
     ///
     /// A declaration the path did not support, or one whose range a repair then
@@ -697,6 +733,14 @@ impl SendLedger {
             .checked_div(self.sent_bytes)
             .unwrap_or(0)
     }
+
+    /// Records a received run retired, and the bytes they carried.
+    fn note_retired_run(&mut self, records: usize, bytes: usize) {
+        let records = u64::try_from(records).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.retired_by_run = self.retired_by_run.saturating_add(records);
+        self.retired_by_run_bytes = self.retired_by_run_bytes.saturating_add(bytes);
+    }
 }
 
 /// One line, so the window report stays one field wide.
@@ -711,7 +755,7 @@ impl std::fmt::Display for SendLedger {
             f,
             "sent={} rep={}({}%) pkt={} ack={} num={} pfx={} late={} \
              loss={}t/{}m probe={} grow={} refus={}w/{}b/{}c/{}a \
-             stop={}none/{}quiet/{}closed/{}other recv={} dup={}",
+             stop={}none/{}quiet/{}closed/{}other recv={} dup={} byrun={}/{}",
             self.sent_bytes,
             self.sent_repair_bytes,
             self.repair_share_pct(),
@@ -734,6 +778,8 @@ impl std::fmt::Display for SendLedger {
             self.stop_other,
             self.recv_bytes,
             self.recv_duplicate_bytes,
+            self.retired_by_run,
+            self.retired_by_run_bytes,
         )
     }
 }
@@ -1749,8 +1795,72 @@ impl Conn {
     ///
     /// `out` is the run the pump is staging, so a stream frame's payload is
     /// appended from the stream's own buffer and never staged twice.
+    /// Re-send the bytes at a stream's acked frontier when it has stopped moving.
+    ///
+    /// The bytes below `base` are the ones the peer's prefix says it holds; the
+    /// send point has passed `base` and no repair queue entry may exist for it,
+    /// because the record that carried it was declared lost and then forgotten
+    /// after [`super::recovery::LOST_HOLD`]. When that happens nothing ever puts
+    /// those bytes on the wire again: the stream's prefix stops, the writer
+    /// blocks on the buffer ceiling, and the lane goes quiet while its wire is
+    /// only repairs of that one range — measured as a ten-second silence
+    /// (`HANDOFF.md` §4.285).
+    ///
+    /// The guard is one range per stream per round trip, so a healthy path never
+    /// sees a duplicate from here: its prefix moves every round trip and the
+    /// stamp is refreshed before this can fire.
+    fn repair_stalled_prefixes(&mut self, now: Instant) {
+        let Some(rtt) = self.recovery.smoothed_rtt() else {
+            return;
+        };
+        for state in self.streams.values_mut() {
+            if state.reset.is_some() {
+                state.prefix_at = None;
+                state.prefix_retries = 0;
+                continue;
+            }
+            let base = state.send.base();
+            if state.send.next_offset() <= base {
+                // Nothing outstanding: no hole to be stuck behind.
+                state.prefix_at = None;
+                state.prefix_retries = 0;
+                continue;
+            }
+            let Some(at) = state.prefix_at else {
+                state.prefix_at = Some(now);
+                continue;
+            };
+            // One attempt a round trip, then doubling, and then no more: a peer
+            // that answers nothing is not fixed by sending the same range again,
+            // and an unbounded rescue turns a stall into a duplicate stream (it
+            // hung a 32 KiB test on the first version of this).
+            if state.prefix_retries >= STALL_REPAIR_ATTEMPTS {
+                continue;
+            }
+            let base_hold = (rtt + rtt / 2).max(Duration::from_millis(20));
+            let hold = base_hold * (1u32 << u32::from(state.prefix_retries.min(3)));
+            if now.saturating_duration_since(at) < hold {
+                continue;
+            }
+            let want = usize::try_from(state.send.next_offset() - base)
+                .unwrap_or(usize::MAX)
+                .min(wire::MAX_STREAM_PAYLOAD);
+            if want == 0 || state.send.available(base, want) == 0 {
+                continue;
+            }
+            state.prefix_at = Some(now);
+            state.prefix_retries = state.prefix_retries.saturating_add(1);
+            state.send.repair(base, want);
+            self.repairs_at_base = self.repairs_at_base.saturating_add(1);
+        }
+    }
+
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<usize> {
         let before = self.built;
+        // **Before the pick.** A prefix that has stopped moving is a hole whose
+        // record may already be forgotten, so nothing else will ever queue it
+        // again (see `StreamState::prefix_at`).
+        self.repair_stalled_prefixes(now);
         // **One pass that found the idle write still queued.** Incremented before
         // the build, so a pass that carries it counts as one rather than zero.
         if self.idle_queued.is_some() {
@@ -3392,6 +3502,10 @@ impl Conn {
             self.ledger
                 .note_retired(u64::from(range.len), false, sent.lost_at.is_some());
         }
+        // How much of that the runs did rather than the bitmap: on a lossy path
+        // it is the only retirement path a number behind a hole has.
+        self.ledger
+            .note_retired_run(acked.by_run, acked.by_run_bytes);
         // The byte prefix is the authority on this stream's frontier, because
         // it cannot stall the way the range acknowledgements can: a packet
         // number lost for good stops the peer's cumulative frontier, and every
@@ -3403,6 +3517,12 @@ impl Conn {
         {
             let moved = state.send.advance_to(ack.prefix);
             state.acknowledged = true;
+            // The prefix moved, so the stream is not stalled: this is what keeps
+            // `repair_stalled_prefixes` from duplicating a healthy stream, and
+            // the attempt count starts over because the hole it was aimed at is
+            // gone.
+            state.prefix_at = Some(now);
+            state.prefix_retries = 0;
             self.buffered = self.buffered.saturating_sub(moved);
             // The prefix moves the same frontier the number path does, so its
             // delivery is counted the same way and only once.
@@ -4952,6 +5072,41 @@ mod tests {
     /// from a lost opening in a couple of retransmission timers is a lane; one that recovers after
     /// the stage has ended is the ship-wreck §4.249 measured, and both would pass a test that only
     /// checked the bytes eventually arrived.
+    /// The stalled-prefix rescue fires, and then stops instead of duplicating for ever.
+    ///
+    /// This is the case nothing else covers: a hole whose recovery record was
+    /// forgotten, so no loss declaration will ever queue its bytes again. The
+    /// rescue re-sends the range at the peer's frontier — and stops after
+    /// [`STALL_REPAIR_ATTEMPTS`], because a peer that answers nothing for that
+    /// long is not fixed by sending more. The first version of this loop had no
+    /// bound and turned a stall into a duplicate stream.
+    #[test]
+    fn a_stalled_prefix_is_rescued_a_bounded_number_of_times() {
+        let mut link = Link::new();
+        link.a.recovery.seed_rtt(Duration::from_millis(100));
+        let now = Instant::now();
+        let stream = link.a.open().id;
+        let body = vec![7u8; 4096];
+        assert_eq!(link.a.write(stream, &body), body.len());
+
+        // Nothing is ever delivered, so the prefix cannot move: the rescue's
+        // whole trigger condition.
+        let mut out = Vec::new();
+        let mut at = now;
+        for _ in 0..200 {
+            while link.a.poll_transmit(at, &mut out).is_some() {
+                out.clear();
+            }
+            at += Duration::from_millis(50);
+        }
+        let state = link.a.streams.get(&stream).unwrap();
+        assert_eq!(
+            state.prefix_retries,
+            super::STALL_REPAIR_ATTEMPTS,
+            "the rescue fires, and stops at its bound"
+        );
+    }
+
     #[test]
     fn a_lost_opening_still_completes_the_stream() {
         let start = Instant::now();

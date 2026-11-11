@@ -377,6 +377,51 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.285 A stalled prefix is re-sent from its own frontier, and the cell still cannot say whether it helped (2026-11-11)
+
+Two things this round: the safety net the ten-second silence needed, and the counter that says the ack
+runs are not yet earning their eight bytes.
+
+**The net.** A lost packet's record is forgotten after `LOST_HOLD` (3 s), and a range **no record names is
+never re-sent**: the send point is past it and the repair queue never held it. If that range holds the
+peer's contiguous prefix, the stream stops for ever — the writer blocks on the buffer ceiling, the lane
+falls silent, and its wire is nothing but repairs of one range (`rep=7944(97%)` measured on the sender's
+own ledger). `repair_stalled_prefixes` is the only path that notices: when a stream has bytes beyond its
+acked frontier and the frontier has not moved for one and a half round trips, it re-queues the range at the
+frontier itself.
+
+**It had to be bounded, and the bound was found by hanging a test.** The first version re-queued every
+pass; `four_sealed_streams_carry_thirty_two_kib_frames` never finished, because the pump keeps building
+while a repair is owed. The rescue now allows [`STALL_REPAIR_ATTEMPTS` = 5], with the hold doubling each
+time and the count resetting when the prefix moves. A peer that has answered nothing for a second is not
+fixed by sending more, and the test that would have caught an unbounded duplicate stream is
+`a_stalled_prefix_is_rescued_a_bounded_number_of_times`: 200 polls over 10 s of virtual time leave the
+counter at exactly the bound.
+
+**The counter.** The ledger now prints `byrun=<records>/<bytes>` — records retired through a received run
+rather than the bitmap, which is the whole reason the block grew in §4.284. On the lossy cell it reads
+**0/0 in every one of the 82 seconds** the sender reported. So the runs are carried, honoured, and
+**doing nothing here**: whatever the frontier is pinned on, it is not a set of arrived numbers the runs
+could name by the time an acknowledgement is built.
+
+**The cell, again, cannot resolve the change.** `loss5` tunnel-leg `bulk-1`, six rounds, A/A in the file:
+
+| arm | rounds (Gbit/s) | median |
+|---|---|---|
+| molehill | 0.0064, 0.0419, 0.0520, 0.0330, 0.0693 | **0.0419** |
+| molehill~aa | 0.0637, 0.0468, 0.0660, 0.0342, 0.0849, 0.0721 | 0.0654 |
+
+A **near-zero round still appeared** (0.0064), so the rescue did not remove the silence it was written
+for. `bulk-n` on a clean path reads **10.17 / 10.21 Gbit/s** — unchanged, which is the one thing this
+round can state: the rescue and the wider block cost nothing on a healthy path.
+
+**What that means for the next step.** More bench rounds cannot answer this: the same binary disagrees
+with itself by a factor of three. The question has to move to a deterministic harness — one stream, a
+known loss pattern, the same stall, and three questions asked in order: does the rescue's repair get
+posted, does the receiver insert it, and does the prefix move when it does? Until that exists, the honest
+statement is "the carrier re-sends a stalled frontier and stops after five tries", not "the lossy cell got
+faster".
+
 ### 4.284 The acknowledgement learns to name an old run, and the cell's noise swallows the result (2026-11-11)
 
 The wire change the previous entry pre-registered, built and measured. The block grew from 28 to **36 bytes**

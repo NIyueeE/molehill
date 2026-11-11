@@ -322,6 +322,15 @@ pub(crate) struct Acked {
     pub(crate) bytes: usize,
     /// Whether a packet it proved lost was part of an opening flight.
     pub(crate) opening_lost: bool,
+    /// Records retired through a received run rather than the bitmap.
+    ///
+    /// The number that says whether the runs are doing any work: before they
+    /// existed a record more than sixty-four numbers behind `largest` could only
+    /// retire through the cumulative frontier, which a single lost packet pins
+    /// for the life of the connection.
+    pub(crate) by_run: usize,
+    /// Stream bytes those records carried.
+    pub(crate) by_run_bytes: usize,
 }
 
 /// Why the timer fired.
@@ -724,6 +733,7 @@ impl Recovery {
             .filter(|(number, _)| ack.contains(**number))
             .map(|(number, _)| *number)
             .collect();
+        let mut from_runs: Vec<u32> = Vec::new();
         for run in ack.runs {
             if run.len == 0 {
                 continue;
@@ -732,12 +742,27 @@ impl Recovery {
             // from there, so the lowest number is `len - 1` further back.
             let high = ack.largest.saturating_sub(u32::from(run.behind));
             let low = high.saturating_sub(u32::from(run.len).saturating_sub(1));
-            acked.extend(
+            from_runs.extend(
                 self.in_flight
                     .range(low..high.saturating_add(1))
                     .filter(|(number, _)| ack.contains(**number))
                     .map(|(number, _)| *number),
             );
+        }
+        from_runs.sort_unstable();
+        from_runs.dedup();
+        for number in from_runs {
+            let Some(sent) = self.take(number) else {
+                continue;
+            };
+            note(&sent);
+            let range = sent.range;
+            if let Some(range) = range {
+                result.bytes += usize::from(range.len);
+                result.by_run_bytes += usize::from(range.len);
+            }
+            result.by_run += 1;
+            result.newly.push(sent);
         }
         acked.sort_unstable();
         acked.dedup();
@@ -761,6 +786,13 @@ impl Recovery {
         // A packet below the frontier is delivered by definition, and one the
         // bitmap names arrived out of order; what is left in the window with
         // three later packets already seen is a hole the peer is waiting on.
+        self.declare_window_lost(now, ack, oldest, &mut result);
+        self.arm(now, result.opening_lost);
+        result
+    }
+
+    /// Declare what the scan window shows is lost, and record it in `result`.
+    fn declare_window_lost(&mut self, now: Instant, ack: Ack, oldest: u32, result: &mut Acked) {
         let lost: Vec<u32> = self
             .in_flight
             .range(oldest..=ack.largest)
@@ -781,8 +813,6 @@ impl Recovery {
                 result.lost.push(sent);
             }
         }
-        self.arm(now, result.opening_lost);
-        result
     }
 
     /// When the caller should look again, if anything is outstanding.
@@ -999,6 +1029,16 @@ mod tests {
                 runs: [run, ReceivedRun::default()],
                 ..Ack::default()
             },
+        );
+        assert_eq!(
+            acked.by_run,
+            usize::from(run.len),
+            "every record the run named is counted as retired by a run"
+        );
+        assert_eq!(
+            acked.by_run_bytes,
+            usize::from(run.len) * 100,
+            "and its bytes ride with the count"
         );
         assert!(
             acked.newly.len() >= usize::from(run.len),
