@@ -377,6 +377,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.298 The queue does not explain the tail either, and §4.296's "ninety percent" is withdrawn (2026-11-11)
+
+§4.296 ended with a sentence that the data does not support: "a 1.5–2 s interactive tail on a path whose round
+trip is 200 ms is ninety percent queueing". The queue is measurable from the runs already on disk, and the
+arithmetic does not get there.
+
+**The shaper's own backlog**, from the same six-round `cost` cell's evidence (`mhbsrv/v-srv2`, the leg the
+carrier crosses): **255 to 3 447 packets**, with 1 000–3 200 in most rounds, and the client leg in the same
+range. At the rates those rounds carried (~0.5 Gbit/s) a 1 341-byte packet takes ~21 µs, so 3 000 packets is
+about **64 ms of standing queue** — not 1.5 seconds, and not even the 400 ms that separates the measured p50
+(600 ms) from the path's round trip (200 ms).
+
+**And the tail is a different regime from the median.** p99 is 1.5–2 s where p50 is 0.6 s — a factor of three,
+which is what loss-driven events look like, not what a linear queue looks like. A queue that doubles the median
+does not multiply the tail by eight.
+
+**So the honest position is: neither the repair RTT (§4.296) nor the queue explains the interactive tail on this
+cell.** What is known is that the tail is an event, that the interactive stream's own timer already has a 20 ms
+small-flight floor (`MIN_RTO_SMALL_FLIGHT`) rather than the wide one, and that no run so far has separated
+"the interactive packet was lost and re-sent late" from "the interactive packet was queued behind bulk in the
+tool's own scheduler" — the two candidates the next instrument has to tell apart.
+
+**Pre-registered for that instrument, before it runs**: on the `cost` cell, per interactive request record (a)
+the stream's send time, (b) the ack's arrival, (c) whether a repair was sent and when, and (d) the request's
+own wire timestamps. A tail with (c) present is loss; a tail with (c) absent and (a→b) long is the tool's own
+queue. One run of the cell, stats on, answers which.
+
 ### 4.297 P3's second attempt breaks exactly-once, and the carrier cannot tell which streams deserve redundancy (2026-11-11)
 
 The first attempt failed by being inert (§4.296). The second tried the opposite: duplicate a new-data range **at
