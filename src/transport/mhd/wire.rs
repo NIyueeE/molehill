@@ -62,7 +62,7 @@ pub(crate) const SEAL_TAG: usize = 16;
 
 /// flags + connection id + packet number.
 pub(crate) const HEAD: usize = 9;
-/// largest + frontier + bitmap + the stream prefix block.
+/// largest + frontier + bitmap + the stream prefix block + two received runs.
 ///
 /// The last twelve bytes are the receiver's own stream frontier: which stream
 /// it last took bytes for, and how many of that stream's bytes it now holds
@@ -77,7 +77,16 @@ pub(crate) const HEAD: usize = 9;
 /// duplicates and reordering, so it is the one field a stalled number frontier
 /// cannot corrupt. It rides every packet, which costs twelve bytes: 0.86 % of a
 /// full datagram.
-pub(crate) const ACK: usize = 28;
+///
+/// The last eight bytes are **two received runs**, and they exist because the
+/// sixty-four-bit bitmap cannot name anything older. A hole that the bitmap
+/// cannot reach is one the sender learns about only from its own timer, while
+/// every number that arrived behind it stays unretired: measured on a
+/// five-percent-loss path, **every** stall line the carrier printed had
+/// `largest - below > 64` (`HANDOFF.md` §4.284). Each run is a
+/// `(behind, len)` pair — numbers `largest - behind` through
+/// `largest - behind + len - 1` arrived — and `len == 0` means unused.
+pub(crate) const ACK: usize = 36;
 /// stream id + offset + length.
 pub(crate) const STREAM: usize = 14;
 /// the connection-wide credit, absolute.
@@ -161,6 +170,33 @@ impl ResetCode {
     }
 }
 
+/// One run of received packet numbers, named relative to the block's `largest`.
+///
+/// `behind` is how far below `largest` the run's **highest** number sits, and
+/// `len` how many consecutive numbers it covers downwards from there. `len == 0`
+/// marks an unused run, which is what a receiver with nothing older than the
+/// bitmap sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ReceivedRun {
+    /// How far below `largest` the run ends (its highest number), one-based.
+    pub(crate) behind: u16,
+    /// How many consecutive numbers the run covers, ending at `behind`.
+    pub(crate) len: u16,
+}
+
+impl ReceivedRun {
+    /// Whether this run names `number`, given the block's `largest`.
+    fn contains(self, largest: u32, number: u32) -> bool {
+        if self.len == 0 || number >= largest {
+            return false;
+        }
+        let Ok(behind) = u16::try_from(largest - number) else {
+            return false;
+        };
+        behind >= self.behind && behind < self.behind.saturating_add(self.len)
+    }
+}
+
 /// An acknowledgement block: a cumulative frontier, the highest packet number
 /// seen, and a bitmap of the 64 below it.
 ///
@@ -190,6 +226,12 @@ pub(crate) struct Ack {
     /// acknowledgement costs nothing permanent — the next one carries a value
     /// at least as large.
     pub(crate) prefix: u64,
+    /// Up to two runs of received numbers older than the bitmap can name.
+    ///
+    /// See [`ReceivedRun`] and the `ACK` block's own comment: without them a
+    /// hole below `largest - 64` is invisible to the peer, which learns of it
+    /// only from its timer while everything behind it stays unretired.
+    pub(crate) runs: [ReceivedRun; 2],
 }
 
 impl Ack {
@@ -205,7 +247,11 @@ impl Ack {
             return false;
         }
         let behind = self.largest - number;
-        behind <= 64 && self.bits & (1u64 << (behind - 1)) != 0
+        (behind <= 64 && self.bits & (1u64 << (behind - 1)) != 0)
+            || self
+                .runs
+                .iter()
+                .any(|run| run.contains(self.largest, number))
     }
 }
 
@@ -296,20 +342,67 @@ impl AckSet {
     }
 
     /// The block to put on the wire, or None before anything has arrived.
-    pub(crate) const fn packet(&self) -> Option<Ack> {
-        match self.largest {
-            Some(largest) => Some(Ack {
-                largest,
-                below: self.below,
-                bits: self.bits,
-                // The stream frontier is not the acknowledgement set's
-                // business: the connection attaches it, because only the
-                // connection knows which stream it last took bytes for.
-                stream: 0,
-                prefix: 0,
-            }),
-            None => None,
+    pub(crate) fn packet(&self) -> Option<Ack> {
+        self.largest.map(|largest| Ack {
+            largest,
+            below: self.below,
+            bits: self.bits,
+            // The stream frontier is not the acknowledgement set's business:
+            // the connection attaches it, because only the connection knows
+            // which stream it last took bytes for.
+            stream: 0,
+            prefix: 0,
+            runs: self.build_runs(largest),
+        })
+    }
+
+    /// The two longest runs of received numbers the 64-bit bitmap cannot name.
+    ///
+    /// Only numbers more than 64 behind `largest` qualify: everything nearer is
+    /// already in `bits`, and repeating it here would spend the eight bytes on
+    /// what the peer can already read. The runs come out of `gaps`, which holds
+    /// exactly the numbers above `below` that arrived out of order, in order.
+    fn build_runs(&self, largest: u32) -> [ReceivedRun; 2] {
+        let mut best = [ReceivedRun::default(); 2];
+        let mut start: Option<u32> = None;
+        let mut last = 0u32;
+        let consider = |start: u32, end: u32, best: &mut [ReceivedRun; 2]| {
+            let len = end - start + 1;
+            let (Ok(len), Ok(behind)) = (u16::try_from(len), u16::try_from(largest - end)) else {
+                return;
+            };
+            if len == 0 || behind == 0 {
+                return;
+            }
+            let run = ReceivedRun { behind, len };
+            if run.len > best[0].len {
+                best[1] = best[0];
+                best[0] = run;
+            } else if run.len > best[1].len {
+                best[1] = run;
+            }
+        };
+        for &number in &self.gaps {
+            if largest.saturating_sub(number) <= 64 {
+                continue;
+            }
+            match start {
+                Some(_) if number == last.saturating_add(1) => last = number,
+                Some(from) => {
+                    consider(from, last, &mut best);
+                    start = Some(number);
+                    last = number;
+                }
+                None => {
+                    start = Some(number);
+                    last = number;
+                }
+            }
         }
+        if let Some(from) = start {
+            consider(from, last, &mut best);
+        }
+        best
     }
 
     /// Whether this packet number has arrived.
@@ -442,7 +535,11 @@ pub(crate) fn encode(
         buf[at + 4..at + 8].copy_from_slice(&block.below.to_le_bytes());
         buf[at + 8..at + 16].copy_from_slice(&block.bits.to_le_bytes());
         buf[at + 16..at + 20].copy_from_slice(&block.stream.to_le_bytes());
-        buf[at + 20..at + ACK].copy_from_slice(&block.prefix.to_le_bytes());
+        buf[at + 20..at + 28].copy_from_slice(&block.prefix.to_le_bytes());
+        buf[at + 28..at + 30].copy_from_slice(&block.runs[0].behind.to_le_bytes());
+        buf[at + 30..at + 32].copy_from_slice(&block.runs[0].len.to_le_bytes());
+        buf[at + 32..at + 34].copy_from_slice(&block.runs[1].behind.to_le_bytes());
+        buf[at + 34..at + ACK].copy_from_slice(&block.runs[1].len.to_le_bytes());
         at += ACK;
     }
     match frame {
@@ -545,6 +642,10 @@ pub(crate) fn encode_stream(
         out.extend_from_slice(&block.bits.to_le_bytes());
         out.extend_from_slice(&block.stream.to_le_bytes());
         out.extend_from_slice(&block.prefix.to_le_bytes());
+        out.extend_from_slice(&block.runs[0].behind.to_le_bytes());
+        out.extend_from_slice(&block.runs[0].len.to_le_bytes());
+        out.extend_from_slice(&block.runs[1].behind.to_le_bytes());
+        out.extend_from_slice(&block.runs[1].len.to_le_bytes());
         // **This layout is written twice** — here, field by field, and in `encode`, by offset. A
         // field added to one and not the other makes every stream packet claim four bytes more than
         // it holds, which shows up as a span overrunning the send run and cost two wrong diagnoses
@@ -610,6 +711,47 @@ pub(crate) struct Packet<'a> {
 
 /// Read one datagram. Anything this carrier did not write is rejected, never
 /// guessed at.
+/// One acknowledgement block, read out of `buf` at `at`.
+///
+/// Its own function because `decode` is at the lint's line budget, and because
+/// the block's one invariant belongs in one place: every field is length-checked
+/// against the buffer, so a block that runs past the end is `Malformed` rather
+/// than a truncated value the caller would trust.
+fn decode_ack(buf: &[u8], at: usize) -> Result<Ack, Malformed> {
+    let u16_at = |offset: usize| -> Result<u16, Malformed> {
+        let slice = buf.get(at + offset..at + offset + 2).ok_or(Malformed)?;
+        let array: [u8; 2] = slice.try_into().map_err(|_| Malformed)?;
+        Ok(u16::from_le_bytes(array))
+    };
+    let u32_at = |offset: usize| -> Result<u32, Malformed> {
+        let slice = buf.get(at + offset..at + offset + 4).ok_or(Malformed)?;
+        let array: [u8; 4] = slice.try_into().map_err(|_| Malformed)?;
+        Ok(u32::from_le_bytes(array))
+    };
+    let u64_at = |offset: usize| -> Result<u64, Malformed> {
+        let slice = buf.get(at + offset..at + offset + 8).ok_or(Malformed)?;
+        let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
+        Ok(u64::from_le_bytes(array))
+    };
+    Ok(Ack {
+        largest: u32_at(0)?,
+        below: u32_at(4)?,
+        bits: u64_at(8)?,
+        stream: u32_at(16)?,
+        prefix: u64_at(20)?,
+        runs: [
+            ReceivedRun {
+                behind: u16_at(28)?,
+                len: u16_at(30)?,
+            },
+            ReceivedRun {
+                behind: u16_at(32)?,
+                len: u16_at(34)?,
+            },
+        ],
+    })
+}
+
 pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
     if buf.len() < HEAD {
         return Err(Malformed);
@@ -627,22 +769,9 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
     let number = bytes(5..9)?;
     let mut at = HEAD;
     let ack = if flags & FLAG_ACK != 0 {
-        let largest = bytes(at..at + 4)?;
-        let below = bytes(at + 4..at + 8)?;
-        let slice = buf.get(at + 8..at + 16).ok_or(Malformed)?;
-        let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
-        let bits = u64::from_le_bytes(array);
-        let stream = bytes(at + 16..at + 20)?;
-        let slice = buf.get(at + 20..at + ACK).ok_or(Malformed)?;
-        let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
+        let block = decode_ack(buf, at)?;
         at += ACK;
-        Some(Ack {
-            largest,
-            below,
-            bits,
-            stream,
-            prefix: u64::from_le_bytes(array),
-        })
+        Some(block)
     } else {
         None
     };
@@ -743,6 +872,7 @@ mod tests {
             // still pass every other test with it.
             stream: 42,
             prefix: 9_000_000_000,
+            ..Ack::default()
         };
         let data = [1u8, 2, 3, 4, 5];
         let cases = [
@@ -847,8 +977,45 @@ mod tests {
             "a jump past the window drops what was below"
         );
         assert!(
-            !set.contains(70),
-            "the old window falls out of a 64-deep map"
+            set.contains(70),
+            "a number past the bitmap is still named by a run, because the receiver still remembers it"
+        );
+        let block = set.packet().unwrap();
+        assert!(
+            block.contains(70) && !block.contains(199),
+            "the block names what arrived and nothing else"
+        );
+    }
+
+    /// A run older than the bitmap is named, and survives the wire unchanged.
+    #[test]
+    fn a_run_older_than_the_bitmap_is_named() {
+        let mut set = AckSet::default();
+        for number in 100..=110 {
+            set.insert(number);
+        }
+        set.insert(400);
+        let block = set.packet().unwrap();
+        assert_eq!(block.largest, 400);
+        assert_eq!(
+            block.runs[0],
+            ReceivedRun {
+                behind: 400 - 110,
+                len: 11
+            },
+            "the old run is named relative to the largest number"
+        );
+        assert!(
+            block.contains(100) && block.contains(110) && !block.contains(99),
+            "the run names exactly the numbers that arrived"
+        );
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let len = encode(&mut buf, 1, 1, Some(block), Frame::None).unwrap();
+        let decoded = decode(&buf[..len]).unwrap();
+        assert_eq!(
+            decoded.ack.unwrap(),
+            block,
+            "the two encoders and the decoder agree on the run layout"
         );
     }
 

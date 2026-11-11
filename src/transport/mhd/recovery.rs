@@ -713,13 +713,34 @@ impl Recovery {
             self.arm(now, false);
             return result;
         }
-        // Delivered: everything the block covers and we still hold.
-        let acked: Vec<u32> = self
+        // Delivered: everything the block covers and we still hold. The bitmap
+        // reaches sixty-four numbers; the two runs reach further back, and they
+        // are what lets a number the frontier has not passed yet retire — the
+        // case a hole older than sixty-four numbers used to make impossible
+        // (`HANDOFF.md` §4.284).
+        let mut acked: Vec<u32> = self
             .in_flight
             .range(oldest..=ack.largest)
             .filter(|(number, _)| ack.contains(**number))
             .map(|(number, _)| *number)
             .collect();
+        for run in ack.runs {
+            if run.len == 0 {
+                continue;
+            }
+            // `behind` names the run's **highest** number; it extends downwards
+            // from there, so the lowest number is `len - 1` further back.
+            let high = ack.largest.saturating_sub(u32::from(run.behind));
+            let low = high.saturating_sub(u32::from(run.len).saturating_sub(1));
+            acked.extend(
+                self.in_flight
+                    .range(low..high.saturating_add(1))
+                    .filter(|(number, _)| ack.contains(**number))
+                    .map(|(number, _)| *number),
+            );
+        }
+        acked.sort_unstable();
+        acked.dedup();
         for number in acked {
             if let Some(sent) = self.take(number) {
                 note(&sent);
@@ -927,6 +948,7 @@ mod tests {
         reason = "tests unwrap values they just constructed"
     )]
     use super::*;
+    use crate::transport::mhd::wire::ReceivedRun;
 
     fn range(offset: u64) -> SentRange {
         SentRange {
@@ -941,6 +963,54 @@ mod tests {
         let number = recovery.next_number();
         recovery.on_sent(now, number, Some(range(offset)), false);
         number
+    }
+
+    /// A run in the block retires numbers the bitmap cannot reach.
+    ///
+    /// The shape is the one measured on a five-percent-loss path: a hole at the
+    /// head of the flight and hundreds of numbers behind it that did arrive.
+    /// Without the runs the sender retires none of them — `below` cannot pass the
+    /// hole, and anything more than sixty-four numbers back is outside the
+    /// bitmap — so it re-sends them until its timer forgets them, which is the
+    /// repair share `HANDOFF.md` §4.281 measured at 32–36 % of the wire.
+    #[test]
+    fn a_received_run_retires_numbers_the_bitmap_cannot_name() {
+        let start = Instant::now();
+        let mut recovery = Recovery::new();
+        let mut numbers = Vec::new();
+        for packet in 0..200u64 {
+            numbers.push(send_one(&mut recovery, start, packet * 100));
+        }
+        let hole = numbers[0];
+        let largest = *numbers.last().unwrap();
+        // The run names everything between the hole and the bitmap's reach.
+        let lowest = numbers[1];
+        let highest = largest - 65;
+        let run = ReceivedRun {
+            behind: u16::try_from(largest - highest).unwrap(),
+            len: u16::try_from(highest - lowest + 1).unwrap(),
+        };
+        let acked = recovery.on_ack(
+            start + Duration::from_millis(40),
+            Ack {
+                largest,
+                below: hole,
+                bits: u64::MAX,
+                runs: [run, ReceivedRun::default()],
+                ..Ack::default()
+            },
+        );
+        assert!(
+            acked.newly.len() >= usize::from(run.len),
+            "the run must retire what the bitmap cannot name: {} of {}",
+            acked.newly.len(),
+            run.len
+        );
+        assert_eq!(
+            recovery.in_flight(),
+            1,
+            "only the hole is left in the flight"
+        );
     }
 
     /// An acknowledgement that covers a packet takes it out of the flight and

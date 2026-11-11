@@ -377,6 +377,52 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.284 The acknowledgement learns to name an old run, and the cell's noise swallows the result (2026-11-11)
+
+The wire change the previous entry pre-registered, built and measured. The block grew from 28 to **36 bytes**
+and now carries **two received runs** — `(behind, len)` pairs relative to `largest`, `len == 0` meaning unused
+— so the receiver can name numbers more than sixty-four behind the largest one it has seen.
+
+**Why that gap mattered, measured before the change.** Every one of the **156** stall lines the carrier
+printed on a 5 %-loss lane had `largest - below > 64`:
+
+```
+stall lines = 156, below-to-largest gap > 64: 156 (100 %)
+```
+
+The bitmap reaches sixty-four numbers. Beyond it the sender learned nothing positive — every number that
+arrived behind the hole stayed unretired, was re-sent as a repair, and the frontier never moved. That is the
+32–36 % repair share §4.281 priced, and the same shape the 10-second zero-byte round came from.
+
+**What the change does, at unit level.** `AckSet::packet` builds the two longest runs of received numbers
+outside the bitmap window; `Ack::contains` and `recovery::on_ack` both honour them, so a number the run names
+retires exactly as if the bitmap had named it. The new unit test sends 200 packets with the first one lost
+and hands back a block whose run covers 2..=135: **134 numbers retire that the bitmap could not name**, and
+the flight is left holding only the hole. A second test pins the wire: the run survives `encode`/`decode`
+unchanged, and the two encoders (offset and field-by-field) still agree — the failure §4.277 cost two rounds
+to find.
+
+**What the cell could not resolve.** `loss5` tunnel-leg `bulk-1`, six rounds, A/A in the file:
+
+| arm | rounds (Gbit/s) | median |
+|---|---|---|
+| molehill | 0.0767, 0.0325, 0.0405, 0.0506, 0.0579, 0.0374 | **0.0493** |
+| molehill~aa | 0.0549, 0.0572, 0.0975, 0.0684, 0.0712, 0.0495 | 0.0628 |
+
+A factor of **three between the two halves of one binary** on the same cell, so this sitting cannot say
+whether the runs helped: the pre-change medians were 0.0659 / 0.0745 and the post-change ones are
+0.0493 / 0.0628, which is the same direction as the noise. `bulk-n` on a clean path reads **10.13 Gbit/s**
+against 9.78 before the extra eight bytes, i.e. the floor holds and the wider block did not cost throughput.
+
+**So the mechanism is in and proven at unit level; its effect on the cell is unresolved and is not claimed.**
+The measurement that can resolve it is not more rounds of the same cell — the floor printed 76 % at six
+rounds and would still be ~40 % at twenty. It is a **counter**: how many records retire through a run per
+second, and what the repair share does when they do. That counter is the next increment, and until it exists
+the honest statement is "the ack can now name an old run", not "the lossy cell got faster".
+
+**Committed**: the 36-byte block with its two runs, the retirement path, the two unit tests, and this record.
+`ACK` 28 → 36 costs 0.57 % of a full datagram; `MAX_STREAM_PAYLOAD` follows it down from 1 349 to 1 341.
+
 ### 4.283 Re-landing the frontier abandonment fails the lossy-stream tests: it loses bytes, not just numbers (2026-11-11)
 
 P2's first candidate was the cheapest one on the plan: put `75cdef5` back. It was re-landed on today's tree

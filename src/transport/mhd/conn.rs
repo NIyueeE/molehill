@@ -5541,6 +5541,7 @@ mod tests {
             bits: 0,
             stream: stream.id,
             prefix: 4000,
+            ..wire::Ack::default()
         };
         conn.apply_ack(now, block, false);
 
@@ -5884,6 +5885,7 @@ mod tests {
                 bits: 0,
                 stream: stream.id,
                 prefix: len,
+                ..super::wire::Ack::default()
             },
             false,
         );
@@ -5933,6 +5935,7 @@ mod tests {
                 bits: 0,
                 stream: stream.id,
                 prefix: len,
+                ..super::wire::Ack::default()
             },
             false,
         );
