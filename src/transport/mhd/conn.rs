@@ -889,6 +889,13 @@ pub(crate) struct Conn {
     /// above it. Only the first kind can unblock a stalled stream.
     repairs_at_base: u64,
     repairs_above: u64,
+    /// Times the stalled-prefix rescue put a range on the wire.
+    ///
+    /// Its own counter because `repairs_at_base` is not one: that field counts
+    /// every declared-loss repair at the frontier, which is the ordinary path and
+    /// fires hundreds of times a second on a lossy lane. Reading the rescue's rate
+    /// out of it is what made §4.289 wrong — the two are now separate numbers.
+    stall_rescues: u64,
     /// What this lane sent, what the peer confirmed, and why it stopped.
     ///
     /// Per lane, and reset once a second by the window line: the numbers are only
@@ -1197,6 +1204,7 @@ impl Conn {
             last_ack_largest: 0,
             repairs_at_base: 0,
             repairs_above: 0,
+            stall_rescues: 0,
             ledger: SendLedger::default(),
             acks_applied: 0,
             acks_attached: 0,
@@ -1878,6 +1886,7 @@ impl Conn {
             state.prefix_retries = state.prefix_retries.saturating_add(1);
             state.send.repair(base, want);
             self.repairs_at_base = self.repairs_at_base.saturating_add(1);
+            self.stall_rescues = self.stall_rescues.saturating_add(1);
         }
     }
 
@@ -2907,6 +2916,11 @@ impl Conn {
 
     pub(crate) fn repair_sides(&self) -> (u64, u64) {
         (self.repairs_at_base, self.repairs_above)
+    }
+
+    /// How many times the stalled-prefix rescue fired on this lane.
+    pub(crate) fn stall_rescues(&self) -> u64 {
+        self.stall_rescues
     }
 
     pub(crate) fn last_ack_prefix(&self) -> u64 {

@@ -277,6 +277,10 @@ fn report_window(shared: &Arc<Shared>) {
             own_last_number = conn.last_number(),
             repairs_at_base = conn.repair_sides().0,
             repairs_above = conn.repair_sides().1,
+            // Its own field: `repairs_at_base` counts every frontier repair, which
+            // is the ordinary loss path, so the rescue's rate cannot be read out
+            // of it (`HANDOFF.md` §4.289).
+            stall_rescues = conn.stall_rescues(),
             parked_writers = conn
                 .parked_writers(now, std::time::Duration::from_millis(50))
                 .0,

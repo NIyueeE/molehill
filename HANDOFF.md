@@ -391,15 +391,20 @@ went from 1 341 to 2 682 bytes re-sent: one lost datagram had started costing tw
 virtual clock advanced a few milliseconds. With the guards it passes again, and the rescue's own test still
 passes — 200 polls over ten seconds of virtual time leave the counter at exactly its bound.
 
-**What could not be read.** Whether the guards cut the firing rate on a real lane: `repairs_at_base` is
-printed in the window line, which carries **no lane id**, and four lanes interleave in one log, so a
-per-lane series cannot be reconstructed from the text. The last stats run shows values between 551 and 675
-in that field, and whether that is twelve fires a second on one lane or one fire on each of a hundred
-streams is exactly what the line cannot say. **Next instrumentation**: put the lane id in the window line,
-the way the stall line already does — then the firing rate is a subtraction, not a guess.
+**What could not be read — and both of this entry's guesses about it were wrong.** The firing rate was
+attributed to `repairs_at_base`, and that field **is not the rescue's counter**: it is incremented on the
+ordinary frontier-repair path as well (`conn.rs`, three sites), so on a 5 %-loss lane its 551–675 a second
+say nothing about the rescue. The entry also claimed the window line carries no lane id; it carries both
+`lane = conn.wire_id()` and `role`, and the fields were simply filtered out when the line was read.
 
-**Committed**: the two guards, the floor, and nothing else. The rescue's effect on the lossy cell remains
-unmeasured, and no throughput claim is made for it.
+**Corrected measurement, one increment later**: a dedicated `stall_rescues` counter now prints beside
+`repairs_at_base`, and on three measured rounds across four lanes it reads **0**. The rescue has **never
+fired in a product run**. That is consistent with its own guards — under 5 % loss the ordinary path keeps a
+repair in flight almost continuously, so the "hole nothing covers" case it exists for has not been observed
+since it was written. The rescue's effect on the lossy cell is therefore **zero, not unmeasured**, and if it
+stays at zero after the next real stall the honest outcome is removal rather than a third guard.
+
+**Committed**: the two guards, the floor, and the counter that finally reads the rescue's own rate.
 
 ### 4.288 The integration suite is flaky for a few seconds after a bench campaign (2026-11-11)
 
