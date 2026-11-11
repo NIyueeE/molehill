@@ -414,6 +414,11 @@ default flip, ten more striped runs and eight integration suites since), so "roo
 something this record can say. Sealing is default-on with `MOLEHILL_MHD_SEAL=0` as the hatch, and the reasons
 it used to be off are documented at `sealing_enabled` as they stand.
 
+**This closes P1 and P2** (confirmed 2026-11-11, with both caveats above recorded rather than smoothed): the
+measurable criteria are met and cited, the deadlock clause is unverifiable on this tree, and `churn-16` misses
+its old line for a reason this record states. **"mhd 定型" is not claimed** — that needs every criterion in the
+plan's §一 plus the F4-grade regression, which is P3/P4/P5 work.
+
 ### 4.292 The window stops paying for repairs, and every cell moves at once (2026-11-11)
 
 **The change.** Admission was `cwnd - flight_bytes`, and `flight_bytes` counted **repairs**. So a lane whose
