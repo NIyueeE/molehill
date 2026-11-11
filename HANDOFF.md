@@ -377,6 +377,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.295 The provenance rule bit a second time: a thirty-five minute A/B measured a binary without the change (2026-11-11)
+
+P3's small-flight duplicate was written, tested and committed (`183f972`), and then the six-round A/B meant to
+judge it was launched against `target/release/molehill` — which had **not been rebuilt since before the
+change**. So the "new" arm and the "old" arm were both P2-era builds, and the 2 115 s campaign compares two
+copies of the same code. Its numbers are noise between identical binaries and answer nothing.
+
+**The tell is in the counter.** A stats run after the rebuild prints `small_dups=` on the window line; before
+it, the field was not in the binary at all. The same mistake was made in round one of this work, where a
+"no difference" churn comparison turned into an 8× difference once the binary was rebuilt (§4.282). Twice is a
+process defect, not an oversight: **the build and the hash belong in the same command as the run**, and a
+bench invocation whose binary hash is not in that command's output is not evidence.
+
+**A second thing the rerun established, this one about the mechanism.** On `bulk-1` the duplicate **cannot
+fire by construction** — the bulk stream's flight is megabytes against an eight-payload bound — so `bulk-1`
+is not a cell that can measure P3 at all. The earlier campaign that reported "no p99 movement" was therefore
+not even a test of the mechanism; only a mixed cell has streams small enough to qualify.
+
+**The corrected comparison**, six rounds, three arms (the new build, its twin, and the pre-P3 build as
+`~b`), is in flight; its `small_dups` readings come from the same run's logs, so the mechanism's presence and
+its effect are read together.
+
 ### 4.294 P2.5: the admission change holds on loss1 and the rate cell, and a wedge keeps landing on one arm (2026-11-11)
 
 The verification the plan's P2.5 asks for, with the pre-P2 binary built from `4614aa8`
