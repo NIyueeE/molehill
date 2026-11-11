@@ -377,6 +377,48 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.294 P2.5: the admission change holds on loss1 and the rate cell, and a wedge keeps landing on one arm (2026-11-11)
+
+The verification the plan's P2.5 asks for, with the pre-P2 binary built from `4614aa8`
+(`/home/dsh/tmp/mhd-baseline-4614aa8`, sha256 `c9b1554…`) as the A/B arm, so every comparison below is
+same-run and same-host.
+
+**No regression on the two cells P2 had never been measured on.**
+
+| cell | P2 (new) | pre-P2 | A/A floor |
+|---|---|---|---|
+| `loss1` tunnel `bulk-1`, six rounds | **1.3435** Gbit/s | 1.2751 | 2.47 % |
+| `loss1_rate100` tunnel `bulk-1`, six rounds | **0.0811** | 0.0781 | 2.48 % |
+| `transport-loss` | **2 312 µs** detect (limit 20 000) | — | — |
+
+Both move the right way (5.4 % and 3.8 %) and the floors are about 2.5 %, so the change is at worst neutral on
+the two paths that were not its target.
+
+**And the soak found something that needs a decision, not a footnote.** Twenty-minute soak, P2 binary, two
+arms of the same build:
+
+| arm | `wedge_count` | `wedge_max_s` | `drift_rss_mib_per_min` | RSS peak |
+|---|---|---|---|---|
+| molehill | **2** | **10.01** | 14.23 | 190.3 MiB |
+| molehill~aa | 0 | 0 | 12.60 | 187.4 |
+
+The interactive probe's own series says the silences are real and repeat: 6.0 s at +206 s, **10.1 s at
++257 s**, 5.1 s at +283 s, **11.1 s at +300 s**, and two more around +335 s and +344 s — the first two inside
+`loss1`, the rest inside `rtt100`. The twin's series has **no gap above 2 s all run**.
+
+**A second run says the same thing, on a different binary.** The `cost` cell on `loss5` with three arms
+(P3 binary, its twin, and the pre-P3 binary) reported `wedge_count` **1 / 0 / 0**: again the arm named
+`molehill`, never a twin, never the older build.
+
+**So the pattern is "the arm, not the build" so far**, and two explanations remain: a bench-side asymmetry in
+that arm's position (it is the only arm every campaign shares, and it takes the first slot in some rounds) or
+the carrier's own bistable collapse (§4.181) landing on whichever instance draws the bad lane. The test that
+separates them is the same cell with **six rounds and both A/B arms present**, asking whether the wedge moves
+between arms or stays on one name — in flight as this entry is written.
+
+**Nothing is reverted yet, and nothing is claimed.** The plan's soak gate is `wedge_count = 0`, this run
+misses it, and a gate breach is a revert unless the next reading says it was not the change's.
+
 ### 4.293 The acceptance battery on the repaired binary, and the two criteria it changes (2026-11-11)
 
 Everything the plan's §一 asks for, measured on the tree that carries every change of this session
