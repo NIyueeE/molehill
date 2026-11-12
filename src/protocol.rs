@@ -142,6 +142,21 @@ pub const DERIVED_SELECTOR: u8 = 0x02;
 #[cfg(feature = "mhd")]
 pub const REGISTERED_SELECTOR: u8 = 0x03;
 
+/// Sealed with the lane's root, **and** the lane is registered: no acknowledgement follows.
+///
+/// The same claim [`REGISTERED_SELECTOR`] makes, for a stream whose bytes are sealed
+/// instead of plain. Both facts matter together: the lane's root proves the session,
+/// and the registration was proved by the lane's first stream, so a later stream has
+/// nothing new to hear back. Without this byte the sealed path had to wait for an
+/// acknowledgement the plain path had already stopped waiting for — measured as **one
+/// round trip inside every channel open** on a shaped path, 200 213 µs at p50 over 264
+/// opens in a round (`HANDOFF.md` §4.303), and paid again by every visitor's pairing.
+///
+/// The trade is the same one `REGISTERED_SELECTOR` takes: a claim the server cannot
+/// honour refuses **that stream**, not the lane, and the pool rebuilds it.
+#[cfg(feature = "mhd")]
+pub const DERIVED_REGISTERED_SELECTOR: u8 = 0x04;
+
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
 /// The data-plane carrier a service's tunnels will use, as declared by the

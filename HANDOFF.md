@@ -377,6 +377,48 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.303 The sealed open was waiting for an acknowledgement the plain path had already stopped waiting for (2026-11-12)
+
+The split §4.302 asked for, from the run's own log lines (all under the stats switch, `rtt100`, shaped path):
+
+| measurement | value |
+|---|---|
+| `mhd tunnel open_stream` slow opens, one round | **264** |
+| their `open_us` | **p50 200 213 µs**, p90 200 732, p99 358 666 |
+| the selector write inside the open | **never ≥ 1 ms** (0 lines) |
+| pool placement (`place_us`/`wait_us`) | **never ≥ 1 ms** (0 lines) |
+
+So one round trip sits inside `tunnel.open_stream()` and is neither the write nor placement. The code says
+why: `Lane::open_stream` writes the hello and then **waits for the server's `Ack::Ok`** — except when
+[`skips_open_ack`] says the lane already proved everything that answer would prove. That predicate required
+`!has_lane_root()`, i.e. **"a sealed stream never had an acknowledgement to begin with"** — which was true
+when it was written and false the moment sealing became the default (§4.282): a sealed stream *does* wait for
+the answer today, on every later open.
+
+**So sealing bought 1 072 µs on an unshaped path and cost 200 000 µs on a shaped one.** Every visitor's
+pairing paid it (§4.301), and no carrier-side counter could see it because it is one control byte, not data.
+
+**The fix is the claim the plain path already had, for the sealed shape**: a new selector,
+`DERIVED_REGISTERED_SELECTOR` (0x04) — sealed *and* registered, so no acknowledgement follows — with the
+server treating it exactly as `REGISTERED_SELECTOR` (`claimed_registered = true`, no ack written) and the
+client extending `skips_open_ack` to `root && registered`. A claim the server cannot honour refuses that
+stream, not the lane, which is the same trade the plain selector takes and has had since v5.
+
+**Measured, same cell, control arm beside it:**
+
+| | before | after | control |
+|---|---|---|---|
+| `paired_p50_us` | 400 269–400 511 | **200 256–200 490** | — |
+| slow `open_stream` per round | 264 | **0** | — |
+| stage `rtt_p50_ms` | 601–606 | **400.95–401.24** | **400.98–401.01** |
+| stage `rtt_p99_ms` | 966–3 234 | **400.9–401.2** | 401.5–401.7 |
+
+**The interactive tail is gone: mhd now reads the control arm's number, on both the median and the tail.**
+The pairing's remaining round trip is the channel's own arrival, which no end can remove without a warm
+channel — the boundary §4.301 named and the plan keeps closed.
+
+Integrations: 22/22 on the new selector; `cargo test --lib mhd`: 122 passed.
+
 ### 4.302 The pairing's 400 ms is one round trip inside `open` plus one for the channel to arrive (2026-11-12)
 
 `open_us` and `ready_us` split the first half of §4.301's pairing on the client, and they are unambiguous:

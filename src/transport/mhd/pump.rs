@@ -1131,25 +1131,31 @@ impl MhdLane {
 
     /// Whether this lane's later streams may skip the open acknowledgement.
     ///
-    /// Three conditions, each excluding a shape that genuinely needs the old
-    /// handshake:
+    /// Two shapes, both of which have already proved everything the acknowledgement
+    /// would prove:
     ///
-    /// - the lane must have **registered**, because that is the fact the
-    ///   acknowledgement proves and a lane whose first stream has not finished
-    ///   has nothing to skip;
-    /// - the data plane must be **plain**, because a Noise lane already rides its
-    ///   hello in the handshake's reply — it pays nothing extra for the answer and
-    ///   has no acknowledgement to remove;
-    /// - the connection must have **no root**, because a sealed stream never had
-    ///   an acknowledgement to begin with.
+    /// - the lane has **registered** and the data plane is **plain** — the rule this
+    ///   had when a lane's streams were plain;
+    /// - the lane has **registered** and the connection has a **root** — a sealed
+    ///   stream. The root proves the session and the lane's first stream proved the
+    ///   registration, so a later sealed stream has nothing new to hear back either.
+    ///   This case was missing, and it cost **one round trip inside every channel
+    ///   open** on a shaped path: 200 213 µs at p50 over 264 opens in a round
+    ///   (`HANDOFF.md` §4.303).
     ///
-    /// The client states this on the wire (`REGISTERED_SELECTOR`) rather than
-    /// letting each end infer it, so a lane whose registration the server has
-    /// lost is refused as one stream instead of stalling both ends.
+    /// A lane that has **not** registered still waits, and so does a Noise lane that
+    /// carries its hello in the handshake (it pays nothing extra for the answer).
+    ///
+    /// The client states this on the wire (`REGISTERED_SELECTOR`, and
+    /// `DERIVED_REGISTERED_SELECTOR` for the sealed shape) rather than letting each
+    /// end infer it, so a lane whose registration the server has lost is refused as
+    /// one stream instead of stalling both ends.
     fn skips_open_ack(&self) -> bool {
-        self.noise.is_none()
-            && !self.shared.has_lane_root()
-            && self.registered.load(std::sync::atomic::Ordering::Relaxed)
+        let registered = self.registered.load(std::sync::atomic::Ordering::Relaxed);
+        if !registered {
+            return false;
+        }
+        self.shared.has_lane_root() || self.noise.is_none()
     }
 
     /// Open one application stream: the transport selector, the optional Noise
@@ -1196,14 +1202,37 @@ impl MhdLane {
         // byte the connection itself protects.
         if self.shared.has_lane_root() {
             let mut plain = plain;
+            // **Which claim the selector carries.** A sealed stream on a lane that
+            // has registered says so, and the server then owes it no acknowledgement
+            // — the same rule the plain path has had since `REGISTERED_SELECTOR`, and
+            // the one whose absence made every sealed open wait a round trip
+            // (`HANDOFF.md` §4.303).
+            let selector = if self.registered.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::protocol::DERIVED_REGISTERED_SELECTOR
+            } else {
+                crate::protocol::DERIVED_SELECTOR
+            };
+            // The write's own duration, because the caller's `open_us` cannot tell
+            // this wait from the work either side of it.
+            let writing = crate::transport::stats::enabled().then(std::time::Instant::now);
             plain
-                .write_all(&[crate::protocol::DERIVED_SELECTOR])
+                .write_all(&[selector])
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
             plain
                 .flush()
                 .await
                 .map_err(|_| crate::transport::multiplex::LaneError::Closed)?;
+            if let Some(at) = writing {
+                let waited = at.elapsed();
+                if waited >= std::time::Duration::from_millis(1) {
+                    tracing::info!(
+                        lane = self.id,
+                        wait_us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+                        "mhd opening write waited for room"
+                    );
+                }
+            }
             return Ok((id, plain));
         }
         match &self.noise {

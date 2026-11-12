@@ -2404,7 +2404,24 @@ impl TunnelPool {
             tunnel,
         } = reservation;
         let counters = std::sync::Arc::clone(tunnel.counters());
-        match tunnel.open_stream().await {
+        let opening = std::time::Instant::now();
+        let opened = tunnel.open_stream().await;
+        // **The last unsplit interval on a visitor's arrival.** Placement, the
+        // pool's reservation and the carrier's own write are each measured and each
+        // read fast; what is left is this call, and a round trip hiding inside it
+        // would explain a pairing that costs two of them (`HANDOFF.md` §4.303).
+        if crate::transport::stats::enabled()
+            && let Ok(_) = &opened
+            && opening.elapsed() >= std::time::Duration::from_millis(1)
+        {
+            tracing::info!(
+                pool = %self.inner.shared.key,
+                tunnel = index,
+                open_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX),
+                "mhd tunnel open_stream took a millisecond or more"
+            );
+        }
+        match opened {
             Ok(stream) => {
                 counters.charge();
                 // `chosen_load` is what the tunnel looks like *after* its open;

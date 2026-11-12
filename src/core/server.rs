@@ -2408,7 +2408,14 @@ async fn wrap_mhd_stream(
         // The same shape as `PLAIN`, plus a claim: this lane registered already,
         // so the hello it names needs no acknowledgement. The caller decides what
         // to do with the claim — honour it, or refuse the stream.
-        crate::protocol::REGISTERED_SELECTOR => {
+        //
+        // **The sealed claim is the same claim.** `DERIVED_REGISTERED_SELECTOR` says
+        // the lane's root proved the session and the lane's first stream proved the
+        // registration, so a later sealed stream has nothing new to hear back either.
+        // Without it the sealed path waited for an acknowledgement the plain path had
+        // already stopped waiting for, at one round trip per channel open
+        // (`HANDOFF.md` §4.303).
+        crate::protocol::REGISTERED_SELECTOR | crate::protocol::DERIVED_REGISTERED_SELECTOR => {
             claimed_registered = true;
             stream
         }
