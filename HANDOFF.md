@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.316 The frontier reserve lands, the soak's one wedge stays, and it is exactly the probe's timeout (2026-11-12)
+
+`SMALL_STREAM_RESERVE` now works on both ends: the sender may spend it past a frozen frontier and the receiver
+accepts exactly that much for a stream whose own holdings are small (`4f4562b`, one test pinning the shape — a
+frozen credit admits a small request and still refuses bulk). Unit and integration suites are green at 124 and
+22.
+
+**And the soak's gate still fails, unchanged**: `wedge_count` **1** on the product arm, 0 on its twin, with
+`wedge_max_s` **10.01** — the same 10.01 as both earlier runs.
+
+**That constant is the finding.** A silence measured at 10.01 s in one run, 10.01 in the last and 10.01 now is not
+a stall whose length varies with the path; it is the probe's own request timeout. The cell counts a gap of more
+than ten seconds, so **one request that exceeded the probe's timeout appears as a wedge of 10.01 s**, and the
+metric cannot tell that from a carrier that stopped for ten seconds.
+
+**So the residue is: one interactive request slower than ten seconds, in twenty minutes, on the product arm.**
+That is a real tail — the control-arm comparison earlier put the same cell's p99 at hundreds of milliseconds —
+but it is one event, not a repeated stall, and the gate as written cannot say which.
+
+**Next, and it is a bench change rather than a carrier one**: record the probe's own timeout in the run's method
+(the interactive probe's per-request limit is a parameter of the measurement), and split the wedge metric into
+"requests that exceeded the probe's timeout" and "the longest gap between successful round trips". With those two
+numbers the gate means what the plan intends, and one request in twenty minutes stops being indistinguishable
+from a ten-second outage.
+
 ### 4.315 Capacity at multi-round medians: four bulk streams with the SLO held (2026-11-12)
 
 P5.4's gate, three measured rounds plus each arm's twin, `capacity` on a clean path, tunnel leg:
