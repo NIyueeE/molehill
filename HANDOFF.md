@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.313 P5's battery: every gate green except the one that matters (2026-11-12)
+
+The finalisation gates the plan asks for, run on this tree (`8888b27` plus the soak's own binary
+`95b0134e…`):
+
+| gate | result |
+|---|---|
+| `just check` | **green** (fmt, machete, docs, ruff, pyright, selfcheck 808, clippy ×3, tests) |
+| `just interop` | **3 passed** |
+| `just l3-accept` | **four PASS lines**: no lane moves with `lend = false`, the valve refuses a surplus lane naming the cap, one claim over four lanes carries the same load, byte-exact on the lanes it got |
+| integrations, `mhd` carrier, three runs | **22 / 22 / 22** |
+| integrations, `tcp` carrier, three runs | **22 / 22 / 22** |
+| striped sealed (`striped_data_channels`), twenty runs | **20/20** |
+| soak, `wedge_count` | **1 on the product arm, 0 on its twin** — the plan's gate is `= 0`, so this **fails** |
+| soak, drift | 7.80 vs 11.88 MiB/min (product below its twin), FDs −4.40 vs +0.02 per minute |
+
+**The soak's wedge is the same intermittent stall the step cell still shows** (§4.312: one round of three
+produced no interactive sample). Two mechanisms are fixed — connection credit and the lane's timeout ladder — and
+a third survives at roughly one occurrence per soak, or one per three step rounds. It is not a release gate this
+record can wave through: `wedge_count = 1` is exactly the number the plan says must be zero.
+
+**So P5.6's condition is not met and "mhd 定型" is not written.** What the plan asked for is recorded here with
+its numbers instead, which is the clause the plan itself provides for.
+
+**What is left, in one line each:**
+
+1. The surviving stall (§4.312): reproduce with stats on, read the lane's `Expiry::Dead` and the stream's own
+   counters side by side, and fix the third starvation path.
+2. `capacity` at multi-round medians (P5.4) — the one gate this round did not run.
+3. `docs/internals.md` rewritten as the final algorithm and `docs/benchmarks.md`'s "where mhd wins" table
+   re-derived from the two-arm readings — both are documentation of the state, and the state is not final while
+   the stall is open.
+
 ### 4.312 The small-record timer halves the step's tail, and one stall survives (2026-11-12)
 
 The per-record rule from §4.311 landed and the same cell measured again, three rounds, control beside it:
