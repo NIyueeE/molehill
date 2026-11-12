@@ -377,6 +377,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.323 The lanes sit exactly on their stream ceiling, and that is the wedge (2026-11-12)
+
+The instrument §4.322 asked for, on the soak that has both arms in trouble (3 and 6 wedges, 18 and 30 timeouts):
+
+| arm | maximum `streams=` on any lane | wedges | timeouts |
+|---|---|---|---|
+| molehill | **56** | 3 | 18 |
+| molehill~b | **56** | 6 | 30 |
+
+**Both arms reach exactly 56 — the lane's stream ceiling and not a byte more.** That is the refusal §4.322 saw
+without a placement wait: an open past the ceiling is refused inside `open_stream`, so the pool never waits, never
+grows and never changes size; its own instruments are all honest and all unrelated.
+
+**So the wedge is a capacity leak, not a carrier defect.** Streams accumulate on the four lanes until each holds
+its ceiling, and then a visitor's dial is refused until enough of them retire — which is minutes, because what
+retires a stream is a TTL, and what should have retired them is the visitor's own end. Two populations are known
+to outlive their visitor in this record:
+
+1. **the abandoned channels of §4.306** — 48 bytes of hello, no reader, waiting for the TTL;
+2. **a churn connection's stream** whose reset was never answered, so the lane keeps the slot.
+
+**And it explains every mystery in this investigation**: the arm-level alternation (§4.317–§4.320, whichever
+arm's lanes filled first), the 10-second and 175-second lengths (the TTL's granularity, not a path property), the
+"no lane closed" (§4.320: the lanes are alive and full), the pool's static size (§4.322), and the fact that
+established streams kept answering perfectly while fresh dials were refused (§4.321).
+
+**The fix is one of the two, and both are pool-protocol work rather than carrier work**: retire an abandoned
+channel when its pairing gives up, or have the lane reclaim a stream whose peer has gone silent for its own
+retirement budget. The second is the safer general rule, because it also covers the churn population that no
+pairing owns.
+
 ### 4.322 The pool was healthy the whole time: size 4, no placement wait, no churn (2026-11-12)
 
 The pool's own instruments, from the same arm and run that refused 35 fresh connects:
