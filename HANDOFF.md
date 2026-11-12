@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.324 Why the reclamation fix is not landed yet: the local rule cannot tell an idle visitor from a dead one (2026-11-12)
+
+§4.323 names two candidate fixes. The safer general one — *reclaim a stream whose peer has gone silent for its own
+retirement budget* — has a failure mode this record cannot afford: a legitimate idle connection (an SSH session,
+a database pool member, a visitor waiting for a slow backend) is indistinguishable from a dead one by silence
+alone. A lane that reclaims those would break exactly the long-lived connections a reverse proxy exists to carry,
+and it would do so silently, at a thirty-second scale.
+
+**What the record does have is the rule the carrier already uses, and its shape is the reason the leak exists**:
+a stream retires when *this* end's handle is dropped (`Drop for StreamIo` → `close_stream`) or when the peer's
+acknowledgement of its last byte arrives. Both are statements about the local end. A channel whose visitor
+vanished is neither: its local forwarder is parked in a read, its handle is alive, and nothing on this end knows
+the visitor is gone.
+
+**So the fix belongs one layer up, in the pool, and needs one number the record does not have**: of the 56
+streams resident when a lane is full, how many are paired to a live visitor, how many are unpaired channels, and
+how many have a paired visitor whose socket is closed. The pool already knows the first two (`streams`,
+`pending`, `pinned` in `pool-stats`); the third is the one that leaks, and measuring it is a server-side counter
+(`channel streams whose visitor socket has seen EOF but whose tunnel stream is still open`), not a guess.
+
+**Not landed, deliberately**: a reclamation rule written without that number would either miss the leak (if it
+only reclaims what it can prove) or break idle connections (if it reclaims on silence alone). Both are worse than
+the measured defect, and this record's own discipline says three failed guesses on one problem is where guessing
+stops.
+
 ### 4.323 The lanes sit exactly on their stream ceiling, and that is the wedge (2026-11-12)
 
 The instrument §4.322 asked for, on the soak that has both arms in trouble (3 and 6 wedges, 18 and 30 timeouts):
