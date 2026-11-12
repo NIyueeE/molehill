@@ -377,6 +377,25 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.315 Capacity at multi-round medians: four bulk streams with the SLO held (2026-11-12)
+
+P5.4's gate, three measured rounds plus each arm's twin, `capacity` on a clean path, tunnel leg:
+
+| arm | `capacity_streams` | median | headroom |
+|---|---|---|---|
+| control (no tool) | 8 / 8 / 8 | **8** | 0 % |
+| molehill | 5 / 4 / 4 | **4** | 37.5 / 50 / 50 % |
+| molehill twin | 5 / 7 / 2 | 5 | 12.5 / 50 / 75 % |
+
+The control arm reaches the ramp's top in every round, which is what a path with no tool should do. The
+product carries **four bulk streams** at the median before a fresh interactive connection breaks the SLO, and its
+own twin spreads from two to seven across the same three rounds — so the cell resolves "four" only to within its
+own noise, and the number is recorded as a median range rather than a point.
+
+**This is the reading P5.4 asks for and the last of P5's gates that a run can answer.** What it does not settle is
+whether the spread is the product's or the harness's: the twin is the same binary, so the seven-versus-two gap is
+the cell's own variance, not a difference between builds.
+
 ### 4.314 The surviving wedge is receiver-side: a frozen credit leaves the sender's reserve nothing to spend (2026-11-12)
 
 Reading the pump for the third path turns up the chain in its own comment, written when the wake was fixed: *"a
