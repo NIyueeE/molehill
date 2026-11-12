@@ -377,6 +377,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.302 The pairing's 400 ms is one round trip inside `open` plus one for the channel to arrive (2026-11-12)
+
+`open_us` and `ready_us` split the first half of §4.301's pairing on the client, and they are unambiguous:
+
+```
+open_us=200165 ready_us=200166   cmd_us=200215
+open_us=200246 ready_us=200247   cmd_us=200276
+open_us=200256 ready_us=200258   cmd_us=200280
+```
+
+The prologue write costs **1 µs**. The whole **200 ms is inside the channel open** — one round trip, to the
+millisecond — and the second 200 ms is the channel reaching the server afterwards. And it is **not a
+handshake**: the same round's logs carry **4** `mhd lane handshake completed` lines (the pool's four lanes,
+once) against **426** pairing requests and **420** channel opens. Every pairing opens a *new channel on an
+existing lane*, and each one waits a round trip before it can report itself open.
+
+**So the fix is narrower than §4.301 thought.** "Make pairing one round trip" is really two separate
+questions, and the first is: *what inside `open_stripe_stream` waits for the peer?* The candidates are the
+stripe placement (which §4.90 measured as free on a different service shape) and the lane's own admission —
+the stream's selector byte is written through `Conn::write`, whose window is shared with bulk, so a new
+channel's first byte can be waiting for an acknowledgement **before it has ever been sent**. That would be
+exactly one round trip under load, which is what the number says.
+
+**Pre-registered for the next run, before any code changes**: split `open_stripe_stream`'s 200 ms with the
+phase instrument that already exists (`note_open_phase`, three phases today) into *placement*, *lane
+admission* and *the peer's answer*, and run the same `cost`/`rtt100` cell with stats. Pass for the fix
+afterwards: `open_us < 50 000` on the same cell, `paired_p50_us` below 250 000, and the probe's `echo_ms` p50
+below 300 ms with the control arm's 200 unchanged. No mechanism is written until that split exists — the last
+three attempts in this record were written against the wrong half.
+
 ### 4.301 Found it: the interactive tail is the pool's pairing wait, and it is exactly two round trips (2026-11-12)
 
 The direction the user chose (queue and backpressure rather than redundancy) answered the question in two
