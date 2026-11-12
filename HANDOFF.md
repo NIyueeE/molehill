@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.318 The wedge lands on whichever arm draws it, so it is not the product's (2026-11-12)
+
+The stats-on soak (same binary, product arm and its twin) reads:
+
+| run | product arm | twin |
+|---|---|---|
+| §4.317 | **wedge 3**, 16 timeouts | wedge 0, 12 timeouts |
+| §4.318 | **wedge 0**, 0 timeouts | **wedge 4**, 16 timeouts |
+
+**The two runs invert.** Same binary, same pool, same host, same schedule — and the wedges sit on one arm in one
+run and on the other arm in the next, three or four at a time. That is not a product property: an arm cannot be
+the cause of a failure that lands on its twin in the next run and on it in this one.
+
+**What it is, then**: an intermittent event that attaches to *an arm* rather than to the build — the same shape the
+first soak showed (§4.294: `wedge_count` 2 on one arm, 0 on the other, and 1 / 0 / 0 across later campaigns). The
+product's own rate is the sum over both arms, about **three to four paired timeouts per twenty minutes**, and a
+single run reads 0 or 3 depending on which arm drew them.
+
+**Consequences, in order of certainty:**
+
+1. **`wedge_count` on one arm is not a product verdict** and never was: the plan's gate as written would pass a
+   broken build that happened to draw the clean arm, and fail a healthy one that drew the other. This is the same
+   error the model's own `--aa` discipline exists to prevent, one level up: a single arm is not a measurement of a
+   difference when the same code runs both.
+2. **The stats run caught nothing to attribute**, because the arm that carried the wedges was the twin and its
+   window lines are as available — but the events are two *paired* timeouts, and neither arm's counters around
+   them said anything distinctive in a first pass.
+3. **The gate the plan should have written** is "the two arms' wedge counts are equal within their own noise, and
+   both are zero", not "the product arm's is zero". Nothing in this record can claim zero yet — the shared rate is
+   three to four — but the *attribution* to the product is now unsupported by its own A/A.
+
+**Recorded rather than resolved.** What would settle it is an experiment the plan does not have: run the soak
+with **two product arms and no twin** (or three), so the event's per-arm rate is measured directly instead of
+being inferred from one arm's worth of events per run.
+
 ### 4.317 The split metric shows what the wedge was hiding: 16 timeouts against the twin's 12 (2026-11-12)
 
 With `wedge_count` counting only real silences (two or more consecutive failures) and `rtt_timeout_count` holding
