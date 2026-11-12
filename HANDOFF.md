@@ -377,6 +377,46 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.310 The stall was credit starvation: a small-flight reserve removes it (2026-11-12)
+
+The interactive probe's own series had the answer §4.307–§4.309 were guessing at, and it was not the listener:
+
+| reading | value |
+|---|---|
+| `error` samples, all `ConnectionRefusedError` | 20, one **every five seconds** for the whole run |
+| successful round trips | 20 a second, then **one 105-second silence starting at +32.7 s** |
+| the silent window | begins exactly at the `rate20` boundary |
+| fresh connections (the churn series) | **1 075 completed** across the same run, 20 errors |
+
+So new visitors were arriving and being served the whole time; the *one long-lived* interactive stream stopped for 105 seconds. The refused connects were a background retry, not the fault.
+
+**The cause is the connection's credit, not the path.** `OPEN_RESERVE` keeps eight payloads of every budget
+for a stream that is *opening*, keyed on the bytes it has ever written. A chat stream that has carried megabytes
+reads as bulk to that rule, so when one bulk stream with a blocked reader held the connection's whole credit, the
+next request had nowhere to go — for 105 seconds, until the peer drained.
+
+**The fix**: `SMALL_STREAM_RESERVE` keeps eight payloads of a bulk writer's budget back for any stream whose
+**unacknowledged flight** is small (`SendBuf::unacked`, not lifetime bytes), taken inside the peer's credit like
+the opening reserve so no frame overruns the advertised window. One test pins the case the old rule missed.
+
+**Measured, three rounds, control beside it:**
+
+| arm | `clean` p50 | `rate20` p50 | `rate20` p99 | `clean#2` p50 / p99 | recovery |
+|---|---|---|---|---|---|
+| control | 1.17–1.44 ms | 388–390 ms | 497–509 ms | 1.0–1.4 / 2.0–2.1 ms | 17–45 ms |
+| molehill | 1.15–2.19 | **161.7 / 442.4 / 483.5** | 162 / 4 946 / 2 391 | 1.09–1.18 / 12–23 | **10 / 13 / 15 ms** |
+| twin | 1.15–2.18 | 463.8 / 472.2 / **no sample** | 464 / 4 249 / — | 1.09–1.25 / 1.7–69 | 10 / 43 / — |
+
+**The 105-second stall is gone**: every measured product round now carries interactive traffic through the step,
+where two of two did not before. Recovery is **10–15 ms**, far inside the plan's ≤2×RTT (this cell's step RTT is
+390 ms).
+
+**What the acceptance still fails, honestly**: the plan's "step-period p99 ≤ 2× steady state" is not met — the
+step p99 reads 2.4–4.9 s against a 12–24 ms clean p99, and against the control arm's 500 ms on the same step.
+That tail is the next thing to price, and it is a different mechanism from the stall: a saturated 20 Mbit/s queue
+with four bulk streams and one interactive flow, where the interactive flow now gets its bytes but waits behind
+the queue.
+
 ### 4.309 The refused connects are not a dead listener either (2026-11-12)
 
 §4.308 left the listener as the suspect. The same run's logs say it stayed up:
