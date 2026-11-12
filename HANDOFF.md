@@ -377,6 +377,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.305 The 39 s reader wait is a channel holding 48 unread bytes, not visitor backpressure (2026-11-12)
+
+§4.300 left one question open: the small-stream reader wait reached 39 225 ms, and "holds eight payloads or
+fewer" cannot tell an interactive stream from a bulk one whose buffer drained. The window line now carries the
+waiting stream's own arrival count beside the wait, and the answer is neither of those shapes:
+
+| `small_ready_ms` | lines | the stream's `after_bytes` |
+|---|---|---|
+| over 1 s | **340 of 2 718** | **48, every one of them** |
+| any line, nonzero | 379 | **48** (2 339 lines read 0) |
+
+**Every long wait belongs to a stream that has received exactly 48 bytes and never had them read.** No bulk
+stream can be 48 bytes, and an interactive visitor's stream would grow past that as its requests accumulate. 48
+is the size of a channel's **hello plus prologue** — the bytes a data channel writes when it opens, before any
+service byte exists.
+
+**So the reader stall is an orphaned channel, not backpressure.** A channel whose pairing expired or whose
+forwarder never started keeps its hello unread, and the wait grows until the TTL closes it; the pairing path
+already re-queues such a channel (`data_ch_rx.unclaim(group)`) rather than closing it, and nothing reads the
+hello of a channel that is never taken. That is a pool-protocol cleanliness item — a stream held for tens of
+seconds with 48 bytes nobody wants — not a visitor that stopped reading and not the carrier.
+
+**It is not the interactive tail either**, which §4.303 removed: the tail's streams were being *created*, not
+left unread. What this item costs is a lingering stream per expired pairing and the reader-wait reading it
+pollutes; it does not appear in any latency cell's tail.
+
+**Not fixed here, deliberately**: closing a re-queued channel's stream is a pool-protocol change (which side
+owns the lifetime of a channel that arrived late), and it needs a decision about whether a re-queued channel may
+still be paired. The instrument and this record are what that decision needs.
+
 ### 4.304 The fix clears its guards: the lossy interactive tail lands on the control arm (2026-11-12)
 
 Three cells, same binary as §4.303, control beside the product, three rounds each.

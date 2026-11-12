@@ -3102,13 +3102,23 @@ impl Conn {
     /// is always bulk, so that reading says nothing about the interactive tail
     /// (`HANDOFF.md` §4.300). This picks the worst wait among streams small enough
     /// to be interactive, which is the number the tail question needs.
-    pub(crate) fn small_ready_wait(&self, now: Instant) -> Option<(u32, Duration)> {
+    pub(crate) fn small_ready_wait(&self, now: Instant) -> Option<(u32, Duration, u64)> {
+        // The third number is the stream's own arrival count, and it is what makes
+        // the reading usable: "holds eight payloads or fewer" also describes a bulk
+        // stream whose reader is blocked long enough for its buffer to drain, so
+        // without the bytes a 39-second wait cannot be attributed to either shape
+        // (`HANDOFF.md` §4.300, §4.305).
         self.streams
             .iter()
             .filter(|(_, state)| state.reset.is_none())
             .filter(|(_, state)| state.recv.held() <= SMALL_STREAM_HELD)
-            .filter_map(|(&id, state)| state.recv.ready_for(now).map(|waited| (id, waited)))
-            .max_by_key(|(_, waited)| *waited)
+            .filter_map(|(&id, state)| {
+                state
+                    .recv
+                    .ready_for(now)
+                    .map(|waited| (id, waited, state.recv.arrived()))
+            })
+            .max_by_key(|(_, waited, _)| *waited)
     }
 
     /// How many streams have had unread bytes for longer than `threshold`.
