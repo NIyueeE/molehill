@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.321 The 175-second wedge is a fresh connection refused, not a stalled stream (2026-11-12)
+
+The failing arm's series split in two when read carefully, and the split is the answer:
+
+| series | result |
+|---|---|
+| successful round trips (`rtt_ms`) | **7 322 samples, longest gap 3.1 s** |
+| failures (`error`) | 35, from +0 to +170 s, a run of **175 s** |
+
+**The established interactive stream never stopped**: its own worst gap is three seconds. What failed, 35 times
+over three minutes, is the probe's **dial loop** — the part that opens a *fresh* connection each time. So the
+"wedge" the gate counts is a pool or listener that refuses new arrivals for minutes while every established
+stream keeps answering.
+
+**That also explains the alternation across arms** (§4.317–§4.320): fresh-connection supply is a per-instance
+pool property, so whichever arm's pool is starved loses its dial loop and reads as a wedge, while its twin —
+whose pool happened to keep a channel free — reads zero. The arm is not the cause; the pool is.
+
+**And it dates the whole investigation back to the right place**: this is the same shape as §4.309's
+`ConnectionRefusedError` and §4.306's ten-second selector timeouts — the pool's supply of channels, not the
+carrier's stream path. The two carrier fixes landed since (credit reserve, small-record timer) were real and
+measured, but they were applied to a symptom the gate was mis-attributing.
+
+**Instrument fixed in the same commit**: `wedges()` now orders attempts by when each one **began**, not by where
+the probe appended it to the file, because a failure is appended up to its own timeout after a success that began
+later. The change does not move this run's result — recomputed in time order it still reads one 175-second run —
+but it removes an artefact that could have.
+
+**Next, and it is the pool's turn**: the channel supply under a soak. `mhd pool placement`'s `wait_us` and the
+`unfed` counter over the same seconds decide whether the pool refused to grow, grew and lost the channels, or
+never asked.
+
 ### 4.320 Four soaks, both arms, silences up to 175 seconds, and no lane ever closed (2026-11-12)
 
 The stats-on run of the same two-product-arm shape adds the fourth observation and the pattern is now unambiguous:

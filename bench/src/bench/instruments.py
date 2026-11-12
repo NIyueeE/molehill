@@ -454,7 +454,16 @@ def wedges(points: list, silence_s: float = WEDGE_SILENCE_S) -> dict:
     0.0 rather than the longest gap (which is the slowest answer, and that is
     [`rtt_max_ms`]'s to report).
     """
-    attempts = [p for p in points if p.get("started_at") is not None]
+    # **Ordered by when each attempt began, not by where it landed in the file.**
+    # The probe appends a failure when it gives up, which is up to its own timeout
+    # after a success that began later; reading the file's order made a run of
+    # failures that were interleaved with successes in real time look like one
+    # continuous silence — measured as 175 s on an arm whose successful round trips
+    # never gapped more than 3.1 s (`HANDOFF.md` §4.321).
+    attempts = sorted(
+        (p for p in points if p.get("started_at") is not None),
+        key=lambda p: p["started_at"],
+    )
     if len(attempts) < MIN_WEDGE_POINTS:
         return {"count": None, "max_s": None}
     spans: list = []
