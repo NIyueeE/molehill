@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.312 The small-record timer halves the step's tail, and one stall survives (2026-11-12)
+
+The per-record rule from §4.311 landed and the same cell measured again, three rounds, control beside it:
+
+| arm | `rate20` p50 | `rate20` p99 | recovery |
+|---|---|---|---|
+| control | 384–387 ms | 502–507 ms | — |
+| molehill, before | 161.7 / 442.4 / 483.5 | **162 / 4 946 / 2 391** | 10 / 13 / 15 ms |
+| molehill, after | **314.2 / — / 180.7** | **1 605 / — / 215** | 42 / — / 48 |
+
+Where the stage measured, the tail fell by **2–3×** (4 946 → 1 605; 2 391 → 215) and the median came down with
+it. The control arm is unchanged across both runs, so the movement is the change and not the host.
+
+**And one stall survives**: the middle round produced **no interactive sample at all** again, with the recovery
+stage reporting 11 169 ms — the same shape as §4.307, now in one round of three instead of two of two. Two
+mechanisms have been removed (credit starvation, the lane's timer ladder) and a third exists.
+
+**What that rules out**: it is neither the connection's credit (the reserve keeps eight payloads for any stream
+with a small flight) nor the timeout ladder (small records are now judged on the path's round trip). What is
+left is per-stream **state** rather than per-stream budget: a stream whose prefix stalls has its repair gated by
+the frontier rules (`has_repair`, `repair_at`, `stall_rescues` — all measured inert in §4.289), and a lane that
+has declared the *connection* dead (`Expiry::Dead`) re-sends everything and closes streams, which the probe would
+see as exactly this silence.
+
+**Next**: reproduce the surviving round with stats on and read `Expiry::Dead`'s counter beside the lane's
+`retransmits` and the stream's `repairs`, which is the one pair that separates "the lane died" from "one stream
+stopped".
+
 ### 4.311 The step's remaining tail is the lane's timeout ladder, and the small-flight floor cannot see a stream (2026-11-12)
 
 §4.310 left one acceptance failing: the step p99 is 2.4–4.9 s while the control arm's is 500 ms. Reading the
