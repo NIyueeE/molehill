@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.317 The split metric shows what the wedge was hiding: 16 timeouts against the twin's 12 (2026-11-12)
+
+With `wedge_count` counting only real silences (two or more consecutive failures) and `rtt_timeout_count` holding
+the single ones, the same soak reads:
+
+| arm | `wedge_count` | `wedge_max_s` | `rtt_timeout_count` | drift |
+|---|---|---|---|---|
+| molehill | **3** | 10.01 | **16** | 6.90 MiB/min |
+| molehill twin | 0 | 0.0 | 12 | 12.12 |
+
+**Two things at once, and the second is the more useful.**
+
+1. **The product arm has three multi-attempt silences and its twin none.** The earlier single-wedge runs were the
+   luckier ones; the gate fails harder than it looked, not less.
+2. **Both arms time out.** Sixteen against twelve over twenty minutes is inside what sixteen events can resolve,
+   so a request that reaches the probe's ten-second timeout is **not** product-specific — it happens to the twin
+   too, which has no tool in its path beyond the same pool. What the product adds is that its timeouts sometimes
+   come **in pairs**, which is what the silence counts.
+
+**That reframes the gate's meaning a second time.** `rtt_timeout_count` is the axis that separates the arms
+weakly (16 vs 12); `wedge_count` is the one that separates them clearly (3 vs 0), and it is a *pairing* of
+failures rather than a slow request. A pair of consecutive failures on a serial probe is two requests in a row
+that each waited ten seconds: the first one's timeout is where the second one starts.
+
+**So the residue is: three times in twenty minutes, two interactive requests in a row each waited the probe's
+full ten seconds.** That is a failure of the stream or the pairing to recover between two attempts — not a single
+slow answer, and not the credit frontier (which is now reserved on both ends).
+
+**Not attributed in this round.** The instrument that decides it is the product's own stream-level state at
+those two attempts: the window line's `ready_ms`/`refus`/`retransmits` for that stream, read from a stats-on run
+of the same soak — which is what the next round runs.
+
 ### 4.316 The frontier reserve lands, the soak's one wedge stays, and it is exactly the probe's timeout (2026-11-12)
 
 `SMALL_STREAM_RESERVE` now works on both ends: the sender may spend it past a frozen frontier and the receiver
