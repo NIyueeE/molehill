@@ -1422,6 +1422,7 @@ def run_staged(ctx: Ctx, params: dict) -> list:
     try:
         with inst.DriftSampler(ctx.pids_of, interval=inst.DRIFT_POLL_S) as drift:
             cells.extend(_one_stage(ctx, stage, params, logs) for stage in stages)
+            _attach_step_recovery(cells, logs)
             drift_points = list(drift.points)
     finally:
         for proc, _ in probes:
@@ -1433,6 +1434,61 @@ def run_staged(ctx: Ctx, params: dict) -> list:
             ctx.topo.set_condition(ctx.leg, ctx.condition)
     cells.append(_run_cell(drift_points, logs, series))
     return cells
+
+
+#: The three stages a `step` timeline has: baseline, the step, the recovery.
+_STEP_STAGES = 3
+
+
+def _attach_step_recovery(cells: list, logs: dict) -> None:
+    """How long the interactive stream took to come back after the step.
+
+    The one number the sweep cannot produce. A sweep changes the condition
+    *between* stages and re-dials the bulk spine, so every stage it measures is
+    of a tool that has already settled; this workload keeps one interactive
+    stream running across both boundaries, and the recovery is read off it.
+
+    Defined as: the first instant, at least one second into the recovery stage,
+    from which a whole second of interactive round trips stays within twice the
+    first stage's median. A stream that never comes back reports the metric's
+    absence with the reason, not a large number.
+    """
+    # A step needs a baseline, the step itself and a recovery to read.
+    if len(cells) < _STEP_STAGES:
+        return
+    baseline = cells[0].metrics.get("rtt_p50_ms")
+    recovery = cells[-1]
+    since = recovery.evidence.get("window_start")
+    until = recovery.evidence.get("window_end")
+    if baseline is None or since is None or until is None:
+        return
+    points = [
+        (row["t"], row["v"])
+        for row in read_series(logs["interactive"], since, until)
+        if row.get("metric") == "rtt_ms"
+    ]
+    if not points:
+        recovery.absent("step_recovery_ms", "the interactive stream had no sample")
+        return
+    limit = 2.0 * float(baseline)
+    recovered = None
+    for index, (start, _) in enumerate(points):
+        # A whole second, and it must exist: the last half second of a stage is
+        # not evidence of a recovery, it is evidence of the run ending.
+        if start + 1.0 > until:
+            break
+        window = [value for when, value in points[index:] if when <= start + 1.0]
+        if window and max(window) <= limit:
+            recovered = start
+            break
+    if recovered is None:
+        recovery.absent(
+            "step_recovery_ms",
+            f"no second of the recovery stage stayed within {limit:.1f} ms",
+        )
+        return
+    recovery.metrics["step_recovery_ms"] = round((recovered - since) * 1000.0)
+    recovery.evidence["step_recovery_baseline_ms"] = round(baseline, 3)
 
 
 class _RestoresCondition:

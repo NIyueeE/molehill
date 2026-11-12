@@ -87,6 +87,20 @@ METRIC_SPECS: tuple[dict, ...] = (
         "precision": 3,
     },
     {
+        "id": "step_recovery_ms",
+        "unit": "ms",
+        "direction": "lower",
+        "definition": (
+            "how long after the path stepped back to its baseline condition the "
+            "interactive stream's round trip returned to within twice that "
+            "baseline's median and stayed there for a second"
+        ),
+        "denominator": "the step back to the baseline condition",
+        "needs": ("staged",),
+        "materiality": ("rel", 30.0),
+        "precision": 0,
+    },
+    {
         "id": "rtt_error_rate_pct",
         "unit": "%",
         "direction": "lower",
@@ -923,6 +937,16 @@ TIMELINES: dict[str, tuple] = {
     # *tail* of an `rtt100` hold (measured 2026-10-15: nothing in the first
     # 60 s of a stage, a collapse from t≈110 s of a 100 s hold), so a stage
     # short enough to be convenient is a stage that mostly misses it.
+    # The robustness axis: the path changes *inside* one transfer. The sweep
+    # changes condition between stages, and its stages re-dial the bulk spine,
+    # so it can only see a tool that is already settled. This one steps the rate
+    # down fivefold and back, and the recovery is read off the interactive
+    # stream that ran across both boundaries.
+    "step": (
+        ("clean", 30.0),
+        ("rate20", 30.0),
+        ("clean", 30.0),
+    ),
     "wedge": (
         ("clean", 30.0),
         ("rtt100", 180.0),
@@ -1566,6 +1590,27 @@ def scenario_catalog() -> list:
                 "series": STAGED_SERIES,
             },
             headline="rtt_p99_ms",
+        ),
+        Scenario(
+            id="step",
+            kind="staged",
+            claim=(
+                "how the tool behaves when the path changes inside one transfer: "
+                "a fivefold rate step down and back, and how long the interactive "
+                "stream takes to return to its baseline"
+            ),
+            params={
+                "timeline": "step",
+                "scale": 1.0,
+                "condition": "clean",
+                "streams": 4,
+                "ping_interval_ms": 50,
+                "udp_interval_ms": 20,
+                "churn_per_s": 16,
+                "min_hold_s": 30.0,
+                "series": STAGED_SERIES,
+            },
+            headline="step_recovery_ms",
         ),
         Scenario(
             id="soak",

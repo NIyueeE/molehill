@@ -176,6 +176,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `throughput_gbps` | Gbit/s | 越高越好 | 接收端窗口内的有效载荷字节数 × 8 / 测量窗口 | 工作负载的测量窗口 |
 | `offered_gbps` | Gbit/s | 背景,不是判定 | 访客链路出方向字节数 × 8 / 测量窗口 | 工作负载的测量窗口 |
 | `rtt_worst_1s_ms` | ms | 越低越好 | 交互流往返时间里最差的一秒均值:一次会被整段百分位抹平的突发 | 交互流的一秒 |
+| `step_recovery_ms` | ms | 越低越好 | 路径回到基线条件之后,交互流的往返要多久回到该基线中位数的两倍以内并保持一秒 | 回到基线的那次阶跃 |
 | `rtt_error_rate_pct` | % | 越低越好 | 失败的交互 ping 数 / (成功 + 失败) | 一次交互 ping |
 | `churn_per_s` | 1/s | 越高越好 | 每秒建立的短连接数 | 该阶段的测量窗口 |
 | `drift_rss_mib_per_min` | MiB/min | 越低越好 | 该臂 RSS 合计值在整轮运行上的最小二乘斜率:泄漏是随时间的斜率,不是一个水位 | 一分钟运行时间 |
@@ -248,6 +249,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `udp-pace` | `udp` | 一次限速的 UDP 会话:到达的比例是多少,间隔又如何 | `udp_loss_pct` |
 | `udp-ladder` | `udp-ladder` | 在每一个报价速率上,UDP 路径从何处开始丢弃 | `udp_loss_pct` |
 | `timeline` | `staged` | 路径劣化又恢复时工具如何表现:一条交互流、N 条 bulk 流、一条 churn 流与一次 UDP 会话,走一份脚本化的条件日程,原地切换 | `rtt_p99_ms` |
+| `step` | `staged` | 路径在**一次传输内部**发生变化时工具的表现:五倍速率阶跃下行再回来 | `step_recovery_ms` |
 | `soak` | `staged` | 在轮换路径上长时间运行:有没有东西泄漏、漂移或退化 | `rtt_p99_ms` |
 | `cost` | `staged` | 在固定工作点上,每承载 1 Gbit/s 要花多少 CPU 秒 | `cpu_s_per_gbit` |
 | `capacity` | `capacity` | 在一条全新的交互连接仍满足 SLO 的前提下,工具能承载多少 bulk 负载 | `capacity_streams` |
@@ -279,6 +281,7 @@ Gbit/s,平时是 11.5)。这几次之间格子本身没变:同样二十四条样
 | `dev` | 4(+1 预热) | ~150 s | 一次优化工作的默认档:每一个场景,以分钟计 |
 | `full` | 6(+1 预热) | ~420 s | 发布级的 sweep:全部内容,需要多久就跑多久 |
 | `stage` | 2(+1 预热) | ~150 s | 一个条件、整套工作负载:一个形状问题,以分钟计 |
+| `step` | 1(+0 预热) | ~90 s | 鲁棒性这条轴:路径在阶段之间变化,而一条交互流横跨两个边界一直在跑 |
 | `soak` | 1(+0 预热) | ~1200 s | 漂移这条轴:一条轮换路径,长时间保持 |
 | `screen` | 3(+1 预热) | ~240 s | 一次开发 A/B:一个条件,两个构建交错 |
 | `sweep` | 1(+0 预热) | ~3000 s | 发布 sweep:阶段日程与负载斜坡 |

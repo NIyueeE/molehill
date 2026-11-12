@@ -221,6 +221,7 @@ the definitions are what the report and the verdict render.
 | `throughput_gbps` | Gbit/s | higher is better | receiver-window payload bytes x 8 / measured window | the workload's measured window |
 | `offered_gbps` | Gbit/s | context, not a verdict | visitor link egress bytes x 8 / measured window | the workload's measured window |
 | `rtt_worst_1s_ms` | ms | lower is better | the worst one-second mean of the interactive stream's round trips: a burst that a percentile over the whole stage would average away | one second of the interactive stream |
+| `step_recovery_ms` | ms | lower is better | how long after the path stepped back to its baseline condition the interactive stream's round trip returned to within twice that baseline's median and stayed there for a second | the step back to the baseline condition |
 | `rtt_error_rate_pct` | % | lower is better | failed interactive pings / (successful + failed) | one interactive ping |
 | `churn_per_s` | 1/s | higher is better | short-lived connections established per second | the stage's measured window |
 | `drift_rss_mib_per_min` | MiB/min | lower is better | least-squares slope of the arm's summed RSS over the run: a leak is a slope over time, not a level | one minute of run time |
@@ -299,6 +300,7 @@ Two conventions the table cannot state, because they belong to the workload:
 
 | `udp-ladder` | `udp-ladder` | where a UDP path starts shedding, per offered rate | `udp_loss_pct` |
 | `timeline` | `staged` | how the tool behaves as the path degrades and recovers: one interactive stream, N bulk streams, a churn stream and a UDP session, over a scripted schedule of conditions, in place | `rtt_p99_ms` |
+| `step` | `staged` | how the tool behaves when the path changes inside one transfer: a fivefold rate step down and back | `step_recovery_ms` |
 | `soak` | `staged` | over a long run on a rotating path: does anything leak, drift or degrade | `rtt_p99_ms` |
 | `cost` | `staged` | at one fixed operating point, how many CPU-seconds one carried Gbit/s costs | `cpu_s_per_gbit` |
 | `capacity` | `capacity` | how much bulk load the tool carries while a fresh interactive connection still meets the SLO | `capacity_streams` |
@@ -336,6 +338,7 @@ fingerprint, a shortened run can never be mistaken for a published one.
 | `dev` | 4 (+1 warm-up) | ~150 s | the default for an optimization: every scenario, minutes |
 | `full` | 6 (+1 warm-up) | ~420 s | the release-grade sweep: everything, for as long as it takes |
 | `stage` | 2 (+1 warm-up) | ~150 s | one condition, the whole workload: a shape question, minutes |
+| `step` | 1 (+0 warm-up) | ~90 s | the robustness axis: the path changes between stages while one interactive stream runs across both boundaries |
 | `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
 | `sweep` | 1 (+0 warm-up) | ~3000 s | the release sweep: the staged schedule and the load ramp |
