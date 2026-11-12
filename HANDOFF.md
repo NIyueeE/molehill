@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.319 Two product arms, one binary: one clean, one collapsed for 25 seconds (2026-11-12)
+
+The experiment §4.318 asked for — two arms of the **same** build and no twin, so the per-arm rate is measured
+rather than inferred:
+
+| arm | `wedge_count` | `wedge_max_s` | `rtt_timeout_count` | drift |
+|---|---|---|---|---|
+| molehill | **0** | 0.0 | **1** | 6.75 MiB/min |
+| molehill~b (same binary) | **8** | **25.024** | **31** | 11.53 |
+
+**One arm answered everything for twenty minutes and timed out once. The other spent eight stretches silent,
+the longest 25 seconds, with 31 timeouts.** Same binary, same host, same schedule, same pool width: the only
+difference is which processes and namespaces it got.
+
+**So the wedge is not "whichever arm draws it" (§4.318) — it is "one instance in two collapses", and it collapses
+hard.** Eight silences and a 25-second maximum is not a jitter in a bench: it is a lane or a pool that stops
+forwarding an interactive stream and takes tens of seconds to come back.
+
+**That is §4.181's bistable collapse, measured again with a sharper instrument.** The earlier record described
+one instance of a pair going wrong while its twin stayed healthy and could not reproduce it on demand; this one
+reproduces it in one run of two, with the split metric saying exactly what it looks like (eight silences, not
+"a wedge").
+
+**What it means for finalisation**: `wedge_count = 0` is not a gate this carrier can pass while half its
+instances collapse. The honest statement is the one the plan's §6 allows: **the finalisation is not claimed, and
+the reason is measured** — a bistable, instance-level collapse in the interactive path, ~1 in 2, worst silence
+25 s.
+
+**What would fix it is a different investigation from the two already closed** (credit starvation, the timer
+ladder): both were per-message paths, and this is per-instance. The next instrument is instance-level, not
+message-level: the two arms' own window lines side by side for the same seconds, above all the lane's
+`closed`/`Expiry::Dead` transitions and the pool's size timeline, which are the only places an instance can
+differ from another running identical code.
+
 ### 4.318 The wedge lands on whichever arm draws it, so it is not the product's (2026-11-12)
 
 The stats-on soak (same binary, product arm and its twin) reads:
