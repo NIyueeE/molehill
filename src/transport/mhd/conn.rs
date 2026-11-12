@@ -1397,7 +1397,21 @@ impl Conn {
         //
         // The congestion window is the second bound, and it is what the flight —
         // and therefore the recovery table — is actually sized by.
-        let credit = self.send_credit.saturating_sub(self.written);
+        let mut credit = self.send_credit.saturating_sub(self.written);
+        // **A small stream may spend a reserve the frontier does not cover.**
+        // The credit frontier is `read + WINDOW`, and it freezes when *one*
+        // reader stalls: a bulk stream whose visitor stopped reading holds the
+        // connection's buffer, the frontier stops advancing, and every other
+        // stream's room is zero. Keeping credit back (the reserve subtracted from
+        // a bulk writer's room) protects against a sender over-committing, not
+        // against a frontier that shrinks after the fact — measured as a
+        // 105-second silence on the step cell and a ten-second wedge in the soak
+        // (`HANDOFF.md` §4.314). The receiver accepts this headroom for the same
+        // predicate, so nothing overruns what it can hold.
+        let small_writer = self.streams.get(&stream).is_some_and(small_flight);
+        if small_writer {
+            credit = credit.saturating_add(SMALL_STREAM_RESERVE);
+        }
         // **Data, not the repairs.** A repair storm used to hold the whole
         // window: every re-send of a range the path keeps dropping sat in
         // `flight_bytes`, so the writer had no room for bytes the peer had never
@@ -3421,7 +3435,22 @@ impl Conn {
             data,
             fin,
         } = *range;
-        if offset + data.len() as u64 > self.recv_credit {
+        // **The frontier's reserve, on this end too.** `recv_credit` follows the
+        // reader, so a stalled reader freezes it for every stream; a stream whose
+        // own reader is keeping up may still write the reserve past it, which
+        // `MAX_BUFFERED`'s second window absorbs. The sender spends exactly this
+        // and no more (`Conn::write`), so neither end can overrun the other
+        // (`HANDOFF.md` §4.314).
+        let small_reader = self
+            .streams
+            .get(&id)
+            .is_none_or(|state| state.recv.held() <= SMALL_STREAM_RESERVE);
+        let frontier = if small_reader {
+            self.recv_credit.saturating_add(SMALL_STREAM_RESERVE)
+        } else {
+            self.recv_credit
+        };
+        if offset + data.len() as u64 > frontier {
             return Err(Rejected::OverWindow);
         }
         let known = self.streams.contains_key(&id);
@@ -6651,6 +6680,41 @@ mod tests {
             conn.write(chatty.id, &request),
             request.len(),
             "an interactive request is admitted while bulk holds the credit"
+        );
+    }
+
+    /// A frozen credit frontier still admits a small stream, and still refuses bulk.
+    ///
+    /// The frontier is `read + window`, so one stalled reader freezes it for every
+    /// stream on the lane: the bulk stream whose visitor stopped reading holds the
+    /// buffer, and the interactive stream's next request has no room. Measured as a
+    /// 105-second silence on the step cell and a ten-second wedge in the soak
+    /// (`HANDOFF.md` §4.314). The reserve is what keeps that request moving, and it
+    /// must not become room for bulk.
+    #[test]
+    fn a_frozen_frontier_admits_a_small_stream_and_refuses_bulk() {
+        let mut conn = Conn::new(21, true);
+        conn.cwnd = WINDOW;
+        let bulk = conn.open();
+        let mut filler = payload(4096);
+        while conn.write(bulk.id, &filler) > 0 {}
+        filler.clear();
+        // Freeze the frontier exactly where the bulk stream left it: this is the
+        // shape a stalled reader produces, and no reserve subtraction can undo it.
+        conn.send_credit = conn.written;
+
+        let chatty = conn.open();
+        let request = payload(1_400);
+        assert_eq!(
+            conn.write(chatty.id, &request),
+            request.len(),
+            "a small request is admitted past a frozen frontier"
+        );
+        let more = payload(4096);
+        assert_eq!(
+            conn.write(bulk.id, &more),
+            0,
+            "bulk is still refused by the frozen frontier"
         );
     }
 
