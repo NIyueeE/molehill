@@ -2989,6 +2989,16 @@ impl Conn {
     }
 
     /// How many times the stalled-prefix rescue fired on this lane.
+    /// How many streams this lane holds, in both directions.
+    ///
+    /// The resource a visitor's channel competes for, printed on the window line
+    /// because nothing else watches it: an open refused by a lane's stream ceiling
+    /// is refused without a placement wait, which is what made §4.322's three
+    /// minutes of refused dials invisible in the pool's own numbers.
+    pub(crate) fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
     pub(crate) fn stall_rescues(&self) -> u64 {
         self.stall_rescues
     }

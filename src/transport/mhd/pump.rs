@@ -335,6 +335,13 @@ fn report_window(shared: &Arc<Shared>) {
             // already the widest thing in the tree.
             ledger = %ledger,
             backlog_streams = backlog.streams,
+            // **How many streams the lane holds at all**, which is the resource a
+            // visitor's channel competes for: a pool of four lanes may carry a
+            // ceiling of streams, and an open refused by that ceiling is refused
+            // *without* a placement wait — measured as a visitor's dial refused for
+            // three minutes while the pool read size 4 with no placement line and no
+            // size change at all (`HANDOFF.md` §4.322).
+            streams = conn.stream_count(),
             backlog_bytes = backlog.total,
             worst_stream,
             worst_ready_ms,
