@@ -342,6 +342,16 @@ fn report_window(shared: &Arc<Shared>) {
             // three minutes while the pool read size 4 with no placement line and no
             // size change at all (`HANDOFF.md` §4.322).
             streams = conn.stream_count(),
+            // The oldest resident and why it is still there, beside the count: a
+            // full lane is `streams=` alone, and which population filled it is this
+            // (`HANDOFF.md` §4.328).
+            oldest_stream_ms = conn
+                .oldest_stream(now)
+                .map_or(0, |(_, age, _, _)| {
+                    u64::try_from(age.as_millis()).unwrap_or(u64::MAX)
+                }),
+            oldest_abandoned = conn.oldest_stream(now).is_some_and(|(_, _, a, _)| a),
+            oldest_fin_sent = conn.oldest_stream(now).is_some_and(|(_, _, _, f)| f),
             backlog_bytes = backlog.total,
             worst_stream,
             worst_ready_ms,

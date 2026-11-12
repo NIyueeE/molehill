@@ -2999,6 +2999,26 @@ impl Conn {
         self.streams.len()
     }
 
+    /// The oldest stream in the table, with its age and the flags that say why
+    /// it is still there.
+    ///
+    /// `streams=` says the lane is full; it cannot say whether the residents are a
+    /// churn wave (seconds old and normal), abandoned streams some retirement path
+    /// should have taken (minutes old, `abandoned` or `fin_sent` set), or sessions
+    /// the peer simply never closed (minutes old and live, which is not a defect).
+    /// Those three populations are identical from every other number on this line
+    /// (`HANDOFF.md` §4.328), so this prints the one field that separates them.
+    pub(crate) fn oldest_stream(&self, now: Instant) -> Option<(u32, Duration, bool, bool)> {
+        let (&id, opened) = self.stream_opened.iter().next()?;
+        let state = self.streams.get(&id)?;
+        Some((
+            id,
+            now.saturating_duration_since(*opened),
+            state.abandoned,
+            state.fin_sent,
+        ))
+    }
+
     pub(crate) fn stall_rescues(&self) -> u64 {
         self.stall_rescues
     }

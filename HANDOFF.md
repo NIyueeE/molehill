@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.329 The "56 streams at the ceiling" was a grep artefact: `backlog_streams`, not `streams` (2026-11-12)
+
+The age instrument answers its own question and, in doing so, retracts four entries.
+
+**The lane holds one stream.** With `streams=` printed as its own field:
+
+| side | `streams=` | oldest |
+|---|---|---|
+| client, both arms | **0, 1 or 2** | ~1 000 s (the lane's own persistent stream, alive, not abandoned) |
+| server, both arms | **1** | 0–201 ms |
+
+**So no lane is anywhere near a ceiling, and nothing is leaking.** §4.323 ("both arms reach exactly 56 — the
+ceiling"), §4.325 ("686 of 700 seconds at 56"), §4.326 ("streams that are never closed"), §4.327 and §4.328 all
+read `grep -o "streams=[0-9]*"` from a log whose line also carries **`backlog_streams=`**. A substring match, not
+a measurement: **`backlog_streams=56` is the number of streams with unread bytes**, and it was reported as if it
+were the lane's stream count.
+
+**That is four entries and one instrument built on a grep**, and the instrument (§4.328's age field) is what
+exposed it within one run. The record keeps the correction rather than the story: nothing about stream ceilings,
+slot leaks or TTL reclamation was ever measured.
+
+**What the run does say, with the honest field names:**
+
+| reading | molehill | twin |
+|---|---|---|
+| `wedge_count` | 3 | 9 |
+| `wedge_max_s` | 15.015 | 15.015 |
+| lane `streams=` (client/server) | 1–2 / 1 | 1–2 / 1 |
+
+So the wedge is **not** a full lane, and its 15-second length is the same on both arms. The next question is the
+one §4.321 raised and this detour delayed: a fresh dial refused while the established stream answers, with the
+pool healthy (size 4, no placement wait) and the lane holding one stream.
+
 ### 4.328 `settle_finished` does run on every acknowledgement, so reading is exhausted and the streams need an age (2026-11-12)
 
 §4.327's hypothesis is refuted by one line: `settle_finished()` sits at the end of the acknowledgement handler, not
