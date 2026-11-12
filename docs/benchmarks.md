@@ -1028,7 +1028,7 @@ The figures that shaped a TCP-versus-KCP axis are published history in
 longer be built, and they are not a baseline. What compares today is the table
 each scenario prints, tool against the control arm of the same run.
 
-### What a fresh connection costs, per carrier (2026-11-11)
+### What a fresh connection costs, per carrier (2026-11-12)
 
 The one axis where the two carriers are not close. Measured with
 `MOLEHILL_DATA_CARRIER` pinning one per run, the same binary both times, over the
@@ -1038,17 +1038,18 @@ across many requests):
 
 | | `churn-16` `mhd` | `churn-16` TCP | `rr-16` `mhd` | `rr-16` TCP |
 |---|---|---|---|---|
-| round trip, p50 | 6.45 ms | 6.01 ms | 0.60 ms | 0.52 ms |
-| round trip, p99 | **7.26 ms** | **6.66 ms** | **1.59 ms** | **1.34 ms** |
-| completed per second | 2 427 | 2 607 | 23 900 | 27 745 |
+| round trip, p50 | 6.32 ms | 5.99 ms | 0.60 ms | 0.52 ms |
+| round trip, p99 | **7.03 ms** | **6.64 ms** | **1.59 ms** | **1.33 ms** |
+| completed per second | 2 481 | 2 617 | 23 807 | 27 726 |
 
-So the carriers are **within nine percent** on the tail when every request needs a new
-connection, and **within twenty percent** on the cell that reuses one — at nine and
-thirteen percent of the rate. The arrival cell pays a stream open, and that open is a
+So the carriers are **within six percent** on the tail when every request needs a new
+connection, and **within twenty-one percent** on the cell that reuses one — at five and
+fourteen percent of the rate. The arrival cell pays a stream open, and that open is a
 key derivation rather than a handshake: a lane's first stream runs the Noise KK, and
 every later stream on it seals with a key derived from the lane root. Measured on the
 product's own open line, the handshake phase is **11 µs** and a channel open under a
-bulk transfer costs **211 µs at the median and 9 ms at the ninety-ninth percentile**.
+bulk transfer costs **37 µs at the median and 2.7 ms at the ninety-ninth percentile**
+(9 857 opens on the `cost` cell, clean, one lane under bulk).
 
 Those are cross-run readings, each with its own A/A pair inside it, so they are
 directional at the percent level the two files' floors resolve.
