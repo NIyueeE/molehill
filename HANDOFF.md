@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.309 The refused connects are not a dead listener either (2026-11-12)
+
+§4.308 left the listener as the suspect. The same run's logs say it stayed up:
+
+| reading | value |
+|---|---|
+| `Control channel established` | **6** — one per service, the initial set, no reconnect |
+| `Listening at 10.10.0.254:2401` | **2** — the registration and the pool, the pair every service prints once |
+| last log line of the whole run | the initial registration burst, nothing after |
+
+So the control channel never churned, no listener was re-created, and the tool was **listening on the address the
+probe dialed** throughout the stage in which the probe reported `ConnectionRefusedError` once every five seconds.
+That closes §4.307's second candidate as well: it is neither the pairing budget nor the accept backlog, and
+`tcp_abort_on_overflow` is 0 anyway (a full backlog would drop, not refuse).
+
+**What is left is the path itself** — the visitor leg, or the name resolution between the probe's namespace and
+the server's. A connect that is refused *instantly* reached something that answered with a reset, so the packet
+went somewhere; either the visitor namespace lost the route to `10.10.0.254` and something on the way answered, or
+the probe's own socket state is at fault. Neither is visible in either end's log, which is why every log-based
+hypothesis has failed on this.
+
+**The next instrument is outside the bench**: a dial loop in the visitor namespace, one `connect()` a second with
+its errno and destination recorded, run while the tunnel leg steps to `rate20` — a hundred lines of Python and no
+product change. It answers "did the packet go to the right place" directly, which is the one question the last
+three rounds have guessed at.
+
 ### 4.308 The step stall is not the pairing budget: pairing reads 288–313 µs (2026-11-12)
 
 §4.307 left two candidates. A stats-on run of the same cell kills the first one outright:
