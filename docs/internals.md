@@ -167,6 +167,21 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
 - `CreateDataChannelFor` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the lane, and the stream's prologue names the service it carries.
 - On an `mhd` lane the stream is the carrier's own: byte offsets, a connection-wide acknowledgement bitmap and credit live in `src/transport/mhd/`, with no yamux and no record layer between the visitor's bytes and the lane's packet scheduler. **A lane's first stream runs a Noise KK handshake; its secret becomes the lane root, and every later stream on that lane derives its own key from `(root, direction, stream id)`** — so one stream still cannot read another's bytes and a reordering still cannot desynchronise a counter, while a later stream starts without a handshake at all. What that moves is forward secrecy: per lane on this carrier, per connection on TCP. On a TCP lane the stream is a yamux stream over the Noise-wrapped connection, as before.
+  **A later stream on a registered lane also says so on the wire** (`DERIVED_REGISTERED_SELECTOR`, `0x04`):
+  sealing a stream means there is no handshake to carry the hello, so without that byte every open waited for an
+  acknowledgement the plain path had already stopped waiting for — one round trip per channel, measured at
+  200 213 µs against 24 µs once the claim is made. A claim the server cannot honour refuses that stream, not the
+  lane, which is the same trade the plain selector takes.
+- **A small stream has its own room and its own timer, and both are keyed on the flight rather than on the
+  lane.** The peer's credit is one number for the whole connection, so a bulk stream whose visitor stopped
+  reading freezes it and every other stream's room goes to zero; the lane keeps eight payloads of a bulk
+  writer's budget back for any stream whose *unacknowledged flight* is small, and the receiver accepts exactly
+  that much past its own frontier — inside the second window `MAX_BUFFERED` already holds. The same predicate
+  decides the retransmission timer: a packet with a small flight behind it is declared lost on the path's own
+  round trip, with none of the 9/8 reordering allowance and none of the backoff, because nothing can be
+  reordered behind it and one datagram costs one datagram to send again. What this fixed was measured: a
+  long-lived interactive stream stopped for **105 seconds** when one bulk reader stalled, and a 20 Mbit/s rate
+  step read p99 4 946 ms against the control arm's 502 until the timer was keyed the same way.
 - **A lane's window grows additively after its first loss.** Until the path drops something, every acknowledged
   byte buys a byte of window, so the flight doubles per round trip; the first loss latches slow start off **for
   good**, and from there the window grows by one packet per `cwnd` worth of acknowledged bytes. Nothing cuts it on
