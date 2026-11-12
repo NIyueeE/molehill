@@ -181,6 +181,15 @@ pub(crate) struct Sent {
     /// an acknowledgement of it arrives (see [`LOST_HOLD`]). It is not in
     /// flight: the byte total and the congestion window do not count it.
     pub(crate) lost_at: Option<Instant>,
+    /// Whether this packet belonged to a stream with a **small flight**.
+    ///
+    /// The lane's own flight is always wide when it carries bulk, so a predicate
+    /// on `live` cannot see the interactive packet inside it: measured on the
+    /// `step` cell, one dropped request waited two to three full timeout steps
+    /// (2.4–4.9 s) while the control arm paid the queue and nothing else
+    /// (`HANDOFF.md` §4.311). The flag is the packet's own nature, set at send time
+    /// from the same predicate the credit reserve uses (`Conn::small_flight`).
+    small: bool,
     /// Whether this packet is part of a stream's **opening flight**.
     ///
     /// A stream's packets before its first acknowledgement are the handshake,
@@ -280,6 +289,20 @@ impl Rtt {
     }
 
     /// The reordering window: nine eighths of the round trip.
+    /// The delay before a packet with a small flight behind it is declared lost.
+    ///
+    /// The path's own round trip, with none of the reordering allowance and none of
+    /// the 9/8 threshold: the allowance exists because a packet can be reordered
+    /// behind later ones, and a small flight has no later ones.
+    fn small_loss_delay(&self) -> Duration {
+        match (self.latest, self.smoothed) {
+            (Some(latest), Some(smoothed)) => latest.max(smoothed),
+            (Some(one), None) | (None, Some(one)) => one,
+            (None, None) => MIN_RTO_SMALL_FLIGHT,
+        }
+        .max(GRANULARITY)
+    }
+
     fn loss_delay(&self) -> Duration {
         // The *larger* of the latest and the smoothed estimate: a fast probe
         // can sample a millisecond while the bulk data in flight was queued for
@@ -647,12 +670,14 @@ impl Recovery {
         range: Option<SentRange>,
         opening: bool,
         repair: bool,
+        small: bool,
     ) {
         let sent = Sent {
             number,
             time: now,
             range,
             lost_at: None,
+            small,
             opening,
             repair,
         };
@@ -683,7 +708,21 @@ impl Recovery {
         // says a handshake datagram is among the losses, and that is small
         // whatever else this connection is carrying.
         let small = self.live <= SMALL_FLIGHT_PACKETS || opening_lost;
-        let rto = self.rtt.rto(small).saturating_mul(1u32 << backoff.min(10));
+        // **A small record does not climb the ladder.** The lane's flight is wide
+        // when it carries bulk, so `small` above cannot see the interactive packet
+        // inside it; when one is in flight the timer is the path's own round trip
+        // and nothing is multiplied onto it, because re-sending one datagram that
+        // nothing can be reordered behind costs a duplicate and no more
+        // (`HANDOFF.md` §4.311).
+        let small_record = self
+            .in_flight
+            .values()
+            .any(|sent| sent.small && sent.lost_at.is_none());
+        let rto = if small_record && !small {
+            self.rtt.rto(true)
+        } else {
+            self.rtt.rto(small).saturating_mul(1u32 << backoff.min(10))
+        };
         // A small flight's backoff stops at the wide timer. Without this a lane
         // waiting for its first sample climbs 20, 40, ... 2 560 ms, and the SUM
         // of those steps — 5.1 s — is what a stream open then waits, against the
@@ -869,11 +908,16 @@ impl Recovery {
             return (Expiry::Dead, all);
         }
         let delay = self.rtt.loss_delay();
+        // A packet with a small flight behind it is judged on the path's own round
+        // trip, not on the reordering allowance: nothing can be reordered *behind*
+        // it, because there is nothing behind it (`HANDOFF.md` §4.311).
+        let small_delay = self.rtt.small_loss_delay();
         let stale: Vec<u32> = self
             .in_flight
             .iter()
             .filter(|(_, sent)| {
-                sent.lost_at.is_none() && now.saturating_duration_since(sent.time) > delay
+                let bound = if sent.small { small_delay } else { delay };
+                sent.lost_at.is_none() && now.saturating_duration_since(sent.time) > bound
             })
             .map(|(number, _)| *number)
             .collect();
@@ -1022,7 +1066,7 @@ mod tests {
 
     fn send_one(recovery: &mut Recovery, now: Instant, offset: u64) -> u32 {
         let number = recovery.next_number();
-        recovery.on_sent(now, number, Some(range(offset)), false, false);
+        recovery.on_sent(now, number, Some(range(offset)), false, false, false);
         number
     }
 
@@ -1201,7 +1245,7 @@ mod tests {
 
         // The repair: the same byte range, a new number.
         let repair = recovery.next_number();
-        recovery.on_sent(start, repair, Some(range(0)), false, false);
+        recovery.on_sent(start, repair, Some(range(0)), false, false, false);
         assert_eq!(
             recovery.flight_bytes(),
             100,
@@ -1340,7 +1384,14 @@ mod tests {
         let mut recovery = Recovery::new();
         for i in 0..u32::try_from(MAX_LOST).unwrap() + 16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(u64::from(i) * 100)), false, false);
+            recovery.on_sent(
+                start,
+                number,
+                Some(range(u64::from(i) * 100)),
+                false,
+                false,
+                false,
+            );
             let _ = recovery.declare_lost(start, number);
         }
         assert!(
@@ -1525,12 +1576,12 @@ mod tests {
         let mut recovery = Recovery::new();
         for step in 1u64..=16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(step * 100)), false, false);
+            recovery.on_sent(start, number, Some(range(step * 100)), false, false, false);
         }
         assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
         let at = start + Duration::from_millis(10);
         let number = recovery.next_number();
-        recovery.on_sent(at, number, Some(range(0)), true, false);
+        recovery.on_sent(at, number, Some(range(0)), true, false, false);
         let waited = recovery
             .poll_timeout()
             .unwrap()
@@ -1627,7 +1678,7 @@ mod tests {
         let mut recovery = Recovery::new();
         for step in 1u64..=16 {
             let number = recovery.next_number();
-            recovery.on_sent(start, number, Some(range(step * 100)), false, false);
+            recovery.on_sent(start, number, Some(range(step * 100)), false, false, false);
         }
         assert!(recovery.in_flight() > SMALL_FLIGHT_PACKETS);
         let waited = recovery
@@ -1763,7 +1814,14 @@ mod tests {
             // is what the kill rule counts.
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range, sent.opening, sent.repair);
+                recovery.on_sent(
+                    now,
+                    number,
+                    sent.range,
+                    sent.opening,
+                    sent.repair,
+                    sent.small,
+                );
             }
         }
         assert_eq!(
@@ -1889,7 +1947,14 @@ mod tests {
             let (_, resent) = recovery.on_timeout(now);
             for sent in resent {
                 let number = recovery.next_number();
-                recovery.on_sent(now, number, sent.range, sent.opening, sent.repair);
+                recovery.on_sent(
+                    now,
+                    number,
+                    sent.range,
+                    sent.opening,
+                    sent.repair,
+                    sent.small,
+                );
             }
         }
         assert_eq!(waits[0], MIN_RTO_SMALL_FLIGHT, "the first step is cheap");
@@ -1939,7 +2004,7 @@ mod tests {
         };
         let total = u32::try_from(MAX_LOST).unwrap_or(u32::MAX) + 64;
         for number in 0..total {
-            recovery.on_sent(now, number, Some(range), false, false);
+            recovery.on_sent(now, number, Some(range), false, false, false);
             assert!(
                 recovery.declare_lost(now, number).is_some(),
                 "every loss asked about must be recorded, not refused: number {number}"

@@ -2401,6 +2401,10 @@ impl Conn {
             // A range already sent once is a repair, and repairs are not what the
             // window admits (`HANDOFF.md` §4.292).
             repair,
+            // Its stream's flight, not the lane's: the interactive packet inside a
+            // bulk lane is invisible to any predicate on the lane's own count
+            // (`HANDOFF.md` §4.311).
+            small_flight(state),
         );
         // What this packet cost the wire, and whether the range was new: the pair
         // is the whole of the "is the lane re-sending itself" question, and it is
@@ -2650,6 +2654,9 @@ impl Conn {
             false,
             // Nor is it a repair: it carries no payload to charge a window for.
             false,
+            // A finish is judged like the stream it ends, which for an interactive
+            // stream is the cheap rule (`HANDOFF.md` §4.311).
+            self.streams.get(&id).is_some_and(small_flight),
         );
         self.ack_pending = false;
         self.keepalive_at = now + KEEPALIVE;
