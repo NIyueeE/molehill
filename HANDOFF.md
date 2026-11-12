@@ -377,6 +377,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.326 The retirement machinery is sound, so the 56 are streams that are never closed at all (2026-11-12)
+
+§4.325's question, answered by reading the paths rather than guessing at them:
+
+| path | what it does |
+|---|---|
+| `close_stream` | marks `abandoned`, discards the receive half, sets `local_fin`, calls `settle` |
+| `settle` | queues a fin when nothing is unacknowledged, and **removes the stream** when `abandoned && fin_sent && unacked == 0` |
+| `settle_finished` | runs after every acknowledgement, so a stream whose last byte is acked is settled |
+| `reap_abandoned` | after `ABANDON_HOLD` (30 s), removes abandoned streams that still **hold** bytes |
+
+So a stream that is closed *is* retired, promptly and on the acknowledgement that empties it. The machinery has no
+hole a churn connection could fall through.
+
+**Which leaves one conclusion: the 56 streams are never closed.** Nothing on the server calls `close_stream` for
+them — the forwarding task for each channel is still parked, its visitor socket has seen EOF or been reset, and
+nothing has told the tunnel stream that its visitor is gone.
+
+**That is exactly the population §4.324 said had no counter**, and it is on the *forwarding* side, not in the
+carrier: the carrier's job is to retire what it is told to retire, and it does.
+
+**So the fix is a forwarding-loop rule, and it is small**: when a visitor socket reaches EOF or error, close the
+tunnel stream (which the carrier then retires in one round trip). The carrier's own retirement is already correct
+and needs no change.
+
+**And it explains every number in this investigation**: 686 of 700 seconds at exactly 56 (§4.325), the monotonic
+climb, the 10 s and 175 s wedges (the ceiling, reached at different times), the pool's static size, and the fact
+that a fresh dial — which needs a new channel — is refused while every established stream keeps working.
+
 ### 4.325 The ceiling is not a policy question: the lane never releases a stream at all (2026-11-12)
 
 The failing arm's stream count over the whole soak, one sample a second:
