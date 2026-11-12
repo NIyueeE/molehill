@@ -377,6 +377,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.322 The pool was healthy the whole time: size 4, no placement wait, no churn (2026-11-12)
+
+The pool's own instruments, from the same arm and run that refused 35 fresh connects:
+
+| reading | value |
+|---|---|
+| `mhd pool placement` lines (`place_us` ≥ 1 ms) | **0** |
+| `pool-stats` lines | 1 089 |
+| pool `size=` | **4 in all 946 reported seconds** |
+| size-change events (`+repair`, `-dead`) | **none** |
+
+So the pool never grew, never shrank, never repaired, and never made a placement wait. Yet the visitor's dial was
+refused 35 times across three minutes, and the established streams answered throughout (§4.321).
+
+**That leaves one resource the visitor's channel needs and none of these instruments watch: the lanes' stream
+ceiling.** A pool of four tunnels may carry `4 × 56` concurrent streams; a soak runs a churn series opening
+sixteen connections a second for twenty minutes alongside the interactive stream, and a stream that outlives its
+visitor — or a channel that is never retired because its pairing was abandoned (§4.306's 48-byte holders) — counts
+against that ceiling. When it is reached, an open is refused **without a placement wait**, which is exactly what
+these numbers show: `OpenError::Refused`, not `AtCapacity` after a wait, and not a pool that tried to grow.
+
+**The 175-second recovery fits the same resource**: a ceiling frees when enough streams retire, and the TTL that
+retires them is minutes, not seconds.
+
+**What would settle it** is one number the window line already has — `backlog_streams`/`streams` per lane — read
+at the seconds of the refusal against the lane's ceiling. That is the next round's single query, and if it shows
+the ceiling reached, the fix is a pool that counts a channel's own lifetime rather than its visitor's (the
+abandoned-pairing holders of §4.306 are exactly such channels).
+
 ### 4.321 The 175-second wedge is a fresh connection refused, not a stalled stream (2026-11-12)
 
 The failing arm's series split in two when read carefully, and the split is the answer:
