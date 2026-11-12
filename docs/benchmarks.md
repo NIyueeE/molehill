@@ -1101,6 +1101,15 @@ molehill carriers' 2.63–2.82 (§"The carrier axis is a path condition now" abo
 pays that). And it is loopback in a container: the loss and jitter cells are shaped, the clean one is
 not, so `clean` is a lower bound on what a real path does to both carriers.
 
+**The rows measured on a shaped path predate two fixes that only move them in the product's favour**, so
+they are a lower bound for the `mhd` carrier and cannot be used to claim a regression. A sealed channel on
+an established lane no longer waits for an opening acknowledgement, which removed one round trip from every
+channel setup (a visitor's setup fell from 400 ms to 200 ms on a 100 ms path, and a channel open from
+p50 200 213 µs to 24 µs); and a stream with a small flight now keeps credit back from bulk writers and is
+judged on the path's own round trip rather than on the lane's timeout ladder. Re-deriving this table on a
+current build is a sweep of its own, and the numbers for the two changes are in `HANDOFF.md` §4.303 and
+§4.310 until it is run.
+
 ### Warm and cold
 
 The staged schedule's first stage and its last carry the **same condition**, and they
