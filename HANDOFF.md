@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.308 The step stall is not the pairing budget: pairing reads 288–313 µs (2026-11-12)
+
+§4.307 left two candidates. A stats-on run of the same cell kills the first one outright:
+
+| reading | value |
+|---|---|
+| `paired_p50_us` | **288 / 292 / 303 / 313** |
+| `paired_p99_us` | 30 344 / 39 050 / 52 720 / 57 260 |
+| pairings that gave up (`unfed`, `budget expired`) | **0** |
+
+Pairing is **microseconds**, a thousandfold below the 5 s budget, and nothing was shed. The constant budget is
+not what stalls the interactive stream, so P4.1's first candidate consumer (a budget that follows the path)
+has no defect to fix and is dropped rather than built.
+
+**And the stall reproduced, intermittently, in the same cell**: one round measured `rate20` at p50 **513 ms** /
+p99 564 ms — the control arm's shape (§4.307: 390 / 505) plus the tool's own share — while the other round
+produced **no sample at all**, exactly as the first run did. The clean stage before it read p50 1.20–2.21 ms in
+both rounds, and the recovery stage came back in **46 / 49 ms**.
+
+**So the failure is at the visitor's edge, not in the pool**: connects are refused while pairing is fast and
+nothing is shed. That leaves the listener's accept path — its backlog behaviour under a saturated shaper, or the
+service's accept loop being stopped while a visitor waits. `tcp_abort_on_overflow` is what turns a full backlog
+into the `ConnectionRefusedError` the probe logged, and it is one `sysctl` read away from being answered.
+
+**Not attributed in this round.** The instrument that decides it is the server's own accepted-connection count
+during the stage beside the probe's attempts per second; both are already in the logs, and the next run reads
+them together.
+
 ### 4.307 The new step cell's first run: the interactive stream stops dead at `rate20` (2026-11-12)
 
 The step cell exists to ask a question the sweep cannot (§4.306's neighbour): what happens when the path changes
