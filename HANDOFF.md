@@ -377,6 +377,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.306 A fifth of the channel opens leave the server waiting ten seconds for a selector (2026-11-12)
+
+The post-fix soak is clean — **`wedge_count` 0 on both arms, `wedge_max_s` 0.0** — so §4.294's wedge mystery
+was the pairing block, and the open fix closed it. Drift reads 16.6 / 8.7 MiB per minute on the two arms.
+
+The reader-wait item from §4.305 has a second, larger population behind it, found while looking for its cause.
+One `rtt100` round, same binary:
+
+| event | count |
+|---|---|
+| `mhd pairing request` (server) | 658 |
+| `channel open finished` (client, the prologue was written) | **658** |
+| `mhd stream ended: mhd transport selector timed out` | **145 (22 %)** |
+| pairings that gave up (`unfed`) | 16 |
+
+So one channel in five is **opened by the client, acknowledged as finished, and never delivers a byte to the
+server**, which then holds that stream's accept task for the full `HANDSHAKE_TIMEOUT * 2` = **10 seconds**
+before logging the timeout. Each of those holds a stream slot for ten seconds — and `PAIR_WAIT_BUDGET` is 5 s
+with `PAIR_ATTEMPTS` 2, so a visitor that meets several of them pays them in series.
+
+**Two shapes, not one.** §4.305's 48-byte holders have their selector consumed and their hello unread; this
+population has no selector at all. A stream the server knows about but whose first byte never arrives means the
+server created it on a packet that carried no payload — the plausible source is the client dropping a channel it
+just opened (a `ReleaseGroup` or a gather that already had enough), whose first packet is then a reset carrying
+nothing. The carrier turns that into a live stream with an accept task, and the task waits ten seconds for a
+byte that cannot come.
+
+**Candidate fixes, both needing a decision because they move stream lifetime ownership:**
+
+1. **Do not create a stream for a first packet with no payload and a reset/fin flag** — the peer is saying it
+   never existed, so nothing has to accept it. Smallest change, in the mhd receive path.
+2. **Do not drop a channel that has been opened and prologued** — the client's gather would hand it to the next
+   pairing instead of releasing it. Larger change, in the pool protocol.
+
+**Not attempted here.** The record's own rule (AGENTS §9, timebox) applies: this is the third time this session
+has followed a symptom into the pool's lifetime rules, and both fixes move a boundary rather than a number.
+
 ### 4.305 The 39 s reader wait is a channel holding 48 unread bytes, not visitor backpressure (2026-11-12)
 
 §4.300 left one question open: the small-stream reader wait reached 39 225 ms, and "holds eight payloads or
