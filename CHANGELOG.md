@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A sealed `mhd` channel on an established lane no longer waits for an opening
+  acknowledgement.** The plain path dropped that wait when stream registration was
+  introduced; the sealed path kept it, so every new channel paid one round trip
+  before it could carry a byte, and every visitor's channel setup paid it on a
+  high-latency path. `DERIVED_REGISTERED_SELECTOR` (`0x04`) carries the same claim
+  the plain selector makes — sealed, and the lane is already registered, so no
+  answer is owed. Measured with 100 ms each way: a visitor's channel setup falls
+  from 400 ms to **200 ms** (the rest is the channel's own arrival), a channel open
+  from p50 200 213 µs to **24 µs**, and the mixed cell's interactive latency from
+  p50 601 ms / p99 up to 4 179 ms to **p50 401 ms / p99 401 ms** — the same number
+  the control arm with no tool in the path reports. A claim the server cannot honour
+  refuses that one stream, as the plain selector's already does.
 - **An `mhd` stream no longer pays a Noise handshake of its own.** A lane's first
   stream runs the KK handshake and its secret becomes the lane root; every later
   stream on that lane seals with a key derived from `(root, direction, stream id)`.

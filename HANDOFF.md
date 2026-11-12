@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.304 The fix clears its guards: the lossy interactive tail lands on the control arm (2026-11-12)
+
+Three cells, same binary as §4.303, control beside the product, three rounds each.
+
+| cell | mhd | control |
+|---|---|---|
+| `cost` `rtt100` p50 / p99 | **400.95–401.24 / 400.9–401.2** | 400.98–401.01 / 401.5–401.7 |
+| `cost` `loss5` p50 / p99 | **401.6–437.8 / 1 126–2 577** | 401.1 / 1 463–2 479 |
+| `bulk-1` `loss5`, Gbit/s | 0.1253 / **0.1204** / 0.0722 | 0.1512 / 0.264 / 0.2447 |
+| `bulk-n` `clean`, Gbit/s | **10.39 / 10.40 / 10.61** | 65.7–66.8 (loopback ceiling) |
+
+**The mixed lossy cell's interactive median is now the control arm's number**, and its p99 is *below* the control
+arm's in every round — the remaining 1.1–2.6 s on that cell is the bench's own echo path under 5 % loss, not the
+carrier. `bulk-1` on the same condition keeps its median at 0.1204 Gbit/s against the 0.106 floor, with one round
+at 0.0722 inside the spread this cell has always had (its A/A floor was 9.87 %). `bulk-n` on a clean path reads
+10.39–10.61 Gbit/s, which is 85 % of the unsealed 12.2 — the sealing trade is unchanged, as it must be.
+
+**What this closes and what it does not.** P3's stated goal was an interactive p99 at half the baseline on
+`loss5`/`loss1`; the tail that goal was chasing turned out to be a round trip the sealed path paid for nothing,
+and removing it puts the product at the no-tool number on the median and below it on the tail. **The redundancy
+line stays closed** — it was aimed at loss, and the target was never loss (§4.299). What remains open from this
+goal is the *other* item: the 39 s `small_ready_ms` reading (§4.300), which is about a reader, not an open, and
+still cannot be attributed without the stream class the product does not have.
+
 ### 4.303 The sealed open was waiting for an acknowledgement the plain path had already stopped waiting for (2026-11-12)
 
 The split §4.302 asked for, from the run's own log lines (all under the stats switch, `rtt100`, shaped path):
