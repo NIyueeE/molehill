@@ -377,6 +377,43 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.307 The new step cell's first run: the interactive stream stops dead at `rate20` (2026-11-12)
+
+The step cell exists to ask a question the sweep cannot (§4.306's neighbour): what happens when the path changes
+*inside* one transfer. Its first run answers with a failure, which is what such a cell is for.
+
+`clean` → `rate20` (fivefold cut) → `clean`, one interactive stream running across both boundaries, control arm
+beside the product:
+
+| arm | `clean` p50 / p99 | `rate20` p50 / p99 | `clean#2` p50 / p99 | `step_recovery_ms` |
+|---|---|---|---|---|
+| **control** | 0.98 / 2.1 ms | **390 / 505 ms** | 1.0 / 2.1 ms | 22 |
+| molehill | 1.15 / 5.6 ms | **no sample** | 1.23 / **17.0** ms | **19** |
+| molehill twin | 1.23 / 20.2 ms | **no sample** | 0.94 / 16.3 ms | **11 592** |
+
+The control arm does what a 20 Mbit/s shaper should do — the interactive round trip sits at 390 ms because bulk
+has filled the queue — and recovers instantly. The product's arm **produces no interactive sample at all for the
+whole 30-second stage**, and the reason the report gives is *"all 2 interactive attempts failed in this stage"*:
+two attempts, not six hundred.
+
+**The probe's own log says how.** Its attempts per ten seconds run 200, 200, 200 while the path is clean, then
+**57, then 2, 2, 2 …** from the moment the rate steps down — one request every five seconds, and the failures
+are `ConnectionRefusedError` against the tool's exposed port. A sequential probe that waits five seconds per
+request is a probe whose request never came back; a refused connect means the tool's listener was not accepting.
+
+**Two candidate causes, both testable and neither assumed:**
+
+1. **The pairing budget does not scale with the path.** `PAIR_WAIT_BUDGET` is a fixed 5 s and `PAIR_ATTEMPTS`
+   is 2; on a 20 Mbit/s queue a control round trip can exceed 5 s, so every visitor could be shed exactly when
+   the path is slow — which is the one time it must not be.
+2. **The accept backlog.** If visitors are shed while the probe keeps dialing, the listener's queue fills and
+   further connects are refused, which is the error the log shows rather than a timeout.
+
+**The run carried stats off**, so the pairing line and its own counters are absent from it — the same provenance
+rule as §4.295, one layer down: this cell's baseline run cannot say which of the two it is. A stats-on run of
+the same cell is the next step, and the fix (a budget that follows the measured path, not a constant) is
+P4.1's first legitimate consumer — a coarse decision outside the send-rate loop.
+
 ### 4.306 A fifth of the channel opens leave the server waiting ten seconds for a selector (2026-11-12)
 
 The post-fix soak is clean — **`wedge_count` 0 on both arms, `wedge_max_s` 0.0** — so §4.294's wedge mystery
