@@ -377,6 +377,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.325 The ceiling is not a policy question: the lane never releases a stream at all (2026-11-12)
+
+The failing arm's stream count over the whole soak, one sample a second:
+
+| `streams=` | 44 | 46 | 47 | 49 | 53 | 54 | 55 | **56** |
+|---|---|---|---|---|---|---|---|---|
+| window lines | 1 | 1 | 1 | 2 | 1 | 1 | 3 | **686** |
+
+**It climbs once and never comes down.** Six hundred and eighty-six of about seven hundred seconds read exactly 56,
+so this is not a lane that fills and drains under churn — it is a lane that fills and stops releasing anything for
+the rest of the run.
+
+**That changes what the fix is.** §4.324 argued the reclamation rule needs a policy (which streams are safe to
+reclaim), and that a silence-based rule would break idle connections. If streams were retiring at all under churn
+— sixteen connections a second for twenty minutes — the count would oscillate; it does not, so the question is not
+"which stream may we reclaim" but **"why is a stream whose visitor closed never retired"**.
+
+**The retirement paths this file has, and why each misses a churn connection:**
+
+1. `Drop for StreamIo` → `close_stream`, which sends a reset and retires locally. This is the path a churn
+   connection's channel should take, and the count says it does not fire — or fires without the entry leaving the
+   table;
+2. the peer's acknowledgement of the last byte, which a reset does not produce;
+3. `LOST_HOLD`'s reap, which forgets a *lost packet's record*, not a stream.
+
+**So the next check is one query in the code**: whether a stream closed by `close_stream` is removed from
+`self.streams` when there is nothing unacknowledged, or only marked and left for a later pass that never comes.
+That is a `streams` table with an entry that outlives its handle, which would also explain §4.306's 48-byte
+holders — the same entry shape, seen from the other end.
+
 ### 4.324 Why the reclamation fix is not landed yet: the local rule cannot tell an idle visitor from a dead one (2026-11-12)
 
 §4.323 names two candidate fixes. The safer general one — *reclaim a stream whose peer has gone silent for its own
