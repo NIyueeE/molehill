@@ -377,6 +377,39 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.314 The surviving wedge is receiver-side: a frozen credit leaves the sender's reserve nothing to spend (2026-11-12)
+
+Reading the pump for the third path turns up the chain in its own comment, written when the wake was fixed: *"a
+client reader holding a megabyte unread, its advertised credit therefore frozen, the server blocked on
+`credit_blocked` with sixteen megabytes queued, the forwarding connections never finishing, and the pool filling
+to its ceiling until it refuses a visitor."* That is the wedge's exact shape, and the wake fix did not remove
+its cause.
+
+**Why the credit reserve cannot help there.** `SMALL_STREAM_RESERVE` gives a small stream priority *inside the
+sender's room*: bulk stops short, so `room` for a small stream is larger. But `room = credit.min(window)…`, and
+when the peer's advertised **credit is zero** every stream's room is zero, small or not. The reserve is taken
+from the writers' share of a budget the receiver has already withdrawn.
+
+**And the receiver has the headroom for it.** `MAX_BUFFERED` is `2 × WINDOW`: a receiver whose credit is
+exhausted still has a window's worth of buffer it is not advertising. The frames it would have to accept to use
+it are refused today at one line — `offset + len > self.recv_credit` → `Rejected::OverWindow` — and an overrun
+that is refused is worse than one that is not: it is never acknowledged, so the sender re-sends it and counts
+ten unanswered retransmissions, which declares the **lane** dead (`HANDOFF.md` §4.183's neighbour).
+
+**The fix, pre-registered and not landed:**
+
+1. the receiver accepts up to `recv_credit + SMALL_STREAM_RESERVE` **for a stream whose flight is small**, which
+   its own `MAX_BUFFERED` headroom already covers, and counts those bytes so the acknowledgement's credit stays
+   honest;
+2. the sender spends that headroom only for the same predicate it already uses (`small_flight`), so bulk cannot
+   reach it;
+3. a wire-level test pins both halves: a full credit still refuses bulk's next packet and still accepts one
+   small request, and the lane survives when the small request is answered.
+
+**Why it is not in this round**: it changes the window contract on both ends at once — the one place where a
+mismatched pair turns "no room" into "lane dead" — and this session is already carrying three landed changes to
+that contract's neighbourhood.
+
 ### 4.313 P5's battery: every gate green except the one that matters (2026-11-12)
 
 The finalisation gates the plan asks for, run on this tree (`8888b27` plus the soak's own binary
