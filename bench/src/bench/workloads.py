@@ -1764,6 +1764,10 @@ def _run_cell(drift_points: list, logs: dict, series: tuple) -> Cell:
         "drift_threads_per_min": inst.slope_per_min(drift_points, "threads"),
         "wedge_count": wedged["count"],
         "wedge_max_s": wedged["max_s"],
+        # The failures a wedge no longer counts: one timed-out request is a slow
+        # answer and belongs beside the silence rather than inside it
+        # (`HANDOFF.md` §4.316).
+        "rtt_timeout_count": wedged["timeouts"],
         "rtt_samples": len([p for p in interaction if p["metric"] == "rtt_ms"]) or None,
     }
     return Cell(

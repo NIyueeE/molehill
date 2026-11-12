@@ -168,6 +168,19 @@ METRIC_SPECS: tuple[dict, ...] = (
         "precision": 0,
     },
     {
+        "id": "rtt_timeout_count",
+        "unit": "count",
+        "direction": "lower",
+        "definition": (
+            "interactive requests the probe gave up on: each one spans its own "
+            "timeout, so it is reported here rather than as a silence"
+        ),
+        "denominator": "one interactive request",
+        "needs": ("staged",),
+        "materiality": ("abs", 1.0),
+        "precision": 0,
+    },
+    {
         "id": "wedge_max_s",
         "unit": "s",
         "direction": "lower",

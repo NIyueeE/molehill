@@ -460,19 +460,31 @@ def wedges(points: list, silence_s: float = WEDGE_SILENCE_S) -> dict:
     spans: list = []
     run_start = None
     last_end = 0.0
+    failures = 0
+    run_failures = 0
     for point in attempts:
         if point.get("metric") == "error":
+            failures += 1
+            run_failures += 1
             run_start = point["started_at"] if run_start is None else run_start
             last_end = point["t"]
         elif run_start is not None:
-            spans.append(last_end - run_start)
+            spans.append((last_end - run_start, run_failures))
             run_start = None
+            run_failures = 0
     if run_start is not None:
-        spans.append(last_end - run_start)
-    silent = [span for span in spans if span > silence_s]
+        spans.append((last_end - run_start, run_failures))
+    # **A single failed attempt is a slow request, not a silence.** The probe is
+    # serial and gives up after its own timeout, so one timed-out request spans
+    # exactly that timeout — measured at 10.01 s in three separate soaks, a length
+    # that cannot vary with the path (`HANDOFF.md` §4.316). A wedge is a stretch in
+    # which the tool answered *nothing*, which takes at least two consecutive
+    # failures; `rtt_timeout_count` carries the ones this no longer calls wedges.
+    silent = [(span, tries) for span, tries in spans if tries > 1 and span > silence_s]
     return {
         "count": len(silent),
-        "max_s": round(max(spans), 3) if spans else 0.0,
+        "max_s": round(max((span for span, _ in silent), default=0.0), 3),
+        "timeouts": failures,
     }
 
 

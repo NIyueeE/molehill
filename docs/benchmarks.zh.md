@@ -183,6 +183,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `drift_fds_per_min` | count/min | 越低越好 | 该臂打开的 fd 数的最小二乘斜率 | 一分钟运行时间 |
 | `drift_threads_per_min` | count/min | 越低越好 | 该臂线程数的最小二乘斜率 | 一分钟运行时间 |
 | `wedge_count` | count | 越低越好 | 探针发问却什么都没听到、持续超过 10 s 的区间数:一个在劣化下停止应答的工具,平均值是看不出来的 | 一次静默 |
+| `rtt_timeout_count` | 次 | 越低越好 | 探针放弃的交互请求:每一条都跨满自己的超时,所以记在这里而不是记成静默 | 一条交互请求 |
 | `wedge_max_s` | s | 越低越好 | 整轮运行中最长的一次这样的区间 | 一次静默 |
 | `capacity_streams` | count | 越高越好 | 容量斜坡上,交互流仍满足 SLO 的最高 bulk 流档位 | 一条 bulk 流 |
 | `capacity_headroom_pct` | % | 越高越好 | 1 - 可持续的最大流数 / 斜坡的上限 | 斜坡的上限 |

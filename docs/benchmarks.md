@@ -228,6 +228,7 @@ the definitions are what the report and the verdict render.
 | `drift_fds_per_min` | count/min | lower is better | least-squares slope of the arm's open descriptors | one minute of run time |
 | `drift_threads_per_min` | count/min | lower is better | least-squares slope of the arm's thread count | one minute of run time |
 | `wedge_count` | count | lower is better | stretches longer than 10 s in which the interactive probe asked and heard nothing: a tool that stops answering under degradation, which an average cannot show | one silent stretch |
+| `rtt_timeout_count` | count | lower is better | interactive requests the probe gave up on: each one spans its own timeout, so it is reported here rather than as a silence | one interactive request |
 | `wedge_max_s` | s | lower is better | the longest such stretch in the run | one silent stretch |
 | `capacity_streams` | count | higher is better | the highest bulk-stream level whose interactive stream still met the SLO, from the capacity ramp | one bulk stream |
 | `capacity_headroom_pct` | % | higher is better | 1 - max sustainable streams / the ramp's ceiling | the ramp's ceiling |
