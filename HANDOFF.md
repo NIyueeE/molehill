@@ -377,6 +377,34 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.320 Four soaks, both arms, silences up to 175 seconds, and no lane ever closed (2026-11-12)
+
+The stats-on run of the same two-product-arm shape adds the fourth observation and the pattern is now unambiguous:
+
+| run | arms | `wedge_count` | `wedge_max_s` | timeouts |
+|---|---|---|---|---|
+| §4.317 | product, twin | 3 / 0 | 10.01 | 16 / 12 |
+| §4.318 | product, twin | 0 / 4 | 10.01 | 0 / 16 |
+| §4.319 | **two product arms** | 0 / 8 | 25.02 | 1 / 31 |
+| §4.320 | **two product arms** | **9 / 1** | **25.02 / 175.175** | 24 / 35 |
+
+**Every run has at least one arm in trouble, and the arm alternates.** Across four runs the silences hit the
+product arm twice, the twin twice, and in the two-arm runs both arms once each. **175 seconds** is the longest
+recorded, and it is not an outlier of the metric: the same run's other arm had nine silences of its own.
+
+**And no lane closed in either arm** — `Expiry::Dead`, `mhd lane closed` and `closed the lane` all read zero in
+both client logs. So the lane stays up, the session stays up, and the *stream* stops delivering for tens of
+seconds. That rules out every lane-death path this record has: the dead-link timer, the pool rebuilding a lane,
+the handshake, the carrier handover.
+
+**What is left is the forwarding path between a live lane and a live visitor**: a stream whose bytes are in the
+lane's buffer and not reaching the reader, or a reader that is not being woken. The pump wakes readers on every
+pass (§4.306's neighbour), so a *missed wake* is the first candidate; the second is the terminal `ready_ms`
+chain — a stream whose frontier is stuck behind a hole nothing repairs.
+
+**This is now the single defect that stands between this carrier and its plan's acceptance**, and it is measured
+four times with the same instrument: one arm in two, silences of 10–175 s, no lane death, no loss required.
+
 ### 4.319 Two product arms, one binary: one clean, one collapsed for 25 seconds (2026-11-12)
 
 The experiment §4.318 asked for — two arms of the **same** build and no twin, so the per-arm rate is measured
