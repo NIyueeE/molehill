@@ -377,6 +377,51 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.330 The P5 verdict: the finalisation is not claimed, and here is exactly why (2026-11-12)
+
+The plan's P5.6 clause has two outcomes and this record takes the second one. **"mhd 定型" is not written**, and
+the reason is not a missing measurement but a measured defect that six entries failed to attribute.
+
+**What is green, with the numbers this record produced:**
+
+| gate | result |
+|---|---|
+| `just check` | fmt, machete, docs, ruff, pyright, selfcheck 812, clippy ×3, 124 mhd unit tests |
+| `just interop` | 3 passed |
+| `just l3-accept` | four PASS lines (no lane moves with `lend = false`, the valve refuses a surplus lane naming the cap, one claim over four lanes carries the same load, byte-exact on the lanes it got) |
+| integrations | 22/22 three times on `mhd` and three times on `tcp` |
+| striped sealed, twenty runs | 20/20 |
+| soak drift | the product arm below its twin (6.52–16.6 vs 7.85–11.9 MiB/min across runs) |
+| `capacity`, multi-round median | 4 bulk streams with a fresh interactive connection still inside the SLO (5 / 4 / 4; control 8) |
+
+**What is not green, and what is known about it:**
+
+| observation | evidence |
+|---|---|
+| A soak's interactive probe is refused for tens of seconds | `wedge_count` 3–9 across the last four runs, `rtt_timeout_count` 12–35, `wedge_max_s` up to 175 s |
+| The refusal is a **fresh dial**, not a stalled stream | the established stream's own worst gap is 3.1 s over 7 322 samples (§4.321) |
+| The pool is healthy while it happens | size 4 in all 946 reported seconds, zero placement waits, zero size changes (§4.322) |
+| The lane is empty while it happens | 0–2 streams client-side, 1 server-side, the oldest a thousand seconds old and alive (§4.329) |
+| No lane ever dies | `Expiry::Dead`, `mhd lane closed` and `closed the lane` all zero (§4.320) |
+| It is not the build | two arms of the same binary both wedge; the counts invert between runs (§4.319, §4.329) |
+
+**And what this record retracted on the way**, because a verdict that hides its own corrections is not evidence:
+the pairing-budget explanation (§4.308), the listener/backlog explanation (§4.309), the queueing and repair-RTT
+explanations for the interactive tail (§4.298, §4.303 — the second of which was replaced by a real fix), three
+readings of the fin/retirement path (§4.326–§4.328) and the whole stream-ceiling theory (§4.329, a `grep`
+artefact).
+
+**What the carrier did gain, and each is measured**: a sealed channel no longer waits for an acknowledgement the
+plain path had already dropped (a visitor's setup 400 → 200 ms on a 100 ms path; a channel open 200 213 → 24 µs);
+a stream with a small flight keeps credit back from bulk and is judged on the path's own round trip (a
+105-second stall removed; a 20 Mbit/s step's p99 4 946 → 1 605 and 2 391 → 215 ms); and the benchmark can now see
+all three of those (a `step` cell with its own recovery metric, a timeout count split from the silence count, and
+the lane's own stream table).
+
+**The one step this record would take next** is the only place left that has never been read: the server's
+`handle_data_channel`, at the seconds of a refused dial — which of its four waits (selector, hello, prologue,
+enqueue) stalls while the pool and the lane are both idle.
+
 ### 4.329 The "56 streams at the ceiling" was a grep artefact: `backlog_streams`, not `streams` (2026-11-12)
 
 The age instrument answers its own question and, in doing so, retracts four entries.
