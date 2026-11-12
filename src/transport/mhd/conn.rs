@@ -149,6 +149,38 @@ fn opening(state: &StreamState) -> bool {
     state.send.written() < OPEN_RESERVE
 }
 
+/// The credit a lane keeps back from its bulk writers for streams with small flights.
+///
+/// [`OPEN_RESERVE`] protects a stream that is *starting* — it is keyed on the bytes
+/// a stream has ever written. That leaves the long-lived interactive stream out: it
+/// has written megabytes over its life, so it never looks like an opening, and when
+/// one bulk stream with a blocked reader holds the connection's whole credit the
+/// interactive stream's next request has nowhere to go.
+///
+/// Measured on the new `step` cell (`HANDOFF.md` §4.307, §4.310): a long-lived
+/// interactive stream whose request/response had run at 20 a second **stopped for
+/// 105 seconds** the moment the tunnel leg was shaped to 20 Mbit/s under four bulk
+/// streams, while the same cell's control arm kept answering in 390 ms.
+///
+/// So the last `SMALL_STREAM_RESERVE` bytes of a bulk writer's budget are kept back
+/// for any stream whose *flight* — not lifetime — is small: an interactive request
+/// is a couple of kilobytes, and eight payloads is enough for it several times over.
+/// The reserve is taken inside the peer's credit, exactly like [`OPEN_RESERVE`], so
+/// a stream that spends it never overruns the advertised window.
+pub(crate) const SMALL_STREAM_RESERVE: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
+
+/// Whether a stream may spend the lane's small-flight reserve.
+///
+/// Two shapes: a stream that is opening (the original rule), and a stream whose
+/// unacknowledged flight is small, which is what a long-lived interactive stream
+/// looks like between requests.
+fn small_flight(state: &StreamState) -> bool {
+    // Unacknowledged, not unsent: a stream that has written megabytes and had them
+    // acknowledged is a bulk stream, while the same stream between two small writes
+    // is exactly the interactive flow this reserve exists for.
+    state.send.unacked() <= SMALL_STREAM_RESERVE
+}
+
 /// The congestion window a connection starts with: ten full packets.
 ///
 /// The peer's credit bounds what it can *hold*; this bounds what the path has in
@@ -1421,10 +1453,10 @@ impl Conn {
         // see — credit 11.7 MB, buffer 28 MB. The reserve has to be a *lane*
         // budget an opening can spend, not a share of whatever is left, or it
         // reserves nothing exactly when it is needed.
-        let room = if opening(state) {
+        let room = if opening(state) || small_flight(state) {
             credit.min(window.saturating_add(OPEN_RESERVE)).min(held)
         } else {
-            room.saturating_sub(OPEN_RESERVE)
+            room.saturating_sub(OPEN_RESERVE + SMALL_STREAM_RESERVE)
         };
         // Was this connection idle before this call? A write that queues bytes on
         // an idle connection is the moment an opening can begin waiting for the
@@ -6570,7 +6602,7 @@ mod tests {
         }
         let reserved = conn.send_credit.saturating_sub(conn.written);
         assert!(
-            reserved > 0 && reserved <= OPEN_RESERVE,
+            reserved > 0 && reserved <= OPEN_RESERVE + SMALL_STREAM_RESERVE,
             "the bulk stream stops a reserve short of the credit, left {reserved}"
         );
 
@@ -6582,6 +6614,37 @@ mod tests {
             "the reserve belongs to the stream that is opening"
         );
         assert!(written > chunk.len(), "the bulk stream really did fill it");
+    }
+
+    /// A long-lived interactive stream keeps its own room while bulk holds the credit.
+    ///
+    /// The opening reserve is keyed on the bytes a stream has ever written, so it
+    /// says nothing about the stream that has been small all along: a chat stream
+    /// that has carried megabytes over its life looks like bulk to that rule, and
+    /// when one bulk stream with a blocked reader holds the connection's credit its
+    /// next request waits for the peer to drain — measured as a **105-second**
+    /// silence on the step cell (`HANDOFF.md` §4.310).
+    ///
+    /// What makes it interactive is its *flight*, not its history: between two
+    /// requests it has nothing unacknowledged, and that is what the reserve is for.
+    #[test]
+    fn a_small_stream_writes_while_bulk_holds_the_credit() {
+        let mut conn = Conn::new(13, true);
+        conn.cwnd = WINDOW;
+        let bulk = conn.open();
+        // Spend the lifetime budget first: this stream is no longer "opening" by
+        // the other rule, which is the whole point of the case.
+        let mut filler = payload(4096);
+        while conn.write(bulk.id, &filler) > 0 {}
+        filler.clear();
+
+        let chatty = conn.open();
+        let request = payload(1_400);
+        assert_eq!(
+            conn.write(chatty.id, &request),
+            request.len(),
+            "an interactive request is admitted while bulk holds the credit"
+        );
     }
 
     /// A loss is re-sent as **the hole**, not as everything after it.
