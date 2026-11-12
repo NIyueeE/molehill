@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.328 `settle_finished` does run on every acknowledgement, so reading is exhausted and the streams need an age (2026-11-12)
+
+§4.327's hypothesis is refuted by one line: `settle_finished()` sits at the end of the acknowledgement handler, not
+in a byte-specific branch, so the acknowledgement of a fin-only packet does reach it. `settle` therefore runs after
+the fin is queued **and** after the handle's drop set `abandoned`, and `done` removes the stream.
+
+**So every path this record can read says the stream is removed, and the measurement says it is not.** Three
+readings have now been withdrawn in this thread (§4.326 closed, §4.327 refuted), which is the signal to stop
+reading and start measuring the thing itself:
+
+**the ages of the streams resident when a lane sits at 56.** Not their count — `streams=` already gives that — but
+how long each has been in the table, which separates the three populations that all look identical from the
+window line:
+
+1. **young** (seconds): the churn wave, which is normal and self-limiting;
+2. **old and abandoned** (minutes): the ones a retirement path should have taken — and their age says which path
+   last touched them;
+3. **old and alive**: sessions the bench never closed, which are not a defect at all.
+
+**That is a small instrument and it is the next round's work**: on the window line, the age of the oldest stream
+in the table (and its `abandoned`/`fin_sent` flags), printed beside `streams=`. With one soak's output the three
+populations separate by inspection, and the fix is whichever one dominates.
+
+**No code change this round, deliberately.** A fourth guessed patch to the retirement path, written against a
+measurement that has refused three readings, is how a working close path gets broken.
+
 ### 4.327 The forwarding side does close its streams, so the question is whether a fin's acknowledgement ever settles one (2026-11-12)
 
 §4.326 said the 56 were never closed. Reading the forwarding side says otherwise: the send direction ends with
