@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.327 The forwarding side does close its streams, so the question is whether a fin's acknowledgement ever settles one (2026-11-12)
+
+§4.326 said the 56 were never closed. Reading the forwarding side says otherwise: the send direction ends with
+`sender.finish()`, which shuts down **every stripe's write side** (`StreamIo::poll_shutdown` → `Conn::finish`),
+and the group's tasks own those handles, so dropping them runs `Drop for StreamIo` → `close_stream`. Both halves of
+the close are therefore invoked on the server and on the client for every churn connection.
+
+**So §4.326's conclusion is withdrawn: the streams are closed.** What follows from that is narrower and testable:
+they are closed and **not removed**, which puts the whole question on one transition — whether the acknowledgement
+of a **fin-only packet** reaches `settle_finished`.
+
+**Why that is the likely gap.** `done = abandoned && fin_sent && unacked == 0` counts *bytes* (`SendBuf::unacked`),
+and a fin-only packet carries none: by that arithmetic a stream is "settled" the moment its fin is queued, on the
+next `settle` — but `settle_finished` runs from the **byte** acknowledgement path, and a fin-only packet's
+acknowledgement may not enter it at all. If it does not, nothing calls `settle` again after the fin is queued, and
+the stream stays in the table with `abandoned` true, `fin_sent` true and nothing outstanding — which is exactly a
+stream that `reap_abandoned` also skips, because its predicate requires `send.held() > 0`.
+
+**The next check is one line of reading**: where `settle_finished` is called from, and whether an acknowledgement
+of a packet with no bytes passes through it. If it does not, the fix is to call `settle_finished` on every
+acknowledgement (or to let `reap_abandoned` also take streams whose `unacked == 0`), and the ceiling stops
+filling.
+
 ### 4.326 The retirement machinery is sound, so the 56 are streams that are never closed at all (2026-11-12)
 
 §4.325's question, answered by reading the paths rather than guessing at them:
