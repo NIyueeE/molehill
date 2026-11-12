@@ -377,6 +377,56 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.301 Found it: the interactive tail is the pool's pairing wait, and it is exactly two round trips (2026-11-12)
+
+The direction the user chose (queue and backpressure rather than redundancy) answered the question in two
+runs.
+
+**First, the control arm separates the path from the tool.** Same `cost` cell, `rtt100`, three rounds, the
+catalog's `control` arm beside the product's:
+
+| arm | probe `echo_ms` p50 | probe `echo_ms` p99 |
+|---|---|---|
+| **control** (no tool in the path) | **200.8 ms** | **201.2 ms** |
+| molehill (mhd) | **601.3 ms** | 1 058 ms |
+
+The path is exactly 200 ms and the backend adds 0.8 ms. The tool adds **400.5 ms**, and it adds the same 400 on
+a path with **no loss at all** — which is why every loss-side mechanism failed against it (§4.296, §4.297).
+
+**Then the product's own pairing line names the 400 ms.**
+
+```
+visitor arrival, split at the pairing  paired_p50_us=355102 paired_p99_us=400816
+                                       paired_p50_us=400481 paired_p99_us=400544
+                                       paired_p50_us=400499 paired_p99_us=400666
+```
+
+`paired_p50_us` sits at **400 350–400 511 µs** in every reported second — two full 200 ms round trips — and the
+probe's extra latency (400.5 ms) is that number to the millisecond. **The interactive tail is the wait for a
+data channel**: under the cell's bulk load every pooled channel is busy, so a visitor's request cannot move
+until the pool produces one, and producing one costs two control round trips on this path.
+
+**That reframes both earlier questions.** The 600 ms median is not queueing, not loss response and not the
+carrier's send path; it is the *pool* (the layer above the carrier), and it is a **channel-supply latency**
+problem — which is why `ready_ms`, `dwell`, the shaper's backlog and every carrier-side counter looked clean:
+the bytes do not exist yet.
+
+**Two candidate fixes, both in-boundary and both measurable, in the order this record prefers:**
+
+1. **Make the pairing cost one round trip instead of two.** The ask and the channel's own establishment are
+   serialised today; the client could answer with the channel it is opening and let the server accept the
+   first frame as the pairing, which halves the wait on any path (the 400 ms becomes 200 ms, which at this
+   cell's 0.2 ms-per-ms is exactly the 400.5 ms the probe pays).
+2. **Prefetch a channel when the pool runs dry** rather than when a visitor asks. The record's refuted
+   designs were *static* reserves (`§4.87`: a depth-1 reserve cannot hold a tail whose refill is 114.7 ms at
+   p99); a dynamic prefetch keyed on occupancy is a different mechanism, and its cost is one idle channel per
+   pool — which the `tunnels` key already governs, so no configuration changes.
+
+**Pre-registered for the next run**: `cost` on `rtt100`, three rounds, measuring `paired_p50_us` and the
+probe's `echo_ms` before and after, with `loss5` beside it as the guard. Pass: `paired_p50 < 250 000 µs` and
+`echo_ms` p50 below 300 ms with the control arm's 200 unchanged; rollback on any regression in the bulk
+cells.
+
 ### 4.300 `ready_ms` was the bulk stream, and even the diagnosis needs the class the product does not have (2026-11-11)
 
 **Correction to §4.299.** Its `ready_ms` reading (51 of 3 380 seconds over one second, max 12 855 ms) is
