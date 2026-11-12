@@ -377,6 +377,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.311 The step's remaining tail is the lane's timeout ladder, and the small-flight floor cannot see a stream (2026-11-12)
+
+§4.310 left one acceptance failing: the step p99 is 2.4–4.9 s while the control arm's is 500 ms. Reading the
+timer code says where the seconds come from, and it is arithmetic rather than a guess:
+
+| piece | value on this cell |
+|---|---|
+| `loss_delay` = max(latest, smoothed) × 9/8 | 390 × 1.125 ≈ **439 ms** |
+| the timer's backoff, up to 2¹⁰ | 439 → 878 → 1 756 → 3 512 ms |
+| a p99 of 2.4–4.9 s | two to three backoff steps |
+
+So a single interactive packet dropped at the shaper waits **two to three full timeout steps** before the timer
+declares it lost and repairs it. The control arm has no timer, so it pays the queue and nothing else.
+
+**And the carrier already has the rule that would fix it — it just cannot see the stream.** `arm()` computes
+`small = self.live <= SMALL_FLIGHT_PACKETS || opening_lost` and gives a small flight the cheap 20 ms floor with
+its backoff capped. But `live` counts **the lane's** packets, and a lane carrying four bulk streams at a
+saturated shaper always has a wide flight, so the interactive packet inside it is treated as bulk for the whole
+ladder. The predicate that now exists for the credit reserve (`small_flight`, §4.310) is exactly the missing
+per-stream signal, and the recovery table's `Sent` records do not carry it.
+
+**The fix, sized and pre-registered**: give `Sent` a `small` flag set from the same predicate at send time; let
+`on_timeout` declare a small record lost after `max(latest, smoothed)` — no ×9/8, no backoff — and arm the lane's
+timer from the earliest deadline among its records rather than from the oldest packet plus one rto. The
+reordering argument that justifies the wide delay does not apply to a packet with nothing behind it, and the
+storm it protects against needs a wide flight.
+
+**Not landed in this round**: the change is inside the recovery engine's timer arithmetic, which is the one place
+in this carrier where a wrong edit costs the whole flight, and the round is already carrying two landed changes.
+
 ### 4.310 The stall was credit starvation: a small-flight reserve removes it (2026-11-12)
 
 The interactive probe's own series had the answer §4.307–§4.309 were guessing at, and it was not the listener:
