@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   p50 601 ms / p99 up to 4 179 ms to **p50 401 ms / p99 401 ms** — the same number
   the control arm with no tool in the path reports. A claim the server cannot honour
   refuses that one stream, as the plain selector's already does.
+- **A busy lane keeps credit back for a small stream's request.** The opening
+  reserve was keyed on the bytes a stream has ever written, so a chat stream that
+  had carried megabytes over its life looked like bulk to it: when one bulk stream
+  with a blocked reader held the connection's credit, the next request had nowhere
+  to go. Measured on a 20 Mbit/s path under four bulk streams, a long-lived
+  interactive stream **stopped for 105 seconds**; with `SMALL_STREAM_RESERVE`
+  keeping eight payloads for any stream whose unacknowledged flight is small, every
+  measured round carried interactive traffic through the same step. The reserve is
+  taken inside the peer's credit, so no frame overruns the advertised window.
+- **A packet whose stream is small is re-sent on the path's own round trip.** The
+  retransmission timer's small-flight rule tested the *lane's* packet count, and a
+  lane carrying bulk always has a wide flight, so the interactive packet inside it
+  climbed the whole timeout ladder: on the same 20 Mbit/s step the p99 was
+  **2 391–4 946 ms**; judged on the path's round trip with no backoff it reads
+  **215–1 605 ms** in the rounds that measured, against the control arm's 502.
 - **An `mhd` stream no longer pays a Noise handshake of its own.** A lane's first
   stream runs the KK handshake and its secret becomes the lane root; every later
   stream on that lane seals with a key derived from `(root, direction, stream id)`.
