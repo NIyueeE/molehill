@@ -377,6 +377,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.335 A single arm never wedges: the defect needs two instances on one host (2026-11-13)
+
+§4.334's pre-registered experiment, run twice:
+
+| run | arms | wedges | `wedge_max_s` | timeouts | dropped visitors |
+|---|---|---|---|---|---|
+| p23 | **one** | **0** | 0.0 | **0** | **0** |
+| p24 | **one** | **0** | 0.0 | **0** | **0** |
+| every two-arm run (§4.317–§4.334) | two | 3–10 on one arm | 10–175 s | 16–47 | 10–91 |
+
+**Forty minutes of soak with one instance produce nothing.** Every two-arm run produces a bad arm, and which arm it
+is inverts between runs.
+
+**So the defect as measured is a two-instance effect on one host, not a single-deployment defect.** That is not a
+reprieve for the product — it is a statement about the instrument — and this record has one precedent already
+(§4.329, a `grep` artefact that survived four entries). The bench runs two instances per round on one host, each
+with its own namespaces, and something in that arrangement breaks one of them: the first-arm/second-arm order is
+*not* the pattern (the bad arm was the first in §4.321 and the second in §4.335), so it is neither "the second one
+inherits the first's state" nor the build.
+
+**What this means for the finalisation, stated plainly:** the plan's gate is `wedge_count = 0`, and a *single*
+deployment now reads 0 in two consecutive twenty-minute soaks. The gate as written is measured through a two-arm
+harness that has a defect of its own, so it cannot be met until that harness defect is understood — and the honest
+record is that the product's own numbers are clean while the instrument is not.
+
+**The next experiment is the instrument's**: two arms whose *conditions differ* (one `clean`, one `loss1`) in one
+run, and two arms that never share a round's host state (separate `--work` roots are already given; the question is
+the topology). If the wedge follows the *pairing* rather than either arm, the harness is the defect; if it follows
+one condition, it is the path.
+
 ### 4.334 The accept window lands and the phenomenon does not move; ten hypotheses are now on record (2026-11-13)
 
 `0c66d13` accepts an initiation that arrives out of order (the peer allocates ids from several tasks at once), which
