@@ -2410,6 +2410,23 @@ impl Conn {
         encode.stop(&stats::PHASES.tx_encode);
         let book = stats::Timing::start(sampled);
         let recording = stats::enabled().then(std::time::Instant::now);
+        if offset == 0 {
+            // **The first byte of a stream, on the wire.** A hung channel open is
+            // either a packet the transmit queue never picked or one that left and
+            // whose acknowledgement was lost; nothing else in the log separates
+            // them, and the write side is already excluded (no stream writer parks
+            // -- `HANDOFF.md` §4.332).
+            tracing::debug!(
+                stream = id,
+                number,
+                len,
+                queued_ms = self
+                    .opened_for(id, now)
+                    .map_or(0, |waited| u64::try_from(waited.as_millis())
+                        .unwrap_or(u64::MAX)),
+                "mhd first byte of a stream sent"
+            );
+        }
         self.recovery.on_sent(
             now,
             number,
@@ -3007,6 +3024,13 @@ impl Conn {
     /// because nothing else watches it: an open refused by a lane's stream ceiling
     /// is refused without a placement wait, which is what made §4.322's three
     /// minutes of refused dials invisible in the pool's own numbers.
+    /// How long ago a stream was opened, for the transmit-side stamp.
+    fn opened_for(&self, stream: u32, now: Instant) -> Option<Duration> {
+        self.stream_opened
+            .get(&stream)
+            .map(|opened| now.saturating_duration_since(*opened))
+    }
+
     pub(crate) fn stream_count(&self) -> usize {
         self.streams.len()
     }
