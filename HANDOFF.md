@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.336 The control arm never wedges while the product does, in the same round (2026-11-13)
+
+§4.335's second experiment — two arms in one round, one of them a control with no tool in the path:
+
+| arm | wedges | `wedge_max_s` | timeouts |
+|---|---|---|---|
+| **control** | **0** | 0.0 | 1 |
+| product | **3** | 10.01 | 14 |
+
+**So the round structure alone does not produce a wedge**: an arm can share a round with another and stay clean.
+What wedges is the product arm — but only when it is not alone:
+
+| shape | product arm | notes |
+|---|---|---|
+| one arm (§4.335) | 0 / 0 | two runs, forty minutes |
+| product + twin | 3–10 or 0, alternating | §4.317–§4.334 |
+| product + control | **3** | this run |
+
+**That is a narrow and specific pattern**: the product is clean alone, clean as one of two, and wedges as the
+other of two — with which one alternating. The control never wedges.
+
+**Two things follow.** The gate `wedge_count = 0` is not reproducible for the product whenever a round carries a
+second arm, and the product is clean in the single-instance shape a deployment actually runs. And the mechanism is
+still unknown: it is not the build (§4.319), not the harness alone (this run), not any of the ten refuted
+hypotheses, and it needs a second arm in the round to appear at all.
+
+**What a round does between arms is the only thing left to read**: the topology is torn down and rebuilt per arm,
+and the soak's own timeline changes the path (clean → loss1 → rtt100 → loss5 → clean) *inside* each arm. If any of
+that state is host-level rather than namespace-level, the first arm's `loss5` could still be shaping something the
+second arm uses — which would explain "clean alone, one of two wedges, control immune" only if the tool's own
+send path is the amplifier, and that is the next question rather than a conclusion.
+
 ### 4.335 A single arm never wedges: the defect needs two instances on one host (2026-11-13)
 
 §4.334's pre-registered experiment, run twice:
