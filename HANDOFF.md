@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.350 The harness gives every arm of a run the same namespaces (2026-11-13)
+
+The user authorised moving the bench's topology, so the first read is what it shares — and it is the one thing this
+line never checked:
+
+**`_open_topology` is called once per campaign** (`runner.py:844`), before `run_campaign`, and `run_campaign` loops
+`for rnd in …: for arm in order: arm_turn(…)`. There is **one `Topology` for the whole run**: every arm of every
+round runs in the same `mhsrv`/`mhcli`/`mhbvis` namespaces, over the same veths and the same qdiscs, with the
+tool's daemons the only thing swapped per arm (`ArmTurn.stop` kills them and waits, then sleeps 300 ms).
+
+**That is exactly the cross-instance state a defect that only appears with more than one instance needs**, and it is
+consistent with everything measured: one instance in one round is clean; a second instance in the same namespaces
+is not; the control arm is immune because it starts no daemon; and which instance suffers depends on what the
+previous one left (sockets in `TIME_WAIT`, a port still held, qdiscs applied by the last stage).
+
+**Not yet measured**: what actually differs between the two instances. The experiment the authorisation makes
+possible is concrete and small: **give each arm its own namespaces** (build the topology per arm, or add a per-arm
+suffix to the three names), and re-run the shape that reproduces. If the wedge disappears, the harness is the
+defect; if it stays, it is the tool and the shared-namespace reading is a coincidence.
+
+**A second, cheaper probe in the same direction**: capture `ss -s`, `ss -u -a` and `tc qdisc show` in each namespace
+between arms, for a two-arm run, and diff the arm that wedges against the one that does not.
+
 ### 4.349 Where this line stops, what it established, and what it could not (2026-11-13)
 
 Twenty rounds on one defect. This entry is the account of what is proven, what was withdrawn, and what would be
