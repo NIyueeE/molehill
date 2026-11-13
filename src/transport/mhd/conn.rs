@@ -1468,7 +1468,19 @@ impl Conn {
         // budget an opening can spend, not a share of whatever is left, or it
         // reserves nothing exactly when it is needed.
         let room = if opening(state) || small_flight(state) {
-            credit.min(window.saturating_add(OPEN_RESERVE)).min(held)
+            // **All three bounds, not two.** The opening reserve was added to the
+            // congestion window and (in §4.310) to the peer's credit, but the buffer
+            // ceiling kept refusing: `held` is `MAX_BUFFERED - buffered`, and a bulk
+            // stream whose reader is slow can hold the lane's whole buffer, at which
+            // point a channel's first byte has nowhere to go and the visitor's
+            // pairing expires with nothing gathered — measured as 24 and 47 dropped
+            // visitors in one twenty-minute soak, against a client that had already
+            // opened the channel within 1 ms of the request (`HANDOFF.md` §4.331).
+            // `MAX_BUFFERED` is two windows, so the second window absorbs this
+            // reserve exactly as it absorbs the frontier's.
+            credit
+                .min(window.saturating_add(OPEN_RESERVE))
+                .min(held.saturating_add(SMALL_STREAM_RESERVE))
         } else {
             room.saturating_sub(OPEN_RESERVE + SMALL_STREAM_RESERVE)
         };
@@ -6745,6 +6757,31 @@ mod tests {
             conn.write(bulk.id, &more),
             0,
             "bulk is still refused by the frozen frontier"
+        );
+    }
+
+    /// A channel's first byte is admitted even when the lane's buffer is full.
+    ///
+    /// The third of the three bounds the opening reserve has to cover. A bulk stream
+    /// whose reader is slow can hold the lane's whole `MAX_BUFFERED`, and with
+    /// `held` at zero a new channel's selector byte has nowhere to go: the channel
+    /// opens on the client and never arrives, so the visitor's pairing expires with
+    /// nothing gathered (`HANDOFF.md` §4.331).
+    #[test]
+    fn a_full_buffer_still_admits_a_fresh_stream() {
+        let mut conn = Conn::new(23, true);
+        conn.cwnd = WINDOW;
+        let bulk = conn.open();
+        let mut filler = payload(4096);
+        while conn.write(bulk.id, &filler) > 0 {}
+        filler.clear();
+        // The worst case a slow reader produces: the lane's buffer ceiling reached.
+        conn.buffered = MAX_BUFFERED;
+        let fresh = conn.open();
+        assert_eq!(
+            conn.write(fresh.id, b"handshake"),
+            9,
+            "an opening writes while the lane's buffer is full"
         );
     }
 
