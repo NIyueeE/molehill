@@ -377,6 +377,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.347 Both ends advertise a complete frontier, so the contradiction stands and the id is the last suspect (2026-11-13)
+
+§4.346's contradiction, checked on **both** ends this time (the previous run measured only each end's own frontier,
+which is what it *advertises*, not what it *receives*):
+
+| arm log | `ack_below` vs `ack_largest` |
+|---|---|
+| client, 7 765 lines | gap 0, maximum 0 |
+| **server, 7 785 lines** | **gap 0, maximum 0** |
+
+So neither end is pinning, and the contradiction is exact: **every number is below both fronts, yet the client
+declares a range lost and re-sends it.** Two explanations survive, and both are about the record rather than the
+frontier:
+
+1. the record for that number was **never in `in_flight`** when the acknowledgement arrived — created, sent and
+   removed by a path that is not a retirement;
+2. the re-send is not that record at all: the client's `open()` handed out an id it had **already used for an
+   earlier connection**, so "three first packets for stream 7" are three distinct streams.
+
+**The allocator's own comment says why 2 is unlikely but not impossible**: it probes at most `len() + 1` candidates
+from `next_stream` and relies on the pigeonhole, and it wraps by two. A soak's lane has thousands of streams over
+its life but only a handful alive at once, so `len() + 1` probes from a *wrapped* `next_stream` would hand back a
+long-dead id — and the number would be plausible after `2^31` handles only.
+
+**So the next instrument is one line on the client at `open()`**: the stream id it picks and `next_stream`'s value,
+logged once per allocation. If stream 7 is allocated twice, the loop is id reuse and not the transport at all.
+
 ### 4.346 Only the two loss paths queue a repair, so something declares that range lost against a frontier that proves otherwise (2026-11-13)
 
 §4.345 left one candidate: the range is re-sent from the stream's own buffer. Reading the callers says there are
