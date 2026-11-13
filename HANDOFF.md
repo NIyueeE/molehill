@@ -377,6 +377,21 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.342 The retirement line read zero for every stream, because it ran after the record was removed (2026-11-13)
+
+The instrument from §4.341 read **26 570 retirements, every one younger than 100 ms** in one soak — and that was
+the instrument: the line was placed after `stream_opened.remove(&stream)`, so the age lookup found nothing and
+`map_or(0, …)` reported zero for every stream. Fixed by taking the age first (`f59f86c` then this).
+
+**Two lessons, both already in this record's mouth.** A log line placed after the state it reads is a line that
+reads nothing — the same shape as §4.329's `grep` matching the wrong field, and the third instrument in this line
+that had to be corrected after one run. The habit that would have caught it: print the field and read one line of
+the output before running a twenty-minute soak.
+
+**What the run did establish, regardless**: 80 selector timeouts (47 + 33) against 26 570 retirements, so retirements
+are common — as common as channels — and the question is their *age*, which this round's line could not answer and
+the fixed one can.
+
 ### 4.341 Both new lines count repairs, and the server re-creates the same stream id four times (2026-11-13)
 
 The join §4.340 asked for, done on p29's round 0, shows something the lines themselves got wrong:
