@@ -377,6 +377,37 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.339 Every stream is created by a packet that carries the selector, and ninety-four reads of it still timed out (2026-11-13)
+
+The two instruments paired on a reproducing campaign (one arm, two rounds):
+
+| reading | round 0 | round 1 |
+|---|---|---|
+| `mhd first packet for an unknown stream` | 9 087 | 13 717 |
+| `selector timed out` | 30 | 64 |
+| wedges / timeouts | 2.5 (median of the two rounds) / 38.5 | |
+
+**And every one of those creating packets carries the selector**, because the distribution of their offset and
+length is:
+
+| offset | len | count |
+|---|---|---|
+| 0 | **48** | 21 591 |
+| 0 | 36 | 1 025 |
+| 0 | **1** | 188 |
+
+Byte zero of every one of them is the selector. So the byte is **in the stream's receive buffer** at the moment the
+stream is created — `accept_stream` appends the payload right after inserting the state — and the accept task's
+`read_u8` then waits ten seconds for it and gives up.
+
+**That is not a lost datagram (as §4.338 said) and not a slow open: it is a reader that does not see bytes its own
+buffer already holds.** The two candidates are a `poll_read` that returns `Pending` with data present, and an
+`accept_stream`/`inbound` path that delivers a *different* (empty) `StreamState` than the one the bytes went into.
+
+**The next instrument is one line in `poll_read`**: when it is about to park, say whether the stream it is parking on
+has bytes buffered (`recv.held() > 0`). A parked reader with data in hand is the contradiction, and the line names
+the stream so the state can be traced.
+
 ### 4.338 The dropped pairings are 32 selector timeouts on the server, against a client that opened every channel fast (2026-11-13)
 
 The wedge round of §4.337 (one arm, two rounds), read on both ends:
