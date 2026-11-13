@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.338 The dropped pairings are 32 selector timeouts on the server, against a client that opened every channel fast (2026-11-13)
+
+The wedge round of §4.337 (one arm, two rounds), read on both ends:
+
+| reading | value |
+|---|---|
+| client `channel open finished` | **19 783**, p50 37 µs, p99 163 µs, **max 2 819 µs** |
+| server `budget expired … gathered=0` | **32** |
+| server `mhd transport selector timed out` | **32** |
+| server `unsealed_tags` | 0 |
+| server write refusals per second | ~15 000 by credit, `opening=0` |
+
+**The two 32s are the same events.** Each dropped pairing is a stream the server accepted and then waited ten
+seconds for a selector byte that never came. So §4.333's "the server never saw the stream" is corrected: it sees the
+stream — something creates it — and never receives the byte that names what it carries.
+
+**And the client sent it.** All 19 783 opens finished, p99 163 µs: `open_us` spans the selector write *and* the
+prologue write, so every one of those channels was written in full and quickly.
+
+**So one packet per stuck stream is lost between a client that wrote it and a server that waited for it** — on a
+loopback path with no loss, no rejection counter non-zero, and the client's transmit queue measured at ≤44 ms
+(§4.333). That is where this line stands, and it is a narrower place than it has been: not the pool, not the lane,
+not the pairing, not the open — **one datagram**, thirty-two times in twenty minutes, only in campaigns that start
+the tool more than once.
+
 ### 4.337 One arm and two rounds also wedges: what triggers it is a campaign with more than one instance (2026-11-13)
 
 The discriminator §4.336 left open, run as one arm and **two rounds**:
