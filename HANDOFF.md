@@ -377,6 +377,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.344 The loop is a cumulative frontier that never passes the re-sent range (2026-11-13)
+
+§4.343's question, read in the code rather than measured again: the client retires a sent record by two paths, and
+both are keyed on the **acknowledgement's own frontier**:
+
+| path | condition |
+|---|---|
+| cumulative | `while in_flight.first().number < ack.below { take }` |
+| bitmap | `ack.largest - 64 ..= ack.largest` |
+
+So number 8 is retired only when some acknowledgement arrives whose `below` is **greater than 8** — and the server
+builds `below` from `self.acks`, its own receive tracker, where `below` is *"every packet numbered below this has
+arrived"* and a single real hole stops it **for the life of the connection** (§4.282's own words in `wire.rs`).
+
+**That is the loop's shape**: a hole from some other stream pins the connection's `below`, every later packet stays
+unretired, and each stream's re-send adds a *new* record that is equally unretirable. The re-send creates the stream
+again on the server (its own state was retired), which answers again, which the client never sees acknowledged —
+which is exactly the ten-second selector timeout and the dropped visitor.
+
+**The runs that exist for this case are only attached to repairs** (§4.283 added `ReceivedRun` pairs for numbers the
+64-bit block cannot reach), so a *cumulative* frontier pinned by one hole still leaves everything above it
+unretired unless that hole is filled.
+
+**The next instrument is two numbers, read once a second on both ends**: the ack tracker's `below` and `largest`.
+If `below` sits still while `largest` climbs, the frontier is pinned and the fix is either to retire from the runs
+unconditionally or to repair the hole faster — both far more specific than anything this line has had.
+
 ### 4.343 One stream's whole life, and the loop it reveals: the client re-sends a request the server already answered (2026-11-13)
 
 The join, on stream 7 of a soak that produced four wedges:
