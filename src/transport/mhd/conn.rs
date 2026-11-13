@@ -3064,6 +3064,11 @@ impl Conn {
     }
 
     /// How many times the stalled-prefix rescue fired on this lane.
+    /// The acknowledgement frontier this end advertises: `(largest, below)`.
+    pub(crate) fn ack_frontier(&self) -> (u32, u32) {
+        self.acks.frontier()
+    }
+
     /// Bytes this stream's reader has not taken, for the parked-reader line.
     pub(crate) fn held_for(&self, stream: u32) -> u64 {
         self.streams

@@ -342,6 +342,11 @@ fn report_window(shared: &Arc<Shared>) {
             // three minutes while the pool read size 4 with no placement line and no
             // size change at all (`HANDOFF.md` §4.322).
             streams = conn.stream_count(),
+            // The frontier this end advertises, and the largest number it has seen:
+            // a `below` that sits still while `largest` climbs pins every above it
+            // and is the loop §4.343 found (`HANDOFF.md` §4.344).
+            ack_below = conn.ack_frontier().1,
+            ack_largest = conn.ack_frontier().0,
             // The oldest resident and why it is still there, beside the count: a
             // full lane is `streams=` alone, and which population filled it is this
             // (`HANDOFF.md` §4.328).

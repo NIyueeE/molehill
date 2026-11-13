@@ -342,6 +342,15 @@ impl AckSet {
     }
 
     /// The block to put on the wire, or None before anything has arrived.
+    /// The frontier this end would advertise: `(largest, below)`.
+    ///
+    /// Two numbers because the cumulative one is what retires a peer's records and
+    /// a single hole pins it for the connection's life (`HANDOFF.md` §4.344). Read
+    /// against `largest`, it says whether the frontier is moving or stuck.
+    pub(crate) fn frontier(&self) -> (u32, u32) {
+        (self.largest.unwrap_or(0), self.below)
+    }
+
     pub(crate) fn packet(&self) -> Option<Ack> {
         self.largest.map(|largest| Ack {
             largest,
