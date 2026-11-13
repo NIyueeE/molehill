@@ -1666,6 +1666,18 @@ impl Conn {
             // and nobody will ever read a stream that no longer exists.
             self.release_unread(stream);
             self.stream_opened.remove(&stream);
+            // **Say it when a stream leaves.** An accept task can be waiting on a
+            // stream this end retires -- it then reads a state that no longer
+            // exists, sees no bytes, and times out ten seconds later, which is the
+            // selector timeout this line has chased (`HANDOFF.md` §4.341). The line
+            // carries the age so a stream retired moments after it opened is
+            // distinguishable from one that lived its life.
+            if crate::transport::stats::enabled() {
+                let age_ms = self.stream_opened.get(&stream).map_or(0, |at| {
+                    u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+                });
+                tracing::debug!(stream, age_ms, "mhd stream retired");
+            }
             if let Some(state) = self.streams.remove(&stream) {
                 // **A close must not overtake queued data.** The bytes this end
                 // accepted but never put on the wire are dropped with the stream, and
