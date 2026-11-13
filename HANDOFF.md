@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.331 The dropped visitors are a channel open that starts and never finishes (2026-11-13)
+
+The failure path, read end to end on one group (`7355`, one of the ten the soak dropped):
+
+| stamp | what |
+|---|---|
+| server `ask_ms` · `channel request sent` | 07:25:00.366655 / .366679 |
+| client `channel request read` | .366735 — **56 µs later** |
+| client `mhd channel open started` | .366752 — `queued_us=1` |
+| server `budget expired … gathered=0 waited_ms=5000` | 07:25:05.367491 |
+| client `channel open finished` for this group | **absent** |
+
+**So the control hop is 56 µs and the client begins the open immediately — and the open never returns.** The channel
+is never created, so nothing can arrive, so the pairing expires and the visitor is dropped. The whole defect is one
+blocked `open_stream` on the client.
+
+**One of the three bounds is now covered and it helped.** The opening reserve existed for the congestion window and
+(for §4.310) the peer's credit; the buffer ceiling `MAX_BUFFERED - buffered` had no reserve, and a bulk stream
+whose reader is slow can hold the lane's whole buffer. `4fcec9b` gives openings and small flights
+`SMALL_STREAM_RESERVE` of that ceiling too — `MAX_BUFFERED` is two windows, so the second absorbs it. Measured on
+the same soak: **dropped visitors 24 → 10 and 47 → 12**, hours of run unchanged otherwise.
+
+**It is not the whole defect**: `wedge_count` reads 5 / 5 with the fix, `rtt_timeout_count` 16 / 17, so the
+remaining ten to twelve opens per run still hang.
+
+**What that leaves, and it is now a short list of exactly two:**
+
+1. the open's own **acknowledgement wait** — `skips_open_ack` needs the lane to be `registered`, and a lane the pool
+   grew during the run may not be, in which case its first stream waits a round trip for an ack that the saturated
+   path delivers late;
+2. the **write wake** — the selector byte parks in `poll_write` and the pump's `wake_writers` may not reach it.
+
+Both are one branch each, and the instrument that separates them is the existing `open_channel` phase stamps
+(`lock_us`, the selector write's own wait, and `ack_us`) on the groups that hang.
+
 ### 4.330 The P5 verdict: the finalisation is not claimed, and here is exactly why (2026-11-12)
 
 The plan's P5.6 clause has two outcomes and this record takes the second one. **"mhd 定型" is not written**, and
