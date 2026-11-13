@@ -377,6 +377,38 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.333 The selector leaves within 44 ms and the server never sees the stream (2026-11-13)
+
+The first-byte instrument answers the last branch, and the answer is neither of the two the record expected.
+
+Two soaks of the same build, one clean and one in trouble:
+
+| run | arm | wedges | timeouts | dropped visitors | first-byte `queued_ms` |
+|---|---|---|---|---|---|
+| p20 | product | 0 | 0 | — | p99 0, max 51 |
+| p20 | twin | 0 | 0 | — | — |
+| p21 | **product** | **10** | **43** | **55** | **n = 12 108, p99 0, max 44** |
+| p21 | twin | 0 | 0 | 0 | — |
+
+**On the arm with ten wedges and fifty-five dropped visitors, no stream's first byte waited more than 44 ms for the
+wire.** The selector is not stuck in the transmit queue, so the packet leaves promptly — and the server still has no
+record of the stream: its log carries the pairing's request and its expiry, and nothing about a channel arriving.
+
+**That rules out the transmit queue and leaves the receive path for a packet naming an unknown stream.** The two
+receive-side refusals this record knows are both counted and both read **zero** on the failing arm: no
+`mhd sealed packet refused` (a packet on a lane whose root this end does not hold), and `OverWindow` cannot apply
+to a fresh stream because the check treats an unknown id as a small reader (§4.310's reserve).
+
+**So the next place is one function**: where the server's lane turns a first packet into an accept — `Conn`'s
+`accept_stream` and the `inbound` queue the pump drains at `pump.rs:1384`. The question is whether the packet is
+dropped somewhere between the lane's decode and that queue, and the counters already exist to say which branch:
+the lane's `refus=`/rejected tallies were printed every second on the failing arm and no rejection class was
+non-zero.
+
+**The two p20/p21 runs are the same build**, so the 0/0 was a lucky run of a defect that is present: the arm-level
+alternation the record has seen since §4.319 is what decides it, and this round's new evidence is that the failing
+arm's packets leave on time and vanish after the wire.
+
 ### 4.332 The hung open never parks in its write, so the selector byte never leaves the queue (2026-11-13)
 
 The parking instrument (`b4b6661`) answers the branch question in one run:
