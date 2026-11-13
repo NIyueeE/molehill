@@ -123,6 +123,17 @@ pub(crate) const ABANDON_HOLD: Duration = Duration::from_secs(30);
 /// duplicate stream fast enough to hang a 32 KiB unit test.
 const STALL_REPAIR_ATTEMPTS: u8 = 5;
 
+/// How far below the inbound frontier an unknown stream id may still be accepted.
+///
+/// A stream is opened by the peer naming it, and the peer allocates ids from
+/// several tasks at once, so two opens can reach the wire out of order. Without a
+/// window the lower one is dropped as "retired" -- silently, with one debug line --
+/// which is how a channel open hung for five seconds on the client while the server
+/// kept no record of the stream (`HANDOFF.md` §4.333). Sixty-four is wider than any
+/// pool's concurrent opens and narrower than the distance a long-retired stream's
+/// retransmission would travel.
+const ACCEPT_WINDOW: u32 = 64;
+
 /// Held bytes below this make a stream small enough to be an interactive flow.
 ///
 /// Only the window line uses it: the tail's reading has to skip bulk streams, and
@@ -2104,12 +2115,32 @@ impl Conn {
     /// stream ids being monotonic means the peer cannot be opening it, so the packet
     /// is late. Without the second rule a late packet for an accepted-then-retired
     /// stream opened a **new** stream and a phantom accept.
-    fn is_retired_stream(&self, id: u32, known: bool) -> bool {
+    fn is_retired_stream(&self, id: u32, known: bool, initiation: bool) -> bool {
         if known {
             return false;
         }
         if id % 2 == u32::from(self.dialer) {
             return true;
+        }
+        // **A window, not a line.** The rule exists so a late retransmission of a
+        // retired stream cannot re-create it as a phantom channel -- but the peer
+        // allocates ids from several tasks at once, and two of them can reach the
+        // wire in the other order: the higher id raises the frontier, the lower one
+        // then arrives "below" it and used to be dropped as retired, silently, with
+        // one debug line and no counter. That is a channel the client opened and the
+        // server never saw, which is the visitor drop and the ten-second wedge
+        // (`HANDOFF.md` §4.333).
+        //
+        // So an unknown id is stale only when it is far enough below the frontier
+        // that no concurrent open could still be in flight for it -- and only when
+        // it is **not** an initiation: a stream is opened at offset zero, while a
+        // retired stream can only ever be continued from the offset it reached. A
+        // continuation is dropped at once; an initiation inside the window is
+        // accepted whatever order the frontier saw.
+        if initiation {
+            return self
+                .highest_inbound
+                .is_some_and(|highest| id.saturating_add(ACCEPT_WINDOW) < highest);
         }
         self.highest_inbound.is_some_and(|highest| id < highest)
     }
@@ -3527,7 +3558,7 @@ impl Conn {
         // packet nobody will acknowledge counts ten unanswered retransmissions and
         // declares the whole lane dead. That is how one short-lived visitor
         // connection was killing the lane every other visitor shared.
-        let retired = self.is_retired_stream(id, known);
+        let retired = self.is_retired_stream(id, known, offset == 0);
         if retired {
             tracing::debug!(stream = id, "mhd dropped data for a retired stream");
             // The bytes are gone and nobody will read them, but the peer spent its
@@ -5689,6 +5720,44 @@ mod tests {
         );
     }
 
+    /// Two opens that reach the wire in the other order both arrive.
+    ///
+    /// The peer allocates stream ids from several tasks at once, so the higher id's
+    /// first packet can leave before the lower one's. Judged against the inbound
+    /// frontier alone the lower id is "below" it and was dropped as retired --
+    /// silently, with one debug line -- which is a channel the client opened and the
+    /// server never saw (`HANDOFF.md` §4.333).
+    #[test]
+    fn an_out_of_order_open_is_not_mistaken_for_a_retired_stream() {
+        let now = Instant::now();
+        let mut dialer = Conn::new(31, true);
+        let first = dialer.open();
+        let second = dialer.open();
+        assert!(dialer.write(first.id, b"one") > 0);
+        assert!(dialer.write(second.id, b"two") > 0);
+
+        let mut datagrams = Vec::new();
+        let mut buf = Vec::new();
+        while let Some(len) = dialer.poll_transmit(now, &mut buf) {
+            datagrams.push(buf[buf.len() - len..].to_vec());
+        }
+        assert!(datagrams.len() >= 2, "both opens reached the wire");
+
+        // The other order: the higher id's packet first.
+        let mut acceptor = Conn::new(31, false);
+        for datagram in datagrams.iter().rev() {
+            let _ = acceptor.on_datagram(now, datagram);
+        }
+        let mut accepted = Vec::new();
+        while let Some(stream) = acceptor.accept() {
+            accepted.push(stream.id);
+        }
+        accepted.sort_unstable();
+        let mut expected = vec![first.id, second.id];
+        expected.sort_unstable();
+        assert_eq!(accepted, expected, "both opens are accepted, in any order");
+    }
+
     /// The same, for a stream this end **accepted** and then retired.
     ///
     /// The dialer's own ids are protected by the parity test in `apply_datagram`;
@@ -5696,7 +5765,8 @@ mod tests {
     /// retired accepted stream and open a *new* one with the same id — a phantom
     /// stream and a phantom accept, for a visitor whose connection had already
     /// closed. Stream ids are monotonic, so an unknown id in the peer's space that
-    /// is *below* the highest accepted one cannot be new.
+    /// is *below* the highest accepted one cannot be new -- and a continuation can
+    /// never be an initiation, which is the rule §4.333's fix keeps.
     #[test]
     fn a_late_packet_for_an_accepted_stream_does_not_open_a_new_one() {
         let now = Instant::now();
