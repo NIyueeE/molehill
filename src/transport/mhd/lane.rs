@@ -545,6 +545,21 @@ impl AsyncWrite for StreamIo {
             this.shared.wake_pump();
             return Poll::Ready(Ok(written));
         }
+        if this.parked_at.is_none() {
+            // **The first park of a handle, named.** A channel's open writes one
+            // selector byte and then waits: if the lane has no room the write parks
+            // here, and the channel never reaches the server, so the visitor's
+            // pairing expires with nothing gathered (`HANDOFF.md` §4.331). Whether
+            // a hung open parks *here* or never gets this far is the difference
+            // between the write wake and the open's own acknowledgement wait, and
+            // nothing else in the log can tell them apart -- the resume-side line
+            // below only prints when a parked write finally resumes, which for a
+            // hung open is never.
+            tracing::debug!(
+                stream = this.id,
+                "mhd stream writer parked for the first time"
+            );
+        }
         this.parked_at.get_or_insert_with(std::time::Instant::now);
         Poll::Pending
     }
