@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.337 One arm and two rounds also wedges: what triggers it is a campaign with more than one instance (2026-11-13)
+
+The discriminator §4.336 left open, run as one arm and **two rounds**:
+
+| campaign | instances started | wedges | `wedge_max_s` | timeouts | dropped visitors |
+|---|---|---|---|---|---|
+| p23, p24 | **one** (one round) | **0 / 0** | 0.0 | 0 / 0 | **0** |
+| p26 | one arm, **two rounds** | **1** | **5.005** | 7 | 4 (all in round 0) |
+| p17–p25 | two arms, one round | 3–10 | 10–175 | 16–47 | 10–91 |
+
+**So the trigger is not "a second arm" — it is "a campaign that starts the tool more than once".** One instance in
+one round is clean, twice over (§4.335); one arm over two rounds wedges; two arms in one round wedge. The control
+arm (§4.336) is immune because it starts no tool.
+
+**That is as far as this line can go inside the plan.** Thirteen hypotheses are now refuted by measurement — the
+pairing budget, the listener, the backlog, pool saturation, the lane's stream ceiling (a `grep` artefact), lane
+death, the build, the transmit queue, the write wake, the sealed refusal, the out-of-order initiation, the second
+arm, and the round's position — and every counter on both ends reads normally on the failing arm except the
+failures themselves.
+
+**What the record establishes, and what it does not:**
+
+- **established**: with a single instance in a single round the product carries a twenty-minute soak with zero
+  wedges, zero timeouts and zero dropped visitors, twice (§4.335); every campaign that starts the tool more than
+  once produces a bad instance, and which one it is varies;
+- **not established**: whether that is the tool (something an instance leaves on the host) or the harness (something
+  a campaign leaves between instances). Nothing measured so far distinguishes them, and the distinguishing
+  experiment is outside the bench's current vocabulary — two instances on **separate hosts**, or the same campaign
+  with each instance's host state captured and compared.
+
+**Two real fixes came out of this line and stayed**: the buffer-ceiling reserve for openings and small flights
+(§4.331, dropped visitors halved) and the accept window for out-of-order initiations (§4.334). Both are covered by
+tests. The thirteen refutations and the four withdrawals are on the record too.
+
 ### 4.336 The control arm never wedges while the product does, in the same round (2026-11-13)
 
 §4.335's second experiment — two arms in one round, one of them a control with no tool in the path:
