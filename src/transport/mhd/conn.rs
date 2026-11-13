@@ -3671,6 +3671,22 @@ impl Conn {
                 data,
             } => {
                 let (data, fresh) = self.open_stream_payload(&packet, id, data)?;
+                if fresh.is_some() && !self.streams.contains_key(&id) {
+                    // **What created the stream, before anything reads it.** A pairing
+                    // whose channel never arrives and one whose channel arrives
+                    // carrying the wrong bytes look identical from the pairing's side
+                    // -- both expire with `gathered=0` -- and the ten-second selector
+                    // timeout is the only line either leaves. This says which packet
+                    // opened the stream, with its offset and length, so the two can be
+                    // told apart (`HANDOFF.md` §4.338).
+                    tracing::debug!(
+                        stream = id,
+                        number = packet.number,
+                        offset,
+                        len = data.len(),
+                        "mhd first packet for an unknown stream"
+                    );
+                }
                 let range = Incoming {
                     id,
                     offset,
