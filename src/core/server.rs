@@ -2402,12 +2402,19 @@ async fn wrap_mhd_stream(
     if crate::transport::stats::enabled() {
         tracing::debug!(stream = stream_id_now, "mhd accept: reading the selector");
     }
-    let io: crate::transport::multiplex::CarrierStream = match tokio::time::timeout(
-        deadline,
-        stream.read_u8(),
-    )
-    .await
-    .with_context(|| "mhd transport selector timed out")??
+    let selector = tokio::time::timeout(deadline, stream.read_u8()).await;
+    if selector.is_err() && crate::transport::stats::enabled() {
+        // **The stuck channel, named where it gives up.** The timeout's own line
+        // carries no id, so it could not be joined to the packet that created the
+        // stream or to the line that retired it -- and those three are the whole
+        // question (`HANDOFF.md` §4.342).
+        tracing::debug!(
+            stream = stream_id_now,
+            "mhd accept: selector deadline reached"
+        );
+    }
+    let io: crate::transport::multiplex::CarrierStream = match selector
+        .with_context(|| "mhd transport selector timed out")??
     {
         // `PLAIN` is followed by the hello in the clear. `DERIVED` is a sealed
         // stream: its connection already unsealed this selector and every later
