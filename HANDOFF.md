@@ -377,6 +377,20 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.340 The reader does not park with data in hand, and both ends of the join are now on the wire (2026-11-13)
+
+§4.339's instrument, on a reproducing campaign: **zero** `mhd reader parked with bytes held` lines against 26
+selector timeouts. So the reader is not blind to bytes its buffer holds — that hypothesis is refuted in one run.
+
+What the run did add is the join: `mhd first packet for an unknown stream` (stream, number, offset, len) and
+`mhd accept: reading the selector` (stream), which together say, for any stuck channel, whether the task that
+waited was reading the stream a packet had created. The same campaign logged 18812 and 20122 accept-reads across
+its two rounds against 21 and 20 timeouts, so the volume is enough to join a handful.
+
+**Next**: for each timed-out stream, the two lines' order and the state between them. Nothing else is left — the
+pool, the lane, the pairing, the open, the datagram, the transmit queue and the reader's own buffer are all
+measured and excluded.
+
 ### 4.339 Every stream is created by a packet that carries the selector, and ninety-four reads of it still timed out (2026-11-13)
 
 The two instruments paired on a reproducing campaign (one arm, two rounds):
