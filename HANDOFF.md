@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.343 One stream's whole life, and the loop it reveals: the client re-sends a request the server already answered (2026-11-13)
+
+The join, on stream 7 of a soak that produced four wedges:
+
+```
+.652706  first packet stream=7 number=8  offset=0 len=48     <- creates the stream
+.652733  accept: reading the selector  stream=7
+.653723  stream retired  stream=7 age_ms=1
+.653726  stream closed   written=81 next=81 acked=81 peer_fin=true local_fin=true
+.803136  first packet stream=7 number=9  offset=0 len=48     <- the SAME range, re-sent
+.803174  accept: reading the selector  stream=7
+.803xxx  first byte sent stream=7 number=134216 len=7        <- the server answers again
+.804xxx  stream retired  stream=7
+17.856   first packet stream=7 number=72 offset=0 len=48     <- again
+18.105   first packet stream=7 number=5  offset=0 len=48     <- again
+```
+
+**The first incarnation completed cleanly**: the server read the 48 bytes, answered 7, and retired the stream with
+everything acknowledged. Then **the client re-sent the same range with a new packet number**, and the server — its
+stream retired — **re-created it**, answered again, retired it again. Over and over, with new numbers each time.
+
+**So the client never retires the range whose ack the server sent.** That is the loop that explains everything this
+line has measured: the retirements at `age_ms=1` (26 570 in one soak, half of them 1 ms), the identical first
+packets at offset 0, the accept tasks that wait on a state that keeps being replaced, the selector timeouts, and the
+dropped visitors — every one of them is a re-send that should have been retired.
+
+**The question is now narrow and mechanical**: why the client's recovery table does not retire number 8 when the
+server's acknowledgement for it arrives. The ack is connection-wide and carries a `largest` plus a block; a number
+far behind the block is carried by `ReceivedRun`s (§4.283's feature), and a number the block cannot reach is exactly
+what a repair of `offset 0` on a retired stream looks like.
+
+**Next**: on the client, log every `on_ack` that does *not* retire a sent record for stream 7's range — the number,
+the ack's `largest`, and whether a run covered it. That is one line and it names the reason.
+
 ### 4.342 The retirement line read zero for every stream, because it ran after the record was removed (2026-11-13)
 
 The instrument from §4.341 read **26 570 retirements, every one younger than 100 ms** in one soak — and that was
