@@ -377,6 +377,26 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.346 Only the two loss paths queue a repair, so something declares that range lost against a frontier that proves otherwise (2026-11-13)
+
+§4.345 left one candidate: the range is re-sent from the stream's own buffer. Reading the callers says there are
+**two**, and both are the loss paths (`conn.rs:1983` is the repair-timer's re-send, and the two in
+`on_ack`/`on_timeout` queue what recovery declared lost). Nothing else calls `SendBuf::repair`.
+
+**So the client did declare that range lost** — and that is now in direct contradiction with §4.345's measurement,
+where the acknowledgement frontier was `largest + 1` in all 7 765 lines of the same soak. A receiver whose `below`
+is one past the largest number it has seen has received **everything**; a sender whose record for that number was
+declared lost means recovery took it out of `in_flight` without an acknowledgement.
+
+**The two declarations that can do that are `Expiry::Dead`** (which clears the whole table and re-sends every
+range) **and the reorder rule** (three numbers behind the largest, absent from the block). §4.320 measured zero
+`Expiry::Dead` in a soak, so it is the reorder rule — and the reorder rule is exactly what a *new* stream's first
+packet cannot satisfy: with one packet in flight and nothing behind it, "three behind the largest" is a statement
+about **the connection's** largest, not the stream's.
+
+**That is the next read, and it is one condition**: where `AckSet` decides "three behind the largest, absent from
+the block" and whether that rule is applied to a number that belongs to a stream whose own flight is one packet.
+
 ### 4.345 The frontier is never pinned, so the re-send comes from somewhere else (2026-11-13)
 
 §4.344's hypothesis, measured: the window line now carries the acknowledgement frontier, and across 7 765 lines of a
