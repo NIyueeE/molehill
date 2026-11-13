@@ -377,6 +377,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.348 Half the channels never put their first byte on the wire, and the pairing failure is a consequence (2026-11-13)
+
+The count that reframes the whole line, from one soak round:
+
+| reading | value |
+|---|---|
+| channels the client opened (`channel open started`) | **15 485** |
+| distinct stream ids that ever sent a first byte | **7 985** |
+| highest stream id seen | 15 969 |
+
+The ids run by two and reach 15 969 for 15 485 opens, so **every open gets a fresh id** — id reuse is refuted as well.
+But only **7 985** ids ever had an `offset 0` packet transmitted: **7 500 channels wrote their selector and never put
+it on the wire.**
+
+**That is what "a channel that never arrives" looks like from the inside**, and it explains the pairing expiry
+without any transport defect: the stream is retired (by the channel's own handle being dropped when its visitor
+goes) before the pump ever picks its bytes, and the send buffer is discarded with the stream. The server keeps no
+record because nothing was ever sent.
+
+**So the pairing failure and the dropped visitor are consequences, not causes.** What made the visitor go is one
+step further up — and it is the same thing the probe reported all along as a refused or abandoned request.
+
+**And the fiften thousand opens against eight thousand first bytes is a shape worth stating plainly**: half of the
+channels this pool opens in a soak are abandoned before their first packet. Whatever stalls the visitor, it stalls
+often enough that half the channel openings are wasted work.
+
+**Next**: the visitor's side. A channel whose visitor vanished before its first byte means the visitor's socket
+closed or errored within the microseconds between the pairing and the pump. The probe's own per-request record says
+which (error class and duration), and that is the last thing this line has not read.
+
 ### 4.347 Both ends advertise a complete frontier, so the contradiction stands and the id is the last suspect (2026-11-13)
 
 §4.346's contradiction, checked on **both** ends this time (the previous run measured only each end's own frontier,
