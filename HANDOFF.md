@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.345 The frontier is never pinned, so the re-send comes from somewhere else (2026-11-13)
+
+§4.344's hypothesis, measured: the window line now carries the acknowledgement frontier, and across 7 765 lines of a
+soak on the client **`ack_below` is `ack_largest + 1` in every one** — a gap of zero, never more than 1 000, maximum
+0. **The cumulative frontier is not pinned.** The hole hypothesis is refuted.
+
+So the re-sends §4.343 found are not the recovery table refusing to retire: every number is below the frontier
+whenever an acknowledgement arrives, so any record is retired on the next one.
+
+**Which leaves two explanations, and one of them is checkable by reading:**
+
+1. **the client reuses a stream id for a new connection** — then three "first packets for stream 7" at offset 0 over
+   two seconds are three *distinct* connections, each legitimately writing a selector, and the server's repeated
+   creation is its own retired state being re-opened by the next connection's id;
+2. the range is re-sent from the stream's own buffer rather than from the recovery table, by a path other than the
+   repair queue.
+
+**Next**: read the client's id allocator. If `Conn::open` hands out an id it has handed out before, the loop is not
+a transport defect at all — it is two connections sharing a name, and the accept task that waits ten seconds is the
+one belonging to the state the first connection created.
+
 ### 4.344 The loop is a cumulative frontier that never passes the re-sent range (2026-11-13)
 
 §4.343's question, read in the code rather than measured again: the client retires a sent record by two paths, and
