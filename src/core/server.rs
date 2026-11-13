@@ -2384,6 +2384,9 @@ async fn wrap_mhd_stream(
     // Taken before the handle is boxed: the connection it belongs to is where the
     // lane's root has to land, and the trait object cannot be asked for it.
     let connection = stream.connection();
+    // The id before the trait object hides it: a selector timeout carries none, so
+    // this is the only way to join a stuck channel to the packet that created it.
+    let stream_id_now = stream.stream_id();
     let mut stream: crate::transport::multiplex::CarrierStream = Box::new(stream);
     let mut carried: Option<Vec<u8>> = None;
     // Whether the handshake's reply already carried the lane's acknowledgement,
@@ -2393,6 +2396,12 @@ async fn wrap_mhd_stream(
     // end does not infer it from its own state: an inference would have each end
     // waiting for the other when the two disagreed (`REGISTERED_SELECTOR`).
     let mut claimed_registered = false;
+    // **Which stream this task is reading, before it reads.** A selector timeout is
+    // the only line a stuck channel leaves, and it carries no id, so it cannot be
+    // joined to the packet that created the stream (`HANDOFF.md` §4.339). This can.
+    if crate::transport::stats::enabled() {
+        tracing::debug!(stream = stream_id_now, "mhd accept: reading the selector");
+    }
     let io: crate::transport::multiplex::CarrierStream = match tokio::time::timeout(
         deadline,
         stream.read_u8(),
