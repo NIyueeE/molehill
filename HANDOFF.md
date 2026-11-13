@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.332 The hung open never parks in its write, so the selector byte never leaves the queue (2026-11-13)
+
+The parking instrument (`b4b6661`) answers the branch question in one run:
+
+| arm | first-park lines | dropped visitors | wedges |
+|---|---|---|---|
+| molehill | **0** | 91 | 6 |
+| molehill±aa | **0** | 11 | 4 |
+
+**Not one stream writer parked.** So a hung open is *not* blocked in `poll_write`: the selector byte was accepted
+into the buffer immediately (which is what `write_all` returning fast means), and what never happened is the
+packet leaving the queue. That excludes the write wake and leaves the open's acknowledgement wait — `read_ack`
+after the hello — as the only await a hung open can be sitting in.
+
+**And it explains the shape of the numbers.** `open_us` reads 24 µs at the median because the write path is fast;
+the drops are the tail where the *packet* sat behind bulk in the lane's transmit queue and the server never saw the
+stream, so its ack never came. The pump's own admission is not re-checked at transmit time — `transmit_stream`
+sends what `write` accepted — so the question is why a one-packet stream is not picked promptly while four bulk
+streams are running.
+
+**The next instrument is one line in the transmit path**: log the first transmitted byte of a stream (offset 0 of
+a stream whose base is 0), so a hung open says whether its selector ever left, and how long after the write. That
+separates "the queue never picked it" from "it left and the ack was lost" — and it is the last branch left.
+
 ### 4.331 The dropped visitors are a channel open that starts and never finishes (2026-11-13)
 
 The failure path, read end to end on one group (`7355`, one of the ten the soak dropped):
