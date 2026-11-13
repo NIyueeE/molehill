@@ -377,6 +377,36 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.334 The accept window lands and the phenomenon does not move; ten hypotheses are now on record (2026-11-13)
+
+`0c66d13` accepts an initiation that arrives out of order (the peer allocates ids from several tasks at once), which
+is a real defect it fixes and a test pins. The soak afterwards:
+
+| arm | wedges | `wedge_max_s` | timeouts | dropped visitors |
+|---|---|---|---|---|
+| product | 0 | 0.0 | 7 | 12 |
+| twin | 4 | 80.08 | 47 | 66 |
+
+**The phenomenon moved to the other arm and stayed the same size.** That is the fourth run in a row where the
+counts invert between two arms of one binary, and it now has ten refuted hypotheses behind it: pairing budget
+(§4.308), listener and backlog (§4.309), pool saturation (§4.322), lane stream ceiling (§4.329 — a `grep`
+artefact), lane death (§4.320), the build (§4.319), the transmit queue (§4.332), the write wake (§4.332), the
+receive-side sealed refusal (§4.333) and now the out-of-order initiation.
+
+**Two fixes were real and stayed**: the buffer-ceiling reserve halved the dropped visitors (§4.331: 24 → 10,
+47 → 12), and the accept window closes a genuine ordering hole. Neither moves the wedge, which means the wedge is
+not any of the ten.
+
+**What the record can now say with confidence, because every run says it**: the bad arm's *fresh dials* are
+refused 10–90 times in twenty minutes; the good arm has near zero; which arm is bad inverts between runs of the
+same binary; and no counter on either end — pool, lane, connection, pairing, refusal, retransmission, credit,
+window, buffer — reads anything unusual on the bad arm except the failures themselves.
+
+**That combination is what an experiment outside the product would explain**, and it is the next step rather than
+another hypothesis: run the soak with **one arm only**, several times. If a lone arm never wedges, the mechanism
+is the interaction between two sequential arms on one host (the second arm inheriting the first's shaper or
+namespace state); if a lone arm does wedge, it is the host at that moment and neither arm nor build.
+
 ### 4.333 The selector leaves within 44 ms and the server never sees the stream (2026-11-13)
 
 The first-byte instrument answers the last branch, and the answer is neither of the two the record expected.
