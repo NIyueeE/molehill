@@ -3049,6 +3049,13 @@ impl Conn {
     }
 
     /// How many times the stalled-prefix rescue fired on this lane.
+    /// Bytes this stream's reader has not taken, for the parked-reader line.
+    pub(crate) fn held_for(&self, stream: u32) -> u64 {
+        self.streams
+            .get(&stream)
+            .map_or(0, |state| state.recv.held())
+    }
+
     /// How many streams this lane holds, in both directions.
     ///
     /// The resource a visitor's channel competes for, printed on the window line

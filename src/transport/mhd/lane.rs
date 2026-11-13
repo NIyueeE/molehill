@@ -497,6 +497,21 @@ impl AsyncRead for StreamIo {
         if this.read_parked_at.is_none() {
             this.read_parked_at = Some(std::time::Instant::now());
             this.read_wakes_at_park = this.shared.wakes.load(std::sync::atomic::Ordering::Relaxed);
+            // **A reader parked while its own buffer holds bytes.** The read above took
+            // nothing, so the bytes it cannot see are behind a hole or the stream it is
+            // reading is not the one they went into. Both are invisible from every
+            // other counter, and the accept task's ten-second selector timeout is
+            // exactly this shape: the creating packet carried the byte, the buffer has
+            // it, and the reader waits (`HANDOFF.md` §4.339).
+            let held = this.shared.with(|conn| conn.held_for(this.id));
+            if held > 0 {
+                tracing::debug!(
+                    stream = this.id,
+                    held,
+                    hole = ?this.shared.with(|conn| conn.hole(this.id)),
+                    "mhd reader parked with bytes held"
+                );
+            }
         }
         Poll::Pending
     }
