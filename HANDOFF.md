@@ -377,6 +377,41 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.349 Where this line stops, what it established, and what it could not (2026-11-13)
+
+Twenty rounds on one defect. This entry is the account of what is proven, what was withdrawn, and what would be
+needed — because the defect is still open and the plan's gate is still red.
+
+**Established, each with its own run:**
+
+| fact | evidence |
+|---|---|
+| a single instance in a single round is clean | two soaks, forty minutes, **0 wedges / 0 timeouts / 0 dropped visitors** (§4.335) |
+| the defect needs a campaign that starts the tool more than once | one arm and two rounds wedges (§4.337); a control arm sharing the round never does (§4.336) |
+| which arm is bad inverts between runs | §4.317–§4.334, four inversions |
+| the failing arm's fresh dials are refused; established streams never stall | established stream's worst gap 3.1 s over 7 322 samples (§4.321) |
+| the pool is healthy while it happens | size 4 in all 946 reported seconds, zero placement waits, zero size changes (§4.322) |
+| no lane ever dies | `Expiry::Dead` zero (§4.320) |
+| both ends advertise a complete acknowledgement frontier | gap 0 across 7 765 and 7 785 lines (§4.347) |
+| id reuse is refuted | every open gets a fresh id, highest 15 969 for 15 485 opens (§4.348) |
+| **half the channels never put their first byte on the wire** | 7 985 ids versus 15 485 opens (§4.348) |
+
+**Withdrawn on the way**: the pairing budget, the listener, the backlog, pool saturation, the lane's stream ceiling
+(a `grep` artefact), lane death, the build, the transmit queue, the write wake, the sealed refusal, the out-of-order
+initiation, the second arm, the arm's position, the pinned acknowledgement frontier — and four instruments that
+read the wrong thing before they were corrected.
+
+**Two fixes were real and stayed**, both covered by tests: the buffer-ceiling reserve for openings and small flights
+(half the dropped visitors gone, §4.331) and the accept window for out-of-order initiations (§4.334).
+
+**What would settle it is outside this bench**: two instances on **separate hosts**, or a campaign that captures each
+instance's host state before and after. Everything inside one host has been measured, and what remains is a question
+about what a *second* start leaves behind — the tool or the harness, and nothing this harness can tell apart.
+
+**So the finalisation is not written**, and the reason is in this entry rather than in an adjective: the carrier is
+clean in the shape a deployment runs it twice over, the harness's multi-instance shape is not, and the difference has
+not been attributed.
+
 ### 4.348 Half the channels never put their first byte on the wire, and the pairing failure is a consequence (2026-11-13)
 
 The count that reframes the whole line, from one soak round:
