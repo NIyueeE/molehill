@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.341 Both new lines count repairs, and the server re-creates the same stream id four times (2026-11-13)
+
+The join §4.340 asked for, done on p29's round 0, shows something the lines themselves got wrong:
+
+| instrument | per stream id |
+|---|---|
+| `mhd first packet for an unknown stream` (server) | `999` **4×**, `997` 4×, `995` 4× … |
+| `mhd first byte of a stream sent` (client) | `9159` **13×**, `8427` 13×, `8429` 8× … |
+| `mhd accept: reading the selector` (server) | `821` 5×, `2849` 5×, `279` 5× |
+
+**Both lines fire on any packet at offset zero, repairs included**, so neither is a per-stream event: a range that
+is re-sent logs again. That is the first correction — the counts are inflated and must not be read as "streams".
+
+**The second correction is the interesting one**: the *server* creates the same stream id several times, so a
+stream that exists is being **removed and re-created**. That is possible only if something retires it while the
+peer still has packets for it, and the peer's later packet (a repair of offset 0, or a continuation) then opens a
+fresh, empty state — whose reader waits for a selector that the discarded state had already consumed.
+
+**That is a coherent explanation of every observation in this line**: the creating packet carried the selector
+(§4.339), no reader ever parks with bytes held (§4.340), the pairing sees nothing arrive, and the timeout is ten
+seconds because the byte went to a state that no longer exists.
+
+**Next, and it is one flag**: log both lines **once per stream** (a `HashSet` in the stats path), and add a line
+when a stream with an accept task in flight is retired. That says whether the re-creation is the cause and what
+retires the stream.
+
 ### 4.340 The reader does not park with data in hand, and both ends of the join are now on the wire (2026-11-13)
 
 §4.339's instrument, on a reproducing campaign: **zero** `mhd reader parked with bytes held` lines against 26
