@@ -377,6 +377,24 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.376 The churn loop is sequential, so the probes account for two channels out of fifty-six (2026-11-14)
+
+`run_churn` (`probes/series.py:191`) is a `while` loop that calls `ping()` and emits — **one connection at a time**, no
+workers, no keep-alive. The interactive probe is likewise one. So the two probes ride on **at most two channels
+between them**, and the budget's other paths (bulk, rr) are not in this profile.
+
+**Fifty-six dialled channels against two accounted for.** §4.375's two candidates are now one: not "a worker pool opens
+more than one per visitor" — there is no worker pool — but **something else calls `open_stream`**.
+
+**`client.rs` has two call sites** (`1597` for a plain visitor channel, and the striped path), and both are per-request
+with no retry. So either a request is forwarded more than once, or a channel is dialled for something that is not a
+visitor at all.
+
+**The next instrument is the caller tag §4.371 named**, and the cheap routes are now exhausted: a `&'static str` on
+`Conn::open` for the call site, counted per opening and printed beside `opened_len`. One run then says whether the
+fifty-six are visitor channels, striped groups, or a third thing — which is the question the last six rounds have
+circled without being able to ask.
+
 ### 4.375 All fifty-six are dialled here, and that is more than the probes can hold (2026-11-14)
 
 The origin instrument (`opened_here`, `4f08d9d`) on a run that wedged (twin: 6 wedges, 15.015 s):
