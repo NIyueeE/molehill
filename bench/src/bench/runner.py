@@ -693,6 +693,7 @@ def run_campaign(camp: Campaign) -> dict:
             samples = arm_turn(camp, arm, rnd, warmup)
             camp.results["samples"].extend(samples)
             camp.save()
+            _capture_host_state(camp, arm, rnd)
             # **A fresh topology per arm.** One `Topology` per campaign means every
             # arm of every round shares the same three namespaces, veths and qdiscs,
             # with only the tool's daemons swapped -- and a soak's twenty minutes of
@@ -832,6 +833,54 @@ def _open_topology(camp: Campaign, args) -> topology.Topology:
         f"condition {args.condition} on the {args.condition_leg} leg"
     )
     return topo
+
+
+def _capture_host_state(camp: Campaign, arm: model.Arm, rnd: int) -> None:
+    """What this arm left behind, inside its namespaces and on the host.
+
+    The one question twenty-two rounds could not answer is what differs between an
+    instance of a campaign that wedges and one that does not. This writes the same
+    list for every arm -- socket counts, the kernel's own limits, the qdiscs still
+    installed -- so the two can be diffed line by line instead of guessed at
+    (`HANDOFF.md` §4.351).
+    """
+    topo = camp.topo
+    if topo is None:
+        return
+    out: list = [f"arm {arm.id} round {rnd}"]
+    probes = (
+        ("host loadavg", ["cat", "/proc/loadavg"]),
+        ("host ss -s", ["ss", "-s"]),
+        ("host udp sockets", ["ss", "-u", "-a"]),
+        ("host tcp sockets", ["ss", "-t", "-a"]),
+        (
+            "host sysctl",
+            [
+                "sysctl",
+                "net.core.rmem_max",
+                "net.core.wmem_max",
+                "net.ipv4.ip_local_port_range",
+                "net.ipv4.tcp_tw_reuse",
+            ],
+        ),
+    )
+    for title, argv in probes:
+        got = topology.run(argv, check=False)
+        out.append(f"--- {title} (rc {got.returncode})")
+        out.append((got.stdout or "")[:4000].strip())
+    for ns in topology.NS_ALL:
+        for title, argv in (
+            ("ss -s", ["ss", "-s"]),
+            ("udp", ["ss", "-u", "-a"]),
+            ("tc", ["tc", "qdisc", "show"]),
+        ):
+            got = topo.ns_run(ns, argv, check=False)
+            out.append(f"--- {ns} {title} (rc {got.returncode})")
+            out.append((got.stdout or "")[:2000].strip())
+    path = camp.work / "hoststate"
+    path.mkdir(parents=True, exist_ok=True)
+    name = f"rnd{rnd}-{arm.id.replace('/', '_')}.txt"
+    (path / name).write_text("\n".join(out) + "\n")
 
 
 def _reopen_topology(camp: Campaign) -> None:
