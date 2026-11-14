@@ -28,7 +28,19 @@ product 6 wedges / **45.044 s**, twin 2 / **85.085 s**, 174 and 134 expired pair
 on both arms. So the open that never finishes is *not* waiting in the placement the bound wrapped, and the change
 correlated with longer wedges — it is **reverted** (`git revert d88ce7a`, 410 tests green).
 
-**What that leaves**, and it is now located: the only statement between `channel open started` and `channel open finished`
+**§4.384 (measured): the prologue never fails either.** With `99dcf0f` in and the product arm wedging seven times
+(max **160.16 s**), `prologue_failed` reads **0** and the error line never appears. So the missing `open finished` is
+**not** a prologue failure.
+
+**And the two log sites are in different functions** — `channel open started` is written by the control-command handler
+(`client.rs:3857`) and `channel open finished` by the data-channel handler (`client.rs:1629`). A channel that logs the
+first and never the second never reached the second: the open was *started* by the command handler and the data path
+for it never ran.
+
+**Which leaves the hand-off between those two functions** — the queue or task that carries an opened channel from the
+control command to the data handler — and that is the next thing to read.
+
+**What an earlier round located**, kept for the record: the only statement between `channel open started` and `channel open finished`
 that can end the function is
 
 ```rust
