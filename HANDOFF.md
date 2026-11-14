@@ -377,6 +377,25 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.369 What the 26 peer-fin streams say: the client's own copy is the stuck one (2026-11-14)
+
+§4.368's distribution, read for what it implies rather than what it counts. Twenty-six of the fifty-six carry the
+**peer's** fin and none carries this end's: the server finished its side, the client has not finished its own. A
+stream in that state is one where the **client's copy toward the visitor** has not ended — either it is still reading
+a visitor that will never send again, or it is blocked writing to a visitor that is gone.
+
+**That is a different suspect from every one this line has cleared**, and it is on the client, in the forwarding
+loop, not in the carrier: the transport delivered the peer's fin (the flag is set), so the frames arrived; what did not
+happen is the local half-close that would let the stream retire.
+
+**The instrument for it is one number per stream**: how long ago the peer's fin arrived on the streams that still have
+no local fin. A value near a round trip means the copy is draining normally; a value of seconds means the copy is
+stuck, and the direction it is stuck in is the answer.
+
+**And the prediction is testable without the pool**: on a *clean* arm this count stays near zero (§4.368 measured 2),
+so anything that makes it climb is the thing to look at — the pool's exhaustion would then be the visible consequence
+rather than the subject.
+
 ### 4.368 The 56 are live, unfinished, in-use channels — the stalled requests themselves (2026-11-14)
 
 The four flag counts §4.366 asked for, on the run that wedged (twin: 5 wedges, 15.015 s) against the clean arm:
