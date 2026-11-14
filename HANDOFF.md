@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.373 The pool is a lease pool, so nothing is prefilled — and the capacity ramp is what fills it (2026-11-14)
+
+§4.372's hypothesis, read in the code: `Multiplex::open_stream` returns a **`StreamLease`** (`multiplex.rs:2064`), a
+lease that releases its stream when dropped. There is no prefill list, no idle set, no pinned-and-unplaced channel.
+
+**So every one of the 56 is held by something that wants it** — hypothesis dead, the tenth in this line to go that way.
+
+**And the thing that wants them is in the benchmark's own design**: `run_capacity` (`workloads.py:1799`) **ramps levels
+and opens streams until the pool refuses**, which is exactly how it measures `capacity_streams`. That scenario forces
+the pool to its ceiling by construction — 4 lanes × 56 = the 224 this line has been counting — and the reading it
+produces is the one already in the record: **`capacity_streams` median 4 against the control's 8**.
+
+**So the shape to test is**: does the capacity ramp's occupancy come back down before the next scenario dials? If it
+does not, every later scenario in that arm — churn, interactive — inherits a full pool, and the "wedge" is the ramp's
+tail rather than a transport defect at all. The bench already prints the capacity cell's `sustainable` count per level;
+what it does not print is the pool's occupancy **after** the ramp, which is the number that decides this.
+
+**That is one line in the harness and no change to the tool**: log `pool-stats`' own `streams`/`pinned` count at the
+end of the capacity cell. If it is 224 there and falls only with the next stage, the wedge is the ramp's, and the gate
+has been blaming the carrier for its own instrument.
+
 ### 4.372 The slowness is a one-percent tail, so occupancy has to come from channels nobody serves (2026-11-14)
 
 The interactive series on the wedged arm (p47, 5 wedges):
