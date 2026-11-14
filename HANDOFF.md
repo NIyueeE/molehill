@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.375 All fifty-six are dialled here, and that is more than the probes can hold (2026-11-14)
+
+The origin instrument (`opened_here`, `4f08d9d`) on a run that wedged (twin: 6 wedges, 15.015 s):
+
+| arm | `opened_len` max | `opened_here` max | wedges |
+|---|---|---|---|
+| product | 5 | **5** | 0 |
+| twin | **56** | **56** | 6 |
+
+**Every stream is one this end dialled** — no peer-created channel is in the table. So the client opened 56 channels to
+one lane and holds them all.
+
+**And that is more than the workload can ask for.** The soak's probes run at 16 concurrent (churn) and 16 (rr), the
+bulk stages at 8, the interactive at 1. Their sum is well under 56, and each probe's *own* measured concurrency is
+single digits (§4.371). **So the count exceeds what any probe claims to be using, on a lane that was dialled 56
+times.**
+
+**That is now the whole of the question, and it is a countable one**: either a probe's worker pool is larger than its
+nominal concurrency (16 workers each opening more than one channel), or something re-dials when a channel is not
+answered — a retry that leaves the previous channel open. The second would explain the growth over minutes and the
+absence of any error counter, and it is checkable in one place: **whether `open_stream` is ever called again for a
+visitor that already has a channel.**
+
 ### 4.374 The soak profile runs no capacity ramp, so §4.373's candidate dies too (2026-11-14)
 
 The soak profile's scenario list is `("soak",)` (`model.py:1834`) — the five-stage timeline and the probes that ride
