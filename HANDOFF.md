@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.357 §4.356's "born bad" was a tautology, and the first error is 20–914 s in (2026-11-14)
+
+§4.356 printed each run's first error offset **relative to that same first error**, so "+0" was arithmetic, not a
+finding. Measured against the arm's own first sample instead:
+
+| run | failing arm | first error at |
+|---|---|---|
+| p17 | product / twin | **+20 s** / +827 s |
+| p21 | product | **+233 s** |
+| p38 | product | **+257 s** |
+| p39 | product | +914 s |
+
+**So an arm runs fine for 20 to 914 seconds and then starts failing** — and its first attempts are healthy (both arms'
+first six round trips in p39 read 0.8–2.4 ms). §4.356's "born bad" is withdrawn, and so is its "every one starts at
++0".
+
+**What that leaves is accumulation**: the failures begin after the instance has been running for minutes, and the
+soak puts ~14 000 visitor connections through it in fifteen minutes. The instance's memory and fds are measured every
+second and never looked wrong; what is **not** measured is the size of its own tables — the stream table, the set of
+retired ids, the inbound queue, the repair queue, the block pool.
+
+**The next instrument is those five sizes on the window line**, read once a second. A table that grows without bound
+while RSS stays flat (a `BTreeMap` of ids is kilobytes) is exactly the shape that would take minutes to bite and be
+invisible to every counter this record has.
+
 ### 4.356 Where in the timeline the failures sit: not a startup artefact and not a stage (2026-11-14)
 
 p39's failing arm, by timestamp: the interactive probe ran **0 → 1 079 s** (the stages end at ~900 s), its 21 failures
