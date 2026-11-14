@@ -1653,7 +1653,16 @@ impl Conn {
             let at = state.send.finished_at().unwrap_or(0);
             self.pending_fins.push_back((stream, at));
         }
-        let done = state.abandoned && state.fin_sent && state.send.unacked() == 0;
+        // **Finished is finished, whoever ended it.** The old condition required
+        // `abandoned` -- this end's handle dropped -- and a stream the *peer* ended,
+        // whose forwarder then ran to completion and dropped its handle, took that
+        // path. A stream both ends have closed with nothing outstanding has nothing
+        // left to do either way, and keeping its entry is what fills the lane's
+        // stream table: measured on a soak, `opened_len` sat at **56**, the lane's
+        // ceiling, on both arms that wedged while a clean arm peaked at 4
+        // (`HANDOFF.md` §4.358).
+        let closed_both = state.local_fin && state.peer_fin && state.send.unacked() == 0;
+        let done = closed_both || (state.abandoned && state.fin_sent && state.send.unacked() == 0);
         if state.local_fin && !state.fin_sent {
             self.finishing.insert(stream);
         } else {
