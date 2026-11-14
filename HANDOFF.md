@@ -377,6 +377,40 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.380 The root cause: the server refuses a stream whose claim says "registered" while it holds no registration (2026-11-14)
+
+§4.379's claim mismatch, located in the code (`server.rs:2603`). When a data channel's selector is
+`REGISTERED_SELECTOR` or `DERIVED_REGISTERED_SELECTOR`, the server sets `claimed_registered` — and then, at the
+session state:
+
+```rust
+if let Some(existing) = registered.as_ref() { … } else if claimed_registered {
+    // **The claim this end cannot honour.** …
+    // So the *stream* is refused, not the lane
+```
+
+**The stream is refused.** Not the lane — the single channel — so the pairing that was waiting for it gathers
+nothing, expires after `PAIR_WAIT_BUDGET`, and the visitor is dropped.
+
+**That is the defect, and it now explains every reading in this line at once:**
+
+| reading | explanation |
+|---|---|
+| 43 pairings expired with `gathered=0` | the channel was refused, not paired |
+| 14 547 channels accepted, selectors all read | the stream *is* accepted and its selector read; the refusal happens after |
+| the pool's four lanes at 56 | each refused channel still charges the lane until the client gives up |
+| a 1 % tail of 5-second hangs | those are the refused channels |
+| no error counter anywhere | the refusal is a `bail!` on a *stream*, and the pool treats it as a failed open and rebuilds |
+| clean on one run, wedged on another | it depends on whether that session's registration is present when the claim arrives |
+
+**The condition** is that the client claims "registered" while the server holds **no** registration for that session:
+the client's belief is stale — it derives the claim from its own lane root, which outlives the server's registration.
+
+**The fix is a decision, not a patch**, and it is the next thing to make: either the client stops claiming registered
+when its registration has not been re-confirmed on this lane, or the server re-registers from the stream's own
+prologue instead of refusing it. The second is the one that removes the failure mode rather than narrowing it, and it
+is what a protocol with no acknowledgement for this claim needs.
+
 ### 4.379 Every expired pairing gathered *zero* channels, while the server accepted every channel (2026-11-14)
 
 The discriminator §4.378 needed, from the logs already on disk — the pairing-expiry line carries `gathered`:
