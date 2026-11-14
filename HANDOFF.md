@@ -17,7 +17,11 @@ Read `AGENTS.md` first for the rules; read this for the state.
 (`wedge_count` 6–9). Everything this line has established, and the fourteen explanations it has refuted, are in
 §4.335–§4.382.
 
-**The one measurement nobody has taken is the ask.** The server's pairing asks the client for a data channel, waits
+**The three timestamps exist** — the server's ask (`595b684`), the client's receipt (`client.rs:4096`, logging the
+group it was asked for), and the open (`open_tagged("open")`). The one measurement nobody has joined is the *join*:
+run one soak and pair the three by `group`.
+
+**The ask is the question.** The server's pairing asks the client for a data channel, waits
 `PAIR_WAIT_BUDGET` (5 s), retries, waits five more, and expires with `gathered=0` — twice, while the same server
 accepted 14 547 channels from that client in the same run (§4.379, §4.382). Three timestamps per pairing decide it:
 
