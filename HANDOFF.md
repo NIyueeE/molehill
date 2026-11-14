@@ -377,6 +377,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.365 The oldest entry in the stream table is as old as the run, on both arms (2026-11-14)
+
+The age instrument (`oldest_opened_ms`, `9bf88f1`) on a run where **both arms were clean** (`0 / 0`):
+
+| arm | `opened_len` max | `oldest_opened_ms` max |
+|---|---|---|
+| product | 6 | **1 073 478 ms (17.9 min)** |
+| twin | 4 | **1 068 469 ms (17.7 min)** |
+
+**The oldest stream has been in the table since the run began**, on both arms — and this run lasted eighteen minutes,
+so that entry is the *first* stream the lane ever opened and it has not been retired by any path: not `settle`'s
+three conditions, not the abandoned reaper, not the both-fins rule added in §4.359.
+
+**It is a real leak and a small one** — with `opened_len` at 4–6, it is one or two entries per lane, not the 56 a
+wedged arm carries. So it does not explain the ceiling by itself; it is a separate defect found on the way, and one
+that a clean arm proves exists without needing the wedge at all.
+
+**The next read is why that one stream never enters `settle`**: the candidate is a stream that was opened by a first
+packet and then never carried another frame — no fin, no ack of its own, no close — which is the *server-side mirror*
+of §4.348's 7 500 channels that never put a first byte on the wire. If the two are the same population seen from the
+two ends, that is the first time this line has joined a client-side count to a server-side one.
+
 ### 4.364 The pool agrees with the window line, and it says why: pinned at four tunnels on its ceiling (2026-11-14)
 
 The comparison §4.363 asked for, the pool's own line on the wedged arm:
