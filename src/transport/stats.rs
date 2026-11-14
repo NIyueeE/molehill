@@ -465,6 +465,25 @@ pub(crate) fn note_open_us(us: u64) {
     }
 }
 
+/// Note one channel whose prologue could not be written.
+///
+/// The counter that turns "the server never heard about this channel" into a number
+/// (`HANDOFF.md` §0).
+pub(crate) fn note_prologue_failed() {
+    if !enabled() {
+        return;
+    }
+    PROLOGUE_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many prologue writes have failed since the process started.
+pub(crate) fn prologue_failed() -> u64 {
+    PROLOGUE_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Prologue writes that failed, since the process started.
+static PROLOGUE_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Note one pool growth, with the time it took.
 pub(crate) fn note_pool_grow(age: Duration) {
     if !enabled() {

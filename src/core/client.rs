@@ -1613,7 +1613,21 @@ async fn run_mux_data_channel(
     // server can deliver this channel to *that* pairing instead of to whichever
     // visitor takes one from the shared queue first. Zero for a plain visitor.
     let group = stripe.map_or(0, |request| request.group);
-    write_tunnel_prologue(&mut stream, args.service_id, tunnel, group).await?;
+    // **A prologue that fails is a channel the server never hears about.** This was a
+    // bare `?`, so a failed write returned without the `channel open finished` line
+    // and without any error line — measured, a group whose pairing then expired twice
+    // logged `open started` and nothing else (`HANDOFF.md` §0).
+    if let Err(error) = write_tunnel_prologue(&mut stream, args.service_id, tunnel, group).await {
+        if crate::transport::stats::enabled() {
+            debug!(
+                group,
+                %error,
+                "mhd channel open failed while writing the prologue"
+            );
+        }
+        crate::transport::stats::note_prologue_failed();
+        return Err(error);
+    }
     let ready_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
     // From the command leaving the control loop to the prologue being written:
     // the only interval in an arrival that no other instrument covers.
