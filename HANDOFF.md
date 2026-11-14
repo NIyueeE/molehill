@@ -377,6 +377,33 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.379 Every expired pairing gathered *zero* channels, while the server accepted every channel (2026-11-14)
+
+The discriminator §4.378 needed, from the logs already on disk — the pairing-expiry line carries `gathered`:
+
+| arm | pairing expiries | `gathered=0` |
+|---|---|---|
+| product (4 wedges) | **43** | **43** |
+| twin (clean) | **0** | — |
+
+**All forty-three expired with no channel at all**, on an arm where the server accepted **14 547** channels from the same
+client. So the channels arrived — the frames were parsed, the streams created, the selectors read (§4.378) — and
+**not one of them was attached to a pairing that was waiting for it**.
+
+**That is a claim mismatch, not a transport loss.** The channel reaches `handle_data_channel`, is claimed under its
+selector, and instead of joining the group that is parked waiting (`pair_striped_group`), it is treated as a new
+visitor — so the pairing sits until `PAIR_WAIT_BUDGET`, expires with `gathered=0`, and the visitor is dropped. From the
+probe's side that is a five-second hang and then a refused dial, which is the wedge.
+
+**This is the first finding in this line that points at a specific code path rather than a distribution**: the selector
+a channel carries, and the group the pairing is waiting on, do not meet. The sealed-open claim (§ earlier in this
+record) is the mechanism that decides which path a channel takes — `DERIVED_REGISTERED_SELECTOR` with a lane root, or
+`REGISTERED_SELECTOR`/`PLAIN_SELECTOR` without one — and a channel whose claim says "registered" while the pairing
+waits under a different claim lands on the wrong side.
+
+**The next read is the claim's write and its parse, side by side**: what the client writes into the selector for a
+pooled channel, and what `handle_data_channel` compares it against.
+
 ### 4.378 The server reads every selector, so the hang is after it (2026-11-14)
 
 §4.377 left one question: what a hung request waits for. The answer's first half, from the wedged arm's own log —
