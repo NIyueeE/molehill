@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.377 Every open is a visitor open, and thirteen a second times four seconds is fifty-six (2026-11-14)
+
+The tag instrument (`3df5adb`) on a run where the product arm wedged (4 wedges, 10.01 s) and its twin did not:
+
+| arm | `opens_open` | `opens_striped` | `opens_other` | `opened_len` max | wedges |
+|---|---|---|---|---|---|
+| product | **14 548** | 0 | **0** | **56** | 4 |
+| twin | 10 995 | 0 | **0** | 4 | 0 |
+
+**No second dialler exists.** Every channel this campaign ever opened came through the plain visitor path — the
+hypothesis that something other than a visitor dials is refuted, and so is a per-visitor retry.
+
+**And the arithmetic now closes**: 14 548 opens over ~1 080 s is **13.5 a second**, and a lane holding 56 of them
+means each lives **~4 seconds** on average. The median request is 1.3 ms, so those four seconds are not the typical
+request — they are the tail that hangs until its **5 s timeout**.
+
+**So the fifty-six are hung visitor requests**, and the lane's ceiling turns "a few requests hang" into "the pool has
+no channel to give". The two facts this line has chased separately — a hanging request and a full pool — are the same
+event seen twice, and the first is the cause.
+
+**What is left is exactly one question, and it is now narrow enough to instrument directly**: what a hung request is
+waiting for. Its channel was opened, its selector written, and the reply never came back within five seconds; on the
+client that is `handle_data_channel` waiting for the first selector byte, i.e. the server never read it.
+
 ### 4.376 The churn loop is sequential, so the probes account for two channels out of fifty-six (2026-11-14)
 
 `run_churn` (`probes/series.py:191`) is a `while` loop that calls `ping()` and emits — **one connection at a time**, no
