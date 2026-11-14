@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.366 Retiring never-used streams does not remove the permanent entry (2026-11-14)
+
+§4.365 guessed the entry whose age equals the run was a stream opened and never used. The fix (`73da8ac`: a stream
+with `send.base() == 0` and nothing outstanding is retired when abandoned) is in, with its tests — and the entry is
+**still there**:
+
+| arm | `opened_len` max | `oldest_opened_ms` max | wedges |
+|---|---|---|---|
+| product | 5 | **1 040 694 ms** | 0 |
+| twin | **56** | 982 862 ms | **2**, 15.015 s |
+
+So it is not a never-used stream. Both arms still carry one entry whose age is the whole run, which means whatever
+holds it is not `abandoned` either — the `abandoned` gate is the only path into every retirement rule this file has,
+and a stream that never becomes `abandoned` never leaves.
+
+**The fix stays** (it is correct on its own terms and covered), but the permanent entry needs the one fact not yet
+printed: **which** stream it is. One line at the moment the table's oldest entry changes would name it — the id, and
+whether `abandoned`, `local_fin`, `peer_fin` and `send.base()` are set — and that is the next instrument.
+
+**Meanwhile the ceiling reproduced on the twin** (56, two wedges), so the wedge itself is unchanged and the two
+questions remain separate: the permanent entry is a leak that a clean arm shows, and the ceiling is what a wedged arm
+shows.
+
 ### 4.365 The oldest entry in the stream table is as old as the run, on both arms (2026-11-14)
 
 The age instrument (`oldest_opened_ms`, `9bf88f1`) on a run where **both arms were clean** (`0 / 0`):
