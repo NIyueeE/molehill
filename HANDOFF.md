@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.372 The slowness is a one-percent tail, so occupancy has to come from channels nobody serves (2026-11-14)
+
+The interactive series on the wedged arm (p47, 5 wedges):
+
+| n | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| 10 445 | **1.3 ms** | 288 ms | **1 007 ms** | 2 900 ms |
+
+**A 1 % tail over 1 s.** At the probes' rates that is a couple of slow requests in flight at any moment — two or three,
+not 224. And the churn's own concurrency was measured in single digits (§4.371). So **no probe is waiting on 224
+channels, while both the pool (`count=4 × ceiling=56`) and the stream table (`opened_len` 56 per lane) say 224 exist**.
+
+**That leaves one shape the record has not tested: channels opened and then never handed to a visitor.** Every one of
+the 56 is in `stream_opened`, which is written only by `open()` — this end dialling — so they were all opened *by the
+client*, and a client opens channels either to serve a visitor or to fill the pool ahead of one. If the pool prefills
+to the ceiling and does not reuse what it prefilled, the table reads 56 forever while the probes see almost nothing.
+
+**The next read is the pool's placement code**: whether a channel it opened is tracked as *available* and handed out,
+or opened and pinned without ever being placed. That is a read of the pool, not of the carrier, and it is the first
+hypothesis in this line that explains *both* counts at once while every probe says the instance is nearly idle.
+
+**Marked as a hypothesis, not a finding** — the last nine of those went down with the next measurement.
+
 ### 4.371 Neither probe can hold 224, so the occupancy is censored *and* unattributed (2026-11-14)
 
 §4.370 said the churn's distribution is censored and that the missing tail would explain the occupancy. The series says
