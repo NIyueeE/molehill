@@ -3102,6 +3102,30 @@ impl Conn {
         )
     }
 
+    /// What the streams in the table are waiting on: `(abandoned, local_fin,
+    /// peer_fin, never_used)` counts.
+    ///
+    /// Four numbers because the 56 that fill a wedged arm's lanes have to be one of
+    /// these shapes, and which one says who is holding them (`HANDOFF.md` §4.366).
+    pub(crate) fn opened_flags(&self) -> (usize, usize, usize, usize) {
+        let mut out = (0usize, 0usize, 0usize, 0usize);
+        for state in self.streams.values() {
+            if state.abandoned {
+                out.0 += 1;
+            }
+            if state.local_fin {
+                out.1 += 1;
+            }
+            if state.peer_fin {
+                out.2 += 1;
+            }
+            if state.send.base() == 0 && state.send.unacked() == 0 {
+                out.3 += 1;
+            }
+        }
+        out
+    }
+
     /// How long the oldest stream in the table has been there, in milliseconds.
     ///
     /// The one distribution §4.364 has not read: 224 charged handles are either
