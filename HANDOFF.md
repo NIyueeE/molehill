@@ -11,6 +11,31 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ---
 
+## 0. Where to start right now (read this first)
+
+**One defect is open and it blocks the finalisation.** It is: on a soak, a fresh dial is refused for 10–25 s
+(`wedge_count` 6–9). Everything this line has established, and the fourteen explanations it has refuted, are in
+§4.335–§4.382.
+
+**The one measurement nobody has taken is the ask.** The server's pairing asks the client for a data channel, waits
+`PAIR_WAIT_BUDGET` (5 s), retries, waits five more, and expires with `gathered=0` — twice, while the same server
+accepted 14 547 channels from that client in the same run (§4.379, §4.382). Three timestamps per pairing decide it:
+
+1. **server asks** — `pair_striped_group` (`src/core/server.rs:4539`), at its `data_ch_req_tx` send;
+2. **client receives** — the control-channel command branch that handles the data-channel request;
+3. **client answers** — `open_tagged("open")` (`src/transport/mhd/conn.rs`), already tagged per call site (§4.377).
+
+Log all three with the `group` number, run one `--aa` soak, and join on `group`: if (1) has no (2) the request never
+arrives; if (2) exists and (3) comes seconds later the answer is late. That is the whole of what remains.
+
+**Do not repeat these** (each has a reading against it): pairing budget, listener, backlog, pool saturation, the lane's
+stream ceiling, lane death, the build, the transmit queue, the write wake, the sealed refusal, out-of-order initiation,
+the second arm, the arm's position, the pinned acknowledgement frontier, id reuse, the shared topology, the host's
+load/CPU/IO/memory, "born bad", the forwarder leak, churn concurrency, the permanent stream-table entry, the capacity
+ramp, and the stale-claim refusal (§4.381 — a real bug, fixed, not this one).
+
+---
+
 ## 1. Current state
 
 | fact | value |
