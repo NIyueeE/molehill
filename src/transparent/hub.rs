@@ -749,8 +749,7 @@ impl Routes {
                     let flag = claim
                         .slots
                         .get(slot)
-                        .map(|entry| Arc::clone(&entry.flag))
-                        .unwrap_or_default();
+                        .map_or_default(|entry| Arc::clone(&entry.flag));
                     (Arc::clone(&claim.retire), flag)
                 })
             })

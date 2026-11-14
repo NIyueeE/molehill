@@ -345,6 +345,12 @@ fn report_window(shared: &Arc<Shared>) {
             // The frontier this end advertises, and the largest number it has seen:
             // a `below` that sits still while `largest` climbs pins every above it
             // and is the loop §4.343 found (`HANDOFF.md` §4.344).
+            // The queues an instance carries, beside the streams it holds: the one
+            // family of numbers that is not measured anywhere and is the shape an
+            // accumulation would take (`HANDOFF.md` §4.357).
+            inbound_len = conn.queue_sizes().0,
+            finishing_len = conn.queue_sizes().1,
+            opened_len = conn.queue_sizes().2,
             ack_below = conn.ack_frontier().1,
             ack_largest = conn.ack_frontier().0,
             // The oldest resident and why it is still there, beside the count: a

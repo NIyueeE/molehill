@@ -3064,6 +3064,20 @@ impl Conn {
     }
 
     /// How many times the stalled-prefix rescue fired on this lane.
+    /// The sizes of the queues an instance carries across its life.
+    ///
+    /// The instance is not born bad (§4.357 withdrew that) — it runs for 20 to 914
+    /// seconds and then fails, so something accumulates. Memory and fds are measured
+    /// every second and never looked wrong; these three are not measured at all, and
+    /// a queue that grows without bound is kilobytes of RAM and minutes to bite.
+    pub(crate) fn queue_sizes(&self) -> (usize, usize, usize) {
+        (
+            self.inbound.len(),
+            self.finishing.len(),
+            self.stream_opened.len(),
+        )
+    }
+
     /// The acknowledgement frontier this end advertises: `(largest, below)`.
     pub(crate) fn ack_frontier(&self) -> (u32, u32) {
         self.acks.frontier()

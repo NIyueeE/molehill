@@ -3283,8 +3283,7 @@ impl LanePool {
         let handing_over: Vec<(ServiceId, LaneId)> = self
             .draining
             .lock()
-            .map(|draining| draining.keys().copied().collect())
-            .unwrap_or_default();
+            .map_or_default(|draining| draining.keys().copied().collect());
         let mut loads = Vec::with_capacity(claims.len());
         let mut used = 0;
         for (endpoint, entry) in claims.iter() {
@@ -3377,8 +3376,7 @@ impl LanePool {
         let asked: Vec<(ServiceId, LaneId)> = self
             .draining
             .lock()
-            .map(|draining| draining.keys().copied().collect())
-            .unwrap_or_default();
+            .map_or_default(|draining| draining.keys().copied().collect());
         for (service, lane) in asked {
             let Some(state) = self.drain_state.take(service, lane) else {
                 // No answer yet: give up on a drain that has been waiting too
@@ -3723,17 +3721,13 @@ impl LanePool {
             // Only lanes that are not already being handed over are candidates:
             // a second drain for the same lane would be about a connection that
             // is already on its way out.
-            let handing_over: Vec<LaneId> = self
-                .draining
-                .lock()
-                .map(|draining| {
-                    draining
-                        .keys()
-                        .filter(|(asked, _)| *asked == service)
-                        .map(|(_, lane)| *lane)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let handing_over: Vec<LaneId> = self.draining.lock().map_or_default(|draining| {
+                draining
+                    .keys()
+                    .filter(|(asked, _)| *asked == service)
+                    .map(|(_, lane)| *lane)
+                    .collect()
+            });
             let evidence: Vec<lanes::LaneEvidence> = evidence
                 .into_iter()
                 .filter(|lane| !handing_over.contains(&lane.lane))
@@ -4364,50 +4358,46 @@ impl ClientSession {
             .collect();
 
         #[cfg(mh_l3_client)]
-        let claims = self
-            .lane_pool
-            .as_ref()
-            .map(|pool| {
-                let claims: HashMap<String, (String, u16)> = self
-                    .services
-                    .values()
-                    .map(|entry| {
+        let claims = self.lane_pool.as_ref().map_or_default(|pool| {
+            let claims: HashMap<String, (String, u16)> = self
+                .services
+                .values()
+                .map(|entry| {
+                    (
+                        entry.slot.service.remote_bind_addr.clone(),
                         (
-                            entry.slot.service.remote_bind_addr.clone(),
-                            (
-                                entry.slot.service.name.clone(),
-                                entry.slot.service.transparent_lanes,
-                            ),
-                        )
-                    })
-                    .collect();
-                pool.snapshot()
-                    .0
-                    .into_iter()
-                    .map(|load| {
-                        let endpoint = load.endpoint.to_string();
-                        let (name, configured_lanes) = claims
-                            .get(&endpoint)
-                            .cloned()
-                            .unwrap_or_else(|| (endpoint.clone(), 0));
-                        crate::status::ClaimSnapshot {
-                            name,
-                            endpoint,
-                            configured_lanes: Some(configured_lanes),
-                            lanes: load
-                                .lanes
-                                .into_iter()
-                                .map(|lane| crate::status::LaneStatus {
-                                    slot: lane.slot,
-                                    flows: lane.flows,
-                                    handover: lane.handover,
-                                })
-                                .collect(),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                            entry.slot.service.name.clone(),
+                            entry.slot.service.transparent_lanes,
+                        ),
+                    )
+                })
+                .collect();
+            pool.snapshot()
+                .0
+                .into_iter()
+                .map(|load| {
+                    let endpoint = load.endpoint.to_string();
+                    let (name, configured_lanes) = claims
+                        .get(&endpoint)
+                        .cloned()
+                        .unwrap_or_else(|| (endpoint.clone(), 0));
+                    crate::status::ClaimSnapshot {
+                        name,
+                        endpoint,
+                        configured_lanes: Some(configured_lanes),
+                        lanes: load
+                            .lanes
+                            .into_iter()
+                            .map(|lane| crate::status::LaneStatus {
+                                slot: lane.slot,
+                                flows: lane.flows,
+                                handover: lane.handover,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect()
+        });
 
         #[cfg(not(mh_l3_client))]
         let claims = Vec::new();

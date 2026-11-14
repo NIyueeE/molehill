@@ -345,8 +345,7 @@ impl TunnelCounters {
         let peer = self
             .peer
             .lock()
-            .map(|peer| peer.counters)
-            .unwrap_or_default()
+            .map_or_default(|peer| peer.counters)
             .unwrap_or((0, 0));
         Some((
             local.0.saturating_add(peer.0),
