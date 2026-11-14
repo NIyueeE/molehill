@@ -377,6 +377,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.351 Fresh namespaces per arm do not remove the wedge, so the shared topology was not the cause (2026-11-14)
+
+The experiment the authorisation made possible, run twice with the topology rebuilt between arms (`c7f2eb1`):
+
+| run | product arm | twin |
+|---|---|---|
+| p34 | **0 / 0 / 0** | **0 / 0 / 0** |
+| p35 | **0 / 0 / 0** | **4 wedges, 55.054 s, 30 timeouts** |
+
+**The wedge survives fresh namespaces**, so sharing them was not the cause — and the first run's clean pair was the
+same luck the record has seen before (§4.335's 0/0). The per-arm topology stays anyway: it makes the arms
+independent, which is what an A/A twin should be, and it costs a few seconds per arm.
+
+**What is now excluded by measurement**: the shared namespaces (this entry), the build, the arm's position, the
+second arm as such, and the sixteen items listed in §4.349. What remains is a defect that attaches to **one instance
+of a campaign that starts the tool more than once**, inside that instance, with every counter on both ends reading
+normally except the failures themselves.
+
+**The honest position is unchanged and now better supported**: the product is clean in the single-instance shape a
+deployment runs (two soaks, forty minutes, §4.335), the campaign's multi-instance shape is not, and twenty-one
+rounds have not found what differs inside the instance that wedges.
+
 ### 4.350 The harness gives every arm of a run the same namespaces (2026-11-13)
 
 The user authorised moving the bench's topology, so the first read is what it shares — and it is the one thing this
