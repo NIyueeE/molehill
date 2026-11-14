@@ -17,6 +17,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 (`wedge_count` 6–9). Everything this line has established, and the fourteen explanations it has refuted, are in
 §4.335–§4.382.
 
+**The mechanism is now measured, and the next change is a bound.** For a group whose pairing expires, the client logs
+`channel request read` (122 µs after the ask) and then `mhd channel open started` **19 µs later**, and **never** logs
+`mhd channel open finished` — where a healthy channel logs both with `open_us=42`. So the open begins immediately and
+hangs: placement waits for a lane below a ceiling that four lanes at 56 have already reached (§4.372), while the
+server's two five-second budgets run out.
+
+**The fix to make next**, in the client's channel-open path:
+
+1. **bound the placement** — `open_stream` fails after a short budget instead of waiting indefinitely;
+2. **answer the request** — on failure the client tells the server, so the pairing re-asks or the visitor fails fast
+   instead of 10 s later;
+3. **count the refusal** — one counter for "placement had no lane below the ceiling", which is the number that says
+   whether lanes are still filling after the fix.
+
+Then one `--aa` soak: `pairing budget expired` should fall to zero and `wedge_max_s` should stop being 10 s.
+
 **The three timestamps exist** — the server's ask (`595b684`), the client's receipt (`client.rs:4096`, logging the
 group it was asked for), and the open (`open_tagged("open")`). The one measurement nobody has joined is the *join*:
 run one soak and pair the three by `group`.
