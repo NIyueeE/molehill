@@ -693,6 +693,14 @@ def run_campaign(camp: Campaign) -> dict:
             samples = arm_turn(camp, arm, rnd, warmup)
             camp.results["samples"].extend(samples)
             camp.save()
+            # **A fresh topology per arm.** One `Topology` per campaign means every
+            # arm of every round shares the same three namespaces, veths and qdiscs,
+            # with only the tool's daemons swapped -- and a soak's twenty minutes of
+            # churn leaves sockets, port bindings and shaper state behind. That is
+            # the one cross-instance state a defect which appears only when a
+            # campaign starts the tool more than once could live in
+            # (`HANDOFF.md` §4.350), so the arms are given their own.
+            _reopen_topology(camp)
     return camp.results
 
 
@@ -824,6 +832,25 @@ def _open_topology(camp: Campaign, args) -> topology.Topology:
         f"condition {args.condition} on the {args.condition_leg} leg"
     )
     return topo
+
+
+def _reopen_topology(camp: Campaign) -> None:
+    """Tear the namespaces down and build a fresh set for the next arm.
+
+    The campaign's topology is created once (`_open_topology`), which is what made
+    every arm share it. Recreating it between arms costs a few seconds and is the
+    only way to tell a defect that the *tool* carries from one the *shared
+    namespaces* carry (`HANDOFF.md` §4.350).
+    """
+    backend = camp.backend
+    if backend is not None:
+        backend.stop()
+        camp.backend = None
+    topo = camp.topo
+    if topo is not None:
+        topo.down()
+        camp.topo = None
+    _open_topology(camp, camp.args)
 
 
 def _sigint(signum, frame):  # noqa: ARG001 — signal handlers take both
