@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.378 The server reads every selector, so the hang is after it (2026-11-14)
+
+§4.377 left one question: what a hung request waits for. The answer's first half, from the wedged arm's own log —
+joining the streams whose first packet arrived against those the accept loop read:
+
+| reading | count |
+|---|---|
+| distinct streams with a first packet | **14 547** |
+| distinct streams the accept loop read a selector from | **14 548** |
+| **first packets never read** | **0** |
+
+**Not one channel was left unread.** So the packet path is clean — the frame arrives, the lane creates the stream, the
+accept loop picks it up and reads the selector, for every single open of the run — and a request that hangs hangs
+**after** its selector.
+
+**That kills the two candidate explanations on this side**: the packet never arriving, and the accept loop never being
+scheduled. What remains is the server's answer: the hello that follows the selector, the pairing it waits on, and the
+reply it writes. `PAIR_WAIT_BUDGET` is five seconds and the probe's own timeout is five seconds — **the same number**,
+which is why a hung request and an unanswered pairing look identical from the probe and why the record could not tell
+them apart for fifty rounds.
+
+**The next instrument names which of the two fired**: on the server, log when a pairing's budget expires with the
+stream id it belonged to, and on the client, when its five-second wait ends — then the two lines either match (the
+pairing) or do not (the reply).
+
 ### 4.377 Every open is a visitor open, and thirteen a second times four seconds is fifty-six (2026-11-14)
 
 The tag instrument (`3df5adb`) on a run where the product arm wedged (4 wedges, 10.01 s) and its twin did not:
