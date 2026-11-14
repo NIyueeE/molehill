@@ -3085,6 +3085,19 @@ impl Conn {
     /// seconds and then fails, so something accumulates. Memory and fds are measured
     /// every second and never looked wrong; these three are not measured at all, and
     /// a queue that grows without bound is kilobytes of RAM and minutes to bite.
+    /// How many of the open streams this end opened itself.
+    ///
+    /// `stream_opened` is written only by `open()`, so a stream in `streams` but not
+    /// in it was created by the *peer's* first packet. The distinction decides
+    /// whether the 224 channels a wedged arm holds were dialled here or arrived
+    /// (`HANDOFF.md` §4.374).
+    pub(crate) fn opened_here(&self) -> usize {
+        self.streams
+            .keys()
+            .filter(|id| self.stream_opened.contains_key(id))
+            .count()
+    }
+
     pub(crate) fn queue_sizes(&self) -> (usize, usize, usize, usize) {
         // The fourth is the shape §4.359 predicted fills the table: streams this end
         // has finished whose peer never said finished, so no fin arrives to complete

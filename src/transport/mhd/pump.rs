@@ -357,6 +357,7 @@ fn report_window(shared: &Arc<Shared>) {
             opened_local_fin = conn.opened_flags().1,
             opened_peer_fin = conn.opened_flags().2,
             opened_never_used = conn.opened_flags().3,
+            opened_here = conn.opened_here(),
             ack_below = conn.ack_frontier().1,
             ack_largest = conn.ack_frontier().0,
             // The oldest resident and why it is still there, beside the count: a
