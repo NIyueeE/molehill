@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.359 Retiring both-fins streams is correct and not enough: the table still fills on one arm (2026-11-14)
+
+The fix from §4.358 (`closed_both`: both fins and nothing outstanding retires the stream, `0b05065`) measured on the
+same shape:
+
+| arm | `opened_len` p50 / p90 / p99 / max | wedges |
+|---|---|---|
+| product | **2 / 3 / 4 / 4** | **0** |
+| twin | 2 / **56 / 56 / 56** | **9**, 15.015 s, 25 timeouts |
+
+**The clean arm never leaves single digits and the wedged one sits at the ceiling** — the correlation §4.358 found is
+now clean, and it is what the fix was aimed at. But the twin still fills, so **the entries it fills with are not
+both-fins streams**: they are half-open from this end's view, with `peer_fin` never set.
+
+**That is a sharper statement than before**: not "entries are not retired" but "entries whose peer never said
+finished". Which streams those are is answerable with one more field — the count of `opened` entries that have
+`local_fin` set and `peer_fin` clear — because a channel whose visitor vanished before the peer's fin arrives is
+exactly that shape, and §4.348 already measured that half the channels never put a first byte on the wire.
+
+**So the next instrument is one number beside `opened_len`**: how many of those entries are locally finished and
+waiting for a peer fin. If it is the same 52–54, the fix is to bound that wait rather than to wait for a fin that
+will never come.
+
 ### 4.358 The wedge correlates with the lane's stream table reaching its ceiling (2026-11-14)
 
 The queue instrument (`inbound`/`finishing`/`opened` on the window line) on a run where **both arms wedged** (6
