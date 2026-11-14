@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.354 The first diff of a wedged arm against a clean one: traffic (an effect) and host load (2026-11-14)
+
+The run that finally caught both halves — p38, product arm **7 wedges, 15.015 s, 30 timeouts**, twin **0 / 0 / 0** —
+with a host-state capture for each. Line by line, the two files differ in exactly two things:
+
+| what | clean twin | wedged arm |
+|---|---|---|
+| sockets the arm carried (`ss -s`, host and both data namespaces) | 2 262 / 2 114 | 664 / 720 |
+| qdiscs installed | `fq …` identical, kernel handle differs only | same |
+| kernel limits (`rmem_max`, `wmem_max`, port range, `tw_reuse`) | identical | identical |
+| **host load average at the end** | **9.03 / 6.21 / 6.04** | **12.59 / 7.99 / 6.63** |
+
+**The socket count is an effect** — the wedged arm served a third as many connections because it was wedged. The
+qdiscs and kernel limits are identical, which closes the two explanations §4.353 predicted a namespace could carry.
+
+**The load average is not an effect of the same kind.** Across the four soaks with this topology the clean arms ended
+at 8.42–9.18 and the wedged one at 12.59, with its one-, five- and fifteen-minute averages all higher. The `1/1021`
+field says one task was running, so most of that 12.59 is **tasks in a non-CPU wait**, not CPU work — and a run whose
+load climbs through an arm wedges that arm.
+
+**That is where the next instrument goes**: `/proc/pressure/{cpu,io,memory}` and `vmstat` sampled through the arm,
+so the load can be read as *before* or *after* the wedge rather than at its end. If the wait precedes the wedge, the
+defect is the environment the benchmark runs in and the gate must say so; if it follows, it is another effect and the
+capture has one more column to add.
+
 ### 4.353 Per-arm namespaces do not remove the wedge but the incidence falls (2026-11-14)
 
 Four soaks with the topology rebuilt between arms, and the rate against the fourteen runs before it:
