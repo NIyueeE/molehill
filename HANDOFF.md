@@ -21,7 +21,11 @@ Read `AGENTS.md` first for the rules; read this for the state.
 group it was asked for), and the open (`open_tagged("open")`). The one measurement nobody has joined is the *join*:
 run one soak and pair the three by `group`.
 
-**The ask is the question.** The server's pairing asks the client for a data channel, waits
+**The join, on the logs already on disk**: all 28 groups whose pairing expired were groups the client had *seen*
+(18 962 groups reached it in that run, and `comm -23` between the two sets is **empty**). So the request always
+arrives; what is missing is the answer.
+
+**The question is now the answer.** The server's pairing asks the client for a data channel, waits
 `PAIR_WAIT_BUDGET` (5 s), retries, waits five more, and expires with `gathered=0` — twice, while the same server
 accepted 14 547 channels from that client in the same run (§4.379, §4.382). Three timestamps per pairing decide it:
 
