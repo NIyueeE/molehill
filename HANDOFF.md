@@ -377,6 +377,29 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.382 One pairing waits ten seconds while the probe's own timeout is five (2026-11-14)
+
+The expiry line carries `attempts`, `gathered` and `waited_ms`, and the same `group` appears twice — for 7812:
+
+```
+attempts=1 group=7812 gathered=0 waited_ms=5000
+attempts=2 group=7812 gathered=0 waited_ms=10001
+```
+
+**So a pairing that gathers nothing waits `PAIR_WAIT_BUDGET` (5 s), retries, and waits another five — ten seconds — while the
+visitor's own connect timeout is five.** The visitor has given up by then, and the wedge durations this record has been
+reading are exactly that arithmetic: 10.01 s, 15.015 s, 25.024 s are one, one and a half, and two and a half pairings.
+
+**Two consequences, both worth acting on:**
+
+1. **The gate's number is a pairing budget, not a carrier stall.** `wedge_max_s` ≥ 10 s is what two attempts of a
+   five-second budget looks like when nothing answers.
+2. **Retrying to ten seconds when the visitor leaves at five is work spent on a visitor that is gone** — the second
+   attempt cannot help anyone, and it holds the group (and its slot) for five more seconds.
+
+**And the cause is still that nothing answers the ask.** Both attempts gather zero, so the client never delivered a
+channel for 7812 either time; the ask, its receipt and its answer remain the three timestamps nobody has taken.
+
 ### 4.381 The stale claim is real and rare, and it was not the cause (2026-11-14)
 
 §4.380 called the refusal at `server.rs:2603` the root cause. The fix landed (`2da9cee`, 410 tests green) and the
