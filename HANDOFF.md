@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.360 The filled table is live channels, not half-open ones (2026-11-14)
+
+§4.359 predicted the 56 entries were streams waiting for a peer fin. Measured:
+
+| arm | `opened_len` max | `half_open_len` max | wedges |
+|---|---|---|---|
+| product | **4** | **1** | 0 |
+| twin | **56** | **2** | 3, 125.125 s |
+
+**So the filler is not the half-open population** — two entries at most, on either arm, while the wedged arm's table
+holds 56. With `closed_both` streams now retiring (§4.359), the remaining entries are those with `local_fin` **false**:
+streams this end has never finished — **live channels**.
+
+**Which makes the ceiling what §4.322 originally said, without the grep**: a lane carrying 56 concurrent channels
+cannot open another, the pairing gets nothing and the visitor's dial is refused. The question is no longer retirement
+but **placement**: why one lane holds 56 while the pool has four.
+
+**Next**: `opened_len` per lane. The window line already carries `lane=`, so one run's logs say whether the wedged arm
+piled its streams on one lane (a placement that never spreads) or filled all four evenly (a ceiling that is simply
+too low for this workload, which would be a `tunnels` parameter and therefore a product decision rather than a bug).
+
 ### 4.359 Retiring both-fins streams is correct and not enough: the table still fills on one arm (2026-11-14)
 
 The fix from §4.358 (`closed_both`: both fins and nothing outstanding retires the stream, `0b05065`) measured on the
