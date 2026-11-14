@@ -465,6 +465,25 @@ pub(crate) fn note_open_us(us: u64) {
     }
 }
 
+/// Note one placement that found no lane below its ceiling.
+///
+/// The count that says whether lanes are still filling after a placement is bounded
+/// (`HANDOFF.md` §0): a bounded wait turns a hang into this number.
+pub(crate) fn note_open_budget_expired() {
+    if !enabled() {
+        return;
+    }
+    OPEN_BUDGET_EXPIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many placements have hit [`note_open_budget_expired`].
+pub(crate) fn open_budget_expired() -> u64 {
+    OPEN_BUDGET_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Placements that found no lane below its ceiling, since the process started.
+static OPEN_BUDGET_EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Note one pool growth, with the time it took.
 pub(crate) fn note_pool_grow(age: Duration) {
     if !enabled() {

@@ -204,6 +204,15 @@ pub fn udp_lifetime(max_gap: std::time::Duration) -> std::time::Duration {
 #[cfg(feature = "server")]
 pub const UDP_ROUTE_TTL_SECS: u64 = 300;
 
+/// How long a data-channel placement may wait for a lane below its ceiling.
+///
+/// Shorter than one `PAIR_WAIT_BUDGET`, so a server that asked for a channel learns
+/// its request cannot be served and can re-ask, instead of both ends waiting out the
+/// other (`HANDOFF.md` §0, measured: an open that began 19 µs after the request and
+/// never finished while two five-second budgets ran out).
+#[cfg(feature = "carrier")]
+pub const OPEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The adaptive cap on a control channel's reconnect backoff, in seconds.
 ///
 /// **The cap follows the failure count, not the clock.** A server that is

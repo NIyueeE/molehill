@@ -1592,9 +1592,24 @@ async fn run_mux_data_channel(
     // slow in the handshake look identical from the server, and only these two
     // numbers tell them apart.
     let stream_opening = std::time::Instant::now();
-    let mut stream = match stripe {
-        Some(request) => open_stripe_stream(args, tunnel, request).await?,
-        None => tunnel.open_stream().await?,
+    // **A placement that waits forever is a visitor that waits forever.** When every
+    // lane sits at its stream ceiling, `open_stream` has no lane to place on and
+    // waits; measured, the open then never finished while the server's two five
+    // second pairing budgets ran out (`HANDOFF.md` §0). A budget shorter than one
+    // pairing budget lets the server re-ask, or lets the visitor fail fast, instead
+    // of both ends waiting out the other.
+    let opened = tokio::time::timeout(crate::common::constants::OPEN_BUDGET, async {
+        match stripe {
+            Some(request) => open_stripe_stream(args, tunnel, request).await,
+            None => tunnel.open_stream().await,
+        }
+    })
+    .await;
+    let mut stream = if let Ok(result) = opened {
+        result?
+    } else {
+        crate::transport::stats::note_open_budget_expired();
+        anyhow::bail!("mhd channel placement found no lane below its ceiling");
     };
     let open_us = u64::try_from(stream_opening.elapsed().as_micros()).unwrap_or(u64::MAX);
     // Every open, into a histogram: the log line below is a slow-open sample and
