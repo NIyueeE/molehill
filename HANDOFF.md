@@ -37,8 +37,20 @@ correlated with longer wedges — it is **reverted** (`git revert d88ce7a`, 410 
 first and never the second never reached the second: the open was *started* by the command handler and the data path
 for it never ran.
 
-**Which leaves the hand-off between those two functions** — the queue or task that carries an opened channel from the
-control command to the data handler — and that is the next thing to read.
+**Which leaves the hand-off between those two functions**, and it is now read: `open_data_channel` (3850) logs
+`started` and ends with
+
+```rust
+spawn_data_channel(active.args.clone(), tunnel, stripe, queued_at);
+```
+
+— the channel is **handed to a spawned task**, and `channel open finished` is written by `run_mux_data_channel` (1577),
+which that task must reach. So `started` without `finished` means **the spawned task never got as far as the finish**,
+and both things measured so far — the placement bound and the prologue — are inside that task and never fired.
+
+**The next instrument goes inside the task**: a line at its entry and a line after `open_stream` returns, so the three
+possibilities separate — never scheduled, scheduled and blocked before the open, or open returned and the handler never
+ran.
 
 **What an earlier round located**, kept for the record: the only statement between `channel open started` and `channel open finished`
 that can end the function is
