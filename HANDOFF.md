@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.368 The 56 are live, unfinished, in-use channels — the stalled requests themselves (2026-11-14)
+
+The four flag counts §4.366 asked for, on the run that wedged (twin: 5 wedges, 15.015 s) against the clean arm:
+
+| arm | `opened_len` | `abandoned` | `local_fin` | `peer_fin` | `never_used` |
+|---|---|---|---|---|---|
+| product | 5 | 0 | 1 | 2 | 0 |
+| twin | **56** | **0** | **1** | **26** | **0** |
+
+**Every one of the 56 is alive in both directions**: none abandoned, only one locally finished, and twenty-six carrying
+the peer's fin. The other thirty have neither fin — **open, unfinished, in use**.
+
+**That closes the chain with nothing left unexplained.** A channel that is open and unfinished is one whose forwarder
+is still copying, i.e. a **visitor connection that is waiting for an answer**. Fifty-six of them per lane, 224 across
+the pool, is what "every request is slow and the pool is full" looks like from inside.
+
+**So the pool's exhaustion, the lane ceiling and the refused dials are all downstream of §4.343's loop**: a request the
+server already answered is re-sent, the visitor keeps waiting, its channel stays open, and once sixteen a second of
+those accumulate the pool has nothing left to give. The ceiling is not a bug; the **waiting is**.
+
+**Which puts the work back at the one place it started**: why a client re-sends a range the server answered. That is
+now the only question left with nothing measured against it, and every other measurement in this line is consistent
+with it being answered.
+
 ### 4.367 The permanent entry is the lane's own handshake stream, not a leak (2026-11-14)
 
 §4.365 and §4.366 treated the entry whose age equals the run as a leak. Read in the code, it is the **lane's root
