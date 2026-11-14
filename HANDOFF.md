@@ -377,6 +377,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.363 The churn series does not carry the occupancy either (2026-11-14)
+
+§4.362's arithmetic needed the churn to average near fourteen seconds. Measured on the same run, the churn series'
+own `setup_ms`:
+
+| arm | n | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| product | 9 544 | **1.5 ms** | 401 ms | 1 050 ms | 5 003 ms |
+| twin | 6 038 | **2.6 ms** | 401 ms | 1 666 ms | 5 005 ms |
+
+**A median of 1.5 ms and a p99 of a second cannot fill 224 channels at sixteen a second** — that needs fourteen
+seconds *on average*. So occupancy is not rate × latency either, and §4.362's explanation goes the way of the others.
+
+**What is left standing is the measurement alone**: on a wedged arm, four lanes each hold **56 live streams** (224
+in total, `local_fin` false), while a clean arm holds **4 per lane**. Every explanation this record has offered for
+how they get there — a leak of forwarders (§4.361), a churn concurrency (§4.362) — is refuted by the next number.
+
+**The one thing not yet asked is where those streams come from at all.** 224 live streams is far more than the
+soak's churn rate implies and far more than the interactive probe holds. The pool's own `pool-stats` line reports
+`streams`/`pending`/`pinned` per pool each second and has not been read against this measurement; that is the next
+thing to read, and it is a comparison of two instruments on the same run rather than another hypothesis.
+
 ### 4.362 The ceiling is an amplifier, not the cause: 16 a second times a slow request (2026-11-14)
 
 §4.361 said 224 forwarding tasks never ended. Reading the forwarder says otherwise: `FORWARD_IDLE_TIMEOUT` is 300 s
