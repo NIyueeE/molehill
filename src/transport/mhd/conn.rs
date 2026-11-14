@@ -1662,7 +1662,13 @@ impl Conn {
         // ceiling, on both arms that wedged while a clean arm peaked at 4
         // (`HANDOFF.md` §4.358).
         let closed_both = state.local_fin && state.peer_fin && state.send.unacked() == 0;
-        let done = closed_both || (state.abandoned && state.fin_sent && state.send.unacked() == 0);
+        // A stream that was opened and never carried a byte has nothing to hand to
+        // the peer and no fin to send, so `abandoned` alone never retired it and the
+        // reaper skips it too (nothing held). Measured: one entry per lane whose age
+        // is the whole run (`HANDOFF.md` §4.365).
+        let never_used = state.send.base() == 0 && state.send.unacked() == 0;
+        let done = closed_both
+            || (state.abandoned && (state.fin_sent || never_used) && state.send.unacked() == 0);
         if state.local_fin && !state.fin_sent {
             self.finishing.insert(stream);
         } else {
