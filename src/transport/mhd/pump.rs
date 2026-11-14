@@ -358,6 +358,11 @@ fn report_window(shared: &Arc<Shared>) {
             opened_peer_fin = conn.opened_flags().2,
             opened_never_used = conn.opened_flags().3,
             opened_here = conn.opened_here(),
+            // Which call site dialled, totalled. `open` is the plain visitor path;
+            // anything else that shows up here is a second dialler (§4.376).
+            opens_open = conn.opens_by_tag().get("open").copied().unwrap_or(0),
+            opens_striped = conn.opens_by_tag().get("striped").copied().unwrap_or(0),
+            opens_other = conn.opens_by_tag().len().saturating_sub(2),
             ack_below = conn.ack_frontier().1,
             ack_largest = conn.ack_frontier().0,
             // The oldest resident and why it is still there, beside the count: a

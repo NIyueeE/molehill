@@ -1101,6 +1101,8 @@ pub(crate) struct Conn {
     /// rest of the opening's duration is the wire. Without the split a "the open
     /// took 750 ms" reading cannot say which side to fix (see `transmit_stream`).
     stream_opened: BTreeMap<u32, Instant>,
+    /// Every `open`, counted by the call site that made it.
+    opens_by_tag: std::collections::BTreeMap<&'static str, usize>,
     /// Aborts waiting for the next pass: a stream one end let go of.
     resets: VecDeque<(u32, ResetCode)>,
     /// Finishes waiting for a packet of their own: (stream, end offset).
@@ -1295,6 +1297,7 @@ impl Conn {
             inbound: VecDeque::new(),
             inbound_at: BTreeMap::new(),
             stream_opened: BTreeMap::new(),
+            opens_by_tag: std::collections::BTreeMap::new(),
             resets: VecDeque::new(),
             pending_fins: VecDeque::new(),
             finishing: BTreeSet::new(),
@@ -1331,6 +1334,12 @@ impl Conn {
 
     /// Open a stream, answering its id.
     pub(crate) fn open(&mut self) -> StreamHandle {
+        self.open_tagged("open")
+    }
+
+    /// The same, naming the call site.
+    pub(crate) fn open_tagged(&mut self, tag: &'static str) -> StreamHandle {
+        *self.opens_by_tag.entry(tag).or_insert(0) += 1;
         self.open_at(Instant::now())
     }
 
@@ -3085,6 +3094,16 @@ impl Conn {
     /// seconds and then fails, so something accumulates. Memory and fds are measured
     /// every second and never looked wrong; these three are not measured at all, and
     /// a queue that grows without bound is kilobytes of RAM and minutes to bite.
+    /// How many streams each call site has opened, by tag.
+    ///
+    /// The probes ride at most two channels between them (`probes/series.py:191`
+    /// is a sequential loop) while a wedged arm holds fifty-six, so something other
+    /// than a visitor dials. The tag says which, and it is the only question left
+    /// that a single run can answer (`HANDOFF.md` §4.376).
+    pub(crate) fn opens_by_tag(&self) -> &std::collections::BTreeMap<&'static str, usize> {
+        &self.opens_by_tag
+    }
+
     /// How many of the open streams this end opened itself.
     ///
     /// `stream_opened` is written only by `open()`, so a stream in `streams` but not
