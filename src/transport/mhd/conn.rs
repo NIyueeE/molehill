@@ -3096,6 +3096,19 @@ impl Conn {
         )
     }
 
+    /// How long the oldest stream in the table has been there, in milliseconds.
+    ///
+    /// The one distribution §4.364 has not read: 224 charged handles are either
+    /// accumulating (an old age that keeps climbing) or merely concurrent (an age
+    /// near a round trip). Nothing else separates those two readings.
+    pub(crate) fn oldest_opened_ms(&self) -> u64 {
+        self.stream_opened
+            .values()
+            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The acknowledgement frontier this end advertises: `(largest, below)`.
     pub(crate) fn ack_frontier(&self) -> (u32, u32) {
         self.acks.frontier()

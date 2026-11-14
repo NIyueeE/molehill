@@ -352,6 +352,7 @@ fn report_window(shared: &Arc<Shared>) {
             finishing_len = conn.queue_sizes().1,
             opened_len = conn.queue_sizes().2,
             half_open_len = conn.queue_sizes().3,
+            oldest_opened_ms = conn.oldest_opened_ms(),
             ack_below = conn.ack_frontier().1,
             ack_largest = conn.ack_frontier().0,
             // The oldest resident and why it is still there, beside the count: a
