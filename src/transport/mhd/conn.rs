@@ -3079,11 +3079,20 @@ impl Conn {
     /// seconds and then fails, so something accumulates. Memory and fds are measured
     /// every second and never looked wrong; these three are not measured at all, and
     /// a queue that grows without bound is kilobytes of RAM and minutes to bite.
-    pub(crate) fn queue_sizes(&self) -> (usize, usize, usize) {
+    pub(crate) fn queue_sizes(&self) -> (usize, usize, usize, usize) {
+        // The fourth is the shape §4.359 predicted fills the table: streams this end
+        // has finished whose peer never said finished, so no fin arrives to complete
+        // the close and the entry waits for a condition that will not come.
+        let half_open = self
+            .streams
+            .values()
+            .filter(|state| state.local_fin && !state.peer_fin)
+            .count();
         (
             self.inbound.len(),
             self.finishing.len(),
             self.stream_opened.len(),
+            half_open,
         )
     }
 
