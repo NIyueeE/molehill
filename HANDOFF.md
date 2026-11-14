@@ -23,7 +23,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 hangs: placement waits for a lane below a ceiling that four lanes at 56 have already reached (§4.372), while the
 server's two five-second budgets run out.
 
-**The fix to make next**, in the client's channel-open path:
+**§4.383 (this round): the bound did not fire and made it worse.** Measured with `d88ce7a` in:
+product 6 wedges / **45.044 s**, twin 2 / **85.085 s**, 174 and 134 expired pairings, and `open_budget_expired` **0**
+on both arms. So the open that never finishes is *not* waiting in the placement the bound wrapped, and the change
+correlated with longer wedges — it is **reverted** (`git revert d88ce7a`, 410 tests green).
+
+**What that leaves**: an open that starts 19 µs after the request and never logs `open finished`, and a bound around
+`open_stream` that never fires. The two are only compatible if the open ends by a path that does not log a finish and
+does not wait in that call — a cancellation, or an early error the handler swallows. **That is the next thing to
+find**, and it is a code read of the handler, not a measurement.
+
+**The fix that was attempted, and is now withdrawn:**
+
 
 1. **bound the placement** — `open_stream` fails after a short budget instead of waiting indefinitely;
 2. **answer the request** — on failure the client tells the server, so the pairing re-asks or the visitor fails fast
