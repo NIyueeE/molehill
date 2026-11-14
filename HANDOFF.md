@@ -377,6 +377,30 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.355 The per-second pressure sampling shows both arms alike, so the load difference was host noise (2026-11-14)
+
+The instrument §4.354 asked for — one line a second of `vmstat` through every arm — on another run that caught both
+halves (p39: product **7 wedges / 25.024 s**, twin **0 / 0 / 0**), 538 and 525 samples:
+
+| reading | wedged arm | clean twin |
+|---|---|---|
+| CPU busy (`us + sy`), mean / max | **30.4 % / 69 %** | **28.5 % / 56 %** |
+| I/O wait (`wa`), mean / max | 0.0 / 2 | 0.0 / 3 |
+| blocked tasks (`b`), mean / max | 0.00 / 1 | 0.01 / 2 |
+| free memory, p50 | 779 MB | 754 MB |
+
+**Nothing separates them.** The end-of-arm load average that looked like a lead (12.59 against 8.42–9.18) is not CPU,
+not I/O wait, not blocked tasks and not memory — it is **what else the shared host was doing at that moment**, i.e.
+noise. §4.354's lead is withdrawn.
+
+Two limits worth recording: `/proc/pressure/` **does not exist in this container**, so that half of the sampler wrote
+nothing; and the two halves of the question have now been measured from outside the process as far as an outside
+view can go — sockets, qdiscs, kernel limits, CPU, I/O, blocked tasks, memory, namespaces, and load.
+
+**So the difference is inside the instance.** Not the host, not the namespaces, not the environment: a tool started
+more than once in a campaign carries something internal that a single start does not, and every external instrument
+says the surroundings are the same.
+
 ### 4.354 The first diff of a wedged arm against a clean one: traffic (an effect) and host load (2026-11-14)
 
 The run that finally caught both halves — p38, product arm **7 wedges, 15.015 s, 30 timeouts**, twin **0 / 0 / 0** —
