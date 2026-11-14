@@ -377,6 +377,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.362 The ceiling is an amplifier, not the cause: 16 a second times a slow request (2026-11-14)
+
+§4.361 said 224 forwarding tasks never ended. Reading the forwarder says otherwise: `FORWARD_IDLE_TIMEOUT` is 300 s
+and both the striped and unstriped paths cut a group that has seen no activity (`stripe.rs:859`), so a task that
+never ends would have to be *active* for twenty minutes.
+
+**And the arithmetic says the same**: the soak's churn series opens 16 connections a second. A pool with 224 channels
+is exhausted when **16 × latency > 224**, i.e. when a request takes **more than 14 seconds**. The wedge's own
+`wedge_max_s` readings are 15, 25, 55, 125 — all above that.
+
+**So the occupancy is a consequence**: something makes a churn request slow, concurrency rises until the pool has no
+channel left, and *then* new dials are refused — which is the failure the probe records. The ceiling turns a slow
+request into a refused visitor; it does not cause the slowness.
+
+**Which puts the line back where §4.343 left it**, with one thing added: the 14-second threshold is the number to
+beat. Anything that keeps a churn request under fourteen seconds keeps the pool from filling, whatever it is —
+and §4.343's finding (the client re-sending a range the server had already answered) is a *plausible* way to spend
+fourteen seconds on a connection that should take one round trip.
+
+**So the next thing to measure is not the pool but that loop**: the re-sent range and its waiting time, on a channel
+that is slow. The pool's exhaustion then becomes an effect that stops once the loop does.
+
 ### 4.361 Every lane reaches 56 on the wedged arm, so the whole pool is out of channels (2026-11-14)
 
 The per-lane reading §4.360 asked for, from the same run:
