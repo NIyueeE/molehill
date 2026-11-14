@@ -377,6 +377,25 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.367 The permanent entry is the lane's own handshake stream, not a leak (2026-11-14)
+
+§4.365 and §4.366 treated the entry whose age equals the run as a leak. Read in the code, it is the **lane's root
+stream**: a lane's first stream runs the Noise KK handshake and its secret becomes `LaneRoot`, from which every later
+stream's keys are derived. That stream is created when the lane is and lives as long as the lane does — so *one entry
+per lane, with an age equal to the run*, is exactly what a healthy lane looks like.
+
+**It explains every reading without a defect**: §4.365 measured 17.9 minutes on the product arm and 17.7 on the twin
+in an eighteen-minute run, and §4.366's `opened_len` of 5 and 4 is one root stream plus the few live channels.
+
+**So the permanent entry is withdrawn as a defect**, and with it the two fixes that chased it. `0b05065` (a stream both
+ends have closed is retired) and `73da8ac` (a stream that never carried a byte is retired) stay, because each is
+correct on its own terms and both have tests — but neither was fixing anything the record can point at, and this entry
+says so rather than leaving two "fixes" implying a bug that is not there.
+
+**What remains is the ceiling and nothing else**: on a wedged arm four lanes reach 56 live streams each; on a clean arm
+they stay near the root stream. That is the whole of the defect's description now, and the next instrument is the one
+§4.366 named — the flags of the streams that make up the 56, not the one that is permanent.
+
 ### 4.366 Retiring never-used streams does not remove the permanent entry (2026-11-14)
 
 §4.365 guessed the entry whose age equals the run was a stream opened and never used. The fix (`73da8ac`: a stream
