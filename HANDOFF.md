@@ -377,6 +377,19 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.352 The host-state capture works and reads identical on a clean pair (2026-11-14)
+
+`_capture_host_state` (`b70f79f`) writes one file per arm into `<work>/hoststate/`: host load, `ss -s`, the UDP and
+TCP socket tables, four kernel limits (`rmem_max`, `wmem_max`, `ip_local_port_range`, `tcp_tw_reuse`), and inside
+each of the three namespaces the socket summary, its UDP table and `tc qdisc show`.
+
+**On the run that produced it both arms were clean** (`0 / 0` each, p36) and, after normalising the header, the two
+files are **byte-identical**. That is the baseline the capture needs: a clean pair leaves nothing that differs, so a
+capture from a wedged arm can be diffed against it without wondering which differences are noise.
+
+**What is still missing is the wedged half.** The defect appears in roughly one campaign in two, so the next step is
+a run that catches it — and the capture now makes that run worth its thirty-five minutes.
+
 ### 4.351 Fresh namespaces per arm do not remove the wedge, so the shared topology was not the cause (2026-11-14)
 
 The experiment the authorisation made possible, run twice with the topology rebuilt between arms (`c7f2eb1`):
