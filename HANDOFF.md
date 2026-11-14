@@ -40,6 +40,23 @@ place a channel.
 **That is placement**, and placement is where §4.372 left the count: the pool's four lanes hold 56 streams each and a
 placement that cannot find a lane below the ceiling has nowhere to go.
 
+**And the client's open never finishes.** Everything the client logged for that group:
+
+```
+18:54:19.650448  channel request read          group=14058  at_us=…
+18:54:19.650467  mhd channel open started      group=14058  queued_us=1     ← 19 µs later
+18:54:24.651162  channel request read (retry)  group=14058
+18:54:24.651179  mhd channel open started      group=14058                  ← again
+```
+
+**No `channel open finished` for 14058 at all** (count: zero), while a healthy group logs both lines with `open_us=42`.
+So the client begins the open, 19 µs after being asked, and **the open hangs** — which is why no channel ever reaches the
+pairing and why the server's budget expires twice.
+
+**That is the mechanism, and it is one line's worth of new information**: `open started` without `open finished` is a
+placement that waits for a lane below the ceiling, on a pool whose four lanes are at 56 (§4.372). It waits while the
+server's budget runs out twice.
+
 **The question is now the answer.** The server's pairing asks the client for a data channel, waits
 `PAIR_WAIT_BUDGET` (5 s), retries, waits five more, and expires with `gathered=0` — twice, while the same server
 accepted 14 547 channels from that client in the same run (§4.379, §4.382). Three timestamps per pairing decide it:
