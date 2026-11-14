@@ -4536,6 +4536,10 @@ fn note_waits(
 }
 
 #[instrument(skip_all, fields(stripes = stripe_count))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the gather loop is one algorithm: asking, waiting, parking and releasing a \n              stripe belong together, and the ask's line puts it one over the limit \n              (`HANDOFF.md` §0). Splitting it is a refactor for its own commit."
+)]
 async fn pair_striped_group<C>(
     incoming: TcpStream,
     stripe_count: usize,
@@ -4565,6 +4569,7 @@ where
         // read timed out). A request the client refuses is answered with
         // nothing at all, which is why the wait below re-asks.
         let asked = std::time::Instant::now();
+        debug!(group, stripes, "pairing asked for a data channel");
         for index in 0..stripes {
             if data_ch_req_tx
                 .send(stripe_request(group_bytes, index, stripes))
