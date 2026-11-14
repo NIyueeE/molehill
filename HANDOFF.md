@@ -48,7 +48,16 @@ spawn_data_channel(active.args.clone(), tunnel, stripe, queued_at);
 which that task must reach. So `started` without `finished` means **the spawned task never got as far as the finish**,
 and both things measured so far — the placement bound and the prologue — are inside that task and never fired.
 
-**The next instrument goes inside the task**: a line at its entry and a line after `open_stream` returns, so the three
+**And the task's first-poll stamp already exists**: `spawn_data_channel` records `let spawned = Instant::now()`, and
+its own comment says why — *"a spawned task that is not scheduled for a second is a runtime that is saturated, and the
+wait is otherwise attributed to the carrier"*. Inside the task, `started_us = spawned.elapsed()` (`client.rs:2944`) is
+taken at the **first poll** and handed to `run_mux_data_channel` (`:2956`), which prints it on the finish line.
+
+**So a channel that is spawned and never runs would show a huge `started_us` on the channels that do finish** — the
+distribution of that field is the measurement, and `grep -c started_us` over a whole run's client log returned **0**,
+which means the field is not reaching the log in this build. Printing it is the next instrument, and it is one line.
+
+**The instrument that was planned, kept for the record**: a line at its entry and a line after `open_stream` returns, so the three
 possibilities separate — never scheduled, scheduled and blocked before the open, or open returned and the handler never
 ran.
 
