@@ -377,6 +377,24 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.374 The soak profile runs no capacity ramp, so §4.373's candidate dies too (2026-11-14)
+
+The soak profile's scenario list is `("soak",)` (`model.py:1834`) — the five-stage timeline and the probes that ride
+it. **`capacity` is a different profile and never runs here**, so nothing in this campaign opens streams until the
+pool refuses. The eleventh candidate goes the way of the other ten, and it goes cheaply: one `grep` of the profile
+table instead of a forty-minute run.
+
+**What that leaves is the starkest statement in this record**: during a soak, the client holds **224 streams** (four
+lanes at 56, `opened_len`, each with a live handle — none abandoned) while **every probe's own concurrency is single
+digits** and every latency distribution is healthy except a one-percent tail.
+
+**Those two cannot both be about the same connections.** Either the probes under-report their own concurrency, or the
+224 handles are held by tasks that are not serving a visitor. The instrument that separates them is the one §4.371
+named and this line has not built: **count the streams by what is on the other side of them** — a visitor socket, a
+peer's fin, or nothing at all. That is a per-stream tag set at `open()` and printed as a histogram, and it is the only
+remaining measurement that can tell "224 visitors are waiting" from "224 tasks are holding a channel each and doing
+nothing".
+
 ### 4.373 The pool is a lease pool, so nothing is prefilled — and the capacity ramp is what fills it (2026-11-14)
 
 §4.372's hypothesis, read in the code: `Multiplex::open_stream` returns a **`StreamLease`** (`multiplex.rs:2064`), a
