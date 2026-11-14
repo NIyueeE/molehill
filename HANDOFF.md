@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.370 §4.369's "stuck copy" is ordinary half-close, and the reader is correct (2026-11-14)
+
+§4.369 read the twenty-six peer-fin streams as the client's copy being stuck. In the code it is not: `StripeSender::
+finish` (`stripe.rs:585`) sends the local fin when the **visitor's** side ends — which is exactly right, because a
+visitor that has not closed may still send more. So a stream with the peer's fin and no local fin is a **visitor that
+is still open**, and holding its channel until it closes is what a correct half-close does.
+
+**Withdrawn.** The twenty-six are normal. And the other thirty (neither fin) are the same thing one step earlier: a
+visitor that has been served nothing yet and has not closed either.
+
+**Which leaves the count itself as the finding, not any flag**: 224 visitors open at once on a pool of four lanes. For
+a churn series that opens sixteen a second, that is **fourteen seconds each on average** — the arithmetic §4.362 tried
+and could not support with the churn's own `setup_ms`. The two are not in contradiction: `setup_ms` measures the
+connections the probe **completed**, and a connection still open at the end of the run has no sample at all. The
+distribution this record has been reading is therefore **censored** — the slowest connections are exactly the ones
+missing from it.
+
+**That is the last instrument to add and it needs nothing new in the tool**: count, per second, the churn connections
+opened and not yet closed. It reads the censored tail directly, and if it climbs while `setup_ms` stays at 1.5 ms, the
+occupancy is made of connections that never finish rather than connections that are slow.
+
 ### 4.369 What the 26 peer-fin streams say: the client's own copy is the stuck one (2026-11-14)
 
 §4.368's distribution, read for what it implies rather than what it counts. Twenty-six of the fifty-six carry the
