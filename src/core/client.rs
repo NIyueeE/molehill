@@ -1640,7 +1640,10 @@ async fn run_mux_data_channel(
         let end_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        info!(group, end_ms, open_us, cmd_us, "mhd channel open finished");
+        info!(
+            group,
+            end_ms, open_us, cmd_us, started_us, "mhd channel open finished"
+        );
     }
     // Five milliseconds, behind the stats switch, exactly like the server's
     // pairing line — and with the group id, because that is the only way the two
