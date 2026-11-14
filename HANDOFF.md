@@ -377,6 +377,35 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.356 Where in the timeline the failures sit: not a startup artefact and not a stage (2026-11-14)
+
+p39's failing arm, by timestamp: the interactive probe ran **0 → 1 079 s** (the stages end at ~900 s), its 21 failures
+fall in **0–165 s**, and its successes have gaps at 902–1 032 s. That looked like "the arm starts bad and recovers" —
+until the same query on three earlier failing runs:
+
+| run | failing arm | errors | first → last error |
+|---|---|---|---|
+| p17 | product / twin | 13 / 25 | +0 → +165 / +0 → +228 |
+| p21 | product | 43 | **+0 → +726** |
+| p38 | product | 30 | **+0 → +754** |
+| p39 | product | 21 | +0 → +165 |
+
+**So the failures are spread across the run in two of the four and early in the other two** — not a startup artefact,
+not one stage. And every one of them starts at **+0**: the very first attempt of a failing arm already fails, which is
+a fact worth keeping on its own.
+
+**What this rules out**: pool establishment (the first seconds), a stage-specific path condition (the stages are
+180 s each and the errors cross all of them), and warm-up.
+
+**What it leaves**: an instance that is *already* wrong when it starts — the probe's first attempt fails — and then
+fails at a rate that varies with the run. That is consistent with the earlier finding that a fresh namespace does not
+help and the host state does not differ: **the instance is born bad sometimes**, and which one is decided before its
+first second.
+
+**Next, and it is one line in the tool**: log, at startup, the values an instance is born with — the lane count the
+pool dials, the first lane's handshake result, and the port each service binds. An instance that is born bad must
+differ in one of those three, and all three are printed once per process.
+
 ### 4.355 The per-second pressure sampling shows both arms alike, so the load difference was host noise (2026-11-14)
 
 The instrument §4.354 asked for — one line a second of `vmstat` through every arm — on another run that caught both
