@@ -808,6 +808,18 @@ needed — because the defect is still open and the plan's gate is still red.
 initiation, the second arm, the arm's position, the pinned acknowledgement frontier — and four instruments that
 read the wrong thing before they were corrected.
 
+**And withdrawn after that list was written** (§4.350–§4.367): the shared topology between arms (§4.351), the host's
+load, CPU, I/O, blocked tasks and memory as differentiators (§4.355), "the instance is born bad" (§4.357, a
+tautology), the forwarder leak (§4.361), churn concurrency as the occupancy (§4.363), and the permanent entry in the
+stream table (§4.367 — it is the lane's own root stream, which is what a healthy lane looks like). Two fixes remain
+in the tree from that stretch (`0b05065`, `73da8ac`): both correct on their own terms, neither fixing anything the
+record can point at.
+
+**What the defect has been reduced to, at this entry**: on an arm that wedges, each of the pool's four lanes holds
+**56 live streams** — the lane's ceiling — and the pool's own line reports `count=4 ceiling=56` with a `pool_cap` it
+cannot grow past; on a clean arm the same four lanes stay near the root stream. Everything else this record has
+measured on both ends reads normal during the event.
+
 **Two fixes were real and stayed**, both covered by tests: the buffer-ceiling reserve for openings and small flights
 (half the dropped visitors gone, §4.331) and the accept window for out-of-order initiations (§4.334).
 
