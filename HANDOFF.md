@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.358 The wedge correlates with the lane's stream table reaching its ceiling (2026-11-14)
+
+The queue instrument (`inbound`/`finishing`/`opened` on the window line) on a run where **both arms wedged** (6
+wedges / 10.01 s and 5 / 15.014 s):
+
+| arm | `opened_len` p50 | p90 | p99 | max | wedges |
+|---|---|---|---|---|---|
+| product | 2 | **41** | **56** | **56** | 6 |
+| twin | 7 | **56** | **56** | **56** | 5 |
+
+**`opened_len` — the number of streams the lane tracks as open — sits at 56, which is the lane's stream ceiling.**
+Compare p41, where the product arm was clean: its `opened_len` peaked at **4** while the twin's reached 56.
+
+**So the correlation is exact in both directions**: a clean arm stays in single digits, a wedged arm fills the
+table to the ceiling. This is §4.325's hypothesis — withdrawn then because its reading was a `grep` artefact —
+measured again with a real instrument, and this time the number is the field the code reads.
+
+**What that means mechanistically**: a lane at its stream ceiling cannot open another channel, so the pairing's
+request produces nothing, the visitor's dial is refused, and the probe records a wedge. The entries are not being
+retired as the streams end.
+
+**The next step is the retirement path for a table entry**, and the instrument to judge it is already on the line:
+`opened_len` must fall back to single digits after a burst of short connections. If it climbs and stays, the removal
+condition in `settle` is missing the ordinary close — a stream the peer finished, with nothing unacknowledged and no
+handle drop to set `abandoned`.
+
 ### 4.357 §4.356's "born bad" was a tautology, and the first error is 20–914 s in (2026-11-14)
 
 §4.356 printed each run's first error offset **relative to that same first error**, so "+0" was arithmetic, not a
