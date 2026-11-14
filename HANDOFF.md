@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.371 Neither probe can hold 224, so the occupancy is censored *and* unattributed (2026-11-14)
+
+§4.370 said the churn's distribution is censored and that the missing tail would explain the occupancy. The series says
+how censored, and it is not enough:
+
+| reading | value |
+|---|---|
+| `setup_ms` samples in the run | **8 689** |
+| connections the nominal rate implies (16/s over ~900 s) | ~14 400 |
+| `error` samples | **18** |
+
+So about **5 700 connections never produced a sample** — the censoring is real and large. But a completed connection
+takes ~120 ms on average (8 689 over ~1 050 s is 8.3/s, i.e. roughly one in flight per worker), so the churn's own
+concurrency is **single digits**, not 224.
+
+**Which leaves the 224 unattributed**: neither probe holds that many at once, so the streams are opened by something
+else or by connections whose sample was lost. The next instrument is therefore not another distribution but **an
+attribution**: tag each `Conn::open` with the caller (service name and probe kind) and print the per-caller count
+beside `opened_len`. That answers "who" with one run, where the last four rounds have answered "what state" four
+times without saying who.
+
 ### 4.370 §4.369's "stuck copy" is ordinary half-close, and the reader is correct (2026-11-14)
 
 §4.369 read the twenty-six peer-fin streams as the client's copy being stuck. In the code it is not: `StripeSender::
