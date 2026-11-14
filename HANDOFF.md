@@ -28,8 +28,21 @@ product 6 wedges / **45.044 s**, twin 2 / **85.085 s**, 174 and 134 expired pair
 on both arms. So the open that never finishes is *not* waiting in the placement the bound wrapped, and the change
 correlated with longer wedges — it is **reverted** (`git revert d88ce7a`, 410 tests green).
 
-**What that leaves**: an open that starts 19 µs after the request and never logs `open finished`, and a bound around
-`open_stream` that never fires. The two are only compatible if the open ends by a path that does not log a finish and
+**What that leaves**, and it is now located: the only statement between `channel open started` and `channel open finished`
+that can end the function is
+
+```rust
+write_tunnel_prologue(&mut stream, args.service_id, tunnel, group).await?;
+```
+
+Tracing shows a **healthy** channel logs both lines. A **failed** prologue write returns through that `?` and logs
+**neither a finish nor an error** — the caller's error is swallowed. So the channel *was* placed (`open_stream`
+returned a stream, which is why the bound never fired) and **the write that introduces it to the server failed**.
+
+**And the previous paragraph's "bound never fires" is exactly consistent with that.**
+
+**What an earlier paragraph said**, kept for the record: an open that starts 19 µs after the request and never logs
+`open finished`, and a bound around `open_stream` that never fires. The two are only compatible if the open ends by a path that does not log a finish and
 does not wait in that call — a cancellation, or an early error the handler swallows. **That is the next thing to
 find**, and it is a code read of the handler, not a measurement.
 
