@@ -377,6 +377,27 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.353 Per-arm namespaces do not remove the wedge but the incidence falls (2026-11-14)
+
+Four soaks with the topology rebuilt between arms, and the rate against the fourteen runs before it:
+
+| shape | runs | arms with a wedge |
+|---|---|---|
+| one shared topology (p17–p33) | 14 runs | **one almost every run**, 3–10 wedges on that arm |
+| a fresh topology per arm (p34–p37) | 4 runs | **one arm in eight**: p35's twin, 4 wedges / 55.054 s |
+
+So §4.351's conclusion stands — fresh namespaces are not the fix — but the *rate* moved, and two of those four runs
+(p36, p37) were completely clean. A defect that goes from "one arm nearly every run" to "one arm in eight" after a
+change that only removes leftover namespace state is a defect that **feeds on that state**, even though removing it
+does not remove the defect.
+
+**That is the first quantitative lead in twenty rounds**, and it points at what a name-space may carry across an
+arm: sockets in `TIME_WAIT`, a port still bound, a qdisc still installed — all things a fresh namespace does not
+have, and all things a *host* keeps.
+
+**The capture is now in place** (`b70f79f`) and two clean pairs have produced identical files (§4.352), so the run
+that catches a wedged arm has a baseline to diff against.
+
 ### 4.352 The host-state capture works and reads identical on a clean pair (2026-11-14)
 
 `_capture_host_state` (`b70f79f`) writes one file per arm into `<work>/hoststate/`: host load, `ss -s`, the UDP and
