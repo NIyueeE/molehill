@@ -25,6 +25,21 @@ run one soak and pair the three by `group`.
 (18 962 groups reached it in that run, and `comm -23` between the two sets is **empty**). So the request always
 arrives; what is missing is the answer.
 
+**Measured on a run that wedged** (product 3 wedges / 10.01 s, twin 1 / **175.175 s**; 41 and 142 pairing expiries):
+
+```
+server asked for group=14058   18:54:19.650326
+client read the request        18:54:19.650448   ← 122 µs later
+client read it again (retry)   18:54:24.651162   ← 5 s later, also instant
+```
+
+**The control-plane hop is 122 microseconds.** The request arrives instantly, twice, and the client still delivers no channel
+for ten seconds. So the failure is entirely on the client's side of that hop: it is asked, it knows, and it does not
+place a channel.
+
+**That is placement**, and placement is where §4.372 left the count: the pool's four lanes hold 56 streams each and a
+placement that cannot find a lane below the ceiling has nowhere to go.
+
 **The question is now the answer.** The server's pairing asks the client for a data channel, waits
 `PAIR_WAIT_BUDGET` (5 s), retries, waits five more, and expires with `gathered=0` — twice, while the same server
 accepted 14 547 channels from that client in the same run (§4.379, §4.382). Three timestamps per pairing decide it:
