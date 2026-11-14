@@ -377,6 +377,28 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.364 The pool agrees with the window line, and it says why: pinned at four tunnels on its ceiling (2026-11-14)
+
+The comparison §4.363 asked for, the pool's own line on the wedged arm:
+
+```
+pool-stats: pool still at its stream ceiling pool=session:10.10.0.254:2400
+            carrier="mhd" count=4 ceiling=56
+```
+
+**Two instruments, one run, the same number**: the pool charges `count=4 × ceiling=56 = 224` streams, and the window
+line reads 56 on each of its four lanes. Neither is an artefact of the other.
+
+**And the pool names the reason it cannot get out**: `count=4` is the arm's `pool_cap` (`tunnels`), a pinned
+parameter — its `report_saturation` comment says so in the code, "a pinned pool cannot dial its way out". So when all
+224 streams are charged, a new channel is refused, the pairing gets nothing, and the visitor's dial is refused.
+
+**What is still unexplained is who holds 224 handles**, and this entry narrows it to that single question with both
+instruments agreeing on the count. The forwarder's idle timeout (300 s) and the churn's own latency (p50 1.5 ms)
+have each been shown not to produce that many on their own; what has not been measured is the **age** of the charged
+streams — how long each handle has been held — which is the one distribution that says whether they are accumulating
+or merely concurrent.
+
 ### 4.363 The churn series does not carry the occupancy either (2026-11-14)
 
 §4.362's arithmetic needed the churn to average near fourteen seconds. Measured on the same run, the churn series'
