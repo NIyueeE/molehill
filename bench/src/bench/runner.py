@@ -435,10 +435,33 @@ class ArmTurn:
         self.config = dict(deployment.configs)
         for launch in deployment.launches:
             self._spawn(launch.role, list(launch.argv))
+        self._start_pressure()
         ready = topo.wait_target(
             deployment.endpoint.host, deployment.endpoint.port, timeout=30.0
         )
         return self.pids(), ready
+
+    def _start_pressure(self) -> None:
+        """Sample the host's pressure and run-queue for the length of the arm.
+
+        The host load is the one field of the end-of-arm capture that was not an
+        effect of the arm being wedged (`HANDOFF.md` §4.354), and a single reading at
+        the end cannot say whether the wait came before or after. This writes one
+        line a second, so it can.
+        """
+        script = (
+            "while :; do "
+            'printf "%s " "$(date +%s)"; '
+            "cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory "
+            "2>/dev/null | tr '\n' ' '; "
+            "vmstat 1 2 | tail -1; "
+            "sleep 1; done"
+        )
+        log = self.dir / "pressure.log"
+        with log.open("ab") as fh:
+            self.pressure = subprocess.Popen(
+                ["/bin/sh", "-c", script], stdout=fh, stderr=subprocess.STDOUT
+            )
 
     def _topology(self) -> topology.Topology:
         """The campaign's topology, which exists before any turn starts."""
@@ -496,6 +519,13 @@ class ArmTurn:
         return out
 
     def stop(self, grace: float = 0.3) -> None:
+        pressure = getattr(self, "pressure", None)
+        if pressure is not None:
+            with contextlib.suppress(OSError):
+                pressure.kill()
+            with contextlib.suppress(Exception):
+                pressure.wait(timeout=5)
+            self.pressure = None
         for p in self.procs.values():
             with contextlib.suppress(OSError):
                 p.kill()
