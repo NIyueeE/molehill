@@ -377,6 +377,32 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.381 The stale claim is real and rare, and it was not the cause (2026-11-14)
+
+§4.380 called the refusal at `server.rs:2603` the root cause. The fix landed (`2da9cee`, 410 tests green) and the
+next soak says otherwise:
+
+| reading | before the fix | after it |
+|---|---|---|
+| twin's wedges | 6 (15.015 s) | **6 (10.01 s)** |
+| twin's pairing expiries | — | **37** |
+| twin's `opened_len` max | 56 | **56** |
+| the new line ("registering it from the stream's own prologue") | — | **4** |
+
+**The stale-claim case happens four times in a run, and the pairings still expire thirty-seven times** — so the
+refusal was never the mechanism behind `gathered=0`, and §4.380's causal claim is withdrawn. The fix stays: it is
+correct on its own terms (a claim with no acknowledgement must not be refused), it is test-covered, and it removes a
+real if rare failure — but it was not this defect.
+
+**What the four-versus-thirty-seven does say**: a pairing expires for reasons that are ten times more common than a
+stale claim. The pairing waits for a channel that was **asked for** — the server's request to the client for a
+channel — and gathers nothing, while the client opens thousands of channels per run. So either the request does not
+reach the client, or the client's channel for it arrives after the budget.
+
+**The next instrument is on that request**: log, on the server, when it asks for a channel (group, service, time) and,
+on the client, when it receives the ask and when it answers. Three timestamps per pairing say which of the two it is,
+and they are the only thing in this line that has never been timed.
+
 ### 4.380 The root cause: the server refuses a stream whose claim says "registered" while it holds no registration (2026-11-14)
 
 §4.379's claim mismatch, located in the code (`server.rs:2603`). When a data channel's selector is
