@@ -2601,25 +2601,21 @@ async fn serve_mhd_stream(
                     bail!("mhd lane carried streams for two different sessions");
                 }
             } else if claimed_registered {
-                // **The claim this end cannot honour.** The peer said on the wire
-                // that the lane is registered, so it will not wait for an
-                // acknowledgement; this end holds no registration, so it has one to
-                // give. Answering anyway would leave an acknowledgement at the head
-                // of a stream nobody reads, and answering nothing would park the
-                // visitor until the lane's dead timer.
-                //
-                // So the *stream* is refused, not the lane: the peer's pool treats
-                // it as a failed open and rebuilds, and the session keeps every
-                // other stream. Reaching this at all means the two ends disagreed
-                // about a lane that has registered, which is worth one debug line
-                // naming the nonce.
+                // **The peer says the lane is registered; this end holds none.**
+                // That happens when a lane was rebuilt — a repair, a restart of the
+                // session's lane — while the client's claim, derived from its own
+                // lane root, outlived the registration here. Refusing the stream
+                // made the pool rebuild forever and the visitor wait out the
+                // pairing budget (§4.380: 43 pairings expired with `gathered=0` on
+                // an arm that accepted 14 547 channels), so this end registers from
+                // the stream's own prologue instead: the claim carries no
+                // acknowledgement to wait for, and everything the registration
+                // needs is in the hello this stream already delivered.
                 debug!(
-                    "Refused an mhd stream that claimed a registered lane: this lane holds no \
-                     registration for session {}",
+                    "An mhd stream claimed a registered lane with no registration here; \
+                     registering it from the stream's own prologue (session {})",
                     hex::encode(nonce)
                 );
-                bail!("mhd stream claimed a registered lane that this end does not hold");
-            } else {
                 match reserve_tunnel(&registry, &nonce, max_tunnels).await {
                     TunnelSlot::Held(session) => {
                         *registered = Some(MhdLaneRegistration {
