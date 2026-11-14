@@ -377,6 +377,31 @@ before the experiment runs**; a run that changes them afterwards is not evidence
   `m<round>-<topic>/`), list what will be deleted and count it first, and keep
   result JSONs in a directory that no clean-up pattern covers.
 
+### 4.361 Every lane reaches 56 on the wedged arm, so the whole pool is out of channels (2026-11-14)
+
+The per-lane reading §4.360 asked for, from the same run:
+
+| arm | lane | `opened_len` max |
+|---|---|---|
+| product (0 wedges) | all four | **4** |
+| twin (3 wedges, 125.125 s) | **all four** | **56** |
+
+**So it is not placement** — the wedged arm's four lanes are *each* at 56, i.e. **224 concurrent live streams** and a
+pool with no channel left. The clean arm's four lanes never leave 4.
+
+**And the 224 are not half-open** (§4.360 measured at most 2), which means they all have `local_fin` **false**: this
+end never finished them. A stream is finished by its forwarder when the copy ends; 224 of those forwarders never
+ended and are still holding their handles.
+
+**That is the defect's shape**: a channel's forwarding task does not terminate, so the stream stays live, so the lane
+never frees a slot, so after enough churn the pool is out of channels and every new visitor's pairing gets nothing.
+It explains every measurement in this line — the pool being healthy while dials are refused, the no-lane-death, the
+absence of any error counter, and the fact that it takes minutes of churn to appear.
+
+**The fix is a bound on that task**, not on the stream table: a forwarding pair whose visitor has gone must be torn
+down even when one of its copies is blocked. That is one watchdog on the forwarder — no progress in either direction
+for a bounded time closes both sides — and it is the next thing to write.
+
 ### 4.360 The filled table is live channels, not half-open ones (2026-11-14)
 
 §4.359 predicted the 56 entries were streams waiting for a peer fin. Measured:
