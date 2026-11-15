@@ -13,6 +13,36 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **Status at the end of this stretch: the defect is OPEN and the finalisation is NOT written.** Twenty-two rounds of
+> the goal above went into it. What follows is the state, the seventeen explanations that are dead, and the one
+> measurement that is ready and not yet read.
+
+**Ready to run, not yet read**: `1fc7323` prints `started_us` (spawn → first poll) on the `channel open finished`
+line, which is the field that says whether a spawned data-channel task is *scheduled*. `spawn_data_channel`'s own
+comment is the reason it matters: *a spawned task not scheduled for a second is a saturated runtime, and the wait is
+otherwise attributed to the carrier*. **Build release first** — the last attempt ran the previous binary and read zero
+of them.
+
+**Seventeen explanations are dead**, each with a reading against it: the pairing budget, the listener, the backlog, pool
+saturation, the lane's stream ceiling, lane death, the build, the transmit queue, the write wake, the sealed refusal,
+out-of-order initiation, the second arm, the arm's position, the pinned acknowledgement frontier, id reuse, the shared
+topology, the host's load/CPU/IO/memory, "born bad", the forwarder leak, churn concurrency, the permanent stream-table
+entry, the capacity ramp, the stale-claim refusal (§4.381), the placement bound (§4.383 — **reverted**, it made wedges
+longer), and the prologue failure (§4.384 — the counter stays at zero).
+
+**Three fixes remain in the tree** from this stretch, each correct on its own terms and test-covered, none of them this
+defect: the buffer-ceiling reserve for openings (half the dropped visitors gone), the both-fins retirement, and the
+registered-claim re-registration.
+
+**What is measured and stands**: the wedge needs a campaign that starts the tool more than once (§4.337); the pool sits
+at `count=4 ceiling=56` while every probe's own concurrency is single digits (§4.364, §4.376); the control-plane hop is
+**122 µs** and the client starts the open **19 µs** later (§4.385 below); 43 pairings expire with `gathered=0` on an arm
+that accepted 14 547 channels (§4.379); and the two `channel open` log lines live in **different functions** —
+`open_data_channel` (3850) and `run_mux_data_channel` (1577) — so an open that starts and never finishes never reached
+the second (§4.384).
+
+
+
 **One defect is open and it blocks the finalisation.** It is: on a soak, a fresh dial is refused for 10–25 s
 (`wedge_count` 6–9). Everything this line has established, and the fourteen explanations it has refuted, are in
 §4.335–§4.382.
