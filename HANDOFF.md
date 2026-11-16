@@ -13,7 +13,31 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
-> **The last round's read, and the narrowest statement in this record**: the client writes the group into a 12-byte
+> **Answer nearly in hand (end of the 80 rounds).** `data_ch_rx.take_for(group)` **does** filter by group (`server.rs:3868`
+> registers a per-group slot), and the log proves delivery happens: of the 48 groups whose pairing expired, **34 logged
+> `mhd channel taken`** — the same 34 the client finished opening. So the channel is opened, arrives, **and is taken**.
+>
+> After the take the loop does one thing before counting it:
+>
+> ```rust
+> if write_and_flush(&mut ch, &cmds[gathered.len()]).await.is_ok() {
+>     gathered.push(ch); …
+> } else {
+>     data_ch_rx.unclaim(group);
+>     let _ = data_ch_req_tx.send(DataChannelRequest::ReleaseGroup(group_bytes));
+>     drop(gathered);
+>     continue 'gather;        // ← a new group id, another PAIR_WAIT_BUDGET
+> }
+> ```
+>
+> **So a channel that is taken and then fails a five-byte write is released and the whole gather restarts under a new
+> group** — which is why groups repeat, why `gathered=0` recurs, and why a visitor waits two budgets (10 s) or more. The
+> failure is `write_and_flush` into a freshly delivered channel, and its error is what nothing logs.
+>
+> **Next: log that error** (group, and the error), then two candidates follow from it — the channel was already closed on
+> the client side, or it was delivered at its lane's ceiling. One run names which.
+
+> **The 80th round's read, kept for the record**: the client writes the group into a 12-byte
 > prologue — `service_id(4) ‖ tunnel(4) ‖ group(4)` big-endian (`protocol.rs:1160`) — and the server reads the same field
 > the same way (`server.rs:4814`). **The bytes agree.** What has not been checked is whether the pairing *filters* on
 > that group: `pair_striped_group` waits on `data_ch_rx`, a **shared** channel, so a channel written for group G can be
