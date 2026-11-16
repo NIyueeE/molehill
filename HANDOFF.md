@@ -13,6 +13,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.399 (measured, and it names the await).** No panic in the client log, so the task is not dying that way: **it is parked.**
+> And the one await between `channel open started` and `channel open finished` that has **no bound and no guard** is the
+> write itself — `write_tunnel_prologue` → `conn.write_all(...).await`. `prologue_failed` counts `Err`, not a **hang**, and
+> `OPEN_BUDGET` (in the run that had it) wrapped `open_stream`, not this write.
+>
+> **So the sixty-six are opens parked in `Conn::write` waiting for room in a stream's send buffer** — the admission this
+> record has studied from the other side all along (`MAX_BUFFERED`, the opening/small-flight reserves), reached through the
+> one call that writes **before** any pump has had a chance to drain.
+>
+> **The next instrument is two lines and it is the last one needed**: a `tokio::time::timeout` around the prologue write
+> with a short budget, logging `group` and the elapsed time when it expires. If it fires for exactly those sixty-six, the
+> hang is proven and the fix is in the admission — a stream's first prologue write must not wait behind a full buffer.
+
 > **§4.398 (measured, and it is the whole of the gap).** The sixty-six are exactly the opens that never finished: of the 66
 > groups whose pairing expired without a delivery, **66 started and 0 finished**, and over the whole run **13 937 opens
 > started against 13 871 finished — a difference of exactly 66**.
