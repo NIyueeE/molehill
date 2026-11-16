@@ -3158,6 +3158,28 @@ impl Conn {
         out
     }
 
+    /// Live streams by age: older than 1 s, 10 s and 60 s.
+    ///
+    /// Every aggregate this record tried before this one was censored: `held_*` runs on
+    /// `Drop`, so it describes the streams that **ended**, never the ones still holding a
+    /// slot when the pool refuses a channel (`HANDOFF.md` §0). This counts what is alive.
+    /// The lane's own root stream is in here and is as old as the lane (§4.367).
+    pub(crate) fn live_ages(&self) -> (usize, usize, usize) {
+        let now = Instant::now();
+        let (mut one, mut ten, mut sixty) = (0usize, 0usize, 0usize);
+        for at in self.stream_opened.values() {
+            let age = now.duration_since(*at);
+            if age >= Duration::from_secs(60) {
+                sixty += 1;
+            } else if age >= Duration::from_secs(10) {
+                ten += 1;
+            } else if age >= Duration::from_secs(1) {
+                one += 1;
+            }
+        }
+        (one, ten, sixty)
+    }
+
     /// How long the oldest stream in the table has been there, in milliseconds.
     ///
     /// The one distribution §4.364 has not read: 224 charged handles are either
