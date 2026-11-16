@@ -13,6 +13,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.397 (measured): the transport delivers what the client sends, and the missing ones were never sent.** On the wedging
+> arm: the client logged `first byte of a stream sent` for **7 267 distinct stream ids**, the server logged a first packet
+> for **7 266 distinct ids** — a difference of **one**. So every stream whose first byte left the client arrived at the
+> server.
+>
+> **And 6 744 of those streams were retired within 5 ms of being created** (`mhd stream retired  age_ms<5`), which is what
+> a churn series looks like from inside: open, one request, retire.
+>
+> **So the sixty-six are channels the client opened and whose first byte was never sent at all** — the open finished, the
+> task ran, and the pump never put the selector on the wire for them. That is the last link, and it is on the client's
+> send path rather than in the carrier.
+
 > **§4.396 (measured, and it closes the server side completely).** On the arm that wedged: the server created **13 874**
 > streams (`first packet for an unknown stream`), **13 873** reached delivery, and **13 895** selectors were read. So the
 > server saw essentially every channel it delivered — **and the sixty-six opened by the client never became streams
