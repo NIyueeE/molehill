@@ -13,6 +13,14 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **A trap for whoever adds that counter.** `run_mux_data_channel` is compiled in the **minimal** `server,client` build too,
+> with its multiplex pieces `cfg`-stripped (`stripe` becomes `()`, `open_stripe_stream`/`tunnel.open_stream`/
+> `write_tunnel_prologue`/`PROLOGUE_BUDGET` vanish). Adding a call or a constant there compiles in the default build and
+> **fails the minimal one with ~19 errors** — which is exactly what happened this round: the edits were discarded with
+> `git reset HEAD -- src/ && git checkout -- src/` and the tree verified green at `6df43cc`. **Run
+> `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
+> that function.**
+
 > **§4.401 (measured): the unfinished opens are not stalled at all — they fail.** With all three bounds and counters in, a
 > run whose twin wedged ten times (45.067 s) read **`prologue_stalled` 0, `open_stripe_stalled` 0, `open_plain_stalled` 0**,
 > while the gap persisted: **12 528 opens started, 12 363 finished** (165 unfinished) and 195 pairing expiries.
