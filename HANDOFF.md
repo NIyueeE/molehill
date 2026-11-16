@@ -21,6 +21,30 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.405: the exact path, read and ready (one edit, no guessing left).** `PoolState` is
+> `{ entries: Vec<PoolEntry>, next_cursor, count, handover }` (`multiplex.rs:620`), and each `PoolEntry` carries the
+> tunnel's `counters: Arc<TunnelCounters>`. So the one line to add at the ceiling site is:
+>
+> ```rust
+> let (held_count, held_mean_ms, held_max_ms) = {
+>     let state = self.inner.state.lock();
+>     let mut count = 0u64;
+>     let (mut nanos, mut max_nanos) = (0u64, 0u64);
+>     for entry in &state.entries {
+>         let (c, _, _) = entry.counters.held_peek();
+>         count += c;
+>         nanos += entry.counters.held_nanos_value();
+>         max_nanos = max_nanos.max(entry.counters.held_max_value());
+>     }
+>     (count, if count == 0 { 0.0 } else { nanos as f64 / count as f64 / 1e6 }, max_nanos as f64 / 1e6)
+> };
+> debug!(… count, ceiling, held_count, held_mean_ms, held_max_ms, "pool-stats: pool still at its stream ceiling");
+> ```
+>
+> **Or, simpler and equally decisive**: put `held_peek()` on `TunnelCounters` as a three-value reader (the `take_held`
+> at `multiplex.rs:409` already computes exactly those three, only clearing them), call it per entry, and print the sum.
+> **The first version of that needs a non-clearing reader; that is the only new code.**
+
 > **§4.404: where the counters live, so the next edit is a read-first one.** `TunnelPool` is
 > `{ inner: Arc<TunnelPoolInner> }` (`multiplex.rs:1004`), and `TunnelPoolInner` holds `shared: Arc<PoolShared>`,
 > `state: Mutex<PoolState>`, `dial`, `preferred` and `pins`. The per-tunnel `TunnelCounters` are therefore reached
