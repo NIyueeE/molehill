@@ -21,6 +21,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.411: the held-time line counts *completed* leases, so it cannot describe the ones that are stuck.** `note_held` runs
+> on `Drop` — it records the hold time of streams that **ended**. A stream that is still holding a slot when the pool
+> refuses is **not** in that average at all, so `held_mean_ms=1044` describes the population that *did* end and says
+> nothing about the occupant.
+>
+> **And the arithmetic says the same**: 13.5 openings a second (§4.377) times a 1 044 ms mean is **≈ 14 concurrent
+> streams**, nowhere near the 224 the ceiling implies. The lines agree with each other and disagree with the ceiling, which
+> is what a censored statistic does.
+>
+> **So the ceiling's occupant is the tail that never drops** — and the only way to see it is a **live** count by hold age,
+> not a completed-lease average. That is the next instrument: on the ceiling line, report how many *currently charged*
+> streams are older than 1 s, 10 s and 60 s. `StreamLease` already carries `charged_at`; the pool needs to walk its live
+> leases (or keep an age histogram updated on charge).
+
 > **§4.410: the bulk cannot be the occupant, because it runs on both arms.** The soak's timeline runs the same bulk stage
 > in the same conditions on the product arm and the twin, so whatever the bulk holds is held on **both** — while the
 > ceiling was reached **133 times on one arm and once on the other** (§4.406). The occupancy that differs between them is
