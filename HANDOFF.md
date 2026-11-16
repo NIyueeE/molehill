@@ -13,6 +13,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **The last round's read, and the narrowest statement in this record**: the client writes the group into a 12-byte
+> prologue — `service_id(4) ‖ tunnel(4) ‖ group(4)` big-endian (`protocol.rs:1160`) — and the server reads the same field
+> the same way (`server.rs:4814`). **The bytes agree.** What has not been checked is whether the pairing *filters* on
+> that group: `pair_striped_group` waits on `data_ch_rx`, a **shared** channel, so a channel written for group G can be
+> taken by whichever waiter polls first — a plain visitor's `CreateDataChannelFor`, or another group's gather. That
+> would produce exactly the reading of §4.386: the channel opens, finishes, reaches the server, and the pairing that
+> asked for it gathers nothing because someone else took it.
+>
+> **So the next read is `data_ch_rx`'s delivery discipline**: does the receiver match on the group, or take the next
+> channel whatever its group? If it takes the next, the fix is a per-group queue or a filter at the receive, and it is a
+> few lines.
+
 > **Status at the end of this stretch: the defect is OPEN and the finalisation is NOT written.** Twenty-two rounds of
 > the goal above went into it. What follows is the state, the seventeen explanations that are dead, and the one
 > measurement that is ready and not yet read.
