@@ -21,6 +21,14 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.408: the carrier has no one-second hold timer either.** The only one-second constants in `src/transport/mhd/` are a
+> log throttle (`conn.rs:422`, "one log a second, however many writes the gate refuses") and the pump's starve check
+> (`pump.rs:878`). Neither defers a release. So the 1 044 ms mean is **not a timer anywhere** in the carrier, the
+> forwarder or the pool: it is how long the forwarding groups of this workload actually live.
+>
+> **That makes the group-exit instrument of §4.407 the only remaining measurement**, and its question narrower: of the
+> groups that live a second, which direction ended last and how.
+
 > **§4.407: the second is not a timer.** The only one-second sleeps near the data-channel path are a statistics reporter
 > loop (`client.rs:1542`) and the pool's own tick (`multiplex.rs:179`), neither of which holds a lease. So the 1 044 ms mean
 > is **the distribution of forwarding-group lifetimes**, not a fixed grace — which fits a distribution whose maximum is
