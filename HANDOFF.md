@@ -17,7 +17,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > the goal above went into it. What follows is the state, the seventeen explanations that are dead, and the one
 > measurement that is ready and not yet read.
 
-**Measured, and it kills the scheduling explanation**: with `1fc7323` built and a run where both arms wedged (1 and 3,
+**Measured, and it moves the defect out of the client's open entirely**: joining the 48 groups whose pairing expired
+against the client's own open lines — **all 48 started and 34 finished**. So for thirty-four pairings the client opened
+the channel, wrote its prologue and logged the finish, and the server's pairing still gathered **nothing**.
+
+**That is the last link and it is a routing one**: the channel is fully introduced — 14 547 channels accepted, every
+selector read (§4.378) — and it does not land on the pairing waiting for its group. The group travels in the prologue;
+what has not been compared is **the bytes the client writes there against what the server parses** — width, order, or
+which side of the pairing the value is stamped from.
+
+**Next, and it is one comparison**: `write_tunnel_prologue`'s group field against the server's read of it, and against
+`pair_striped_group`'s `group_bytes`. If they differ in width or order, every channel lands on the wrong pairing or on
+none, which is exactly `gathered=0` with a channel that opened and finished.
+
+**Earlier this round, and still true**: with `1fc7323` built and a run where both arms wedged (1 and 3,
 max 10.01 s), `started_us` reads **p50 6 µs, p99 17–19 µs, max 141 µs** over 17 073 and 19 513 channels. The spawned
 tasks are **scheduled immediately**; there is no runtime starvation.
 
