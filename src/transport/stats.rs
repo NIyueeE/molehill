@@ -500,6 +500,35 @@ pub(crate) fn prologue_stalled() -> u64 {
 /// Prologue writes that waited out their budget, since the process started.
 static PROLOGUE_STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Note one placement that waited out its budget on the striped open path.
+pub(crate) fn note_open_stripe_stalled() {
+    if !enabled() {
+        return;
+    }
+    OPEN_STRIPE_STALLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many striped placements have waited out their budget.
+pub(crate) fn open_stripe_stalled() -> u64 {
+    OPEN_STRIPE_STALLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Note one placement that waited out its budget on the plain open path.
+pub(crate) fn note_open_plain_stalled() {
+    if !enabled() {
+        return;
+    }
+    OPEN_PLAIN_STALLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many plain placements have waited out their budget.
+pub(crate) fn open_plain_stalled() -> u64 {
+    OPEN_PLAIN_STALLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static OPEN_STRIPE_STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPEN_PLAIN_STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Note one pool growth, with the time it took.
 pub(crate) fn note_pool_grow(age: Duration) {
     if !enabled() {

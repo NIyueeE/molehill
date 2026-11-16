@@ -365,6 +365,8 @@ fn report_window(shared: &Arc<Shared>) {
             opens_other = conn.opens_by_tag().len().saturating_sub(2),
             prologue_failed = crate::transport::stats::prologue_failed(),
             prologue_stalled = crate::transport::stats::prologue_stalled(),
+            open_stripe_stalled = crate::transport::stats::open_stripe_stalled(),
+            open_plain_stalled = crate::transport::stats::open_plain_stalled(),
             ack_below = conn.ack_frontier().1,
             ack_largest = conn.ack_frontier().0,
             // The oldest resident and why it is still there, beside the count: a

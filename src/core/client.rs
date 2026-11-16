@@ -1592,9 +1592,26 @@ async fn run_mux_data_channel(
     // slow in the handshake look identical from the server, and only these two
     // numbers tell them apart.
     let stream_opening = std::time::Instant::now();
+    // Each open call bounded and counted on its own (`HANDOFF.md` §0).
     let mut stream = match stripe {
-        Some(request) => open_stripe_stream(args, tunnel, request).await?,
-        None => tunnel.open_stream().await?,
+        Some(request) => tokio::time::timeout(
+            crate::common::constants::PROLOGUE_BUDGET,
+            open_stripe_stream(args, tunnel, request),
+        )
+        .await
+        .map_err(|_| {
+            crate::transport::stats::note_open_stripe_stalled();
+            anyhow!("mhd striped placement waited out its budget")
+        })??,
+        None => tokio::time::timeout(
+            crate::common::constants::PROLOGUE_BUDGET,
+            tunnel.open_stream(),
+        )
+        .await
+        .map_err(|_| {
+            crate::transport::stats::note_open_plain_stalled();
+            anyhow!("mhd placement waited out its budget")
+        })??,
     };
     let open_us = u64::try_from(stream_opening.elapsed().as_micros()).unwrap_or(u64::MAX);
     // Every open, into a histogram: the log line below is a slow-open sample and
