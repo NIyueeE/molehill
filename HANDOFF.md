@@ -35,7 +35,12 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **The one measurement left needs no new data structure after all.** `Conn::stream_opened` is already a map of live
+> **The live age histogram is BUILT (`64a7e30`) and its reading is the first thing the next stretch must take.**
+> `mhd window` now carries `live_gt_1s`, `live_gt_10s`, `live_gt_60s`, counted from the lane's own `stream_opened` map — the
+> first aggregate in this record that counts **live** streams instead of completed ones. Read it against `opened_len`:
+> **`live_gt_60s == 1` is the lane's root stream and is normal; `> 1` is the occupant this record could not see.**
+>
+> **A plan that was made before the map was read**, kept for the record: `Conn::stream_opened` is already a map of live
 > stream id → creation `Instant`, and `queue_sizes()`/`oldest_opened_ms()` already read it. So the live age histogram is
 > three filters over that map, printed beside `opened_len` on the mhd window line:
 >
