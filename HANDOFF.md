@@ -13,6 +13,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.391 (measured): `deliver` is never called for the expired groups.** The registry has a third log line — `mhd channel
+> delivered`, written by `ServerChannels::deliver` (`server.rs:3768`) when it hands a channel to the group's waiter — and a
+> soak writes **18 847** of them. For the three expired groups (10128, 10183, 10184) there is **neither `delivered` nor
+> `taken`**, only the two budget expiries.
+>
+> **So the channel arrives as a stream and is never delivered to the group that asked for it** — the break is one step
+> earlier than the take, at the call into `deliver`. Two shapes remain: the channel never reaches the code that calls
+> `deliver` (it is dropped after its selector is read), or it reaches it **with a different group value** and is delivered
+> to someone else's slot.
+>
+> **The next instrument is at `deliver`'s caller**: the group parsed from the channel's prologue, logged whether or not a
+> waiter exists. That single line distinguishes "never got there" from "got there with the wrong number".
+
 > **§4.390 (measured, and it is the sharpest statement in this record).** For three groups that expired (10128, 10183,
 > 10184) the server logged **`asking the client for data channels` and never `mhd channel taken`** — the channel never
 > reached the group's slot. And yet a soak's server accepts ~14 500 channels and reads every selector (§4.378), so the
