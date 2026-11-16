@@ -13,7 +13,14 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
-> **§4.392 (measured, and this is the root cause).** The new line shows the expired groups **do** reach delivery with the
+> **§4.393 (measured): the one-group-per-visitor fix is in and the wedge survives.** With `303da63` in — the group
+> allocated once per visitor and its slot kept across attempts — the product arm read **0 wedges, 0 pairing expiries** and
+> the twin **2 wedges / 160.16 s / 136 expiries**. So the per-attempt group was **a** real defect and is fixed; it was
+> **not** the whole of this one. The twin's 136 expiries are the same phenomenon still standing, and the instrument that
+> names it next is the one added in §4.392: `reached delivery` beside `mhd channel taken` **per group**, on the arm that
+> wedges, now that the group id no longer changes under it.
+
+> **§4.392 (measured, and thought to be the root cause).** The new line shows the expired groups **do** reach delivery with the
 > right group — groups 7472, 7473 and 7581 each logged one `reached delivery` beside their one `pairing budget expired`.
 > So `deliver(group, ch)` ran, with the number the client sent, and the pairing that had asked for that number still
 > expired.
