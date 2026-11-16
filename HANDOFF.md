@@ -21,6 +21,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.403: the leases are genuinely held, and their hold time is already measured but not printed there.** `StreamLease`'s
+> `Drop` (`multiplex.rs:495`) decrements the tunnel's stream count unconditionally, so the ceiling is not a counter leak: 224
+> leases really are alive when the pool refuses. And `TunnelCounters::note_held` already accumulates **count, mean ms and
+> max ms** of hold time (`multiplex.rs:400`), but the line that fires at the ceiling —
+> `pool-stats: pool still at its stream ceiling … count=4 ceiling=56` — does not print them.
+>
+> **The next instrument is one line: put `held_count/held_mean_ms/held_max_ms` on that ceiling line.** If the mean hold time
+> is milliseconds, the leases turn over and the ceiling is a *rate* problem; if it is seconds, something is holding streams
+> far past their request and that holder is the defect.
+
 > **§4.402 (THE ANSWER, and it was already in the log).** The caller of `run_mux_data_channel` has always logged the error —
 > `debug!("{:#}", e)` at `client.rs:3004` — and a soak's client log contains, in order of count:
 >
