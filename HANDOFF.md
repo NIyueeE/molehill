@@ -13,6 +13,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.395 (measured): the client opened all sixty-six, and only three opens are `group=0`.** So the two producers are not
+> eating each other's requests, and the channel is **opened for the right group** — and still never reaches `deliver` at
+> the server. The stream arrives (the server creates it and reads a selector for every channel it accepts), and the
+> prologue that carries the group never gets to `handle_data_channel` for those sixty-six.
+>
+> **Which puts the defect back inside the carrier, at the one thing this record already measured from the other side**:
+> a stream whose first packet arrives and whose following bytes do not — the client re-sending a range it never sees
+> acknowledged, with a new packet number each pass (§4.343, and `mhd stream retired  age_ms=1` under it).
+>
+> **So the two halves now meet**: the server-side half is clean (arrive ⇒ delivered ⇒ taken, 13 871 = 13 871), and the
+> missing sixty-six are streams the client opened and the transport never delivered. **The next instrument is on that
+> stream**: for one of the sixty-six, the client's `first byte of a stream sent` and the server's `first packet for an
+> unknown stream` for the same id — whether the packet ever left, and whether it ever arrived.
+
 > **§4.394 (measured): sixty-six of seventy expired groups never reached delivery at all.** On the arm that wedged after the
 > fix, `reached delivery` and `mhd channel taken` are **13 871 each — perfectly matched** — and of the **70** groups whose
 > pairing expired, only **4** ever reached delivery (all four taken). So the delivery path is now clean for every channel
