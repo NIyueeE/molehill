@@ -13,6 +13,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.394 (measured): sixty-six of seventy expired groups never reached delivery at all.** On the arm that wedged after the
+> fix, `reached delivery` and `mhd channel taken` are **13 871 each — perfectly matched** — and of the **70** groups whose
+> pairing expired, only **4** ever reached delivery (all four taken). So the delivery path is now clean for every channel
+> that arrives, and **66 expired groups were never answered by any channel at all**.
+>
+> **Which moves the question back to the client, but to a different actor**: the client opened ~14 500 channels in that run
+> and only 13 871 arrived naming a group. The gap is the shape of a channel that was opened **for a different name** —
+> the plain-visitor path (`group = 0`) consuming a request the striped pairing had issued, or the reverse.
+>
+> **The next instrument is one line on the client's open**: the `group` it is about to write, logged *for every* open
+> (not only the striped ones), plus a count of `group == 0` opens. If that count is roughly the 66, the two producers are
+> taking each other's requests and the fix is in how a request names its consumer.
+
 > **§4.393 (measured): the one-group-per-visitor fix is in and the wedge survives.** With `303da63` in — the group
 > allocated once per visitor and its slot kept across attempts — the product arm read **0 wedges, 0 pairing expiries** and
 > the twin **2 wedges / 160.16 s / 136 expiries**. So the per-attempt group was **a** real defect and is fixed; it was
