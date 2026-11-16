@@ -40,7 +40,20 @@ attempt, asks again for the next one, and a channel that was in flight for the o
 is pushed to the shared queue, and the pairing — now waiting on a *new* slot — does not look at the shared queue for
 that group again in the same attempt.
 
-**The fix therefore has two parts, and the first is the safer one:**
+**And the group id itself is allocated inside the retry loop** (`server.rs:4572`–`4573`: `'gather: loop { let group =
+GROUP_IDS.fetch_add(1, …) }`), so **every attempt is a new group** and the previous one is `unclaim`ed on the way out
+(`4683`). A channel in flight for the old group therefore arrives at a closed slot, is pushed to the shared queue, and
+is never seen by the pairing — which by then is asking under a different number. **That is the whole defect**: a pairing
+that needs a second attempt cannot receive the channel the first attempt had already caused the client to open.
+
+**The fix is two lines, and it is the smallest in this record:**
+
+1. move `let group = GROUP_IDS.fetch_add(…)` and `let group_bytes`/`cmds` **out of** `'gather: loop` — one group per
+   visitor, not per attempt;
+2. **do not `unclaim` on the retry path** (`4683`): the slot must outlive the attempt that failed, so a late channel
+   lands in it and the next `take_for(group)` returns immediately.
+
+**Earlier note on the fix (superseded):**
 
 1. **keep the slot alive across attempts** — register once per group and hold the receiver across the retry loop instead
    of unclaiming it at each attempt's end;
