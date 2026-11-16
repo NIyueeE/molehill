@@ -21,6 +21,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.412: the capacity is 4 × 56 = 224, and the churn needs about fourteen.** `ceiling()` is
+> `tunnel_ceiling(self.inner.shared.stream_cap)` — **per tunnel** (`multiplex.rs:2204`), and the refusal message says so
+> ("every tunnel is at its stream ceiling; this pool is at its configured tunnel …"). So the pool really can carry 224
+> concurrent streams, and §4.377's opening rate times any plausible churn hold time is an order of magnitude below that.
+>
+> **Which means the occupants are not the churn's concurrency at all.** Something else is charged to those lanes in
+> hundreds — the `rr-16` and bulk stages are the only other producers, and the A/A contrast (§4.410) says the difference
+> between the arms is not theirs. The one population that fits both statements is **churn streams that never ended**, and
+> §4.411 explains why the completed-lease average could not show them.
+>
+> **So the one measurement that settles it is the live age histogram** (§4.411), and it is the only thing left to build.
+
 > **§4.411: the held-time line counts *completed* leases, so it cannot describe the ones that are stuck.** `note_held` runs
 > on `Drop` — it records the hold time of streams that **ended**. A stream that is still holding a slot when the pool
 > refuses is **not** in that average at all, so `held_mean_ms=1044` describes the population that *did* end and says
