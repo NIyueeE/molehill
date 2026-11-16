@@ -21,6 +21,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.404: where the counters live, so the next edit is a read-first one.** `TunnelPool` is
+> `{ inner: Arc<TunnelPoolInner> }` (`multiplex.rs:1004`), and `TunnelPoolInner` holds `shared: Arc<PoolShared>`,
+> `state: Mutex<PoolState>`, `dial`, `preferred` and `pins`. The per-tunnel `TunnelCounters` are therefore reached
+> **through `state`** (or through whatever `PoolState`'s entries carry), **not** as a method on the pool — which is why
+> the two attempts at `self.held_peek()` failed to compile.
+>
+> **The next edit is one read followed by one line**: find the field of `PoolState`'s tunnel entry that holds
+> `Arc<TunnelCounters>`, sum `held_peek()` across the entries, and print `(count, mean_ms, max_ms)` on the ceiling line.
+> Two attempts have already died on guessing that path instead of reading it.
+
 > **§4.403: the leases are genuinely held, and their hold time is already measured but not printed there.** `StreamLease`'s
 > `Drop` (`multiplex.rs:495`) decrements the tunnel's stream count unconditionally, so the ceiling is not a counter leak: 224
 > leases really are alive when the pool refuses. And `TunnelCounters::note_held` already accumulates **count, mean ms and
