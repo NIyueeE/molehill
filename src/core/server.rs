@@ -2749,6 +2749,18 @@ async fn route_mhd_stream(
     // pairing that asked for it instead of waking every waiter.
     let sent = queue.deliver(group, DataChannel::RawMhd(io)).await;
     let waited = queued.elapsed();
+    // **The group this channel names, whether or not anyone was waiting for it.**
+    // Groups whose pairing expires log no `delivered` and no `taken`, so the break is
+    // somewhere at or before this call; this line is the only one that carries the
+    // number the client sent (`HANDOFF.md` §0).
+    if crate::transport::stats::enabled() {
+        debug!(
+            group,
+            service = %service_id,
+            delivered = sent.is_ok(),
+            "mhd data channel reached delivery"
+        );
+    }
     if waited >= std::time::Duration::from_millis(100) {
         debug!(
             service = %service_id,
