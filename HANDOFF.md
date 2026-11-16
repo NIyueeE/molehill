@@ -13,6 +13,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.401 (measured): the unfinished opens are not stalled at all — they fail.** With all three bounds and counters in, a
+> run whose twin wedged ten times (45.067 s) read **`prologue_stalled` 0, `open_stripe_stalled` 0, `open_plain_stalled` 0**,
+> while the gap persisted: **12 528 opens started, 12 363 finished** (165 unfinished) and 195 pairing expiries.
+>
+> **So those opens do not wait — they return an error**, and the only paths left that do so are the two propagated ones
+> (`open_stripe_stream(...)?` and `tunnel.open_stream()?`) and the prologue write (whose failure counter is also 0). **The
+> error is swallowed by the caller and nothing counts it.**
+>
+> **The next instrument is the last one this chain needs**: count and log the **error** returned by those two opens — not a
+> stall, an error — with its text. That text names the cause directly, and the two candidates the record already has are a
+> pool that will not place (no lane below the ceiling) or a group released under the open.
+
 > **§4.400 (measured): the correspondence is exact and neither guard fires.** On a run whose twin wedged four times: the
 > client **started 19 039 opens and finished 18 994** — a gap of **45** — and the server logged **45 pairing expiries**.
 > Both guards read **0**: `prologue_stalled` (the write) and `open_budget_expired` (the placement).
