@@ -13,7 +13,21 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
-> **Answer nearly in hand (end of the 80 rounds).** `data_ch_rx.take_for(group)` **does** filter by group (`server.rs:3868`
+> **§4.389 (measured): the write never breaks and the take is instant.** With the new line in, a soak whose twin wedged six
+> times (15.015 s) logged **zero** `broke on it` — `write_and_flush` never fails. And on a healthy pairing, the ask at
+> `.150920` is followed by `mhd channel taken` at `.151179`: **259 µs**.
+>
+> **Which reframes the expiry line**: it is per *attempt* (`attempts=1 … waited_ms=5000`, then `attempts=2 … waited_ms=10001`
+> for the same group), while `mhd channel taken` is per *group* — so a group can appear in both sets and still have been
+> served on its second attempt. The join that said "34 of 48 took a channel" therefore does not mean those visitors were
+> refused; it means their channel arrived in a **later** attempt.
+>
+> **So the question is now the one number this line has never computed**: for the groups that expire, how long after the
+> ask did the channel actually arrive? Both stamps exist (`asking the client for data channels` and `mhd channel taken`
+> carry the group, and the second carries `take_ms` in epoch milliseconds). That interval, per group, separates "the
+> channel came late" from "the pairing had already given up".
+
+> **Earlier (end of the 80 rounds):** `data_ch_rx.take_for(group)` **does** filter by group (`server.rs:3868`
 > registers a per-group slot), and the log proves delivery happens: of the 48 groups whose pairing expired, **34 logged
 > `mhd channel taken`** — the same 34 the client finished opening. So the channel is opened, arrives, **and is taken**.
 >
