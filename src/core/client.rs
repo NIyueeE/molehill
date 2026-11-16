@@ -1617,7 +1617,24 @@ async fn run_mux_data_channel(
     // bare `?`, so a failed write returned without the `channel open finished` line
     // and without any error line — measured, a group whose pairing then expired twice
     // logged `open started` and nothing else (`HANDOFF.md` §0).
-    if let Err(error) = write_tunnel_prologue(&mut stream, args.service_id, tunnel, group).await {
+    let prologue = tokio::time::timeout(
+        crate::common::constants::PROLOGUE_BUDGET,
+        write_tunnel_prologue(&mut stream, args.service_id, tunnel, group),
+    )
+    .await;
+    if prologue.is_err() {
+        // **A first write that waits forever.** Sixty-six opens in a soak started and
+        // never finished with no failure and no panic: the await below is the only one
+        // between those two lines with neither a bound nor a guard (`HANDOFF.md` §0).
+        if crate::transport::stats::enabled() {
+            debug!(group, "mhd channel prologue write waited out its budget");
+        }
+        crate::transport::stats::note_prologue_stalled();
+    }
+    if let Err(error) = prologue
+        .map_err(|_| anyhow!("mhd channel prologue write timed out"))
+        .and_then(|written| written)
+    {
         if crate::transport::stats::enabled() {
             debug!(
                 group,

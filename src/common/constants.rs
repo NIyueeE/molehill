@@ -340,3 +340,10 @@ mod max_tunnels_tests {
         assert!(max_tunnels_for(u64::MAX) > 1_000_000);
     }
 }
+
+/// How long a channel's prologue write may wait for room in its send buffer.
+///
+/// A stream's first write has no pump that could have drained it yet, so a full
+/// buffer there is a wait with no end (`HANDOFF.md` §0).
+#[cfg(all(feature = "client", feature = "multiplex"))]
+pub const PROLOGUE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);

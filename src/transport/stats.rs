@@ -484,6 +484,22 @@ pub(crate) fn prologue_failed() -> u64 {
 /// Prologue writes that failed, since the process started.
 static PROLOGUE_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Note one prologue write that waited out its budget.
+pub(crate) fn note_prologue_stalled() {
+    if !enabled() {
+        return;
+    }
+    PROLOGUE_STALLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many prologue writes have waited out their budget.
+pub(crate) fn prologue_stalled() -> u64 {
+    PROLOGUE_STALLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Prologue writes that waited out their budget, since the process started.
+static PROLOGUE_STALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Note one pool growth, with the time it took.
 pub(crate) fn note_pool_grow(age: Duration) {
     if !enabled() {
