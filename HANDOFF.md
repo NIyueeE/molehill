@@ -21,6 +21,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.410: the bulk cannot be the occupant, because it runs on both arms.** The soak's timeline runs the same bulk stage
+> in the same conditions on the product arm and the twin, so whatever the bulk holds is held on **both** — while the
+> ceiling was reached **133 times on one arm and once on the other** (§4.406). The occupancy that differs between them is
+> therefore **not the bulk's**: it is the population that also differs, which is the churn's thousands of short streams.
+>
+> **So §4.406's reading stands after all, with a better argument than the mean**: a stream that should have been released
+> at the end of a millisecond exchange is still charged to a lane, and on one arm that happens often enough to fill all
+> four. §4.409's caveat is answered by the A/A contrast rather than by the aggregate.
+>
+> **The next measurement is still the split one** — the churn population's own hold time — but it is now a confirmation
+> rather than a fork: if it reads milliseconds the ceiling is a rate problem and the 133-vs-1 contrast has another cause,
+> and that would be worth knowing before any fix.
+
 > **§4.409 (a caveat that must be settled before the next conclusion): the 1 s mean may be the bulk stages, not a leak.**
 > The soak's timeline runs a bulk (iperf3) stage in every condition, and a bulk stream **legitimately** lives for its
 > stage. The **187 s maximum sits right against the 180 s stage length**, and a mean of ~1 s over 13 730 leases is exactly
