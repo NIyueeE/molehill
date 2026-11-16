@@ -4645,10 +4645,20 @@ where
                 first_take_us =
                     Some(u64::try_from(pairing_started.elapsed().as_micros()).unwrap_or(u64::MAX));
             }
-            if write_and_flush(&mut ch, &cmds[gathered.len()])
-                .await
-                .is_ok()
-            {
+            let wrote = write_and_flush(&mut ch, &cmds[gathered.len()]).await;
+            if let Err(error) = &wrote {
+                // **The one failure nothing logged.** A channel that is taken and then
+                // fails this five-byte write is released and the whole gather restarts
+                // under a new group id — which is why groups repeat, why `gathered=0`
+                // recurs and why a visitor waits two budgets (`HANDOFF.md` §0).
+                debug!(
+                    group,
+                    stripe = gathered.len(),
+                    %error,
+                    "mhd data channel took a stripe command and broke on it"
+                );
+            }
+            if wrote.is_ok() {
                 gathered.push(ch);
                 if gathered.len() == stripe_count {
                     break;
