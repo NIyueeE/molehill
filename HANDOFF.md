@@ -30,7 +30,24 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > look, so a delivery landing between the look and the wait is not lost"* — protects the wrong interval: between the
 > **look and the wait**, not between the **ask and the look**.
 >
-> **The fix is to register the slot before asking**, and it is a few lines: allocate the `mpsc::channel` and insert it
+> **The fix, specified exactly (implement with a fresh context; it is three edits):**
+
+1. **`ServerChannels::register(&self, group: u32) -> Option<mpsc::Receiver<C>>`** — the registration half of
+   `take_for` (`server.rs:3870`–`3885`): allocate `mpsc::channel(1)`, `groups.insert(group, tx)`, return `rx`; `None` for
+   `group == 0`.
+2. **`take_for` becomes `take_registered(&self, group: u32, claim: Option<&mut Receiver<C>>)`** — its loop unchanged
+   except that it no longer registers (the `claim` is already in the map), and `unclaim` still runs on every exit.
+3. **`pair_striped_group`**: `let mut claim = data_ch_rx.register(group);` **before** the `for index in 0..stripes` send
+   loop (`server.rs:4575`), and the `select!` arm becomes `take_registered(group, claim.as_mut())`.
+
+Then the window between the ask and the slot's registration is gone: a channel that arrives a microsecond after the
+request finds its slot, `deliver` sends into it, and the pairing takes it.
+
+**The judgement, on the same soak**: `pairing budget expired` zero, `wedge_count` zero, and `reached delivery` equal to
+`mhd channel taken` for every group.
+
+**Earlier note on the same fix:**
+ allocate the `mpsc::channel` and insert it
 > into `groups` before the send loop, then have `take_for` use the already-registered receiver.
 >
 > **Earlier (superseded by this round's reading):** The registry has a third log line — `mhd channel
