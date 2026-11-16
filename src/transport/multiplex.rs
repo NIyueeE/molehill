@@ -406,6 +406,29 @@ impl TunnelCounters {
     }
 
     /// Take the window's held-time readings: `(count, mean ms, max ms)`.
+    /// The same three readings **without clearing them**, for a line that repeats.
+    fn held_peek(&self) -> (u64, f64, f64) {
+        use std::sync::atomic::Ordering;
+        let count = self.held_count.load(Ordering::Relaxed);
+        let nanos = self.held_nanos.load(Ordering::Relaxed);
+        let max = self.held_max_nanos.load(Ordering::Relaxed);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "nanosecond counts over a second of window are far below 2^53"
+        )]
+        let mean_ms = if count == 0 {
+            0.0
+        } else {
+            (nanos as f64 / count as f64) / 1e6
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the same bound applies: a hold of hours is still below 2^53 nanoseconds"
+        )]
+        let max_ms = max as f64 / 1e6;
+        (count, mean_ms, max_ms)
+    }
+
     fn take_held(&self) -> (u64, f64, f64) {
         use std::sync::atomic::Ordering;
         let count = self.held_count.swap(0, Ordering::Relaxed);
@@ -2207,11 +2230,33 @@ impl TunnelPool {
                 true
             },
             || {
+                // **How long the streams it holds have been held.** `note_held` has
+                // accumulated this since the pool existed and no line printed it
+                // (`HANDOFF.md` §0): milliseconds means the ceiling is a rate problem,
+                // seconds means something holds streams past their request.
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "stream counts are far below 2^53; the same bound as the hold times"
+                )]
+                let (held_count, held_mean_ms, held_max_ms) = {
+                    let state = self.inner.state.lock();
+                    let (mut n, mut sum, mut max) = (0u64, 0f64, 0f64);
+                    for entry in &state.entries {
+                        let (c, mean, hi) = entry.tunnel.counters().held_peek();
+                        n += c;
+                        sum += mean * c as f64;
+                        max = max.max(hi);
+                    }
+                    (n, if n == 0 { 0.0 } else { sum / n as f64 }, max)
+                };
                 debug!(
                     pool = %self.inner.shared.key,
                     carrier,
                     count,
                     ceiling,
+                    held_count,
+                    held_mean_ms,
+                    held_max_ms,
                     "pool-stats: pool still at its stream ceiling"
                 );
                 false
