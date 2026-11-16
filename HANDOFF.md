@@ -21,6 +21,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.406 (THE MEASUREMENT): a stream is held for a second on average and 187 seconds at worst.**
+> ```
+> pool-stats: pool still at its stream ceiling count=4 ceiling=56
+>             held_count=13730  held_mean_ms=1044  held_max_ms=187401
+> ```
+> On the arm that wedged (3 wedges, 90.09 s; 133 ceiling lines) against 1 ceiling line on the clean one.
+>
+> **A churn request lives milliseconds (§4.377: median 1.3 ms) and its stream is held 1 044 ms on average — a thousand
+> times longer — with a worst case of 187 seconds.** That is the ceiling's cause: 4 lanes × 56 slots are occupied by
+> streams that have already served their request, so the pool refuses the next channel and the visitor waits out two
+> pairing budgets.
+>
+> **The defect is therefore the stream's release, not the pool's size** — and the next question is exactly one: what keeps
+> a `StreamLease` alive for a second (and sometimes three minutes) after its visitor's exchange is over. The candidates
+> are the forwarding group's two directions (a copy that never sees EOF) and the half-close grace
+> (`FORWARD_IDLE_TIMEOUT` is 300 s, which brackets the 187 s maximum).
+
 > **§4.405: the exact path, read and ready (one edit, no guessing left).** `PoolState` is
 > `{ entries: Vec<PoolEntry>, next_cursor, count, handover }` (`multiplex.rs:620`), and each `PoolEntry` carries the
 > tunnel's `counters: Arc<TunnelCounters>`. So the one line to add at the ceiling site is:
