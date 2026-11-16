@@ -21,6 +21,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.407: the second is not a timer.** The only one-second sleeps near the data-channel path are a statistics reporter
+> loop (`client.rs:1542`) and the pool's own tick (`multiplex.rs:179`), neither of which holds a lease. So the 1 044 ms mean
+> is **the distribution of forwarding-group lifetimes**, not a fixed grace — which fits a distribution whose maximum is
+> 187 s: some groups take a second to finish and one took three minutes.
+>
+> **The next instrument is on the group's end**: log, per group, which direction finished first, when the second one ended,
+> and whether it ended by EOF, by the half-close grace, or by `FORWARD_IDLE_TIMEOUT` (300 s). One line at the group's exit
+> (`stripe.rs`, where `spawn_inner`'s select finishes) names the shape of the 1 s and of the 187 s, and those two are the
+> whole of this defect.
+
 > **§4.406 (THE MEASUREMENT): a stream is held for a second on average and 187 seconds at worst.**
 > ```
 > pool-stats: pool still at its stream ceiling count=4 ceiling=56
