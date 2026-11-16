@@ -13,7 +13,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
-> **§4.399 (measured, and it names the await).** No panic in the client log, so the task is not dying that way: **it is parked.**
+> **§4.400 (measured): the correspondence is exact and neither guard fires.** On a run whose twin wedged four times: the
+> client **started 19 039 opens and finished 18 994** — a gap of **45** — and the server logged **45 pairing expiries**.
+> Both guards read **0**: `prologue_stalled` (the write) and `open_budget_expired` (the placement).
+>
+> **So the gap is real, reproducible, and equal to the expiries in every run measured** (66 = 66, then 45 = 45), and it is
+> **not** in either of the two awaits that now carry a bound. The open is stranded somewhere else in that task — the only
+> remaining candidate is inside `open_stripe_stream` itself, below the bound the reverted build had and this one does not.
+>
+> **The next instrument therefore wraps the two calls separately and counts each**: a bound and a counter on
+> `open_stripe_stream` and on `tunnel.open_stream` individually. With the prologue ruled out by measurement, the answer is
+> one of those two, and the counters will say which without another hypothesis.
+
+> **§4.399 (measured, and it named the wrong await).** No panic in the client log, so the task is not dying that way: **it is parked.**
 > And the one await between `channel open started` and `channel open finished` that has **no bound and no guard** is the
 > write itself — `write_tunnel_prologue` → `conn.write_all(...).await`. `prologue_failed` counts `Err`, not a **hang**, and
 > `OPEN_BUDGET` (in the run that had it) wrapped `open_stream`, not this write.
