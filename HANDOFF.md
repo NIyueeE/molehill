@@ -21,6 +21,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.409 (a caveat that must be settled before the next conclusion): the 1 s mean may be the bulk stages, not a leak.**
+> The soak's timeline runs a bulk (iperf3) stage in every condition, and a bulk stream **legitimately** lives for its
+> stage. The **187 s maximum sits right against the 180 s stage length**, and a mean of ~1 s over 13 730 leases is exactly
+> what a mix of thousands of millisecond churn streams and a handful of 180-second bulk streams produces.
+>
+> **So §4.406's sentence — "a stream is held a thousand times longer than its request" — compares a churn request with an
+> aggregate that includes the bulk streams, and that comparison is not sound.** The measurement is right; the *reading* is
+> unproven.
+>
+> **The next measurement must separate them**: `held_mean_ms` per call site, or simply the same line restricted to streams
+> whose request took under 100 ms (the churn), which is exactly the population the ceiling is starving. If the churn's own
+> holds are milliseconds, the ceiling is a rate problem and the pool is simply too narrow for 16 connections a second.
+
 > **§4.408: the carrier has no one-second hold timer either.** The only one-second constants in `src/transport/mhd/` are a
 > log throttle (`conn.rs:422`, "one log a second, however many writes the gate refuses") and the pump's starve check
 > (`pump.rs:878`). Neither defers a release. So the 1 044 ms mean is **not a timer anywhere** in the carrier, the
