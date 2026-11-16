@@ -35,7 +35,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **The one measurement left, and it needs a data structure, not a line**: a histogram of **live** lease ages — count the
+> **The one measurement left needs no new data structure after all.** `Conn::stream_opened` is already a map of live
+> stream id → creation `Instant`, and `queue_sizes()`/`oldest_opened_ms()` already read it. So the live age histogram is
+> three filters over that map, printed beside `opened_len` on the mhd window line:
+>
+> ```rust
+> pub(crate) fn live_ages(&self, now: Instant) -> (usize, usize, usize) {
+>     let mut one = 0; let mut ten = 0; let mut sixty = 0;
+>     for at in self.stream_opened.values() {
+>         let age = now.duration_since(*at);
+>         if age >= Duration::from_secs(60) { sixty += 1; }
+>         else if age >= Duration::from_secs(10) { ten += 1; }
+>         else if age >= Duration::from_secs(1) { one += 1; }
+>     }
+>     (one, ten, sixty)
+> }
+> ```
+>
+> and `live_gt_1s/live_gt_10s/live_gt_60s` on the window line. **Note the lane's root stream is one of them** (§4.367) —
+> expect at least one entry in whichever bucket covers the lane's age, and subtract it mentally.
+>
+> **An earlier plan, kept for the record**: it needs a data structure, not a line: a histogram of **live** lease ages — count the
 > currently charged streams older than 1 s, 10 s and 60 s. `StreamLease` already carries `charged_at`; the pool keeps only
 > a counter, so this needs a small registry of charge times (push on charge, remove on drop) or an age histogram updated
 > at both ends. **That is the first task of the next stretch, and nothing else should be attempted before it.**
