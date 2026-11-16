@@ -13,6 +13,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.398 (measured, and it is the whole of the gap).** The sixty-six are exactly the opens that never finished: of the 66
+> groups whose pairing expired without a delivery, **66 started and 0 finished**, and over the whole run **13 937 opens
+> started against 13 871 finished — a difference of exactly 66**.
+>
+> **And neither guard fired**: `open_budget_expired` is 0 (the placement never returned late) and `prologue_failed` is 0
+> (the write never failed). An open that neither completed, nor failed, nor timed out, in a task that was scheduled within
+> 6 µs — is an **open whose task was dropped mid-flight**. That is the cancellation this record first suspected in
+> §4.384 and could not confirm; it is now the only shape left.
+>
+> **The next instrument is on the drop**: a guard on the open task that logs when it is dropped before it reaches either
+> end (`group`, and the stage it had reached). A `Drop` on a small state struct in `spawn_data_channel`'s future does it,
+> and the stage names which await it was parked in.
+
 > **§4.397 (measured): the transport delivers what the client sends, and the missing ones were never sent.** On the wedging
 > arm: the client logged `first byte of a stream sent` for **7 267 distinct stream ids**, the server logged a first packet
 > for **7 266 distinct ids** — a difference of **one**. So every stream whose first byte left the client arrived at the
