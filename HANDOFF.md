@@ -21,6 +21,29 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` before staging anything in
 > that function.**
 
+> **§4.402 (THE ANSWER, and it was already in the log).** The caller of `run_mux_data_channel` has always logged the error —
+> `debug!("{:#}", e)` at `client.rs:3004` — and a soak's client log contains, in order of count:
+>
+> ```
+> 165  Failed to run the data channel: Failed to open a multiplexed data channel:
+>      every tunnel is at its stream ceiling; this pool is at its stream ceiling
+> 164  the pool refused a data channel: every tunnel is at its stream ceiling; …
+> 37   Failed to run the data channel: Failed to read data cmd: early eof
+> ```
+>
+> **165 — exactly the gap of unfinished opens measured in the same run (12 528 started, 12 363 finished).** No new instrument
+> was needed; every one of the sixty-six, the forty-five and the 165 were **the pool refusing the channel because every
+> tunnel is at its stream ceiling**.
+>
+> **So the whole chain is closed, and it ends where §4.322 first pointed**: the client opens a channel, the pool refuses it
+> because all four lanes are at 56 streams, the open returns that error, the server's pairing gathers nothing and expires,
+> and the visitor is refused 5–10 s later. **The defect is the ceiling being reached at all** — streams that are not
+> released — not anything in the pairing, the delivery or the open path.
+>
+> **The next question is therefore the one holding the ceiling**: why a lane holds 56 live streams when the probes' own
+> concurrency is single digits (§4.376) and every channel is retired within 5 ms (§4.397). That is the last link, and it is
+> inside the pool's accounting.
+
 > **§4.401 (measured): the unfinished opens are not stalled at all — they fail.** With all three bounds and counters in, a
 > run whose twin wedged ten times (45.067 s) read **`prologue_stalled` 0, `open_stripe_stalled` 0, `open_plain_stalled` 0**,
 > while the gap persisted: **12 528 opens started, 12 363 finished** (165 unfinished) and 195 pairing expiries.
