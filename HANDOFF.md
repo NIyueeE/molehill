@@ -17,7 +17,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > the goal above went into it. What follows is the state, the seventeen explanations that are dead, and the one
 > measurement that is ready and not yet read.
 
-**Ready to run, not yet read**: `1fc7323` prints `started_us` (spawn → first poll) on the `channel open finished`
+**Measured, and it kills the scheduling explanation**: with `1fc7323` built and a run where both arms wedged (1 and 3,
+max 10.01 s), `started_us` reads **p50 6 µs, p99 17–19 µs, max 141 µs** over 17 073 and 19 513 channels. The spawned
+tasks are **scheduled immediately**; there is no runtime starvation.
+
+**So the channel that never finishes is not waiting for the scheduler, not waiting in the placement (§4.383's bound never
+fired) and not failing its prologue (§4.384's counter is zero).** The remaining shape is that the task is **cancelled
+mid-open** — dropped by whatever owns it when the visitor goes — which is why no finish line and no error line exist.
+
+**The next instrument therefore measures cancellation**: a line when the task is dropped before it logs a finish, joined
+by group. If those groups are the ones whose pairing expired, the chain closes: the visitor gives up, the task is
+cancelled, the channel never arrives, the pairing gathers nothing.
+
+**Superseded note** (kept because it cost a run): `1fc7323` prints `started_us` (spawn → first poll) on the `channel open finished`
 line, which is the field that says whether a spawned data-channel task is *scheduled*. `spawn_data_channel`'s own
 comment is the reason it matters: *a spawned task not scheduled for a second is a saturated runtime, and the wait is
 otherwise attributed to the carrier*. **Build release first** — the last attempt ran the previous binary and read zero
