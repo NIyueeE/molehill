@@ -13,7 +13,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
-> **§4.391 (measured): `deliver` is never called for the expired groups.** The registry has a third log line — `mhd channel
+> **§4.392 (measured, and this is the root cause).** The new line shows the expired groups **do** reach delivery with the
+> right group — groups 7472, 7473 and 7581 each logged one `reached delivery` beside their one `pairing budget expired`.
+> So `deliver(group, ch)` ran, with the number the client sent, and the pairing that had asked for that number still
+> expired.
+>
+> **Which means `deliver` found no waiter for the group** and the channel fell through to the shared queue. And that is
+> a race in the code this record has been reading all along:
+>
+> 1. `pair_striped_group` **sends** the requests (`data_ch_req_tx.send(...)`, `server.rs:4575`);
+> 2. then its `select!` polls `data_ch_rx.take_for(group)` — and `take_for` is what **registers the group's slot**
+>    (`groups.insert(group, tx)`, `server.rs:3877`).
+>
+> A channel that arrives between (1) and (2) finds no slot, is delivered to the shared queue instead, and the pairing
+> waits for a slot that was registered a microsecond too late. The comment in `take_for` — *"Registered before the first
+> look, so a delivery landing between the look and the wait is not lost"* — protects the wrong interval: between the
+> **look and the wait**, not between the **ask and the look**.
+>
+> **The fix is to register the slot before asking**, and it is a few lines: allocate the `mpsc::channel` and insert it
+> into `groups` before the send loop, then have `take_for` use the already-registered receiver.
+>
+> **Earlier (superseded by this round's reading):** The registry has a third log line — `mhd channel
 > delivered`, written by `ServerChannels::deliver` (`server.rs:3768`) when it hands a channel to the group's waiter — and a
 > soak writes **18 847** of them. For the three expired groups (10128, 10183, 10184) there is **neither `delivered` nor
 > `taken`**, only the two budget expiries.
