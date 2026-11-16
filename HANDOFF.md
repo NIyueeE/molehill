@@ -30,7 +30,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > look, so a delivery landing between the look and the wait is not lost"* — protects the wrong interval: between the
 > **look and the wait**, not between the **ask and the look**.
 >
-> **The fix, specified exactly (implement with a fresh context; it is three edits):**
+> **Correction before implementing (this round's read of `deliver`).** `deliver` logs `mhd channel delivered` **only on a
+successful `try_send`**, and the expired groups never log it. So the slot was **not absent** — `try_send` returned
+`Full` or `Closed`, and both of those fall through to the shared queue (`server.rs:3812`). `Closed` means the receiver
+was already gone, i.e. the pairing had **`unclaim`ed** its slot — on an earlier iteration, or when an attempt ended.
+
+**So the race is not "ask before register" but "unclaim before arrival"**: the pairing gives up its slot at the end of an
+attempt, asks again for the next one, and a channel that was in flight for the old slot arrives when that slot is closed,
+is pushed to the shared queue, and the pairing — now waiting on a *new* slot — does not look at the shared queue for
+that group again in the same attempt.
+
+**The fix therefore has two parts, and the first is the safer one:**
+
+1. **keep the slot alive across attempts** — register once per group and hold the receiver across the retry loop instead
+   of unclaiming it at each attempt's end;
+2. only then the ask-before-register ordering, which this entry still recommends but as a second step.
+
+**The fix that was specified before this correction (kept for the record):**
 
 1. **`ServerChannels::register(&self, group: u32) -> Option<mpsc::Receiver<C>>`** — the registration half of
    `take_for` (`server.rs:3870`–`3885`): allocate `mpsc::channel(1)`, `groups.insert(group, tx)`, return `rx`; `None` for
