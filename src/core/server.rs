@@ -4569,10 +4569,15 @@ where
     // visitor was slow, and this says whether the wait was here.
     let pairing_started = std::time::Instant::now();
     // Each iteration is one gather attempt under a fresh group id.
+    // **One group per visitor, not per attempt.** The group is the name this end's
+    // channel registry knows the waiter by, and a retry that took a new name could
+    // never receive a channel the previous attempt had already asked the client for:
+    // it arrived at a slot this end had just released and fell through to the shared
+    // queue (`HANDOFF.md` §0).
+    let group = GROUP_IDS.fetch_add(1, Ordering::Relaxed);
+    let group_bytes = group.to_be_bytes();
+    let cmds = stripe_cmds(group_bytes, stripes)?;
     'gather: loop {
-        let group = GROUP_IDS.fetch_add(1, Ordering::Relaxed);
-        let group_bytes = group.to_be_bytes();
-        let cmds = stripe_cmds(group_bytes, stripes)?;
         // One striped request per stripe, before the first wait: the
         // unstriped path asks for its channel this way, and a striped gather
         // that does not ask simply waits for channels nobody was told to
@@ -4680,7 +4685,8 @@ where
                 // stripes the client already parked for it, and gather a fresh
                 // one. The next iteration's own requests replace the channels
                 // that died with it, so nothing is re-asked here.
-                data_ch_rx.unclaim(group);
+                // The slot is **not** released here: the next attempt asks under the
+                // same group, and a channel already in flight must still land in it.
                 let _ = data_ch_req_tx.send(DataChannelRequest::ReleaseGroup(group_bytes));
                 drop(gathered);
                 continue 'gather;
