@@ -13,6 +13,40 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **CLOSING STATE of the second goal (37 of 40 rounds used, defect still open, finalisation NOT written).**
+>
+> **What is closed** — the whole chain is measured end to end, with a number at every link:
+>
+> ```
+> request reaches the client          122 µs
+> task scheduled                      6 µs   (started_us p50, 17 073 samples)
+> placement bound expired             0
+> prologue write failed / stalled     0 / 0
+> pool refuses the channel            165 ×  "every tunnel is at its stream ceiling"
+>   = the gap of unfinished opens     (12 528 started, 12 363 finished)
+> server pairing gathers nothing      43, 45, 48, 66, 195 expiries across runs, all gathered=0
+> server side is clean                created 13 874 → delivered 13 873 → taken 13 871
+> transport is clean                  client sent 7 267 distinct ids, server saw 7 266
+> visitor refused                     10–25 s = two 5 s pairing budgets
+> ```
+>
+> **What is not closed**: *which streams occupy the 224 slots*. The arithmetic is unambiguous — the pool can carry
+> **4 × 56 = 224** concurrent streams (§4.412) and the churn's own concurrency is about **fourteen** (13.5 openings a
+> second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
+> aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
+>
+> **The one measurement left, and it needs a data structure, not a line**: a histogram of **live** lease ages — count the
+> currently charged streams older than 1 s, 10 s and 60 s. `StreamLease` already carries `charged_at`; the pool keeps only
+> a counter, so this needs a small registry of charge times (push on charge, remove on drop) or an age histogram updated
+> at both ends. **That is the first task of the next stretch, and nothing else should be attempted before it.**
+>
+> **Two traps paid for in full, do not repeat them**: `cargo clippy --all-targets` passing does **not** mean the build is
+> green — the minimal `server,client` build must be run too (it caught 19 errors once and 3 another time); and a
+> statistic measured on `Drop` says nothing about what is still alive.
+
+## 0b. The account that was here before
+
+
 > **A trap for whoever adds that counter.** `run_mux_data_channel` is compiled in the **minimal** `server,client` build too,
 > with its multiplex pieces `cfg`-stripped (`stripe` becomes `()`, `open_stripe_stream`/`tunnel.open_stream`/
 > `write_tunnel_prologue`/`PROLOGUE_BUDGET` vanish). Adding a call or a constant there compiles in the default build and
