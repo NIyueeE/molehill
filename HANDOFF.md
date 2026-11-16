@@ -13,6 +13,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.390 (measured, and it is the sharpest statement in this record).** For three groups that expired (10128, 10183,
+> 10184) the server logged **`asking the client for data channels` and never `mhd channel taken`** — the channel never
+> reached the group's slot. And yet a soak's server accepts ~14 500 channels and reads every selector (§4.378), so the
+> streams *do* arrive.
+>
+> **So the last hop is the delivery into `data_ch_rx`'s group slot**, not the client, not the transport, not the take.
+> The next instrument is one line at the point the server parses a channel's prologue and registers it: **the group it
+> read and whether a slot for it existed**. That separates "the prologue carried a different group than the pairing
+> asked for" from "the group was right and the registration missed".
+
 > **§4.389 (measured): the write never breaks and the take is instant.** With the new line in, a soak whose twin wedged six
 > times (15.015 s) logged **zero** `broke on it` — `write_and_flush` never fails. And on a healthy pairing, the ask at
 > `.150920` is followed by `mhd channel taken` at `.151179`: **259 µs**.
