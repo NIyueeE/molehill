@@ -13,6 +13,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.396 (measured, and it closes the server side completely).** On the arm that wedged: the server created **13 874**
+> streams (`first packet for an unknown stream`), **13 873** reached delivery, and **13 895** selectors were read. So the
+> server saw essentially every channel it delivered — **and the sixty-six opened by the client never became streams
+> there at all**. Their first packet never arrived.
+>
+> **Which leaves exactly one link and it is the carrier's**: a channel the client opens, whose packets the server never
+> receives, while ~13 900 others of the same run do. That is the same shape the record measured from the far side
+> (§4.343: a client re-sending a range it never sees acknowledged, `mhd stream retired  age_ms=1`), and the pairing
+> budget is what turns it into a ten-second refusal.
+>
+> **The next instrument, and it needs no new run to specify**: for the sixty-six groups, the client's
+> `mhd channel open finished` carries `group`; the open's stream id is on the same task's later lines. Print the stream
+> id on the finish line, then look for that id in the server's `first packet for an unknown stream`. An id that never
+> appears there is a stream whose first packet never left — or never landed — and the client's own `mhd stream retired
+> age_ms=…` for it says which.
+
 > **§4.395 (measured): the client opened all sixty-six, and only three opens are `group=0`.** So the two producers are not
 > eating each other's requests, and the channel is **opened for the right group** — and still never reaches `deliver` at
 > the server. The stream arrives (the server creates it and reads a selector for every channel it accepts), and the
