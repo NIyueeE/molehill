@@ -35,6 +35,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.423 (the lead that fits every remaining fact): the server side never sends its fin.** §4.368 measured, on the same lanes,
+> that of the 56 live streams **26 carried the peer's fin and 30 carried neither** — the client's streams are waiting for a
+> fin that never arrives. A stream whose peer never finished cannot end, cannot be reaped by the grace (which starts only
+> when one direction ends), and does not park a writer: it simply sits. **That is exactly the state that survived every
+> check of the last three rounds.**
+>
+> **And the shape of it points at the benchmark's own backend**: the churn probe talks through the tool to the echo service
+> the harness starts inside the client namespace (`workloads.py`, `ECHO_PORT = 2401`). If that echo keeps each connection
+> open after replying — a keep-alive backend — then the tool's server-side copy never ends, no fin travels back, and **every
+> churn channel stays open on the client for as long as the backend holds it**. The pool then fills with channels whose
+> requests finished long ago, which is the 56.
+>
+> **The check is one read, not one run**: does the harness's echo close the connection after echoing, or does it loop on the
+> same socket? If it loops, the defect is the harness's, and the product's only fault is holding a channel open for a peer
+> that never closes — which is what `FORWARD_IDLE_TIMEOUT` is for, at five minutes.
+
 > **§4.422 (a contradiction that reopens it): the clean arm holds 5–6, and it runs the same rr and bulk.** §4.421 blamed the
 > occupancy on the benchmark's own concurrent connections — but `rr-16` and the bulk stage run on **both** arms, so if they
 > were the occupants the clean arm would sit at the same 56. It sits at **4–6**. **The extra fifty are the churn's**, and
