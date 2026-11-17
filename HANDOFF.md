@@ -35,6 +35,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.425: the server has no `copy_bidirectional`; both ends forward through `spawn_group`, and the fin has four hops to make.**
+> `src/core/server.rs` never copies with `copy_bidirectional` (the only `shutdown` calls are session handles), so the server's
+> channel forwarding is the same stripe forwarder the client uses. The churn's close is therefore a **four-hop chain**:
+>
+> ```
+> probe closes → client forwarder sees EOF → sender.finish() → fin on the stream
+>              → server recv_loop sees fin → closes toward the echo
+>              → echo sees EOF → closes → server send_loop sees EOF → sender.finish()
+>              → fin back on the stream → client recv_loop ends → group ends → lease drops
+> ```
+>
+> **A hang at any hop leaves the stream open exactly as measured** (§4.368: of 56 live, 26 had the peer's fin and 30 had
+> neither — the 30 stopped somewhere before the second fin). And each hop has an instrumentable moment.
+>
+> **The next step is to instrument the chain once, on one churn channel, with the stream id**: `fin sent`, `fin received`,
+> `echo EOF`, `fin sent back`. Four lines, one stream, and the hop that never prints names the defect.
+
 > **§4.424: the echo closes when its peer closes, so the backend is not holding anything.** `workloads.py`'s `serve` runs
 > `read_direction` as `while True: data = conn.recv(65536); if not data: return` — it returns on EOF, so when the probe's
 > connection goes the echo's side goes with it. **The harness backend keeps nothing open** (§4.423 is refuted), and the
