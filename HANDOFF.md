@@ -35,7 +35,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.428 (THE ANSWER, from the retirement ages): the occupancy is a heavy tail, not a leak.** `mhd stream retired age_ms`
+> **§4.429 (THE MECHANISM): the long-lived streams are mostly **finished**, and nothing re-settles them.** Joining the
+> retirement ages against the fin flags on the same run: of the **1 674** streams that retired after 60 s, **1 267 closed with
+> `peer_fin=true`** and 407 without.
+>
+> **So two thirds of the tail had both directions finished and still sat in the table for over a minute.** That is not a
+> forwarding-group problem at all — it is the **table entry**: `Conn::settle` is what removes a stream from
+> `stream_opened`/`streams`, it runs only on **events** (a close, an acknowledgement), and a stream whose last event was the
+> peer's fin has no further event to trigger it. The periodic reaper does not cover this case either: `reap_abandoned`
+> requires `send.held() > 0`, and a finished stream holds nothing.
+>
+> **Which names the fix exactly**: the periodic pass must also settle a stream that is **finished and unacknowledged-free**
+> — `local_fin && peer_fin && send.unacked() == 0`, the same predicate `settle` already uses for `closed_both` (§4.359).
+> One clause in `reap_abandoned`, no new state, and it retires the finished-but-unvisited entries within one tick instead of
+> leaving them for `FORWARD_IDLE_TIMEOUT`'s five minutes.
+>
+> **That is the defect this whole line has been chasing**: not a leak in the forwarder, not a missing fin, not the grace —
+> **a table entry whose only removal path is an event that never comes again.**
+
+> **§4.428 (the retirement ages): the occupancy is a heavy tail, not a leak.** `mhd stream retired age_ms`
 > on the wedged arm over **13 983** streams:
 >
 > | p50 | p90 | p99 | max |
