@@ -35,6 +35,33 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.428 (THE ANSWER, from the retirement ages): the occupancy is a heavy tail, not a leak.** `mhd stream retired age_ms`
+> on the wedged arm over **13 983** streams:
+>
+> | p50 | p90 | p99 | max |
+> |---|---|---|---|
+> | **21 ms** | **6 835 ms** | **140 201 ms** | 183 974 ms |
+>
+> **Half the streams retire in 21 ms — the product is fast.** But the tail is enormous: 10 % live past **6.8 s** and 1 % past
+> **140 s**. At 13.5 openings a second that tail alone fills the pool:
+>
+> ```
+> 1 % × 140 s × 13.5/s  ≈ 19 slots
+> 9 % × 6.8 s × 13.5/s  ≈  8 slots
+> persistent rr-16 + bulk ≈ 24 slots
+>                         ≈ 51 — against a measured 56 per lane
+> ```
+>
+> **So `every tunnel is at its stream ceiling` is produced by one stream in a hundred living two to three minutes**, plus a
+> tenth living several seconds, plus the harness's own persistent connections. The number fits without any leak, any
+> missing fin and any grace.
+>
+> **And the tail is bounded by `FORWARD_IDLE_TIMEOUT` (300 s)** — which is why nothing lives past ~184 s: those streams are
+> not stuck forever, they are **held far too long for a millisecond exchange**.
+>
+> **The next question is the only one left and it is narrow**: what makes one churn channel in a hundred live two minutes?
+> The candidates that survive are the ones with no fin (23 of 13 983) and the ones whose group waited on the grace.
+
 > **§4.427: the returning fin arrives 99.8 % of the time, so §4.426's race is a tail, not the cause.** On the wedged arm the
 > client closed **13 983** streams: **13 960 with `peer_fin=true`, 23 with `peer_fin=false`**. The fin comes back.
 >
