@@ -35,6 +35,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.413 (first reading of the live histogram): on a clean arm, most live streams are already old.** A run whose both arms
+> were clean (`0 / 0`) read `opened_len` max **4–5** and `live_gt_60s` max **3–4** — so **three or four of the four or five
+> live entries are older than a minute**, on an arm with no wedge at all.
+>
+> **Two readings of that, and the second is the interesting one**: either the lane's root stream plus a couple of long-lived
+> channels is the whole population (the root is as old as the lane, §4.367), or `stream_opened` **keeps entries whose
+> streams are already closed** — the §4.365 thread, which was withdrawn when the root stream explained *one* entry, not
+> four. **Four per lane is not a leak that fills 56**, but the question is now exact: does that number grow on the arm that
+> wedges?
+>
+> **So the next run must be one that wedges**, and the reading to take is the `opened_len` / `live_gt_*` pair **on the
+> ceiling lines**, not the run's maximum.
+
 > **The live age histogram is BUILT (`64a7e30`) and its reading is the first thing the next stretch must take.**
 > `mhd window` now carries `live_gt_1s`, `live_gt_10s`, `live_gt_60s`, counted from the lane's own `stream_opened` map — the
 > first aggregate in this record that counts **live** streams instead of completed ones. Read it against `opened_len`:
