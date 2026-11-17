@@ -35,7 +35,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.420: the shape is a standing population, not a rising one.** `opened_len` sits at 56 while churn retires ~13 streams a
+> **§4.421 (the last measurement, and it closes the leak question): nothing is parked.** `mhd stream writer parked for the
+> first time` — **zero on both arms**, the wedged one included. So no send loop is blocked in `Conn::write`, and the standing
+> 56 are not blocked writers either.
+>
+> **Put that beside the rest and the leak hypothesis is gone**: no grace ever ran (0 lines), no writer ever parked (0
+> lines), and the population is **steady at 56** rather than climbing. What is left is the ordinary case — **56 connections
+> that are open because their visitors are open** — and the arithmetic supports it: `rr-16` holds 16 sockets for its whole
+> stage (`rr.py:_connect` keeps them), bulk holds its `-n` for its stage, and churn's own in-flight set sits on top.
+>
+> **So the answer to "who occupies the 224 slots" is: the benchmark's own concurrent connections, and a pool of 4 × 56 that
+> the soak's mix reaches.** The refusal is then a capacity wall, not a defect — `every tunnel is at its stream ceiling`
+> is exactly what that line is for, and the wedge is the visitor's 10 s wait for a channel the pool will not open.
+>
+> **This is the characterisation the objective allowed for, and the decision belongs to the user**: widen `tunnels`, lower
+> the churn rate in the soak profile, or accept the ceiling as the documented capacity of the default configuration.
+
+> **§4.420 (the shape is a standing population, not a rising one.** `opened_len` sits at 56 while churn retires ~13 streams a
 > second, so the lane is not accumulating a leak that grows — it holds a **steady** 56, which is the signature of groups
 > that **stay** open rather than of a counter that never decrements. Combined with §4.419 (the grace never ran, so neither
 > direction ended on those groups), the remaining explanation for a churn channel is that its **send direction is parked in
