@@ -35,6 +35,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.426: the server closes its streams with both fins, so the missing one is on the way back.** The wedged arm's server
+> log carries 78 800 fin/EOF lines and, for its streams, `mhd stream closed … peer_fin=true local_fin=true`: **the server side
+> of every channel completes**. Yet the client measured **30 of 56 with no peer fin** (§4.368). So the fin is produced and
+> not seen — which is the shape this record met at the very beginning: **`mhd stream retired  age_ms=1`** on the client, a
+> stream retired within a millisecond while its peer was still sending to it (§4.343).
+>
+> **So the four-hop chain has one hop that is not a filter but a race**: the server sends the fin into a stream the client has
+> already retired, and a retired stream's frames are dropped (`is_retired_stream`). The client's `stream_opened` entry is
+> gone, the group still holds the lease, and nothing will ever close it.
+>
+> **That makes the next check small and specific**: on the client, does `mhd stream closed` (or retirement) for a churn
+> channel ever happen **before** the group's recv direction ends? One line at both events with the stream id answers it.
+
 > **§4.425: the server has no `copy_bidirectional`; both ends forward through `spawn_group`, and the fin has four hops to make.**
 > `src/core/server.rs` never copies with `copy_bidirectional` (the only `shutdown` calls are session handles), so the server's
 > channel forwarding is the same stripe forwarder the client uses. The churn's close is therefore a **four-hop chain**:
