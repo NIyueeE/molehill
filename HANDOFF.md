@@ -35,7 +35,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.415 (THE ROOT CAUSE, and the number matches exactly): the half-close grace waits ten seconds of idle.**
+> **§4.416 (the grace fix is in and the wedge survives — reverted).** With `3c0f98c` in, the twin still read
+> `opened_len 56`, `live_gt_10s 56`, **145 ceiling lines, 140 expiries, 3 wedges (75.075 s)** while the product arm stayed
+> clean. So ending the grace early changes nothing here, and it was **reverted** (`a3ea939`).
+>
+> **And the reason is now obvious in the code**: `wait_until_idle` only runs **when one direction has already ended**
+> (`spawn_grace` is spawned on that event). The streams that occupy the slots are the ones where **neither direction
+> ends** — the group is alive in both directions, so no grace ever starts and nothing cuts it.
+>
+> **So the 10–60 s holds are not the grace's**: they are groups that stay open because **the visitor's connection stays
+> open** (or a copy blocks). That is §4.368's shape, and the next question is exact: for a churn channel that should be
+> finished, which side is still open sixty seconds later.
+
+> **§4.415 (incorrect as a root cause; kept for the record): the half-close grace waits ten seconds of idle.**
 > `stripe.rs:1075`–`1101`: when one direction of a forwarding group ends, `spawn_grace` calls `wait_until_idle`, whose own
 > doc says it *"wait[s] until a group has made **no progress** for ten seconds"*, and only then aborts the other direction.
 >
