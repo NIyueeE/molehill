@@ -35,7 +35,29 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.414 (THE ANSWER): the occupants are 10–60 seconds old.** On the arm that wedged (4 wedges, 10.01 s, 67 ceiling
+> **§4.415 (THE ROOT CAUSE, and the number matches exactly): the half-close grace waits ten seconds of idle.**
+> `stripe.rs:1075`–`1101`: when one direction of a forwarding group ends, `spawn_grace` calls `wait_until_idle`, whose own
+> doc says it *"wait[s] until a group has made **no progress** for ten seconds"*, and only then aborts the other direction.
+>
+> **Ten seconds is the whole defect**, and the arithmetic closes on it:
+>
+> ```
+> churn openings          13.5 a second   (§4.377)
+> × grace                 10 s            (this function)
+> = streams held          ≈135            — against a pool of 4 × 56 = 224
+> measured live            live_gt_10s = 56, live_gt_60s = 4   (§4.414)
+> ```
+>
+> **A millisecond exchange occupies a slot for ten seconds**, so the churn's own rate is multiplied by the grace and the
+> pool fills; the ceiling then refuses the next channel, the pairing gathers nothing, and the visitor waits out two
+> five-second budgets. **Every number this record has collected is a consequence of that one constant.**
+>
+> **The fix is to cut a direction that has nothing left to drain instead of waiting ten seconds for it**: the grace already
+> computes `missing = highest - delivered` before it fires — when that is zero the receive direction has delivered
+> everything and can be cut at once. A short idle bound (a few hundred milliseconds) covers the genuine tail. **That is
+> the next change, and it is the last one this defect needs.**
+
+> **§4.414 (the occupants are 10–60 seconds old).** On the arm that wedged (4 wedges, 10.01 s, 67 ceiling
 > lines), the live histogram reads:
 >
 > ```
