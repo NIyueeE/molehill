@@ -35,6 +35,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.414 (THE ANSWER): the occupants are 10–60 seconds old.** On the arm that wedged (4 wedges, 10.01 s, 67 ceiling
+> lines), the live histogram reads:
+>
+> ```
+> opened_len max = 56   live_gt_1s = 56   live_gt_10s = 56   live_gt_60s = 4
+> ```
+>
+> **Fifty-six live streams, every one older than 10 s, only four older than 60 s.** So the occupants are streams **ten to
+> sixty seconds old** — while the requests they serve take milliseconds (§4.377: median 1.3 ms). The clean arm never passed
+> 6, with the same 4 old ones (its root stream and a few long-lived channels).
+>
+> **That is a leak of ten to sixty seconds, not of minutes**, and it explains every earlier censored reading: `held_*`
+> never saw them because they had not ended, and the completed-lease mean was diluted by thousands of short streams that
+> did end. `FORWARD_IDLE_TIMEOUT` is 300 s, so a group that never finishes is only cut at five minutes — far beyond the
+> 10–60 s this measures.
+>
+> **So the defect is the forwarding group's end condition** (§4.407's next instrument is now the right one: which direction
+> ends last, and by what). Fix that and the ceiling stops being reached for reasons the workload does not explain.
+
 > **§4.413 (first reading of the live histogram): on a clean arm, most live streams are already old.** A run whose both arms
 > were clean (`0 / 0`) read `opened_len` max **4–5** and `live_gt_60s` max **3–4** — so **three or four of the four or five
 > live entries are older than a minute**, on an arm with no wedge at all.
