@@ -35,7 +35,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.426: the server closes its streams with both fins, so the missing one is on the way back.** The wedged arm's server
+> **§4.427: the returning fin arrives 99.8 % of the time, so §4.426's race is a tail, not the cause.** On the wedged arm the
+> client closed **13 983** streams: **13 960 with `peer_fin=true`, 23 with `peer_fin=false`**. The fin comes back.
+>
+> **Which kills the missing-fin theory as the explanation** and re-opens the reading of §4.368: the 30 of 56 that "carried
+> neither fin" were a **snapshot of live streams**, not of closed ones — young channels caught mid-flight, exactly what a
+> 56-deep standing population looks like.
+>
+> **So the stands are: 56 live, >10 s old, no grace, no parked writer, fins delivered in 99.8 % of closures.** Every
+> component behaves, and the lane still holds 56. What has not been measured is **how long a churn channel's group lives
+> from the visitor's close to the lease's release** — one interval, at one stream, and it is the only number in this whole
+> line that has never been taken.
+
+> **§4.426 (the returning fin; superseded by the count below), so the missing one is on the way back.** The wedged arm's server
 > log carries 78 800 fin/EOF lines and, for its streams, `mhd stream closed … peer_fin=true local_fin=true`: **the server side
 > of every channel completes**. Yet the client measured **30 of 56 with no peer fin** (§4.368). So the fin is produced and
 > not seen — which is the shape this record met at the very beginning: **`mhd stream retired  age_ms=1`** on the client, a
