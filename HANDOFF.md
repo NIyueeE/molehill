@@ -35,6 +35,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.418 (the characterisation the objective asked for): the pool is too narrow, and the reason is the hold time.**
+> Counting the workload's own occupancy:
+>
+> | population | streams held | for how long |
+> |---|---|---|
+> | `rr-16` | 16 | the whole stage — its sockets are kept, not closed per request (`rr.py:_connect`) |
+> | bulk (`-n`) | ~8 | the whole stage |
+> | churn, 13.5 a second | **~135 at a 10 s hold** | 1.3 ms of work, then the slot waits |
+>
+> **135 + 24 ≈ 159 of 224 slots (71 %)**, before any burst, and the per-lane limit of 56 is reached sooner than the pool
+> total when placement is uneven — which is exactly what the logs show (all four lanes at 56, 145 ceiling lines).
+>
+> **So both statements are true and they are the same statement**: the pool is too narrow **because** a millisecond
+> exchange costs a slot for about ten seconds. Halve the hold and the occupancy halves; double `tunnels` and the ceiling
+> doubles. **Which of the two to change is a product decision, and it is the user's** — the objective says not to change
+> product configuration unilaterally.
+>
+> **What the code cannot do on its own**: two fixes aimed at the release path (the early-cut grace, `3c0f98c`) changed
+> nothing measurable, so the ten seconds are not a stray wait in `spawn_grace` that a condition can remove. They are the
+> time this workload's channels genuinely spend open in the forwarder.
+
 > **§4.417: the probe does close, and the ten seconds do look like the grace.** `run_churn`'s `ping` uses
 > `with socket.create_connection(...) as sock`, so the visitor's socket gets its FIN when the block exits. The client's send
 > loop should see that EOF, `sender.finish()`, end that direction — and **start the grace**, which cuts the other one ten
