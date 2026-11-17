@@ -35,6 +35,17 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.420: the shape is a standing population, not a rising one.** `opened_len` sits at 56 while churn retires ~13 streams a
+> second, so the lane is not accumulating a leak that grows — it holds a **steady** 56, which is the signature of groups
+> that **stay** open rather than of a counter that never decrements. Combined with §4.419 (the grace never ran, so neither
+> direction ended on those groups), the remaining explanation for a churn channel is that its **send direction is parked in
+> `Conn::write`** and therefore never reads the visitor's EOF.
+>
+> **Where to look, precisely**: `stripe.rs`'s `send_loop` → `StripeSender::write` → the lane's `Conn::write` admission
+> (credit / window / buffered). A park there with no wake-up would hold the slot exactly like this, and the bench already
+> has a line for it — **`mhd stream writer parked for the first time`** (`lane.rs`), which fires once per stream and can be
+> counted on the wedged arm to confirm parked writers in bulk.
+
 > **§4.419 (decisive, from the log alone): the grace never ran on the wedged arm.** Counting `half-close grace expired` in the
 > wedged run: **0 on the twin that wedged (56 live streams, 145 ceiling lines)** and 1 on the clean product arm.
 >
