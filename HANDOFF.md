@@ -35,6 +35,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.419 (decisive, from the log alone): the grace never ran on the wedged arm.** Counting `half-close grace expired` in the
+> wedged run: **0 on the twin that wedged (56 live streams, 145 ceiling lines)** and 1 on the clean product arm.
+>
+> **So the ten seconds are not the grace's at all** — the grace never even started, which means for those channels **neither
+> direction ended**. The visitor did close (the probe uses a context manager, §4.417), so the **send direction never got to
+> its EOF**: it is blocked writing into the tunnel and never returns to read the visitor's socket again.
+>
+> **That is the last link and it points at `Conn::write`'s admission** — the credit/buffer gate this record studied from the
+> other side long ago. A churn channel whose reply is written while the lane is at its ceiling has nowhere to put the bytes,
+> so its send loop parks, the visitor's EOF is never read, the group never ends, and the slot is held until something else
+> kills it.
+>
+> **The next measurement is exact and needs one line**: on the send loop, log when it parks in `write` (stream, bytes,
+> which bound refused: credit, window or buffered) and when it leaves. That distinguishes "blocked on space" from "blocked
+> on the peer".
+
 > **§4.418 (the characterisation the objective asked for): the pool is too narrow, and the reason is the hold time.**
 > Counting the workload's own occupancy:
 >
