@@ -35,6 +35,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.422 (a contradiction that reopens it): the clean arm holds 5–6, and it runs the same rr and bulk.** §4.421 blamed the
+> occupancy on the benchmark's own concurrent connections — but `rr-16` and the bulk stage run on **both** arms, so if they
+> were the occupants the clean arm would sit at the same 56. It sits at **4–6**. **The extra fifty are the churn's**, and
+> that is the A/A argument of §4.410 again, which has not been refuted.
+>
+> **So the leak is real and it is churn-specific, while three separate checks came back zero** — no grace, no parked writer,
+> no growth. That combination has one natural shape left: **the churn group's tasks are alive and not blocked**, waiting on a
+> future that nothing will complete — most likely the receive direction waiting for frames that were never delivered because
+> the *client* stopped reading that stream (the pool refused its channel? no — the channel existed), or the visitor-side
+> copy waiting on a socket the probe already closed.
+>
+> **The next instrument, and it is one line in the churn's own path**: log, for a group older than 10 s, which of its two
+> directions is still alive and which `await` it is parked at. That is a `select!` instrument, not a counter.
+
 > **§4.421 (the last measurement, and it closes the leak question): nothing is parked.** `mhd stream writer parked for the
 > first time` — **zero on both arms**, the wedged one included. So no send loop is blocked in `Conn::write`, and the standing
 > 56 are not blocked writers either.
