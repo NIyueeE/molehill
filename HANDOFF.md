@@ -35,6 +35,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.424: the echo closes when its peer closes, so the backend is not holding anything.** `workloads.py`'s `serve` runs
+> `read_direction` as `while True: data = conn.recv(65536); if not data: return` — it returns on EOF, so when the probe's
+> connection goes the echo's side goes with it. **The harness backend keeps nothing open** (§4.423 is refuted), and the
+> missing fin must therefore be the **tool's server-side copy** not finishing — not the peer's silence.
+>
+> **So both ends of the missing fin are inside the tool**: the server's forwarder never sends it, so the client's stream waits
+> for it forever. That is a different suspect from every one examined in this goal: not the grace, not the client's write, not
+> the backend — **the server-side copy's own end**.
+>
+> **The next read is `src/core/server.rs`'s channel forwarding**: which condition ends the copy toward the visitor, and what
+> keeps it from doing so when the visitor's request is answered but the connection stays open in the tool's own view.
+
 > **§4.423 (the lead that fits every remaining fact): the server side never sends its fin.** §4.368 measured, on the same lanes,
 > that of the 56 live streams **26 carried the peer's fin and 30 carried neither** — the client's streams are waiting for a
 > fin that never arrives. A stream whose peer never finished cannot end, cannot be reaped by the grace (which starts only
