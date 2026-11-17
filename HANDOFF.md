@@ -35,6 +35,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.417: the probe does close, and the ten seconds do look like the grace.** `run_churn`'s `ping` uses
+> `with socket.create_connection(...) as sock`, so the visitor's socket gets its FIN when the block exits. The client's send
+> loop should see that EOF, `sender.finish()`, end that direction — and **start the grace**, which cuts the other one ten
+> seconds later. `live_gt_10s = 56` with `live_gt_60s = 4` is exactly the shape of "held just over ten seconds".
+>
+> **So the grace is very likely the holder after all, and §4.416's dismissal was too quick**: the early-exit condition
+> `delivered >= highest` was compared on `Frames`, which counts **data frames** and keeps advancing while a reply is in
+> flight, so it may have been false at every 250 ms poll for exactly the groups that matter.
+>
+> **The condition to use instead**: cut when **both directions are finished** — the send loop has ended (visitor EOF seen)
+> **and** the receive direction has delivered everything **and** the stream has carried its fin. That is a state, not a
+> race, and it needs the receive loop to publish "no more frames will arrive" rather than "delivered == highest so far".
+>
 > **§4.416 (the grace fix is in and the wedge survives — reverted).** With `3c0f98c` in, the twin still read
 > `opened_len 56`, `live_gt_10s 56`, **145 ceiling lines, 140 expiries, 3 wedges (75.075 s)** while the product arm stayed
 > clean. So ending the grace early changes nothing here, and it was **reverted** (`a3ea939`).
