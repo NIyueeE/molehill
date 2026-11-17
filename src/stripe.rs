@@ -1080,7 +1080,7 @@ fn spawn_grace(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let last = alive.load(std::sync::atomic::Ordering::Relaxed);
-        wait_until_idle(alive, &frames, last).await;
+        wait_until_idle(alive, last).await;
         let highest = frames.highest.load(std::sync::atomic::Ordering::Relaxed);
         let delivered = frames.delivered.load(std::sync::atomic::Ordering::Relaxed);
         debug!(
@@ -1100,25 +1100,10 @@ fn spawn_grace(
 /// wait after the other direction ended cut a receive direction that was still
 /// delivering frames, and the visitors' bytes were then dropped at close with nothing
 /// counted as lost. `activity` is where progress is already recorded.
-async fn wait_until_idle(
-    alive: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    frames: &Frames,
-    mut last: u64,
-) {
+async fn wait_until_idle(alive: std::sync::Arc<std::sync::atomic::AtomicU64>, mut last: u64) {
     let mut idle = 0u8;
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        // **Nothing left to drain ends the grace at once.** The surviving direction is
-        // cut ten seconds after it stops making progress, and a churn exchange occupies
-        // its slot for all of them: 13.5 openings a second times ten seconds is ~135
-        // streams against a pool of 224, which is why the ceiling was reached and the
-        // next dial refused (`HANDOFF.md` §0). When the receive direction has delivered
-        // everything it was sent there is nothing to wait for.
-        let highest = frames.highest.load(std::sync::atomic::Ordering::Relaxed);
-        let delivered = frames.delivered.load(std::sync::atomic::Ordering::Relaxed);
-        if delivered >= highest {
-            return;
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let now = alive.load(std::sync::atomic::Ordering::Relaxed);
         if now != last {
             last = now;
@@ -1126,8 +1111,7 @@ async fn wait_until_idle(
             continue;
         }
         idle += 1;
-        // Four of these quarter-seconds make the old one-second tick.
-        if idle >= 40 {
+        if idle >= 10 {
             return;
         }
     }
