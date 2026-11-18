@@ -60,6 +60,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.494 (and the client's tunnel establishment fails on a refusal, so the second entry is not a refused dial).** The client's
+> tunnel connect (`client.rs:2120`) writes the hello and reads one ack: anything but `Ack::Ok` is
+> `bail!("the server refused the multiplexed data tunnel: {v}")`, so an establishment the valve refused **returns an error** and
+> never becomes a pool entry.
+>
+> **So the two entries in the pool are not one-live-and-one-refused** — the refused dial never lands. What is left is the pool's
+> own repair path: an entry created before its dial finishes, and `is_alive()` answering true for it while the dial is still in
+> flight or has silently failed. **That is the next thing to read** (`PoolEntry` creation in `open_stream`'s growth path and the
+> liveness flag's update), and it is the fourth distinct explanation this line has narrowed these three assertions to.
+
 > **§4.493 (the valve is correct on the server; the second entry is the client's own).** `do_v4_tunnel` reserves through
 > `reserve_tunnel(&registry, &nonce, max_tunnels)` and, on `TunnelSlot::OverCap { held }`, logs the cap and answers
 > `refuse_tunnel(&mut conn)` — **a refusal, not a failure, and the session survives** (`server.rs:1756`–1775). So the operator's
