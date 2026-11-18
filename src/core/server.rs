@@ -2626,7 +2626,13 @@ async fn serve_mhd_stream(
                 if existing.nonce != nonce {
                     bail!("mhd lane carried streams for two different sessions");
                 }
-            } else if claimed_registered {
+            } else {
+                // **Every lane reserves, not only a rebuilt one.** The reservation used
+                // to happen on the rebuild path alone (`claimed_registered` with no
+                // registration here), so a lane's **first** establishment never charged
+                // `[server.data].max_tunnels` — measured with the valve at one: a
+                // TCP tunnel plus an mhd lane, and the pool reporting two tunnels while
+                // the valve had refused nothing at all (`HANDOFF.md` §4.496).
                 // **The peer says the lane is registered; this end holds none.**
                 // That happens when a lane was rebuilt — a repair, a restart of the
                 // session's lane — while the client's claim, derived from its own
@@ -2637,11 +2643,13 @@ async fn serve_mhd_stream(
                 // the stream's own prologue instead: the claim carries no
                 // acknowledgement to wait for, and everything the registration
                 // needs is in the hello this stream already delivered.
-                debug!(
-                    "An mhd stream claimed a registered lane with no registration here; \
-                     registering it from the stream's own prologue (session {})",
-                    hex::encode(nonce)
-                );
+                if claimed_registered {
+                    debug!(
+                        "An mhd stream claimed a registered lane with no registration here; \
+                         registering it from the stream's own prologue (session {})",
+                        hex::encode(nonce)
+                    );
+                }
                 match reserve_tunnel(&registry, &nonce, max_tunnels).await {
                     TunnelSlot::Held(session) => {
                         *registered = Some(MhdLaneRegistration {
