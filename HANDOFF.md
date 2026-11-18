@@ -86,6 +86,24 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.455 (the mechanism the empty channels point at: an incomplete group holds its stripes for a minute).** `stripe.rs:204`
+> — `STRIPE_GROUP_TTL = Duration::from_secs(60)`: *"how long an incomplete group's stripes are parked before the registry
+> drops them. A completed gather takes milliseconds; an entry that stays incomplete this long belongs to a server-side gather
+> that was abandoned"*.
+>
+> **So a group whose stripes do not all arrive parks its channels — and the visitor attached to it waits**, with nothing
+> forwarded (`frames=0`), until either the visitor gives up or the TTL fires a minute later. **That is exactly the shape
+> measured**: empty channels living seconds (§4.454), and a lane holding streams ten to sixty seconds old (§4.443's
+> `live_gt_10s`).
+>
+> **And it explains why the pool fills without any component misbehaving**: at the ceiling, an open is refused, so the group a
+> visitor belongs to never completes, and the channels it did get are held for the whole TTL — each refusal makes the next
+> minute worse, which is a positive feedback loop rather than a leak.
+>
+> **The fix to test is therefore not in the stream table but in that TTL's premise**: a group that cannot complete should fail
+> its visitor **promptly** — the visitor can retry — instead of holding a channel for a minute in the hope that a gather which
+> already failed to complete will finish. The churn probe's own timeout is the natural bound.
+
 > **§4.454 (the ambiguity resolves — and it is a defect, not bulk): every long-lived group is an empty one).** Splitting the
 > same 1–5 s groups by the `frames` count already on the EOF line:
 >
