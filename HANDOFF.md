@@ -60,6 +60,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.485 (the streams are `tokio::io::split`, so a lease lives while **either** half lives).** `spawn_inner` splits each channel
+> into a read half and a write half (`stripe.rs:1140`) and moves them into the two directions. On a send-direction failure the
+> group task calls `recv.abort()`, which takes effect **at the aborted task's next await point** — so both halves are gone only
+> once that task is actually dropped, and until then the underlying stream, and the lease inside it, are alive.
+>
+> **That explains a short delay, not fifteen seconds** — so it is not yet the whole answer either, and this is the eighth reading
+> without a fix. **What is needed is not another global count but a lease's own life story**: who created it, which half held it,
+> and when it was dropped. That is a per-lease instrument (`StreamLease` already carries `tunnel_id` and a counter
+> `Arc<TunnelCounters>`), and it is the next thing to build rather than the next thing to guess.
+
 > **§4.484 (it is the failure path, not the grace: 36 send directions *failed*).** Counting how each direction ended in the same
 > failing case:
 >
