@@ -660,6 +660,17 @@ pub(crate) struct RecvBuf {
 }
 
 impl RecvBuf {
+    /// Whether every byte the peer sent has been handed to the reader.
+    ///
+    /// With the peer's fin already seen this means nothing more can arrive and
+    /// nothing is waiting, which is the condition the periodic pass uses to retire a
+    /// stream that no event will visit again (`HANDOFF.md` §4.429).
+    pub(crate) fn is_drained(&self) -> bool {
+        self.pieces.is_empty()
+    }
+}
+
+impl RecvBuf {
     /// Take a range. Answers whether it was news.
     ///
     /// A range that starts below the read offset is trimmed, and one that
