@@ -1117,6 +1117,10 @@ async fn wait_until_idle(alive: std::sync::Arc<std::sync::atomic::AtomicU64>, mu
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one group's whole life: spawn, join both directions, grace, telemetry. \n              The two stamps that say which direction ended first put it five over the \n              limit; splitting it is a refactor for its own commit."
+)]
 fn spawn_inner<R, D, S>(
     src: R,
     dest: D,
@@ -1213,6 +1217,7 @@ where
         // the bound a peer that never closes its read side holds every stream
         // of the group — and the tunnel's capacity — indefinitely.
         let mut grace: Option<tokio::task::JoinHandle<()>> = None;
+        let (mut send_ms, mut recv_ms): (Option<u64>, Option<u64>) = (None, None);
         while send_res.is_none() || recv_res.is_none() {
             tokio::select! {
                 res = &mut send, if send_res.is_none() => {
@@ -1220,6 +1225,7 @@ where
                         debug!("stripe send direction failed: {e:#}");
                         recv.abort();
                     }
+                    send_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
                     send_res = Some(res);
                 }
                 res = &mut recv, if recv_res.is_none() => {
@@ -1227,6 +1233,7 @@ where
                         debug!("stripe receive direction failed: {e:#}");
                         send.abort();
                     }
+                    recv_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
                     recv_res = Some(res);
                 }
             }
@@ -1258,6 +1265,12 @@ where
         if lived >= std::time::Duration::from_secs(60) {
             tracing::info!(lived_s = lived.as_secs(), "a long-lived stripe group ended");
         }
+        debug!(
+            group = group_id,
+            send_ms = send_ms.unwrap_or(0),
+            recv_ms = recv_ms.unwrap_or(0),
+            "stripe group directions ended"
+        );
         debug!("stripe group finished");
     })
 }
