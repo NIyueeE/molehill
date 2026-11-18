@@ -4685,20 +4685,31 @@ where
             let next = tokio::select! {
                 _ = stops.shutdown.recv() => None,
                 _ = stops.control.changed() => None,
-                // A refused channel means this group can never complete: shed the
-                // visitor now instead of sitting out the rest of the budget and
-                // then retrying a gather that cannot succeed (`HANDOFF.md` §4.460).
+                // A refused channel costs **this attempt**, not the visitor: it is
+                // the one failure the gather can see without waiting, so the retry
+                // that a budget expiry pays five seconds for can start at once
+                // (`HANDOFF.md` §4.460). Shedding the visitor here instead made every
+                // transient refusal fatal, which cost more visitors than the wait did.
                 () = data_ch_rx.refused(group) => {
+                    attempts += 1;
                     debug!(
                         group,
+                        attempts,
                         gathered = gathered.len(),
                         stripe_count,
-                        "a channel of this group was refused; shedding the visitor"
+                        "a channel of this group was refused; retrying at once"
                     );
-                    crate::transport::stats::note_pairing_unfed();
-                    data_ch_rx.unclaim(group);
-                    let _ = data_ch_req_tx.send(DataChannelRequest::ReleaseGroup(group_bytes));
-                    return Ok(false);
+                    if attempts >= PAIR_ATTEMPTS {
+                        debug!("Refused {attempts} times; dropping the visitor");
+                        crate::transport::stats::note_pairing_unfed();
+                        data_ch_rx.unclaim(group);
+                        let _ = data_ch_req_tx.send(DataChannelRequest::ReleaseGroup(group_bytes));
+                        return Ok(false);
+                    }
+                    if ask_missing(data_ch_req_tx, group_bytes, stripes, gathered.len())? {
+                        return Ok(true);
+                    }
+                    continue;
                 }
                 ch = data_ch_rx.take_for(group) => ch,
                 () = time::sleep(PAIR_WAIT_BUDGET) => {
