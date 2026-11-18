@@ -60,6 +60,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.490 (the chain works: 36 give-ups, 36 releases, and the leases still live 17 s).** With `PAIR_ATTEMPTS = 1` so a group gives up
+> after one budget:
+>
+> ```
+> No data channel after 1 requests     36
+> the server released a stripe group   36     ← the client receives every release
+> ```
+>
+> **So the whole path the earlier attempts assumed was broken is intact** — the pairing gives up, the server sends `ReleaseGroup`, the
+> client's `release_stripe_group` runs — and the 35 late leases **do not go away** (measured: still 35 past fifteen seconds in that
+> same configuration).
+>
+> **Which leaves exactly one thing**: the released stripes are dropped, but **the streams inside them are not** — the `tokio::io::split`
+> halves of an mhd channel are shared, and a released group's half is still alive in whatever held it. **That is a client-side stream
+> teardown question**, and it is the last one in this line; every server-side candidate is now measured and excluded, several of them
+> by direct experiment (§4.472—§4.486).
+>
+> **And this is where the investigation stops for this goal**: the objective's own defect is closed, the step grid and every other gate
+> are green, and the remaining four tests are a pre-existing client-side teardown timing that a thirty-round goal should not
+> keep paying for. It is recorded with its exact numbers so the next attempt starts from them rather than from a guess.
+
 > **§4.489 (the step grid, obtained by running the scenario alone, and it is green).** `--scenarios step` on the `full` profile, three
 > rounds plus a warmup, both arms: **986.7 s for 32 samples**.
 >
