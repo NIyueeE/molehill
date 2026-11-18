@@ -33,6 +33,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.465 (the server half of the refusal path is in; the client half is the last piece).** `9098125` adds
+> `SessionCmd::ChannelRefused(ServiceId, [u8; 4])` with a roundtrip test, a `refused` set and `Notify` on `ChannelQueue` with
+> `refuse()` / `refused(group)`, the queue filed per service in `SessionCtx` (via a new `ControlChannelHandle::channels()`),
+> the dispatch arm that calls `refuse`, and the pairing's select arm that **sheds the visitor at once** instead of waiting out
+> the budget. Both clippy builds are 0 and the 410 tests pass. **Behaviour is unchanged until the client sends it.**
+>
+> **What the client half needs, precisely**: `RunDataChannelArgs` has no session sender, and the only place that can write a
+> session command is the control session loop, which owns `wr` (`client.rs:4225`). So:
+> 1. create an `mpsc::UnboundedSender<(ServiceId, [u8; 4])>` where the session loop starts and hold the receiver there;
+> 2. add a select arm to that loop that writes `SessionCmd::ChannelRefused(..)` with `wr`;
+> 3. carry a clone of the sender into `RunDataChannelArgs` through `activate()` (`client.rs:4882`, built at `4937`);
+> 4. send `(service_id, group.to_be_bytes())` where the prologue fails (`client.rs:1657`) and where `open_stream` is refused.
+
 > **§4.464 (the protocol path's ordering constraint, found by trying to add the variant first).** Adding
 > `SessionCmd::ChannelRefused` alone **does not build**: the server's `handle_session_cmd` match is exhaustive
 > (`server.rs:1303`), so the variant needs its consumer in the same commit. And that consumer is not reachable today —
