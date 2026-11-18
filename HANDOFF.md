@@ -13,7 +13,32 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
-> **CLOSING STATE (20 rounds of this goal, defect still open, finalisation NOT written).**
+> **CLOSING STATE (35 rounds into this goal, defect NOT closed, finalisation NOT written — read this, then §4.460).**
+>
+> **The defect is now fully described and not fixed.** When the client's stream pool is at its ceiling, the server's gather
+> for a visitor's channel request **waits out a full `PAIR_WAIT_BUDGET` (5 s) per attempt** (`server.rs:4618`, budget at
+> `server.rs:96`), because **a refused or never-arriving channel produces no event that gather loop can see** — it selects on
+> shutdown, the control channel, `take_for(group)` and the sleep, nothing else. `PAIR_ATTEMPTS` of those is the "visitor
+> refused for 10–25 s" this record has carried since the beginning.
+>
+> **Every measurement in this goal is that one wait seen from a different end**: churn groups living 1–5 s with `frames = 0`
+> (1 735 of them, §4.451/§4.454), `pairing budget expired` 54–195 per run, a lane holding 56 streams 1–60 s old (§4.443), and
+> visitors refused in whole multiples of five seconds.
+>
+> **What is measured and clean**: request → client 122 µs; task scheduled 6 µs; the close path is milliseconds end to end
+> (`closed_ms` 0–6 ms §4.445, the server's own half 2 ms §4.447, the fin never waits §4.450, no writer ever parks §4.453);
+> the server creates 13 874 streams, delivers 13 873, takes 13 871; both ends log every channel's source EOF (9 099 vs
+> 9 108); the echo backend closes when its peer closes.
+>
+> **Ten fixes were written, gated and reverted** because none moved the wedge: early-cut grace, `reap_abandoned` both-fins,
+> the same predicate on the pump tick, fin without waiting for ack (twice, the second time measured by lifetime and it was
+> *ten times worse*), periodic retire of never-used streams, and four diagnostic-only instruments kept.
+>
+> **The fix that is needed is a protocol path, not a constant**: the client must tell the server that a channel for a group
+> **was refused**, so the gather can fail that attempt immediately instead of spending five seconds on it. Until that exists,
+> shortening the budget hides the wait rather than removing it.
+
+> **CLOSING STATE (20 rounds, superseded by the block above)**
 >
 > **The defect is one interval, bounded on both sides.** A churn stream lives **8.4 s on the arm that wedges against 1.7 s
 > on the one that does not** (`mhd stream retired age_ms`, §4.436) while its request takes milliseconds, and the new
