@@ -60,6 +60,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.482 (a seventh attempt, and it refutes §4.479 — the streams are not in the queue at all).** The full form was built this
+> time: entries stamped with their arrival, `try_take` refusing expired ones, `sweep_idle()` draining the queue, and **a real
+> one-second tick spawned per service** so the bound runs with nobody taking. **The pool suite still reads 7 passed, 4
+> failed.**
+>
+> **So the queue is not where the 35 live.** §4.479's reading — that the shared pool parks them — is **withdrawn**, and with it
+> the whole "design versus test" framing: the design does park channels, but that is not what holds these streams.
+>
+> **Seven attempts, seven refutations, all reverted**: the client's release (handled), the queue's orphans (dropped on sight, no
+> change), the queue's idleness (timer and TTL, no change), the pairing's patience (`PAIR_ATTEMPTS=1`, no change), the visitor's
+> EOF (peek, no change), a group's death (no change), and a group-named channel with no pairing (no change). **What is left is
+> that the streams belong to forwarding groups of visitors that are gone** — the grace and `FORWARD_IDLE_TIMEOUT` family — and
+> that needs the lane's lease accounting to confirm, not another global guess.
+
 > **§4.481 (a sixth attempt, refuted, and this line is now closed by decision).** Dropping a group-named channel in `push` when no
 > pairing is registered for its group — the natural fix, since a pairing claims before it asks — **also leaves 7 passed, 4
 > failed**. The arrival path is `deliver`, which removes the waiter and then falls through to `push` for the Full and Closed
