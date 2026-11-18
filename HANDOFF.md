@@ -33,6 +33,10 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.476 (the sweep is progressing and its file is incremental).** `p78-full.json` grows as samples land (`meta` + `samples`,
+> no `summary` until the run closes): **44 samples** at the time of writing, profile `full`. Everything else on this branch is
+> green (§4.474) and the pool fix is measured (§4.468).
+
 > **§4.475 (the `full` sweep is running, and it is the release ritual, not a regression check).** `--profile full` is
 > `rounds 6 × warmup 1 × both arms × every scenario` at a 420 s budget per arm-round — the release-grade sweep
 > (`model.py:1795`). It is in round 0 of 6 as this is written, so it needs hours, and its `step` cell
