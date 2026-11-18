@@ -35,6 +35,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.432: the send loop is waiting on a silent-but-open visitor, tens of thousands of times.** The send loop already has a
+> two-second read deadline (`stripe.rs:502`) with its own line: a soak logged **14 557** of them on the clean arm and
+> **36 765** on the wedged one. So `src.read_buf` returns nothing for two seconds, repeatedly — the visitor is **open and
+> silent**, which is exactly what an idle persistent connection looks like (`rr-16` between requests, a bulk stream between
+> bursts).
+>
+> **And the counts scale with the number of idle streams** (about 600 two-second ticks per stream over a twenty-minute run:
+> 56 streams ≈ 33 600, close to the 36 765 measured; 24 ≈ 14 400, close to 14 557). So this line is proportional to the
+> population and does not by itself discriminate the arms — but it does settle one thing: **`local_fin` is false because
+> the visitor really is still open**, not because the send loop is stuck somewhere unseen.
+>
+> **Which returns the question to where it started and narrows it to one word**: why does the arm that wedges keep ~56
+> visitors open while the other keeps ~24? Both run the same scenarios, so the difference is in what the tool does with a
+> visitor once its request is answered — and the measurement that answers it is the *count of open visitor sockets* per
+> arm, which the bench's own `service_sockets` already samples.
+
 > **§4.431 (the diagnostic never fired either, and that is the answer to the clause question): no *live* stream has both
 > fins.** With `4291601` in, a soak whose arms wedged (5 and 3, up to 145 s) logged **zero** `kept by the periodic pass`
 > lines on either arm. So at no point did the table hold a stream with `local_fin && peer_fin` — the 56 live streams have
