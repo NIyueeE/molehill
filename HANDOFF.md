@@ -35,7 +35,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.434 (the two halves do not add up, and that is the finding): 224 streams hold the pool while only ~61 are idle-waiting.**
+> **§4.435 (§4.434's "163 abandoned opens" is most likely the 165 pool refusals, so it is not a new population).** The same
+> run measured **12 528 opens started and 12 363 finished — a gap of 165**, and the client logged **165** "every tunnel is at
+> its stream ceiling". Those opens **never became streams**: the pool refused them, so they hold no lease and no slot.
+>
+> **Which means the 224 live streams are not explained by them**, and §4.434's arithmetic (224 live vs ~61 idle ticks) is
+> still unexplained rather than answered. The honest reading is that the tick estimate is the weak link — 600 ticks per
+> stream assumes a stream that idles for the whole run, and a stream that is busy for part of it contributes fewer.
+>
+> **So the next step is not another instrument but a recount**: the read-idle ticks divided by *the time each stream was
+> actually parked*, which nobody has measured. Until that is done, "224 vs 61" is two numbers of different denominators.
+
+> **§4.434 (the two halves do not add up; superseded by the check below): 224 streams hold the pool while only ~61 are idle-waiting.**
 > Per lane on the wedged arm, `opened_len` is **56 on all four** — 224 live streams. But the send loop's read-idle ticks
 > (36 765 at two seconds each, ≈600 per stream over the run) account for only about **61**. **So roughly 163 of the 224 have
 > no send loop waiting on a read** — and §4.421 established that none is parked in `write` either.
