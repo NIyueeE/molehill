@@ -86,6 +86,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.446 (first reading of the direction stamps): it does not say what I expected.** `stripe group directions ended` carries
+> `send_ms` and `recv_ms`, both relative to the group's start. On a run whose twin wedged **once** (10.01 s) against a clean
+> product arm: mean |recv − send| is **1 279 ms on the clean arm and 79 ms on the wedged one** — the wrong way round.
+>
+> **Two readings are possible and neither can be settled by this run**: either the stamps measure what I think and the
+> clean arm's larger spread is the *bulk* stages (a long transfer's two directions legitimately end seconds apart), or the
+> direction I assumed for "the visitor's fin" is wrong on the server — it is the **client's** visitor that closes, so on the
+> server the fin arrives on the **receive** side and the echo's EOF ends the **send** side, which is what `send_ms` and
+> `recv_ms` name, but which one *leads* depends on the carrier's half-close order.
+>
+> **So this instrument is in place and its first reading is inconclusive**; the next run must catch several wedges and the
+> reading must be split by stage (bulk vs churn) before it means anything.
+
 > **§4.445 (the bisection lands): `closed_ms` is nothing, so a stream's whole life is spent *before* it closes.** The new
 > field on the retirement line, on a run whose twin wedged five times:
 >
