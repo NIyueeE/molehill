@@ -1656,7 +1656,7 @@ impl Conn {
             self.finishing.remove(&stream);
             return;
         };
-        if state.local_fin && !state.fin_sent {
+        if state.local_fin && !state.fin_sent && state.send.unacked() == 0 {
             state.fin_sent = true;
             // No byte carries the fin now (everything queued is already
             // acknowledged), so it needs a packet of its own — and one that is
