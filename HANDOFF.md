@@ -86,6 +86,29 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.451 (the tail is measured, and it is one to five seconds on one connection in seven).** Pairing each channel's
+> `channel open started` with its `stripe source ended: eof` (both carry `group`, both carry microsecond timestamps, and the
+> visitor's EOF is the group's source ending), over **12 877** pairs on the arm that wedged nine times:
+>
+> | connection lifetime | count |
+> |---|---|
+> | under 0.1 s | 9 225 |
+> | 0.1–1 s | 1 913 |
+> | **1–5 s** | **1 735** |
+> | 5–30 s | 4 |
+> | over 30 s | 0 |
+>
+> **So one connection in seven stays open for one to five seconds**, and that population is exactly the occupancy: at ~15
+> connections a second, 14 % living ~3 s is about **6 concurrent** per lane from the churn alone, on top of whatever else is
+> idle — and the lane's ceiling is 56, reached when bursts stack on the tail.
+>
+> **And the interval is the *visitor's own connection*, not the tunnel's close**: every part of the close is milliseconds
+> (§4.445, §4.447, §4.450). So this end is slow to *notice* that the visitor has gone, or the visitor is slow to go.
+>
+> **The mechanism that fits both**: the send loop reads the visitor, then writes into the lane; if the lane makes it wait,
+> the next read is late — and the visitor's FIN sits in the socket until that read happens. That is a lane-write backlog, a
+> subsystem this goal has never examined, and the counter for it already exists (`mhd stream writer parked`).
+
 > **§4.450 (the fin never waits — so the eight seconds belong to the visitor's connection).** The new field on the fin line, on a
 > run whose product arm wedged **nine** times (worst 65 s): over **511** fin sends, `waited_ms` is **p50 0, p90 0, max 1**. The
 > fin goes out the instant the application finishes; `unacked` is already zero.
