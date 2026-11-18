@@ -3221,6 +3221,36 @@ impl Conn {
             self.finishing.remove(id);
             tracing::debug!(stream = id, "mhd finished stream retired by the sweep");
         }
+        // **Why the sweep retires nothing.** It runs every second and a soak showed it
+        // never firing, so one clause is false for every live stream and the record has
+        // narrowed that to `peer_fin`, `unacked` or `pending` (`HANDOFF.md` §4.441).
+        if crate::transport::stats::enabled() && finished.is_empty() {
+            let kept: Vec<(u32, bool, bool, u32, usize)> = self
+                .streams
+                .iter()
+                .filter(|(_, state)| state.local_fin)
+                .map(|(&id, state)| {
+                    (
+                        id,
+                        state.local_fin,
+                        state.peer_fin,
+                        u32::try_from(state.send.unacked()).unwrap_or(u32::MAX),
+                        state.recv.pending(),
+                    )
+                })
+                .take(2)
+                .collect();
+            for (id, local_fin, peer_fin, unacked, pending) in kept {
+                tracing::debug!(
+                    stream = id,
+                    local_fin,
+                    peer_fin,
+                    unacked,
+                    pending,
+                    "mhd finished stream kept by the sweep"
+                );
+            }
+        }
         finished.len()
     }
 
