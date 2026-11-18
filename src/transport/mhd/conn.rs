@@ -1653,7 +1653,14 @@ impl Conn {
             self.finishing.remove(&stream);
             return;
         };
-        if state.local_fin && !state.fin_sent && state.send.unacked() == 0 {
+        // **The fin does not wait for an acknowledgement.** It names the final offset, and
+        // the peer places it against that offset, so a fin that overtakes its own data is
+        // still correct — while a fin held behind the acknowledgement of data the peer will
+        // never read (`unacked` never reaching zero) is never sent at all. Measured: the
+        // sweep found a stream with `local_fin = true, peer_fin = false, unacked = 0,
+        // pending = 0`, and the fin's own condition is the only place that can lose it
+        // (`HANDOFF.md` §4.441).
+        if state.local_fin && !state.fin_sent {
             state.fin_sent = true;
             // No byte carries the fin now (everything queued is already
             // acknowledged), so it needs a packet of its own — and one that is
