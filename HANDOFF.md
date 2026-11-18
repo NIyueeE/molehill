@@ -60,6 +60,21 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.479 (why the four pool tests cannot pass, and why every fix failed: the queue is a pool by design).** `ChannelQueue::push`
+> puts a channel in the shared `rx` when no pairing is waiting for its group, and `server.rs:3771` says so in words: *"the shared
+> queue keeps serving plain visitors and any channel whose group has already gone."* The queue's capacity is
+> `CHAN_SIZE * 2 = 4096` (`server.rs:86`, `3041`), so in the valve test nothing ever evicts them.
+>
+> **A channel sitting there holds its stream lease**, which is exactly what `pool.streams()` counts. The four failing tests ask the
+> pool to reach **zero streams** within fifteen seconds of the visitors leaving, while the design **deliberately keeps a channel
+> ready for the next visitor**. **Those two cannot both hold**, which is why all four fixes failed: the channels are not
+> orphaned, not abandoned, and not waiting on a pairing — they are *parked on purpose*.
+>
+> **So this is a design-versus-test decision, not a defect I should fix by myself**: either a group-named channel that no pairing
+> claims must be dropped when its group is gone (a change to the pool's contract), or the queue's capacity must be small enough
+> to evict (a product change), or the test's fifteen-second promise is stricter than the design and is what moves. **Each is the
+> user's call** — and none of them is a "fix" I can verify against a promise the code does not make.
+
 > **§4.478 (`step` lives only in `full`, and `full` is a multi-hour ritual — the sweep was stopped on purpose).** Reading
 > `model.PROFILES`: **`full` runs seventeen scenarios**, `stage` and `screen` run only `cost`, `nobulk` and `carrier` only
 > `timeline`, `soak` only `soak`. **`step` is in `full` alone**, and `full` is six rounds plus a warmup over both arms — with
