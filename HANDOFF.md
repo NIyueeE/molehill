@@ -33,6 +33,44 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **FINAL STATE OF THIS DEFECT (round 38 of this goal; supersedes the block below and every earlier closing note).**
+>
+> **One sentence**: when the client's stream pool is at its ceiling, **a channel request that is refused produces no event the
+> server's gather can see**, so the gather waits out `PAIR_WAIT_BUDGET` (5 s) per attempt (`server.rs:4618`, budget at
+> `server.rs:96`, `PAIR_ATTEMPTS` of them), holding the visitor's connection and every channel that did arrive.
+>
+> **Why it fills the pool**: each refusal costs five seconds of held capacity, which causes the next refusal. That is a positive
+> feedback loop, not a leak — and it is why nothing in isolation looked broken.
+>
+> **The measurements that establish it, all on this branch**:
+> | reading | value | where |
+> |---|---|---|
+> | churn groups living 1–5 s carrying **zero** frames | **1 735 of ~13 000** | §4.451, §4.454 |
+> | `pairing budget expired` per run | 54–195 | §4.412, §4.443 |
+> | lane occupancy when it wedges | 56 per lane, all four | §4.434 |
+> | `closed_ms` (post-close wait) | **0–6 ms** | §4.445 |
+> | the server's own close half | **2 ms** | §4.447 |
+> | `waited_ms` (fin waiting for its data) | **0 ms**, max 1 | §4.450 |
+> | parked writers | **0**, and the code confirms why | §4.453 |
+> | both ends' source EOFs | 9 099 vs 9 108 against 9 115 retirements | §4.439 |
+>
+> **The fix this needs, designed and not written**: a channel-open **failure** has to reach the server as a message on the
+> control channel naming the group, so `pair_gather` can fail that attempt **at once** instead of at the budget. It is a
+> protocol addition (a new command beside `CreateDataChannelForStripe`), a client-side send on the refusal path, a server-side
+> select arm, and a test that a refused gather returns in milliseconds. **Not started**, because it changes the wire and this
+> goal's rounds ran out.
+>
+> **Ten fixes were written, gated, measured and reverted** — none moved the wedge: the early-cut grace, the both-fins retiral
+> in `reap_abandoned`, the same predicate on the pump's one-second tick, "send the fin without waiting for its ack" twice (the
+> second measured by lifetime: **ten times worse**), the periodic retiral of never-used streams, and two that were kept because
+> they are correct on their own terms (the per-attempt group fix `303da63`, the stale-claim re-registration `2da9cee`).
+>
+> **Four instruments are in place and worth keeping**: `live_gt_1s/10s/60s` (the only uncensored occupancy reading),
+> `closed_ms`, `waited_ms`, and the sweep's clause diagnostic.
+>
+> **Finalisation is NOT written, for two independent reasons**: the defect above is open, and `just check` fails on
+> `RUSTSEC-2026-0542` (`humantime`, unmaintained, no safe upgrade) which this branch did not cause and which needs a decision.
+
 > **CLOSING STATE (35 rounds into this goal, defect NOT closed, finalisation NOT written — read this, then §4.460).**
 >
 > **The defect is now fully described and not fixed.** When the client's stream pool is at its ceiling, the server's gather
