@@ -60,6 +60,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.477 (a fourth hypothesis, tested and refuted: it is not the patience).** `PAIR_ATTEMPTS` set to **1** instead of 2, so a group sheds
+> after a single expiry: **the pool suite still reads 7 passed, 4 failed**, unchanged. Reverted at once.
+>
+> **And the config makes the shape explicit**: `tunnel_valve.toml` has `[client.data] tunnels = 2` against a server valve of
+> `max_tunnels = 1`, so the pool holds **one** tunnel whose ceiling is 56; the test opens `ENGINE_STREAM_CAP + 8 = 72` visitors.
+> Sixteen must be refused, and after `drop(held)` the pool must return to zero streams within fifteen seconds.
+>
+> **So the patients, the release message and the parked stripes have all been ruled out**, and what is left is the possibility
+> that the **35 are not gathers at all** — they may be streams of visitors that *were served*, whose close never reaches this
+> end in that test's configuration. That is a different question from every one asked so far, and it needs the lane's lease
+> accounting rather than the pairing's.
+
 > **§4.473 (the numbers pin it precisely, and the fourth investigation is where this stops for now).** Counting the real give-up
 > line (not just the new refusal one) on the failing case:
 >
