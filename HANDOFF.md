@@ -35,7 +35,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.439: both ends see their source's EOF for every channel, so the chain is complete and the delay is the client's own
+> **§4.440 (the clause is named): `peer_fin`.** The sweep's diagnostic fired with exactly one line, and it says everything:
+>
+> ```
+> mhd finished stream kept by the sweep  local_fin=true  peer_fin=false  unacked=0  pending=0
+> ```
+>
+> **This end finished, sent its fin, it was acknowledged, nothing is left to read — and the peer's fin is not there.**
+> So the stream waits for a fin the peer never sends (or that never arrives), and every earlier candidate is measured
+> false: not `unacked`, not `pending`, not `local_fin`.
+>
+> **And the two earlier readings now have to be reconciled**: the server closes its streams with `peer_fin=true
+> local_fin=true` (§4.426) and both ends log their source's EOF for every channel (§4.439) — yet the client's counterpart
+> of some channels never sees that fin. **A fin produced on one side and not observed on the other, for a channel both ends
+> agree was closed**, is precisely what a lost-or-ignored fin looks like.
+>
+> **The next read is the receiving side's filter**: `Conn` drops frames for streams it considers retired (§4.343's
+> `is_retired_stream`). If the peer's fin arrives for a stream this end has already retired — or for one whose id the
+> window rule refuses — the fin is discarded and the entry above never retires. That is one condition to check, and it is
+> the last one in this chain.
+
+> **§4.439 (both ends see their source's EOF for every channel), so the chain is complete and the delay is the client's own
 > retirement.** The forwarder logs `stripe source ended: eof` on **both** sides of a channel — the client's visitor closing
 > and the server's echo closing — and on the wedged arm the counts are **9 099 (client) and 9 108 (server)** against 9 115
 > retirements. Every channel closed on both ends.
