@@ -5078,6 +5078,12 @@ impl ClientSession {
     /// on the way out: a stripe the client was already opening when the
     /// release was written must not park after it.
     fn release_stripe_group(&self, id: ServiceId, group: [u8; 4]) {
+        debug!(
+            %id,
+            group = %hex::encode(group),
+            known = self.services.contains_key(&id),
+            "the server released a stripe group"
+        );
         if let Some(entry) = self.services.get(&id)
             && let ServiceState::Active(active) = &entry.state
         {
