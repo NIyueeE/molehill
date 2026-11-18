@@ -60,6 +60,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.486 (the 35 are released together, and not by the pairing).** With the lease ids in hand:
+>
+> - **109 opened, 109 dropped** in one run — nothing is leaked;
+> - **35 of them live past fifteen seconds**, and their drops carry the **same age to the millisecond** (17 2xx ms) and land in
+>   the same instant, so they are released **as a batch**, not one by one;
+> - **`PAIR_ATTEMPTS` set to 1 leaves the late count at exactly 35**, so the server's gather patience is not what gates them.
+>
+> **So the 17-second deadline is elsewhere**, and it is a **single** deadline that expires once and frees all of them — not a
+> per-stream timeout. The candidates are a budget on the client's side of the open (its own prologue budget is two seconds, and
+> the placed-open path waits on a placement), or the moment the burst's sockets are torn down by the test.
+>
+> **This is the first description that fits every count**: nothing leaks, one shared deadline runs out two seconds after the test
+> gives up, and changing anything on the server's side moves neither the count nor the moment.
+
 > **§4.485 (the streams are `tokio::io::split`, so a lease lives while **either** half lives).** `spawn_inner` splits each channel
 > into a read half and a write half (`stripe.rs:1140`) and moves them into the two directions. On a send-direction failure the
 > group task calls `recv.abort()`, which takes effect **at the aborted task's next await point** — so both halves are gone only
