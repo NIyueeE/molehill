@@ -33,7 +33,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
-> **§4.469 (the four failing pool tests are older than the refusal path, and one attempt at them is reverted).** Running the
+> **§4.470 (the release path is not the suspect — it does drop parked streams).** `client.rs:5080` answers `ReleaseStripedGroup`
+> with `stripe::StripeGroups::release` (`stripe.rs:1449`), which **removes the group's parked entries and drops them, with
+> their tunnel leases** — its own comment says the capacity returns there, not at the next pairing. So "the client ignores the
+> release" is refuted by reading: the message is handled and the streams are freed.
+>
+> **That leaves the server's own side**: channels already **pushed into the shared queue** for a group that gave up. The `dead`
+> experiment (§4.469) dropped those on sight and changed nothing, which means either they are not there, or they are taken by
+> the next visitor before the 15-second window closes — and the test's own snapshot shows 35 **held**, not queued.
+>
+> **Standing decision**: these four tests are a **pre-existing red, unrelated to this goal's defect**, and they are recorded as
+> such rather than fixed by guesswork. `just check` names them, the user has been told, and the next step needs either a
+> targeted instrument on the client's `StripeGroups::state.groups` or on the lane's lease accounting — not another blind edit.
+
+> **§4.469 (the four failing pool tests, and one attempt at them is reverted).** Running the
 > same suite on `f4de640` — the commit **before** any of this work — gives the identical result: **7 passed, 4 failed**. The
 > failures are `a_saturated_pool_still_serves_the_next_visitor`, `a_valve_held_pool_still_never_reaches_the_stream_cap`,
 > `one_unanswerable_visitor_does_not_park_the_service` and `the_server_tunnel_valve_refuses_a_startup_establishment`, all
