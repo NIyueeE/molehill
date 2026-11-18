@@ -60,6 +60,24 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.489 (the step grid, obtained by running the scenario alone, and it is green).** `--scenarios step` on the `full` profile, three
+> rounds plus a warmup, both arms: **986.7 s for 32 samples**.
+>
+> | reading | molehill | `~aa` twin |
+> |---|---|---|
+> | **`step_recovery_ms`** (fivefold rate step down and back) | **22 ms** | **44 ms** |
+> | `slo_broken` | **0** | **0** |
+> | `wedge_count` / `wedge_max_s` | **0 / 0** | **0 / 0** |
+> | `rtt_timeout_count` | **0** | **0** |
+> | `rtt_p99_ms` | 1.8–2.2 | 2.0–5.4 |
+> | `throughput_gbps` | **7.25** | **7.26** |
+>
+> **So the step cell is not a gap any more**: the interactive stream returns in **tens of milliseconds** after a fivefold rate step, the
+> A/A twin agrees to within a factor of two on the recovery and to 0.1 % on throughput, and no SLO is broken.
+>
+> **`step` is a scenario, not a profile** — that is why `--profile step` was refused and why the earlier `stage` run could not
+> contain it; `--scenarios` is the switch that was missing from the recipe list.
+
 > **§4.488 (the lease outlives its group by fifteen seconds, and it is in no queue).** Two measurements on the same failing case:
 >
 > | reading | value |
