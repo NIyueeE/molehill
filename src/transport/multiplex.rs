@@ -488,6 +488,10 @@ impl TunnelCounters {
 /// implements both IO traits), so the charge lives exactly as long as the data
 /// channel does.
 pub(crate) struct StreamLease {
+    /// A process-wide number, so one lease's life can be followed from open to drop:
+    /// counting opens against drops says how many are outstanding, and the number
+    /// says **which** (`HANDOFF.md` §4.485).
+    id: u64,
     stream: CarrierStream,
     /// When the slot was charged, so its whole life can be recorded on drop.
     charged_at: std::time::Instant,
@@ -500,7 +504,19 @@ pub(crate) struct StreamLease {
     pool: std::sync::Weak<PoolShared>,
 }
 
+/// The next lease number.
+static NEXT_LEASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl StreamLease {
+    /// Stamp a lease, once per stream.
+    fn next_id() -> u64 {
+        let id = NEXT_LEASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::transport::stats::enabled() {
+            tracing::debug!(lease = id, "mhd lease opened");
+        }
+        id
+    }
+
     /// The tunnel this stream is charged to (the pin accounting's key).
     pub(crate) fn tunnel_id(&self) -> usize {
         self.tunnel_id
@@ -517,6 +533,14 @@ impl StreamLease {
 
 impl Drop for StreamLease {
     fn drop(&mut self) {
+        if crate::transport::stats::enabled() {
+            tracing::debug!(
+                lease = self.id,
+                tunnel = self.tunnel_id,
+                age_ms = u64::try_from(self.charged_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "mhd lease dropped"
+            );
+        }
         self.counters
             .streams
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -2476,6 +2500,7 @@ impl TunnelPool {
                 placement.chosen_load = counters.load();
                 PlacementStats::record(placement, started.elapsed(), None);
                 Ok(StreamLease {
+                    id: StreamLease::next_id(),
                     charged_at: started,
                     stream,
                     tunnel_id: tunnel.id(),
@@ -2527,6 +2552,7 @@ impl TunnelPool {
                                 Some("fallback"),
                             );
                             return Ok(StreamLease {
+                                id: StreamLease::next_id(),
                                 charged_at: started,
                                 stream,
                                 tunnel_id: next.tunnel.id(),
