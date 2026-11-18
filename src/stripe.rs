@@ -1271,7 +1271,11 @@ where
             recv_ms = recv_ms.unwrap_or(0),
             "stripe group directions ended"
         );
-        debug!("stripe group finished");
+        debug!(
+            group = group_id,
+            lived_ms = u64::try_from(lived.as_millis()).unwrap_or(u64::MAX),
+            "stripe group finished"
+        );
     })
 }
 

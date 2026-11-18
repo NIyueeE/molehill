@@ -60,6 +60,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.488 (the lease outlives its group by fifteen seconds, and it is in no queue).** Two measurements on the same failing case:
+>
+> | reading | value |
+> |---|---|
+> | group lifetimes (`stripe group finished`, `lived_ms`) | p50 **34 ms**, p90 **2 170 ms**, max **2 226 ms** |
+> | lease lifetimes (`mhd lease dropped`, `age_ms`) | 35 of them past **15 s**, max **17.2 s** |
+> | the shared queue's idle sweep | **never dropped a single channel** |
+>
+> **So a lease outlives the group that used it by about fifteen seconds, and it is not parked in the queue** — the sweep that
+> would have reported dropping it reported nothing at all, twice.
+>
+> **That is a contradiction with everything the code says it does**, and it is where this investigation has to stop: groups close
+> in 2.2 s, queues are empty, and 35 streams still live 17 s. **The only remaining place a stream can be held is a clone that
+> outlives both** — the split halves are shared, so a task or registry that keeps one keeps the lease, and finding it needs the
+> allocator's answer, not another reading of the code.
+
 > **§4.487 (it is not a leak and not the grace: the pool does settle, in about seventeen seconds).** Two decisive diagnostics:
 >
 > - **The single test passes with its deadline raised to sixty seconds**, finishing in 23.6 s overall — so the pool **does reach zero
