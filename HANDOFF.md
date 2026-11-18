@@ -35,6 +35,15 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.444: the close-to-retire gap cannot be joined from the log, and that is a finding too.** Joining `mhd stream closed`
+> against `mhd stream retired` by stream id on the wedged arm gave a mean of **513 seconds** with a maximum of 972 — larger
+> than the run. **So the join is invalid**: stream ids are per lane and are reused, and the timestamps are printed to the
+> microsecond but compared to whole seconds. Any number produced that way is meaningless.
+>
+> **Which means the one interval left — close to retirement — needs an instrument in the code**, not a log join: a timestamp
+> taken when the stream closes, printed when it retires, on the same line. That is one field, and it is the last one this
+> line needs.
+
 > **§4.443 (the two-arm table, with no causal claim): every instrument on one page, same run (p70).**
 >
 > | reading | clean arm | wedged arm |
