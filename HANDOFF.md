@@ -35,6 +35,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.437: the five seconds are *after* the exchange, not during it.** The churn probe measures its own request end to end and
+> records `setup_ms` — a median of milliseconds and a p99 near one second in earlier runs — while the stream that carried it
+> lives **8.4 seconds on average** on the wedged arm. **So the stream outlives the request it served by about seven
+> seconds**, and that interval is the one thing this defect is.
+>
+> **And the state at that time is known**: `local_fin` is false, the send loop is waiting in `read` on a visitor socket that
+> the probe has already closed (§4.432: 36 765 two-second read timeouts, none parked in `write`). So the seven seconds are
+> **between the visitor's close and the tool noticing it**.
+>
+> **That is now a single, narrow claim that one line settles**: log the moment `read` returns `Ok(0)` for a stream, and
+> compare it with the probe's own end for the same request. If the two are seconds apart, the defect is in how this end
+> learns that a visitor has gone — and both the accept loop and the copy loop are candidates.
+
 > **§4.436 (the sharpest comparative statement of the defect): on the arm that wedges, a stream lives five times longer.**
 > `mhd stream retired age_ms` on the same run:
 >
