@@ -1248,6 +1248,7 @@ async fn do_session_handshake(
         registry: Arc::clone(&registry),
         server_config: Arc::clone(&server_config),
         shared: Arc::clone(&shared),
+        queues: std::sync::Mutex::new(HashMap::new()),
     };
     let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat)?;
 
@@ -1322,6 +1323,17 @@ async fn handle_session_cmd(
                 return Ok(Some(anyhow!("The session writer is gone")));
             }
         }
+        // A refusal is the one thing a gather can learn without waiting for the
+        // budget: the group can never complete, so the pairing that is waiting
+        // for it is told at once rather than five seconds from now
+        // (`HANDOFF.md` §4.460).
+        Ok(SessionCmd::ChannelRefused(id, group)) => {
+            if let Ok(queues) = ctx.queues.lock()
+                && let Some(queue) = queues.get(&id)
+            {
+                queue.refuse(u32::from_be_bytes(group));
+            }
+        }
         Err(e) => return Ok(Some(e)),
     }
     Ok(None)
@@ -1358,6 +1370,9 @@ async fn answer_lane_drain(
 /// One v4 session's registration path: the session it belongs to, plus the
 /// server-side policy every registration is checked against.
 struct SessionCtx {
+    /// Each registered service's data-channel queue, so a `ChannelRefused` can
+    /// reach the pairing waiting on that group (`HANDOFF.md` §4.460).
+    queues: std::sync::Mutex<HashMap<ServiceId, std::sync::Arc<ChannelQueue<DataChannel>>>>,
     nonce: Nonce,
     /// The session credential — the server's default token bound to the nonce.
     /// The server owns no per-service token table, so this is also the only
@@ -1555,6 +1570,9 @@ impl SessionCtx {
             // The session ended while this registration was being served.
             return Ok(());
         };
+        if let Ok(mut queues) = self.queues.lock() {
+            queues.insert(service_id, std::sync::Arc::clone(handle.channels()));
+        }
         session.services.insert(service_id, handle);
         drop(guard);
         info!(service = %service.name, "Control channel established");
@@ -2791,6 +2809,12 @@ pub struct ControlChannelHandle {
 }
 
 impl ControlChannelHandle {
+    /// This service's data-channel queue, so a session-level command that
+    /// concerns one group can reach the pairing that is waiting for it.
+    fn channels(&self) -> &std::sync::Arc<ChannelQueue<DataChannel>> {
+        &self.data_channel
+    }
+
     /// Tear this service's control path down now: the pool task stops and its
     /// public port is released.
     ///
@@ -3739,6 +3763,16 @@ pub(crate) struct ChannelQueue<C> {
     /// the shared queue keeps serving plain visitors and any channel whose group
     /// has already gone.
     groups: std::sync::Mutex<HashMap<u32, mpsc::Sender<C>>>,
+    /// Groups whose last channel open was refused by the client.
+    ///
+    /// A refusal is the one thing a gather can learn **without waiting**: a
+    /// channel that never arrives looks exactly like a slow one, so the pairing
+    /// had to sit out its whole budget (`HANDOFF.md` §4.460). A group in here can
+    /// never complete, so the pairing sheds its visitor at once.
+    refused: std::sync::Mutex<std::collections::HashSet<u32>>,
+    /// Wakes the pairings waiting on `refused`: `notify_waiters` rather than one,
+    /// for the same reason `ready` uses it — each waiter re-reads the set.
+    refused_ready: tokio::sync::Notify,
 }
 
 impl<C> ChannelQueue<C> {
@@ -3750,7 +3784,39 @@ impl<C> ChannelQueue<C> {
             rx: std::sync::Mutex::new(rx),
             ready: tokio::sync::Notify::new(),
             groups: std::sync::Mutex::new(HashMap::new()),
+            refused: std::sync::Mutex::new(std::collections::HashSet::new()),
+            refused_ready: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Record that a group's channel was refused, and wake the pairing for it.
+    fn refuse(&self, group: u32) {
+        if let Ok(mut refused) = self.refused.lock() {
+            refused.insert(group);
+        }
+        self.refused_ready.notify_waiters();
+    }
+
+    /// Wait until this group is known to be unbuildable, then forget it.
+    ///
+    /// The registration happens **before** the re-check so a refusal that lands
+    /// between the two is seen rather than missed — the same ordering `ready`
+    /// relies on.
+    async fn refused(&self, group: u32) {
+        loop {
+            let notified = self.refused_ready.notified();
+            if self.take_refused(group) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Whether this group was refused, clearing the mark.
+    fn take_refused(&self, group: u32) -> bool {
+        self.refused
+            .lock()
+            .is_ok_and(|mut refused| refused.remove(&group))
     }
 
     /// Hand a channel over, and wake every pairing waiting for one.
@@ -4619,6 +4685,21 @@ where
             let next = tokio::select! {
                 _ = stops.shutdown.recv() => None,
                 _ = stops.control.changed() => None,
+                // A refused channel means this group can never complete: shed the
+                // visitor now instead of sitting out the rest of the budget and
+                // then retrying a gather that cannot succeed (`HANDOFF.md` §4.460).
+                () = data_ch_rx.refused(group) => {
+                    debug!(
+                        group,
+                        gathered = gathered.len(),
+                        stripe_count,
+                        "a channel of this group was refused; shedding the visitor"
+                    );
+                    crate::transport::stats::note_pairing_unfed();
+                    data_ch_rx.unclaim(group);
+                    let _ = data_ch_req_tx.send(DataChannelRequest::ReleaseGroup(group_bytes));
+                    return Ok(false);
+                }
                 ch = data_ch_rx.take_for(group) => ch,
                 () = time::sleep(PAIR_WAIT_BUDGET) => {
                     // Nothing arrived inside the budget. Only the channels this

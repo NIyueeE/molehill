@@ -405,6 +405,16 @@ pub enum SessionCmd {
     /// outlived the budget, or the replacement never came up), and a claim with
     /// a lane nobody may use is worse than the carrier it was trying to leave.
     CancelDrain(ServiceId, [u8; 4]),
+    /// One channel of a named group could not be opened, so that group can never
+    /// complete and the pairing waiting for it should stop waiting.
+    ///
+    /// The server waits out `PAIR_WAIT_BUDGET` for every gather attempt because a
+    /// channel that never arrives produces no event it can see. A refusal, unlike
+    /// a silence, is knowable at once, and the difference is five seconds of a
+    /// held visitor plus every channel of that group that did arrive
+    /// (`HANDOFF.md` §4.460). The group is the one the server named in
+    /// `CreateDataChannelForStripe`, so both ends mean the same gather.
+    ChannelRefused(ServiceId, [u8; 4]),
 }
 
 /// Upper bound for the encoded size of a [`SessionCmd`] frame: a registration
@@ -416,7 +426,7 @@ pub const MAX_SESSION_CMD_LEN: usize = MAX_REGISTRATION_LEN + 64;
 /// A v4 session carries acks and commands on one stream, and the client tells
 /// them apart from the first byte: a framed ack starts with its length's *high*
 /// byte, which is `0` while the frame stays under 256 bytes, whereas every
-/// command tag a session can receive is `1..=4` (the v3-only tag `0` is never
+/// command tag a session can receive is `1..=5` (the v3-only tag `0` is never
 /// sent in a session). A longer reason would move that high byte into the
 /// command-tag range and make the two frames indistinguishable, so the writer
 /// shortens the reason instead: the ack frame is `2 + 1 (tag) + varint(len) +
@@ -2694,6 +2704,21 @@ mod tests {
         .unwrap();
         let back = read_session_cmd(&mut rx).await.unwrap();
         assert!(matches!(back, SessionCmd::CancelDrain(..)));
+
+        // A refused channel names the group the server asked for, so the pairing
+        // waiting on it can fail that attempt at once (`HANDOFF.md` §4.460).
+        write_session_cmd(
+            &mut tx,
+            &SessionCmd::ChannelRefused(ServiceId::new(9), [0xde, 0xad, 0xbe, 0xef]),
+        )
+        .await
+        .unwrap();
+        let back = read_session_cmd(&mut rx).await.unwrap();
+        assert!(matches!(
+            back,
+            SessionCmd::ChannelRefused(id, group)
+                if id == ServiceId::new(9) && group == [0xde, 0xad, 0xbe, 0xef]
+        ));
 
         // The answer: tag 6, then service, lane and state — 9 bytes, whatever
         // the values are (the state is one byte, not a varint).
