@@ -86,6 +86,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.460 (the wait itself: a full five seconds per gather attempt, on the server, with the visitor held).** `server.rs:4618`'s
+> gather loop selects on exactly three things — shutdown, the control channel, and `data_ch_rx.take_for(group)` — plus
+> `sleep(PAIR_WAIT_BUDGET)` where `PAIR_WAIT_BUDGET = 5 s` (`server.rs:96`). **A channel that never arrives produces no event**,
+> so each attempt costs the whole budget, and `PAIR_ATTEMPTS` of them is what the record has been calling "a visitor refused
+> for 10–25 s".
+>
+> **And that is the last number that matches the measurements**: the empty groups live **1–5 s** (§4.451: 1 735 of them), the
+> expiries number **54–195** per run, and the visitor's TCP connection — which the server owns — is held across all of it.
+>
+> **So the shape is complete and needs no further instrument**: when the pool is at its ceiling, a channel request is refused,
+> **the refusal produces no event the pairing can see**, and the visitor waits out a five-second budget (twice) before being
+> shed. Every refusal therefore costs five seconds of a held visitor and of whatever channels did arrive.
+>
+> **The two candidate fixes, neither applied**: make a refused open an event the pairing sees (fail the attempt at once rather
+> than at the budget), or shorten the budget. The first is the honest one — it removes the wait instead of hiding it — and it
+> needs a protocol path for "this group's channel was refused", which does not exist today.
+
 > **§4.459 (correction before any code moves: the client has no visitor socket, so `frames=0` means the backend never wrote).**
 > Reading `client.rs:1922` again without assuming: when the group completes the client makes **one local connection** to
 > `done.local_addr` — the **service's** address — and that connection is the group's *source*. So on the client,
