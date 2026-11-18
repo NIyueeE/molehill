@@ -233,6 +233,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > **`git status` clean**, `just interop` 3/3, `just l3-accept` PASS through its sudo entry point. The only red in the chain is
 > §4.461's advisory, which predates this branch's last dependency change.
 
+> **WHERE THE WORK STANDS (this goal, after the pool fix).**
+>
+> **The defect §4.460 named is closed and measured** (`c9ac9a2`, §4.468): `live_gt_10s` **56 → 4**, the ceiling line **54 → 1**,
+> `wedge_count` **→ 0**, on **both** arms, with stream lifetimes back at the clean arm's 337/342 ms mean and `pairing budget
+> expired` at zero. The fix is a protocol addition — `SessionCmd::ChannelRefused` — so the server's gather sees a refused open
+> at once and retries after a 50 ms grace instead of sitting out a five-second budget.
+>
+> **Also landed**: the optional `console` feature and its dependency tree are gone (`f4de640`), so `cargo deny check` passes
+> **with no waiver at all**, and the lock file is 494 lines shorter.
+>
+> **Green**: integration 22/22, lib 410, both clippy builds, deny, interop 3/3, l3-accept PASS, `--profile stage` clean.
+>
+> **Still open, and why "定型" is not written**: (1) **four pool tests fail** — pre-existing (§4.473), quantified as *36 budget
+> expiries with zero give-ups*, so their groups are still waiting when the test's fifteen-second window closes; three fixes
+> were tried and reverted (§4.472). (2) **`--profile full` is running** (§4.475/§4.476) and is the only source of the `step`
+> grid and the P1–P3 sweep; it takes hours and its result is the last regression.
+
 > **FINAL STATE OF THIS DEFECT (round 38 of this goal; supersedes the block below and every earlier closing note).**
 >
 > **One sentence**: when the client's stream pool is at its ceiling, **a channel request that is refused produces no event the
