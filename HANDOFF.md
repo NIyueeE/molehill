@@ -35,7 +35,21 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.438 (the interval is bounded on both sides now): the visitor's EOF *is* seen, and the retirement follows it seven seconds
+> **§4.439: both ends see their source's EOF for every channel, so the chain is complete and the delay is the client's own
+> retirement.** The forwarder logs `stripe source ended: eof` on **both** sides of a channel — the client's visitor closing
+> and the server's echo closing — and on the wedged arm the counts are **9 099 (client) and 9 108 (server)** against 9 115
+> retirements. Every channel closed on both ends.
+>
+> **So the seven seconds are not a fin in flight and not a hop that never fired.** Both directions finished, the frames went
+> out, and the client's stream still took ~7 s more to leave its table. **That is the retirement path itself** — and it
+> contradicts the §4.430 measurement that the per-tick retire never fired, which means the entry at that moment did **not**
+> satisfy `local_fin && peer_fin && unacked == 0`: **one of those three is false after both ends have closed**.
+>
+> **The next question is therefore exact and small**: after the client sent its fin and received the peer's, which of
+> `local_fin`, `peer_fin`, `unacked == 0` is still false — and the instrument is one line at the moment a stream is **not**
+> retired by the periodic pass although both EOFs were logged.
+
+> **§4.438 (the interval bounded on both sides): the visitor's EOF *is* seen, and the retirement follows it seven seconds
 > later.** The forwarder already logs its EOF (`stripe source ended: eof`, `stripe.rs:521`) and the counts match the
 > retirements almost exactly — clean arm **19 196 vs 19 209**, wedged arm **9 099 vs 9 115**, the handful of difference being
 > the lane root and long-lived channels.
