@@ -60,6 +60,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.491 (the last four were a deadline equal to the product's own timeout — and three more remain, about the valve).** The settle
+> assertion was `Duration::from_secs(15)`, and **`pool::COLD_GROW_WAIT` is also fifteen seconds** (`pool.rs:49`, documented as
+> covering the slowest carrier's dial timeout): an open against a saturated pool waits exactly that long for a growth before it
+> gives up, so the test asked the pool to finish at the instant its last waiter stopped waiting. **Measured, such a burst settles in
+> about seventeen seconds — fifteen plus the prologue** — which is the lease age to the millisecond.
+>
+> **That correction is in and it is a test correction, not a code one**: the window is now a named `SETTLE_WINDOW` of thirty
+> seconds with the constant quoted in its comment. **The saturated-pool test passes and the suite went from 7 passed / 4 failed to
+> 8 / 3.**
+>
+> **The three that remain are a different claim**: `assert_eq!(pool.size, 1, "the valve must still hold the pool at one tunnel")`
+> with the snapshot reading `size: 2, count: 2`, and two more about a visitor unanswered after two seconds. **The valve itself is
+> applied on the multiplexed-tunnel hello** (`server.rs:883` → `do_v4_tunnel(conn, registry, nonce, shared.max_tunnels)`), so
+> "the valve is bypassed" is not true by inspection; the open question is whether `PoolSnapshot.size` counts live tunnels or
+> configured candidates, which decides whether the assertion or the snapshot's meaning is wrong.
+
 > **§4.490 (the chain works: 36 give-ups, 36 releases, and the leases still live 17 s).** With `PAIR_ATTEMPTS = 1` so a group gives up
 > after one budget:
 >
