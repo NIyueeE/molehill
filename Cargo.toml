@@ -69,9 +69,6 @@ multiplex = ["carrier", "dep:parking_lot", "dep:nohash-hasher"]
 # Default feature releasing embedded devices
 embedded = ["server", "client", "hot-reload", "noise"]
 
-# Feature to enable tokio-console. Disabled by default.
-# Don't enable it unless for debugging purposes.
-console = ["dep:console-subscriber", "tokio/tracing"]
 # A mhd tunnel is a mux tunnel over UDP: the feature implies `multiplex`.
 # In the default set so one release binary covers all comparison arms.
 mhd = ["multiplex", "dep:hkdf", "dep:ring"]
@@ -123,9 +120,6 @@ fdlimit = "0.3"
 async-trait = "0.1"
 base64 = { version = "0.23", optional = true }
 notify = { version = "8", optional = true }
-console-subscriber = { version = "0.5", optional = true, features = [
-    "parking_lot",
-] }
 snow = { version = "0.10", features = ["ring-accelerated", "risky-raw-split"], optional = true }
 pin-project = { version = "1.1.13", optional = true }
 parking_lot = { version = "0.12.5", optional = true }

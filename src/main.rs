@@ -2,7 +2,6 @@
 //! configured instance (server, client, or `--genkey`) until shutdown.
 use anyhow::Result;
 use clap::Parser;
-#[cfg(not(feature = "console"))]
 use molehill_rathole::logging;
 use molehill_rathole::{Cli, run};
 use tokio::{signal, sync::broadcast};
@@ -71,17 +70,8 @@ async fn entry() -> Result<()> {
         }
     });
 
-    #[cfg(feature = "console")]
-    {
-        console_subscriber::init();
-
-        tracing::info!("console_subscriber enabled");
-    }
-    #[cfg(not(feature = "console"))]
-    {
-        // Colored levels + span context; ANSI only on a TTY (respects NO_COLOR)
-        logging::init("info");
-    }
+    // Colored levels + span context; ANSI only on a TTY (respects NO_COLOR)
+    logging::init("info");
 
     info!(
         "molehill v{} ({}, {})",

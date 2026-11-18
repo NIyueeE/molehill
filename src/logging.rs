@@ -112,8 +112,7 @@ pub fn env_switch(name: &str) -> bool {
 
 /// Install the global default subscriber.
 ///
-/// `RUST_LOG` wins when set; otherwise `default_level` applies. The `console`
-/// feature replaces the subscriber entirely in the binary entrypoint.
+/// `RUST_LOG` wins when set; otherwise `default_level` applies.
 pub fn init(default_level: &str) {
     let ansi = colors_enabled();
     let filter =
