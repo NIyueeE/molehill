@@ -86,6 +86,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.457 (`sourced=0` narrows it to "the forwarder never read", not "the visitor never wrote").** The periodic `stripe group
+> state` line carries `highest`, `delivered`, `written`, `sourced` and `idle_ms`; on a group that carries nothing, `sourced` is
+> zero. **That is a statement about what the forwarder read, not about what the visitor sent**: bytes that arrived and were
+> never read sit in the socket's buffer, and `sourced` still reads zero.
+>
+> **So the empty groups are the ones whose send direction never ran a single read** — and §4.456's phrasing ("the request is
+> not forwarded") is right while its mechanism is still open between two cases: the forwarder never started for that visitor,
+> or it started and its first read is still pending when the visitor gives up.
+>
+> **Those two are separable with one line at the handover**: log when the visitor's socket is handed to the forwarder and when
+> its send direction performs its first read. **If the first line appears and the second does not, the forwarder was spawned
+> and never polled; if neither appears, the handover itself is where the visitor waits.**
+
 > **§4.456 (the gather is not the delay, and the empty channels are requests that were never forwarded).** Two readings on the
 > same arm settle it:
 >
