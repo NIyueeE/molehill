@@ -86,6 +86,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.449 (what the failed fix actually proves: the fin's condition is right, and the defect is the acknowledgement).**
+> Sending the fin before its data was acknowledged made streams live **ten times longer** (§4.448), and the only mechanism
+> that explains that is the one the condition exists for: **a fin that overtakes its data leaves the peer waiting for bytes
+> that then have to be retransmitted**, so the stream ends later, not sooner. **So `unacked == 0` is correct behaviour and
+> must not be relaxed.**
+>
+> **Which moves the defect one step back, to the last thing before the fin: the time for the final bytes to be acknowledged.**
+> The client's stream lives 8.4 s because its fin waits for `unacked == 0`, and the server's side of the close costs 2 ms
+> (§4.447) — so the seconds are spent **getting the last data acknowledged**, not closing.
+>
+> **That is a different subsystem from every one examined so far in this goal**: not the stream table, not the forwarder, not
+> the server, not the pool — **the acknowledgement path of the carrier**, where a lost or delayed ack costs the whole close.
+>
+> **The next measurement is one field on the client's close line**: the interval between the last byte leaving and
+> `unacked` reaching zero. If it is seconds, the ack path is the defect and the bench already has the counters to say which
+> half (retransmission of the ack, or the timer that defers it).
+
 > **§4.448 (the fin condition tested by lifetime, and it is worse — reverted).** Relaxing the fin to fire as soon as `local_fin`
 > and reading the **lifetime** this time (p73, same soak): product arm **mean 5 528 ms, p90 13 300 ms, 6 wedges including
 > 90 s**; twin **mean 3 313 ms, 1 wedge of 175 s**. The baseline before the change (p70) was **326 ms and 1 748 ms**.
