@@ -86,6 +86,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.452 (the probe closes immediately, so the delay is on this end's side).** `series.run_churn` calls `ping(target, size)`,
+> which is a `with socket.create_connection(...)`; the socket closes when `ping` returns and `setup_ms` measures everything up
+> to that return. **So a probe that records milliseconds cannot be holding a connection open for seconds** — the FIN is on
+> the wire within a millisecond of the reply it just counted.
+>
+> **Which means this end takes seconds to notice it.** The send loop is in `read` on that socket; a FIN that has arrived wakes
+> it immediately unless the loop is somewhere else — and the only place it can be is a `write` into the lane that is waiting.
+>
+> **So the lane's write path is the last suspect**, and this record has one reading that seems to exonerate it: `mhd stream
+> writer parked for the first time` never fires (§4.421). **That reading has to be re-checked as a reading before it is
+> trusted again** — a counter that fires once per stream, at one level, on a log that was filtered, could be silent for
+> reasons that have nothing to do with writers not parking.
+
 > **§4.451 (the tail is measured, and it is one to five seconds on one connection in seven).** Pairing each channel's
 > `channel open started` with its `stripe source ended: eof` (both carry `group`, both carry microsecond timestamps, and the
 > visitor's EOF is the group's source ending), over **12 877** pairs on the arm that wedged nine times:
