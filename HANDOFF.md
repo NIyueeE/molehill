@@ -35,7 +35,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.429 (THE MECHANISM): the long-lived streams are mostly **finished**, and nothing re-settles them.** Joining the
+> **§4.430 (the periodic-retire fix is in and it never fired — reverted).** With `72ebe5b` in (retire a stream that is
+> `local_fin && peer_fin && unacked == 0 && recv.is_drained()` in the periodic pass), a soak whose **both** arms wedged
+> (2 and 4 wedges, 61 and 76 ceiling lines, 60 and 75 expiries) logged **zero** `retired by the periodic pass` lines on
+> either arm, and `opened_len` / `live_gt_10s` stayed at **56**. Reverted (`d5a9b7c`), both clippy builds green.
+>
+> **So at least one of the four clauses is false for exactly the streams that matter** — and `abandoned` is known false, so
+> it is `local_fin`, `peer_fin`, `unacked == 0` or `recv.is_drained()`. §4.429 measured `peer_fin` true for 1 267 of them,
+> which leaves **the unacknowledged fin or undrained bytes** as the clause that holds the entry.
+>
+> **The next instrument is one line, not a run**: in the periodic pass, for a stream that has `local_fin && peer_fin` but is
+> skipped, log which clause refused it (`unacked`, `recv`). That names the last unknown in this chain, and it costs one
+> debug line.
+
+> **§4.429 (the mechanism): the long-lived streams are mostly **finished**, and nothing re-settles them.** Joining the
 > retirement ages against the fin flags on the same run: of the **1 674** streams that retired after 60 s, **1 267 closed with
 > `peer_fin=true`** and 407 without.
 >
