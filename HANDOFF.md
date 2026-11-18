@@ -60,6 +60,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.481 (a sixth attempt, refuted, and this line is now closed by decision).** Dropping a group-named channel in `push` when no
+> pairing is registered for its group — the natural fix, since a pairing claims before it asks — **also leaves 7 passed, 4
+> failed**. The arrival path is `deliver`, which removes the waiter and then falls through to `push` for the Full and Closed
+> cases, so the guard is reached and still not the answer.
+>
+> **Six attempts, six refutations, all reverted.** The recorded conclusion (§4.479) stands: the shared pool parks channels on
+> purpose, nothing evicts them without a timer, and the four tests ask for zero streams in fifteen seconds. **This is now closed
+> by decision, not by a fix**: three options were named (a timer and sweep on the queue, a smaller queue, or moving the test's
+> promise) and all three are the user's call, because each changes a contract rather than repairing a defect.
+>
+> **Nothing else in this goal is blocked by it**: the defect the objective named is closed and measured on both arms.
+
 > **§4.480 (a fifth attempt, and it names the missing piece: the queue has no timer).** Giving the shared queue an idle bound — stamp
 > each entry, drop it in `try_take` when older than five seconds — **left the suite at 7 passed, 4 failed**. The reason is
 > structural and worth recording: **the eviction only runs when somebody takes**, and after the burst nobody takes. A time-based
