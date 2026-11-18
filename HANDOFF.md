@@ -60,6 +60,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.478 (`step` lives only in `full`, and `full` is a multi-hour ritual — the sweep was stopped on purpose).** Reading
+> `model.PROFILES`: **`full` runs seventeen scenarios**, `stage` and `screen` run only `cost`, `nobulk` and `carrier` only
+> `timeline`, `soak` only `soak`. **`step` is in `full` alone**, and `full` is six rounds plus a warmup over both arms — with
+> `soak` alone budgeted at five 180-second stages, that is **hours per arm-round set**, not a regression check.
+>
+> **So the sweep was stopped** (its file had reached 44 samples and stopped moving; a partial result answers nothing) rather
+> than left to run for hours, and `step_recovery_ms` is recorded here as **not obtained in this session** — the honest state,
+> not a hole to be papered over.
+>
+> **What that means for finalisation**: "全绿" cannot be claimed without either the sweep or a decision that the step grid is
+> out of scope for this judgement. Everything else is green and the defect is closed, so the decision is a scheduling one, not
+> an engineering one.
+
 > **§4.477 (a fourth hypothesis, tested and refuted: it is not the patience).** `PAIR_ATTEMPTS` set to **1** instead of 2, so a group sheds
 > after a single expiry: **the pool suite still reads 7 passed, 4 failed**, unchanged. Reverted at once.
 >
