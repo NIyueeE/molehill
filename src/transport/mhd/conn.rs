@@ -4115,6 +4115,33 @@ impl Conn {
             })
             .map(|(&id, _)| id)
             .collect();
+        // **Why a finished stream is still here.** The retirement rule above is the one
+        // this defect needs, and a soak showed it never firing — so the clause that
+        // refuses the entry is the last unknown (`HANDOFF.md` §4.430): `unacked` (our fin
+        // was never acknowledged) or `drained` (bytes the reader has not taken).
+        if crate::transport::stats::enabled() {
+            let kept: Vec<(u32, u32, usize)> = self
+                .streams
+                .iter()
+                .filter(|(_, state)| state.local_fin && state.peer_fin)
+                .map(|(&id, state)| {
+                    (
+                        id,
+                        u32::try_from(state.send.unacked()).unwrap_or(u32::MAX),
+                        state.recv.pending(),
+                    )
+                })
+                .take(2)
+                .collect();
+            for (id, unacked, pending) in kept {
+                tracing::debug!(
+                    stream = id,
+                    unacked,
+                    pending,
+                    "mhd finished stream kept by the periodic pass"
+                );
+            }
+        }
         for id in &stale {
             // The peer is told the stream is over, so its own table does not hold a
             // half-open stream that nothing will ever finish.

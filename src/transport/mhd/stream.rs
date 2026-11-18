@@ -660,6 +660,13 @@ pub(crate) struct RecvBuf {
 }
 
 impl RecvBuf {
+    /// How many pieces the reader has not taken yet.
+    pub(crate) fn pending(&self) -> usize {
+        self.pieces.len()
+    }
+}
+
+impl RecvBuf {
     /// Take a range. Answers whether it was news.
     ///
     /// A range that starts below the read offset is trimmed, and one that
