@@ -4115,33 +4115,6 @@ impl Conn {
             })
             .map(|(&id, _)| id)
             .collect();
-        // **A finished stream is retired here too.** `settle` is the only place a
-        // stream leaves this table, and it runs on events; a stream whose last event was
-        // the peer's fin has no further event to visit it, so it sat for a minute or more
-        // — measured: of the streams that retired after 60 s, 1 267 of 1 674 closed with
-        // `peer_fin = true` (`HANDOFF.md` §4.429). Nothing can arrive after that fin and
-        // nothing is waiting to be read, so the entry is only holding a slot.
-        let finished: Vec<u32> = self
-            .streams
-            .iter()
-            .filter(|(_, state)| {
-                !state.abandoned
-                    && state.local_fin
-                    && state.peer_fin
-                    && state.send.unacked() == 0
-                    && state.recv.is_drained()
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        for id in &finished {
-            self.streams.remove(id);
-            self.stream_opened.remove(id);
-            self.finishing.remove(id);
-            tracing::debug!(
-                stream = id,
-                "mhd finished stream retired by the periodic pass"
-            );
-        }
         for id in &stale {
             // The peer is told the stream is over, so its own table does not hold a
             // half-open stream that nothing will ever finish.
@@ -4159,7 +4132,7 @@ impl Conn {
                 "mhd abandoned stream retired without an acknowledgement"
             );
         }
-        stale.len() + finished.len()
+        stale.len()
     }
 
     /// The timer expired: why, and how many packets it put back in the queue.
