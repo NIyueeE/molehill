@@ -35,6 +35,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.431 (the diagnostic never fired either, and that is the answer to the clause question): no *live* stream has both
+> fins.** With `4291601` in, a soak whose arms wedged (5 and 3, up to 145 s) logged **zero** `kept by the periodic pass`
+> lines on either arm. So at no point did the table hold a stream with `local_fin && peer_fin` — the 56 live streams have
+> **at most one** fin, and §4.368 measured exactly that (26 with the peer's, 30 with neither, **none with both**).
+>
+> **Which moves the missing half to `local_fin`**: the client's send loop never finished for those streams. It is not parked
+> in `write` (§4.421: zero), it is not waiting on a fin (there is none), so it is **waiting for the visitor's EOF that it
+> never sees** — or not being polled at all.
+>
+> **And the earlier measurement now makes sense**: §4.429's "1 267 of 1 674 closed with `peer_fin = true`" was measured **at
+> close**, long after the group finally ended — not while the stream was live. The live population is the other shape.
+
 > **§4.430 (the periodic-retire fix is in and it never fired — reverted).** With `72ebe5b` in (retire a stream that is
 > `local_fin && peer_fin && unacked == 0 && recv.is_drained()` in the periodic pass), a soak whose **both** arms wedged
 > (2 and 4 wedges, 61 and 76 ceiling lines, 60 and 75 expiries) logged **zero** `retired by the periodic pass` lines on
