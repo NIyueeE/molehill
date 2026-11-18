@@ -60,6 +60,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.495 (two entries mean two successful dials — so the valve did admit two).** The growth path dials **before** it creates anything:
+> `let (tunnel, shutdown) = dial(wanted).await?;` and only then `state.entries.push(PoolEntry { … })`
+> (`multiplex.rs:2673`–2684). The establishment it calls bails on any non-`Ok` ack (§4.494). **So an entry exists only for a dial
+> that succeeded** — which means the pool's two entries are **two tunnels the server admitted**, and `[server.data].max_tunnels = 1`
+> admitted two.
+>
+> **That is the contradiction to chase next**, and it is not a test artefact: `reserve_tunnel(&registry, &nonce, max_tunnels)` is
+> what counts, and either it counts something other than live tunnels of one session, or the test's client establishes through two
+> session identities (`tunnel_valve.toml` sets `[client.data] tunnels = 2` for one client, one endpoint).
+>
+> **A valve that admits two when it allows one is worse than everything this goal has fixed**, and these three assertions are the
+> only thing that has ever pointed at it.
+
 > **§4.494 (and the client's tunnel establishment fails on a refusal, so the second entry is not a refused dial).** The client's
 > tunnel connect (`client.rs:2120`) writes the hello and reads one ack: anything but `Ack::Ok` is
 > `bail!("the server refused the multiplexed data tunnel: {v}")`, so an establishment the valve refused **returns an error** and
