@@ -60,6 +60,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.483 (the number that matches: 146 groups, 110 source EOFs, and 36 groups whose send direction never ended).** Counting the
+> group lifecycle in the failing case:
+>
+> ```
+> stripe group finished            146
+> stripe group directions ended    146
+> stripe source ended: eof          110     ← the send direction saw its source end
+> ```
+>
+> **Thirty-six groups finished without their send direction ever reaching EOF** — and the pool reports **35** streams still held.
+> That is the first count in this whole investigation that matches the number the test complains about, and it points at the one
+> family not yet refuted: **a group whose send direction is cut rather than completed** — the grace path (`spawn_grace`,
+> `wait_until_idle`) and whatever happens to the channel of a direction that never ended.
+>
+> **So the next question is exact**: when the grace aborts a send direction, does anything close that direction's stream? If
+> nothing does, those 36 streams wait for `FORWARD_IDLE_TIMEOUT` — and `pool.streams()` cannot reach zero in fifteen seconds.
+
 > **§4.482 (a seventh attempt, and it refutes §4.479 — the streams are not in the queue at all).** The full form was built this
 > time: entries stamped with their arrival, `try_take` refusing expired ones, `sweep_idle()` draining the queue, and **a real
 > one-second tick spawned per service** so the bound runs with nobody taking. **The pool suite still reads 7 passed, 4
