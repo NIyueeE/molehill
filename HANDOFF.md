@@ -86,6 +86,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.458 (the wait is `stripes.register`, and it is before the forwarder exists).** The client's path is `client.rs:1922`:
+> the server sends `StartForwardStripedTcp`, `stripes.register(group, index, count, …)` returns `Some(done)` **only when the
+> last stripe of the group has arrived**, and only then is the local connection made and `spawn_group_tagged` called.
+>
+> **So a visitor's bytes wait in its socket buffer until its whole group is placed** — no forwarder exists before that, which
+> is exactly `sourced = 0` (§4.457) and exactly `frames = 0` on the channel (§4.454). **The forwarder is not spawned and never
+> polled; it has not been created yet.**
+>
+> **That closes the question of mechanism.** What remains is only what to do about it: a visitor whose group cannot be placed
+> within its own patience **should be closed then**, and the stripes already parked for it released, instead of being held
+> until the visitor gives up on its own timeout — which is the same instant for the slot but a whole timeout later for the
+> pool, and every one of those parked stripes counts against the ceiling that prevents the next group from completing.
+
 > **§4.457 (`sourced=0` narrows it to "the forwarder never read", not "the visitor never wrote").** The periodic `stripe group
 > state` line carries `highest`, `delivered`, `written`, `sourced` and `idle_ms`; on a group that carries nothing, `sourced` is
 > zero. **That is a statement about what the forwarder read, not about what the visitor sent**: bytes that arrived and were
