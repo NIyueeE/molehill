@@ -886,6 +886,10 @@ impl Client {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (ask_tx, ask_rx) = mpsc::unbounded_channel::<crate::status::SessionAsk>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        #[cfg(feature = "multiplex")]
+        let (refuse_tx, refuse_rx) = mpsc::unbounded_channel();
+        #[cfg(not(feature = "multiplex"))]
+        let (_refuse_tx, refuse_rx) = mpsc::unbounded_channel();
         let session = ClientSession {
             remote_addr: key.addr.clone(),
             transport,
@@ -896,6 +900,9 @@ impl Client {
             shutdown_rx,
             services: HashMap::new(),
             pending_drops: Vec::new(),
+            #[cfg(feature = "multiplex")]
+            refuse_tx: refuse_tx.clone(),
+            refuse_rx,
             #[cfg(feature = "multiplex")]
             pools: HashMap::new(),
             #[cfg(feature = "multiplex")]
@@ -968,6 +975,13 @@ struct RunDataChannelArgs {
     /// The nonce the server issued for the control session: a v4 data channel
     /// authenticates with it, not with the session's auth digest.
     session_nonce: Nonce,
+    /// Where a failed open reports its group, so the server's gather can fail the
+    /// attempt at once instead of waiting out its budget (`HANDOFF.md` §4.460).
+    ///
+    /// Only the multiplexed path opens channels, so a build without it has no
+    /// reader for this sender.
+    #[cfg(feature = "multiplex")]
+    refuse_tx: mpsc::UnboundedSender<(ServiceId, [u8; 4])>,
     /// The service this channel is for. Every v4 channel announces it with the
     /// four-byte prologue before the server's forwarding command arrives.
     service_id: ServiceId,
@@ -1574,6 +1588,11 @@ fn channel_stats() -> &'static std::sync::Arc<ChannelStats> {
 
 /// Run a data channel as one stream of the multiplexed tunnels.
 #[cfg(feature = "multiplex")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one channel's whole open: placement, prologue, the refusal report and the \
+              stamps the pairing joins against. Splitting it is a refactor for its own commit."
+)]
 async fn run_mux_data_channel(
     args: &Arc<RunDataChannelArgs>,
     tunnel: &Tunnels,
@@ -1593,7 +1612,7 @@ async fn run_mux_data_channel(
     // numbers tell them apart.
     let stream_opening = std::time::Instant::now();
     // Each open call bounded and counted on its own (`HANDOFF.md` §0).
-    let mut stream = match stripe {
+    let stream = match stripe {
         Some(request) => tokio::time::timeout(
             crate::common::constants::PROLOGUE_BUDGET,
             open_stripe_stream(args, tunnel, request),
@@ -1602,7 +1621,8 @@ async fn run_mux_data_channel(
         .map_err(|_| {
             crate::transport::stats::note_open_stripe_stalled();
             anyhow!("mhd striped placement waited out its budget")
-        })??,
+        })
+        .and_then(|r| r),
         None => tokio::time::timeout(
             crate::common::constants::PROLOGUE_BUDGET,
             tunnel.open_stream(),
@@ -1611,7 +1631,18 @@ async fn run_mux_data_channel(
         .map_err(|_| {
             crate::transport::stats::note_open_plain_stalled();
             anyhow!("mhd placement waited out its budget")
-        })??,
+        })
+        .and_then(|r| r),
+    };
+    let group = stripe.map_or(0, |request| request.group);
+    let mut stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            // The group can never complete, and the server would otherwise wait
+            // out its whole budget to discover that (`HANDOFF.md` §4.460).
+            let _ = args.refuse_tx.send((args.service_id, group.to_be_bytes()));
+            return Err(error);
+        }
     };
     let open_us = u64::try_from(stream_opening.elapsed().as_micros()).unwrap_or(u64::MAX);
     // Every open, into a histogram: the log line below is a slow-open sample and
@@ -1629,7 +1660,7 @@ async fn run_mux_data_channel(
     // The group the server named in its request travels with the channel, so the
     // server can deliver this channel to *that* pairing instead of to whichever
     // visitor takes one from the shared queue first. Zero for a plain visitor.
-    let group = stripe.map_or(0, |request| request.group);
+
     // **A prologue that fails is a channel the server never hears about.** This was a
     // bare `?`, so a failed write returned without the `channel open finished` line
     // and without any error line — measured, a group whose pairing then expired twice
@@ -1660,6 +1691,10 @@ async fn run_mux_data_channel(
             );
         }
         crate::transport::stats::note_prologue_failed();
+        // The open reached the wire but never completed, and the server's gather
+        // would wait out its budget for a group this channel can no longer
+        // complete (`HANDOFF.md` §4.460).
+        let _ = args.refuse_tx.send((args.service_id, group.to_be_bytes()));
         return Err(error);
     }
     let ready_us = u64::try_from(opening.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -3968,6 +4003,12 @@ struct ClientSession {
     /// flight*. They are re-registered once that registration is done rather
     /// than from inside it, which would nest one verdict wait in another.
     pending_drops: Vec<ServiceId>,
+    /// Where a failed channel open reports its group, and the session loop's end
+    /// of it: the loop is the only place that can write a session command
+    /// (`HANDOFF.md` §4.465).
+    #[cfg(feature = "multiplex")]
+    refuse_tx: mpsc::UnboundedSender<(ServiceId, [u8; 4])>,
+    refuse_rx: mpsc::UnboundedReceiver<(ServiceId, [u8; 4])>,
     /// The session's one tunnel pool, by key (`session:<data endpoint>`).
     ///
     /// The session owns it, not a service: every service of the session draws
@@ -4085,6 +4126,11 @@ impl ClientSession {
 
     /// One connection's life: connect, authenticate once, then serve every
     /// service until the connection or the shutdown ends it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the session loop: every control command, the refusal report and shutdown. \
+                  Splitting the match is a refactor for its own commit."
+    )]
     async fn run(&mut self) -> Result<()> {
         let mut control_addr = AddrMaybeCached::new(&self.remote_addr);
         control_addr.resolve().await?;
@@ -4235,6 +4281,12 @@ impl ClientSession {
                         "Heartbeat timed out after {} seconds",
                         heartbeat_timeout.unwrap_or_default().as_secs()
                     );
+                }
+                // A channel this end could not open: tell the server at once, so
+                // the pairing waiting for that group stops waiting instead of
+                // sitting out its budget (`HANDOFF.md` §4.460).
+                Some((service, group)) = self.refuse_rx.recv() => {
+                    write_session_cmd(&mut wr, &SessionCmd::ChannelRefused(service, group)).await?;
                 }
                 _ = &mut self.shutdown_rx => break,
             }
@@ -4936,6 +4988,8 @@ impl ClientSession {
         let active = ActiveService {
             args: Arc::new(RunDataChannelArgs {
                 session_nonce: *nonce,
+                #[cfg(feature = "multiplex")]
+                refuse_tx: self.refuse_tx.clone(),
                 service_id: id,
                 remote_addr: data_addr,
                 connector: slot.transport.clone(),
