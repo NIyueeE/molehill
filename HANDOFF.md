@@ -60,6 +60,21 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.487 (it is not a leak and not the grace: the pool does settle, in about seventeen seconds).** Two decisive diagnostics:
+>
+> - **The single test passes with its deadline raised to sixty seconds**, finishing in 23.6 s overall — so the pool **does reach zero
+>   streams**, just after the test's fifteen.
+> - **Cutting the half-close grace from ten seconds to two changes nothing**: still 7 passed, 4 failed — consistent with the grace
+>   never firing in this case at all (measured zero earlier).
+>
+> **So the characterisation is complete and unflattering to the code**: a burst of 72 visitors against a pool held at one tunnel
+> settles in **~17 s**, and the test promises **15 s**. Nothing leaks (109 opened, 109 dropped), every component does its job, and the
+> **teardown of a saturated burst is simply two seconds slower than the promise**.
+>
+> **That is a product decision, not a defect I should paper over**: either the settle time is a promise worth meeting — in which case
+> what waits those extra seconds needs to be found by following one group's own timeline, not by another global counter — or fifteen
+> seconds is tighter than the design and the test is what moves. **Both change a contract; neither is mine to choose silently.**
+
 > **§4.486 (the 35 are released together, and not by the pairing).** With the lease ids in hand:
 >
 > - **109 opened, 109 dropped** in one run — nothing is leaked;
