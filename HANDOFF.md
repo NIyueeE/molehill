@@ -35,7 +35,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.433: the clean arm's tick count is exactly the harness's persistent connections.** Converting the two-second read ticks
+> **§4.434 (the two halves do not add up, and that is the finding): 224 streams hold the pool while only ~61 are idle-waiting.**
+> Per lane on the wedged arm, `opened_len` is **56 on all four** — 224 live streams. But the send loop's read-idle ticks
+> (36 765 at two seconds each, ≈600 per stream over the run) account for only about **61**. **So roughly 163 of the 224 have
+> no send loop waiting on a read** — and §4.421 established that none is parked in `write` either.
+>
+> **Which leaves one shape**: they are streams with **no forwarding group at all** — channels opened, never used, never closed.
+> And that is §4.348's measurement arriving from the other side: **7 500 of 15 485 channels in a soak never put a first byte
+> on the wire.** Those opens hold a lease, the lease holds a pool slot, and nothing ever releases it because no group exists
+> to end.
+>
+> **So the defect is the abandoned open**: `open_stream` succeeds, the channel is written into the pool's lease, and if the
+> visitor goes before the forwarder ever starts, nothing closes the stream.
+
+> **§4.433 (the tick arithmetic; superseded by the per-lane count below) Converting the two-second read ticks
 > back into streams (≈600 ticks per stream per twenty-minute run): the **clean** arm's 14 557 is about **24** streams, which
 > is exactly `rr-16`'s 16 persistent sockets plus the bulk stage's handful. The **wedged** arm's 36 765 is about **61** — the
 > same 24 plus roughly **32 that the harness did not open and does not hold**.
