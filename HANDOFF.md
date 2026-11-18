@@ -86,6 +86,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.454 (the ambiguity resolves — and it is a defect, not bulk): every long-lived group is an empty one).** Splitting the
+> same 1–5 s groups by the `frames` count already on the EOF line:
+>
+> ```
+> groups living 1-5 s by frames:  frames=0 -> 1735,  frames<=2 -> 0,  frames>2 -> 0
+> ```
+>
+> **All 1 735 of them carried not one byte.** They are not bulk transfers; they are **channels that opened, forwarded
+> nothing, and sat for one to five seconds before closing**. And this is §4.348's old observation arriving with an
+> explanation attached: *"7 500 of 15 485 channels never put a first byte on the wire"* — the ones that wait are exactly the
+> ones that carry nothing.
+>
+> **Which makes the defect concrete and not about closing at all**: a visitor connects, the channel opens, and **the visitor's
+> bytes are never forwarded into it**. The stream then holds a pool slot until the visitor gives up and closes.
+>
+> **So the question is now one sentence**: why does a channel open for a visitor whose request never reaches it? The send
+> loop is the place — `frames` is incremented only when it writes — and the two candidates it leaves are that the loop never
+> started, or that it started and its first read returned nothing to forward.
+
 > **§4.453 (the parked-writer reading is sound: the lane never made a writer wait).** `mhd stream writer parked for the first time`
 > sits at the top of `poll_write`, immediately before it returns `Pending` for the first time on a stream (`lane.rs:567`–575),
 > and its companion line (`writer was parked`, `parked_us`) prints when the write resumes after ≥ 20 ms. **Neither fires.** So
