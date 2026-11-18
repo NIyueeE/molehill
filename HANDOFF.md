@@ -33,6 +33,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.466 (the refusal path works, measured): the five-second stall is gone.** With both halves in (`9098125`, `9983658`), a
+> soak whose arms both run the refusal path:
+>
+> | reading | before (p70) | after (p75) |
+> |---|---|---|
+> | `pairing budget expired` | 0 / **54** | **0 / 0** |
+> | `shedding the visitor` on a refused group | — | **391 / 410** |
+> | `every tunnel is at its stream ceiling` | 1 / 54 | 392 / 411 |
+> | wedge count / worst | 2 / 6, up to 15 s | **1 / 1, 10.2 / 10.9 s** |
+> | `live_gt_10s` | 56 | 56 |
+>
+> **The budget expiry is at zero on both arms** — the five seconds per unsuccessful gather no longer exist, because a refusal
+> is now an event the gather sees and it sheds the visitor at once. The ceiling and shed counts rose **because the cycle is
+> fast now**: the same offered churn produces many more, much shorter, refusals instead of a few five-second stalls.
+>
+> **What did not change is the occupancy**: `live_gt_10s` is still 56. That is a different fact — the pool really is at its
+> ceiling for this workload — and the fix was never going to change it. It changed the **cost of a refusal** from five seconds
+> of a held visitor to microseconds, and the worst wedge on either arm from 15–175 s to 10.9 s.
+
 > **§4.465 (the server half of the refusal path is in; the client half is the last piece).** `9098125` adds
 > `SessionCmd::ChannelRefused(ServiceId, [u8; 4])` with a roundtrip test, a `refused` set and `Notify` on `ChannelQueue` with
 > `refuse()` / `refused(group)`, the queue filed per service in `SessionCtx` (via a new `ControlChannelHandle::channels()`),
