@@ -86,6 +86,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.448 (the fin condition tested by lifetime, and it is worse — reverted).** Relaxing the fin to fire as soon as `local_fin`
+> and reading the **lifetime** this time (p73, same soak): product arm **mean 5 528 ms, p90 13 300 ms, 6 wedges including
+> 90 s**; twin **mean 3 313 ms, 1 wedge of 175 s**. The baseline before the change (p70) was **326 ms and 1 748 ms**.
+>
+> **So sending the fin early makes a stream live *longer*, by an order of magnitude** — the opposite of the hypothesis, and it
+> is reverted again (`b9e20a7`). That closes the `unacked == 0` question for good: it was tested twice, once by wedge count
+> and once by lifetime, and both readings say no.
+>
+> **What the failure implies is worth more than the fix would have been**: a fin that arrives before its data is answered by
+> the peer **slower**, so the peer's own close is gated on something that a premature fin delays. That is a behaviour of the
+> protocol, not of one condition, and it is where the next investigation starts.
+
 > **§4.447 (split by group lifetime, the anomaly disappears and the server is exonerated).** Groups that live under a second
 > are the churn's; splitting the same log on that:
 >
