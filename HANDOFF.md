@@ -60,6 +60,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.496 (the valve never refused anything in that test — the second tunnel did not go through it).** The arithmetic is right:
+> `try_reserve` refuses when `held >= cap` (`server.rs:238`), so with `max_tunnels = 1` the second reservation must come back
+> `OverCap` and be answered with `refuse_tunnel`. **Counting the refusal lines in the failing test gives zero**: neither
+> `Refused a data tunnel for session …` nor `the server refused the multiplexed data tunnel` is logged, and the test also fails
+> when run **alone**, so it is not pollution from another test's pool.
+>
+> **So the second pool entry was never presented to the valve**, and the guard is not the problem either: `do_v4_tunnel` hands the
+> `SessionTunnel` straight into `upgrade_to_tunnel(…, Some(slot), …).await`, which holds it for the tunnel's lifetime.
+>
+> **That leaves one question**, and it is a small one: **which endpoint does the client dial for its second tunnel**, and does that
+> connection reach the handler that reserves. `tunnel_valve.toml` gives the client `[client.data] tunnels = 2` for one service, so
+> both dials name one endpoint — unless the pool dials the *service* address rather than the data address for a repair, which
+> would explain a tunnel that exists, carries 35 streams, and never met the cap.
+
 > **§4.495 (two entries mean two successful dials — so the valve did admit two).** The growth path dials **before** it creates anything:
 > `let (tunnel, shutdown) = dial(wanted).await?;` and only then `state.entries.push(PoolEntry { … })`
 > (`multiplex.rs:2673`–2684). The establishment it calls bails on any non-`Ok` ack (§4.494). **So an entry exists only for a dial
