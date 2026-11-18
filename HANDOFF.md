@@ -13,6 +13,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.461 (an unrelated gate failure blocks "全绿", and it is not this branch's): `just check` now fails at `cargo deny
+> advisories`** — `RUSTSEC-2026-0542`: **`humantime 2.4.0` is unmaintained** (because chrono is), reached through
+> `console-subscriber` → the optional `console` feature. The advisory states **"No safe upgrade is available"**.
+>
+> **It is not caused by anything in this goal**: `Cargo.toml` and `Cargo.lock` were last touched by `2a53b69` and `fc7f063`,
+> both long before this work, and no round here changed a dependency. The advisory is newer than the dependency.
+>
+> **It is left unfixed on purpose.** The three options are a dependency change (none available), removing the `console`
+> feature (a product change), or an `deny.toml` ignore with a reason — which is the mechanism that file exists for and
+> already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
+> goes to the user rather than into this session.
+
 > **CLOSING STATE (35 rounds into this goal, defect NOT closed, finalisation NOT written — read this, then §4.460).**
 >
 > **The defect is now fully described and not fixed.** When the client's stream pool is at its ceiling, the server's gather
