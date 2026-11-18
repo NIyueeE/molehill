@@ -33,6 +33,15 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.475 (the `full` sweep is running, and it is the release ritual, not a regression check).** `--profile full` is
+> `rounds 6 × warmup 1 × both arms × every scenario` at a 420 s budget per arm-round — the release-grade sweep
+> (`model.py:1795`). It is in round 0 of 6 as this is written, so it needs hours, and its `step` cell
+> (`step_recovery_ms`, scenario at `model.py:1608`) is the grid the objective asks for.
+>
+> **Everything cheaper is already green** (§4.474): integration 22/22, lib 410, both clippy builds, deny with no waiver,
+> interop 3/3, l3-accept PASS, and the stage profile clean. **The remaining reds are the four pre-existing pool tests (§4.473)
+> and this sweep's result, which is pending by definition.**
+
 > **§4.474 (regressions after the pool fix: integration green, stage profile clean, `step` grid still to run).**
 >
 > | gate | result |
