@@ -33,6 +33,24 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.464 (the protocol path's ordering constraint, found by trying to add the variant first).** Adding
+> `SessionCmd::ChannelRefused` alone **does not build**: the server's `handle_session_cmd` match is exhaustive
+> (`server.rs:1303`), so the variant needs its consumer in the same commit. And that consumer is not reachable today —
+> `pair_striped_group` selects on `data_ch_rx`, but **the `ChannelQueue` is created at `server.rs:3008`, after the session loop
+> at `1245`, and `SessionCtx` does not hold it**.
+>
+> **So the order of work is forced**:
+> 1. make the queue reachable from the session task (share it before the loop, add it to `SessionCtx`);
+> 2. add `refused: Mutex<HashSet<u32>>` + `Notify` and `refuse(group)` / `refused(group)` to `ChannelQueue`;
+> 3. add `SessionCmd::ChannelRefused(ServiceId, [u8; 4])` with a roundtrip test;
+> 4. the server arm: `ctx.data_ch_rx.refuse(group)`;
+> 5. the pairing's select arm: a refused group **sheds the visitor at once** — a refusal is definitive, unlike a slow
+>    channel, which is what `PAIR_ATTEMPTS` is for;
+> 6. the client sends it: `RunDataChannelArgs` has no session sender, so one has to be threaded in.
+>
+> **Step 3 alone was written and reverted** rather than landed as an unhandled variant — a variant with no consumer is a dead
+> path, and the tree is green as it stands.
+
 > **§4.463 (the tree at the end of this goal, verified).** On `47df18b`: **both clippy builds at 0 errors**, **410 lib tests pass**,
 > **`git status` clean**, `just interop` 3/3, `just l3-accept` PASS through its sudo entry point. The only red in the chain is
 > §4.461's advisory, which predates this branch's last dependency change.
