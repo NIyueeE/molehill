@@ -35,6 +35,29 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.443 (the two-arm table, with no causal claim): every instrument on one page, same run (p70).**
+>
+> | reading | clean arm | wedged arm |
+> |---|---|---|
+> | `wedge_count` / `wedge_max_s` | 0 / — | **6 / 15.015** |
+> | `pairing budget expired` | 0 | **54** |
+> | `every tunnel is at its stream ceiling` | 1 | **54** |
+> | `opened_len` max | 4 | **59** |
+> | `live_gt_1s` / `live_gt_10s` / `live_gt_60s` max | 3 / 4 / 4 | **56 / 57 / 7** |
+> | streams retired | 21 163 | 18 917 |
+> | retirement p50 | **1 ms** | **1 ms** |
+> | retirement p90 | 201 ms | **4 493 ms** |
+> | retirement mean | **326 ms** | **1 748 ms** |
+>
+> **The median is one millisecond on both arms.** The whole difference is the tail: p90 is twenty-two times larger, the
+> mean five times, and — the number that matters — **fifty-six of the fifty-nine live streams are older than a second while
+> only seven are older than a minute**. So the occupants are streams **one to sixty seconds old**, and they are not
+> "stuck forever": they end, eventually.
+>
+> **And Little's law says the population should be about 28** (15.8 retirements a second × 1.75 s mean) **while the lane
+> holds 59** — so **roughly half the live streams at any moment are ones that will not retire in this run's lifetime**,
+> which is where the tail comes from and why the pool fills.
+
 > **§4.442 (the fin fix is in and the wedge survives — reverted).** With `83d332e` in (send the fin as soon as `local_fin`, not
 > after `unacked == 0`), a soak read: product arm **0 wedges / 0 expiries / 1 ceiling line**, twin **6 wedges, 15.015 s, 54
 > expiries, opened_len 59, live_gt_10s 57**. So the wedge is unchanged and the change is **reverted** (`8a1aff3`), both
