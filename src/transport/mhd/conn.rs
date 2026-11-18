@@ -294,6 +294,9 @@ struct StreamState {
     local_fin: bool,
     /// The peer finished.
     peer_fin: bool,
+    /// When both directions had finished, so the wait to retirement can be told apart
+    /// from the life of the stream (`HANDOFF.md` §4.444).
+    closed_at: Option<Instant>,
     /// Set when either end reset the stream.
     reset: Option<ResetCode>,
     /// The local handle was dropped: nothing will read this stream again, and
@@ -1696,7 +1699,14 @@ impl Conn {
                 let age_ms = self.stream_opened.get(&stream).map_or(0, |at| {
                     u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
                 });
-                tracing::debug!(stream, age_ms, "mhd stream retired");
+                let closed_ms = self
+                    .streams
+                    .get(&stream)
+                    .and_then(|state| state.closed_at)
+                    .map_or(0, |at| {
+                        u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+                    });
+                tracing::debug!(stream, age_ms, closed_ms, "mhd stream retired");
             }
             self.stream_opened.remove(&stream);
             // **Say it when a stream leaves.** An accept task can be waiting on a
@@ -3832,6 +3842,7 @@ impl Conn {
         if fin {
             state.recv.finish(offset + data.len() as u64);
             state.peer_fin = true;
+            state.closed_at.get_or_insert(now);
         }
         // Remember this stream's arrived prefix, which every acknowledgement from
         // now on carries: it is what lets the peer's send buffer move on the bytes
