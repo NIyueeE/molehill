@@ -13,6 +13,14 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.462 (the runtime regressions are green on this tree).** `just interop` — **3 passed** (new server refuses old client and
+> keeps serving; old server refuses new client and says so; old server rejects an unknown dialect and survives). `just l3-accept`
+> via `sudo -n bash bench/src/bench/utils/l3/run.sh` (the recipe itself skips with 77 without root) — **PASS** on the policy
+> refusals, the lane-lending cases, the byte-exactness through a lane change, the operator's valve and the four-lane load
+> case. Both clippy builds are at 0 errors and the 410 lib tests pass.
+>
+> **So the only red in the chain is §4.461's advisory**, which predates this branch's last dependency change and has no fix.
+
 > **§4.461 (an unrelated gate failure blocks "全绿", and it is not this branch's): `just check` now fails at `cargo deny
 > advisories`** — `RUSTSEC-2026-0542`: **`humantime 2.4.0` is unmaintained** (because chrono is), reached through
 > `console-subscriber` → the optional `console` feature. The advisory states **"No safe upgrade is available"**.
