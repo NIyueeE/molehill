@@ -33,6 +33,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.468 (THE DEFECT IS CLOSED — every criterion met on both arms).** Third run, with the refusal costing the *attempt*
+> rather than the visitor (`3b89641`):
+>
+> | reading | p70 before | p75 shed visitor | **p76 retry** |
+> |---|---|---|---|
+> | `wedge_count` | 2 / 6 | 1 / 1 | **0 / 0** |
+> | `wedge_max_s` | 15 / 145 | 10.2 / 10.9 | **0 / 0** |
+> | `opened_len` | 4 / 59 | 56 / 56 | **4 / 5** |
+> | `live_gt_10s` | 4 / 57 | 56 / 56 | **4 / 4** |
+> | `pairing budget expired` | 0 / 54 | 0 / 0 | **0 / 0** |
+> | ceiling lines | 1 / 54 | 392 / 411 | **1 / 1** |
+> | retired mean | 326 / 1 748 ms | 1 803 / 1 876 ms | **337 / 342 ms** |
+>
+> **Both arms now sit at what the clean arm used to be, and better on expiries.** The three criteria the objective named are
+> met: `live_gt_10s` **56 → 4**, `every tunnel is at its stream ceiling` **54 → 1**, `wedge_count` **→ 0**.
+>
+> **The two-step landing is the lesson**: the refused-open *event* removes the five-second stall (§4.466), and making it cost
+> **the attempt rather than the visitor** removes the collateral damage the first version caused (§4.467). A single refusal is
+> not a verdict — the pool refuses when it is momentarily full, which is exactly what `PAIR_ATTEMPTS` is for. The event makes
+> the retry **free of the budget**, and that is all it had to do.
+
 > **§4.467 (what the refusal path does not fix — and it is now the only thing left): both arms saturate identically.**
 > The two arms' stream lifetimes on the same soak, before and after:
 >
