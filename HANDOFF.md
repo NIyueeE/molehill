@@ -33,6 +33,15 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.471 (the release never happens at all).** Running the failing case alone with `RUST_LOG=molehill=debug` and grepping for the
+> release line gives **zero** `released stripe group … (N parked stripes)` lines — over the whole test. So `ReleaseStripedGroup`
+> either never reaches the client or reaches it for a service the client cannot find; either way **the parked stripes are never
+> freed**, which is what the 35 held streams are.
+>
+> **The next step is one line, and it splits the two**: log unconditionally at the top of `release_stripe_group` (before the
+> service lookup). If it prints, the message arrives and the lookup is what fails; if it does not, the server never sends it —
+> and then the give-up path that is supposed to send it (`unclaim` + `ReleaseGroup`) is what to look at.
+
 > **§4.470 (the release path is not the suspect — it does drop parked streams).** `client.rs:5080` answers `ReleaseStripedGroup`
 > with `stripe::StripeGroups::release` (`stripe.rs:1449`), which **removes the group's parked entries and drops them, with
 > their tunnel leases** — its own comment says the capacity returns there, not at the next pairing. So "the client ignores the
