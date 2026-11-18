@@ -297,6 +297,9 @@ struct StreamState {
     /// When both directions had finished, so the wait to retirement can be told apart
     /// from the life of the stream (`HANDOFF.md` §4.444).
     closed_at: Option<Instant>,
+    /// When this end asked to finish: the wait until the fin can be sent is the wait for
+    /// its own last bytes to be acknowledged (`HANDOFF.md` §4.449).
+    finish_at: Option<Instant>,
     /// Set when either end reset the stream.
     reset: Option<ResetCode>,
     /// The local handle was dropped: nothing will read this stream again, and
@@ -1621,6 +1624,7 @@ impl Conn {
         if let Some(state) = self.streams.get_mut(&stream) {
             state.send.finish();
             state.local_fin = true;
+            state.finish_at.get_or_insert(Instant::now());
         }
         self.settle(stream);
     }
@@ -1647,6 +1651,7 @@ impl Conn {
         state.recv.discard(blocks);
         state.send.finish();
         state.local_fin = true;
+        state.finish_at.get_or_insert(Instant::now());
         self.settle(stream);
     }
 
@@ -1682,6 +1687,12 @@ impl Conn {
         let done = closed_both
             || (state.abandoned && (state.fin_sent || never_used) && state.send.unacked() == 0);
         if state.local_fin && !state.fin_sent {
+            if crate::transport::stats::enabled() {
+                let waited_ms = state.finish_at.map_or(0, |at| {
+                    u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+                });
+                tracing::debug!(stream, waited_ms, "mhd fin sent after waiting for its data");
+            }
             self.finishing.insert(stream);
         } else {
             self.finishing.remove(&stream);
