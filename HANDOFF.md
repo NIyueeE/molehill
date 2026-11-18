@@ -35,6 +35,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.436 (the sharpest comparative statement of the defect): on the arm that wedges, a stream lives five times longer.**
+> `mhd stream retired age_ms` on the same run:
+>
+> | arm | n | p50 | p90 | p99 | mean |
+> |---|---|---|---|---|---|
+> | clean | 19 209 | **1 ms** | 4 806 | 21 753 | **1 667 ms** |
+> | wedged | 9 115 | **201 ms** | 17 992 | **180 387** | **8 439 ms** |
+>
+> **The same binary, the same scenarios, and one arm's channels live 8.4 seconds on average against 1.7** — with a p90 of
+> eighteen seconds against five. That is the whole defect in one line of numbers, and it is independent of every tick
+> arithmetic and every instrument reading in this record.
+>
+> **And it also explains why the wedged arm retires half as many streams** (9 115 against 19 209 in the same wall time):
+> each one occupies its slot for five times as long, so the same offered load completes a third as much.
+>
+> **What remains is the question this record has failed to answer for a hundred and sixty rounds**: what makes one arm's
+> channels slow to finish. **Not** the pool (it refuses when full, honestly), **not** the carrier (delivers what it is given),
+> **not** the server (delivers and takes every channel), **not** the grace, **not** parked writers.
+
 > **§4.435 (§4.434's "163 abandoned opens" is most likely the 165 pool refusals, so it is not a new population).** The same
 > run measured **12 528 opens started and 12 363 finished — a gap of 165**, and the client logged **165** "every tunnel is at
 > its stream ceiling". Those opens **never became streams**: the pool refused them, so they hold no lease and no slot.
