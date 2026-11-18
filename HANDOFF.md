@@ -33,6 +33,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.467 (what the refusal path does not fix — and it is now the only thing left): both arms saturate identically.**
+> The two arms' stream lifetimes on the same soak, before and after:
+>
+> | | p50 | p90 | mean |
+> |---|---|---|---|
+> | p70 clean arm | 1 ms | 201 ms | **326 ms** |
+> | p70 wedged arm | 1 ms | 4 493 ms | 1 748 ms |
+> | **p75 both arms** | 1 ms | **7 066 / 7 731 ms** | **1 803 / 1 876 ms** |
+>
+> **The divergence is gone** — the two arms now measure the same thing, which is what an A/A run is supposed to show — **but
+> both sit where the wedged arm used to.** And the occupancy is 56 on both, with `live_gt_60s` only 3, so ~53 streams are
+> ten to sixty seconds old on a workload whose requests take milliseconds.
+>
+> **The mechanism is a feedback the old stall was hiding**: a refused visitor used to occupy its pairing for five seconds, and
+> that stall *was* the backpressure. Making the refusal instant removes the stall, so the churn loop cycles faster, offers
+> more concurrent work, and the pool saturates harder — the ceiling line fires 392 times where it fired once.
+>
+> **So the refusal path is right and insufficient**: it removes a five-second stall and an unbounded wedge (worst 175 s → 10.9 s)
+> while removing the backpressure that kept the pool under its ceiling. **Explicit admission is the missing piece** — refusing
+> the visitor at the listener when the pool cannot serve it, instead of accepting and then failing fast.
+
 > **§4.466 (the refusal path works, measured): the five-second stall is gone.** With both halves in (`9098125`, `9983658`), a
 > soak whose arms both run the refusal path:
 >
