@@ -33,6 +33,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.472 (three attempts at the 35 held streams, all ineffective — stopped by the rule).** The rule is three failed attempts on
+> one problem: stop, write it down, move on. What was tried and what it proved:
+>
+> | attempt | result |
+> |---|---|
+> | drop queued channels whose group was abandoned (`dead` + `bury`) | 7/4 unchanged |
+> | make a refusal shed the visitor | 7/4 unchanged (and worse in the soak) |
+> | abandon the gather when the visitor's socket reads EOF | 7/4 unchanged |
+>
+> **And the counts from the failing case say why**: 73 `pairing asked for a data channel`, **36 `pairing budget expired`**, and
+> **zero** refusals and **zero** give-ups. So the gathers *are* timing out, repeatedly, and never reach `PAIR_ATTEMPTS`; the
+> client never refuses; and `ReleaseStripedGroup` is never sent — hence no release and 35 parked streams.
+>
+> **The one fact that is not yet explained**: 36 budget expiries across 73 asks means fewer than `PAIR_ATTEMPTS` per group, so
+> **a group gives up only after a wait the test does not reach** — the pairing is patient by design and the test expects the
+> pool back in fifteen seconds. Whether that is a defect or a test that encodes a stricter promise than the code makes is now
+> the question, and it is the user's call: it predates this work, and every guess at it has cost a round without moving the
+> count.
+
 > **§4.471 (the release never happens at all).** Running the failing case alone with `RUST_LOG=molehill=debug` and grepping for the
 > release line gives **zero** `released stripe group … (N parked stripes)` lines — over the whole test. So `ReleaseStripedGroup`
 > either never reaches the client or reaches it for a service the client cannot find; either way **the parked stripes are never
