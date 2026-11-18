@@ -35,7 +35,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.440 (the clause is named): `peer_fin`.** The sweep's diagnostic fired with exactly one line, and it says everything:
+> **§4.441: the fin frame is not filtered — it is deferred, and the deferral can last forever.** Reading the receiver: `peer_fin`
+> is set by an **unguarded** `if fin { … }` (conn.rs:3832) — it runs for every frame carrying the flag, duplicates included. So
+> the client's `peer_fin = false` means **no fin frame ever arrived**, not that one was dropped.
+>
+> **Which moves the question to why the peer never sent one.** On the sending side the fin is emitted from a condition —
+> `local_fin && !fin_sent && send.unacked() == 0` (conn.rs:1656, 1681) — so a stream whose outbound bytes are never
+> acknowledged **holds its fin indefinitely**, while `local_fin` is already true and its close log says so.
+>
+> **That is the last link and it fits every number**: the server's close line shows `local_fin=true` (§4.426) because it
+> *decided* to finish; the client never sees a fin because the **fin packet was never emitted**; the entry then waits for a
+> `peer_fin` that cannot arrive, and the sweep cannot retire it.
+>
+> **The check is one line on the server**: at close, log `fin_sent` beside `local_fin` and `unacked`. A stream that closes
+> with `local_fin=true, fin_sent=false` is the defect, and the fix is to send the fin **as soon as the application has
+> finished**, not behind an acknowledgement of data the peer will never read.
+
+> **§4.440 (the clause is named: `peer_fin`) The sweep's diagnostic fired with exactly one line, and it says everything:
 >
 > ```
 > mhd finished stream kept by the sweep  local_fin=true  peer_fin=false  unacked=0  pending=0
