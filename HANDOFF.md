@@ -35,6 +35,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.433: the clean arm's tick count is exactly the harness's persistent connections.** Converting the two-second read ticks
+> back into streams (≈600 ticks per stream per twenty-minute run): the **clean** arm's 14 557 is about **24** streams, which
+> is exactly `rr-16`'s 16 persistent sockets plus the bulk stage's handful. The **wedged** arm's 36 765 is about **61** — the
+> same 24 plus roughly **32 that the harness did not open and does not hold**.
+>
+> **So the extra thirty-odd idle visitors are the tool's own**, and they are churn's: the probe closed its side and the tool
+> kept a socket open. That is not a stream-table question at all — the table is a consequence — it is **the client's local
+> listener not closing an accepted connection when its forwarder ends**.
+>
+> **The next measurement is the visitor socket's own lifetime on the client**: `accept` → the moment the fd is dropped, per
+> connection, one line each. If those 32 show an accept without a drop until minutes later, the defect is found and it is in
+> the listener, not in `Conn`.
+
 > **§4.432: the send loop is waiting on a silent-but-open visitor, tens of thousands of times.** The send loop already has a
 > two-second read deadline (`stripe.rs:502`) with its own line: a soak logged **14 557** of them on the clean arm and
 > **36 765** on the wedged one. So `src.read_buf` returns nothing for two seconds, repeatedly — the visitor is **open and
