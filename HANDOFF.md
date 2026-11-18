@@ -13,6 +13,33 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **CLOSING STATE (20 rounds of this goal, defect still open, finalisation NOT written).**
+>
+> **The defect is one interval, and it is now bounded on both sides.** A churn stream lives **8.4 s on the arm that wedges
+> against 1.7 s on the one that does not** (`mhd stream retired age_ms`, §4.436), while the request it serves takes
+> milliseconds. The new `closed_ms` field — the wait *after* both directions finished — reads **0–6 ms (§4.445)**. So the
+> whole eight seconds are spent **before the stream closes**: waiting for the peer's fin.
+>
+> **Everything else in the chain is measured and clean**: request → client 122 µs; task scheduled 6 µs; the pool refuses
+> honestly when full (165 refusals = the gap of unfinished opens); the server creates 13 874 streams, delivers 13 873, takes
+> 13 871; both ends log every channel's source EOF (9 099 vs 9 108); the echo backend closes when its peer closes; no grace
+> ever runs (0) and no writer ever parks (0).
+>
+> **Seven fixes were written, gated and reverted** because none moved the wedge: per-attempt group (kept — a real defect,
+> product arm 0 expiries), the early-cut grace, the both-fins retirement in `reap_abandoned`, the same predicate on the
+> pump's one-second tick, the fin sent without waiting for its acknowledgement, the periodic retire of never-used streams,
+> and the stale-claim refusal (kept, correct, not this defect).
+>
+> **The one measurement left** is the server's own half of that interval: **the time between its `recv_loop` seeing the
+> client's fin and its `send_loop` ending** — i.e. how long the server takes to close toward the echo and send its fin back.
+> One timestamp pair on the server's close path, one run, and the hop that never prints names the defect.
+>
+> **Four instruments are in place and worth keeping**: `live_gt_1s/10s/60s` (the only uncensored occupancy reading),
+> `closed_ms` (the post-close wait), the sweep's clause diagnostic, and `mhd stream retired age_ms`.
+
+## 0b. Where this file used to start
+
+
 > **CLOSING STATE of the second goal (37 of 40 rounds used, defect still open, finalisation NOT written).**
 >
 > **What is closed** — the whole chain is measured end to end, with a number at every link:
