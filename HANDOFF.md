@@ -86,7 +86,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.455 (the mechanism the empty channels point at: an incomplete group holds its stripes for a minute).** `stripe.rs:204`
+> **§4.456 (the gather is not the delay, and the empty channels are requests that were never forwarded).** Two readings on the
+> same arm settle it:
+>
+> - **12 859 of 12 966 groups are single-stripe** (only 107 have more than one), so a gather cannot be what makes a request
+>   wait — there is nothing to gather.
+> - **12 887 groups started and 12 887 finished**, and the registry never had to drop an incomplete one.
+>
+> **So the TTL of §4.455 is not what holds these channels** (that entry is withdrawn as an explanation), and what is left is the
+> original shape with nothing removed: **a visitor is accepted, its channel opens, not one frame is forwarded, and one to five
+> seconds later the visitor closes.** One to five seconds is the probe's own timeout, so **these are the requests the probe
+> gave up on** — the tool accepts them and never forwards a byte.
+>
+> **That is the defect in one sentence, and it is the one this record started from**: *a request that arrives is not
+> forwarded*. Every other measurement in this goal — occupancy, wedges, refusals — follows from it.
+
+> **§4.455 (withdrawn as an explanation: see the two readings below): an incomplete group holds its stripes for a minute).** `stripe.rs:204`
 > — `STRIPE_GROUP_TTL = Duration::from_secs(60)`: *"how long an incomplete group's stripes are parked before the registry
 > drops them. A completed gather takes milliseconds; an entry that stays incomplete this long belongs to a server-side gather
 > that was abandoned"*.
