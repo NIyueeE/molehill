@@ -60,6 +60,15 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.493 (the valve is correct on the server; the second entry is the client's own).** `do_v4_tunnel` reserves through
+> `reserve_tunnel(&registry, &nonce, max_tunnels)` and, on `TunnelSlot::OverCap { held }`, logs the cap and answers
+> `refuse_tunnel(&mut conn)` — **a refusal, not a failure, and the session survives** (`server.rs:1756`–1775). So the operator's
+> valve does what its documentation says.
+>
+> **Which leaves the client**: its pool carries an entry for the tunnel it dialed and had refused, and that entry answers
+> `is_alive() == true` — that is why pruning changed nothing. **A refused tunnel is not a live tunnel**, and marking it dead on the
+> refusal is the next fix, small and testable against these three assertions.
+
 > **§4.492 (the pool really reports two live tunnels under a valve of one — and pruning dead entries does not change it).**
 > `PoolSnapshot.size` is `state.entries.len()` (`multiplex.rs:1991`), and the failing assertion reads `size: 2, count: 2` against
 > `[server.data].max_tunnels = 1`. Making `size()` prune entries whose tunnel is not alive **changed nothing** (still 8 passed,
