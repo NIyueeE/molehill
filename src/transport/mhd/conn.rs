@@ -3193,6 +3193,37 @@ impl Conn {
             .unwrap_or(0)
     }
 
+    /// Retire every stream that is finished in both directions and has nothing left to
+    /// hand its reader.
+    ///
+    /// **This has to run on a timer, not on an event.** `settle` is the only other place a
+    /// stream leaves the table and it runs when something happens; a stream whose last
+    /// event was the peer's fin has no further event to visit it, so it sat until the
+    /// lane's five-minute idle cut. Measured: a stream lived 8.4 seconds on the arm that
+    /// wedged against 1.7 on the one that did not, and both ends had closed every
+    /// channel (`HANDOFF.md` §4.438–§4.439).
+    pub(crate) fn retire_finished(&mut self) -> usize {
+        let finished: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, state)| {
+                !state.abandoned
+                    && state.local_fin
+                    && state.peer_fin
+                    && state.send.unacked() == 0
+                    && state.recv.pending() == 0
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in &finished {
+            self.streams.remove(id);
+            self.stream_opened.remove(id);
+            self.finishing.remove(id);
+            tracing::debug!(stream = id, "mhd finished stream retired by the sweep");
+        }
+        finished.len()
+    }
+
     /// The acknowledgement frontier this end advertises: `(largest, below)`.
     pub(crate) fn ack_frontier(&self) -> (u32, u32) {
         self.acks.frontier()

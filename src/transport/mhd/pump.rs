@@ -883,6 +883,11 @@ pub(crate) fn spawn(
                 let now = std::time::Instant::now();
                 let n = shared
                     .with(|conn| conn.starved_streams(now, std::time::Duration::from_secs(1)));
+                // A stream both directions have finished has nothing left to wait for, and
+                // no event will come back for it (`HANDOFF.md` §4.439).
+                shared.with(|conn| {
+                    conn.retire_finished();
+                });
                 crate::transport::stats::note_starved_streams(n);
             }
             let flushing = std::time::Instant::now();
