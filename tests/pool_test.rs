@@ -355,6 +355,16 @@ const LOAD_STREAMS: usize = 56;
 /// here because the assertions below are about crossing it.
 const ENGINE_STREAM_CAP: usize = 64;
 
+/// How long the pool may take to give its streams back after a burst.
+///
+/// **Longer than the product's own cold-grow wait**, deliberately: an open against a
+/// saturated pool waits `pool::COLD_GROW_WAIT` (fifteen seconds) for a growth before it
+/// gives up, so a test window of fifteen seconds asked the pool to finish in the same
+/// instant its last waiter stopped waiting. Measured, such a burst settles in about
+/// seventeen seconds — which is exactly the fifteen plus the prologue, and it is why this
+/// assertion failed while nothing leaked (`HANDOFF.md` §4.491).
+const SETTLE_WINDOW: Duration = Duration::from_secs(30);
+
 /// The pool's own per-tunnel placement ceiling
 /// (`transport::pool::TUNNEL_STREAM_CEILING`), repeated for the same reason:
 /// the burst scenarios drive the pool up to it, and the two are deliberately
@@ -855,7 +865,7 @@ async fn a_saturated_pool_still_serves_the_next_visitor() -> Result<()> {
     // (measured: 2.83-3.13 s against 47.6-47.8 ms once the tail had run), which
     // is why the question below is asked repeatedly rather than once.
     drop(held);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + SETTLE_WINDOW;
     loop {
         if molehill_rathole::live_pools()
             .first()
@@ -1393,7 +1403,7 @@ async fn echo_visitor(conn: &mut TcpStream) {
 async fn wait_for_pool(
     this_pool: impl Fn() -> Option<molehill_rathole::PoolSnapshot> + Copy,
 ) -> molehill_rathole::PoolSnapshot {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + SETTLE_WINDOW;
     loop {
         if let Some(pool) = this_pool()
             && pool.size == pool.count
