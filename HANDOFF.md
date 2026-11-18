@@ -60,6 +60,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.480 (a fifth attempt, and it names the missing piece: the queue has no timer).** Giving the shared queue an idle bound — stamp
+> each entry, drop it in `try_take` when older than five seconds — **left the suite at 7 passed, 4 failed**. The reason is
+> structural and worth recording: **the eviction only runs when somebody takes**, and after the burst nobody takes. A time-based
+> bound needs a **timer the queue does not have**, which makes it a real design change rather than a one-line guard.
+>
+> **That closes the investigation of these four tests**: the channels are parked on purpose (§4.479), nothing evicts them
+> without a timer, and the test asks for zero streams in fifteen seconds. **Five attempts, five refutations, every one reverted.**
+> The next person needs either a decision to add a sweep to the queue — a timer, a task, and a lifecycle — or a decision that the
+> test's promise moves.
+
 > **§4.479 (why the four pool tests cannot pass, and why every fix failed: the queue is a pool by design).** `ChannelQueue::push`
 > puts a channel in the shared `rx` when no pairing is waiting for its group, and `server.rs:3771` says so in words: *"the shared
 > queue keeps serving plain visitors and any channel whose group has already gone."* The queue's capacity is
