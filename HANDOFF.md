@@ -35,7 +35,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.444: the close-to-retire gap cannot be joined from the log, and that is a finding too.** Joining `mhd stream closed`
+> **§4.445 (the bisection lands): `closed_ms` is nothing, so a stream's whole life is spent *before* it closes.** The new
+> field on the retirement line, on a run whose twin wedged five times:
+>
+> | arm | `closed_ms` mean | max | n |
+> |---|---|---|---|
+> | clean | **0 ms** | 211 | 19 676 |
+> | wedged | **6 ms** | 302 | 13 713 |
+>
+> **So once both directions have finished, the retirement follows within microseconds.** The eight seconds are **all spent
+> waiting for the peer's fin to arrive**, which is exactly the interval `age_ms` measures and `closed_ms` does not.
+>
+> **Which pins the last hop**: the client sends its fin, and the peer's fin comes back seconds later. Both ends log their
+> source's EOF (§4.439), so the frames leave — what is late is the **fin**, and the fin's own sender is the one place this
+> record already tested: `local_fin && !fin_sent && send.unacked() == 0` (§4.441). That condition was relaxed and the wedge
+> did not move (§4.442), so the delay is not the condition — it is **the fin's packet being lost and re-sent**, or the
+> acknowledgement of the client's fin never arriving on the server so the server never closes toward the echo.
+>
+> **The next measurement is one field on the server's close line**: the interval between its `recv_loop` seeing the client's
+> fin and its `send_loop` ending — the server's half of the chain, which no run has ever timed.
+
+> **§4.444 (the close-to-retire gap cannot be joined from the log), and that is a finding too.** Joining `mhd stream closed`
 > against `mhd stream retired` by stream id on the wedged arm gave a mean of **513 seconds** with a maximum of 972 — larger
 > than the run. **So the join is invalid**: stream ids are per lane and are reused, and the timestamps are printed to the
 > microsecond but compared to whole seconds. Any number produced that way is meaningless.
