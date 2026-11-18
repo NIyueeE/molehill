@@ -33,6 +33,10 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.463 (the tree at the end of this goal, verified).** On `47df18b`: **both clippy builds at 0 errors**, **410 lib tests pass**,
+> **`git status` clean**, `just interop` 3/3, `just l3-accept` PASS through its sudo entry point. The only red in the chain is
+> §4.461's advisory, which predates this branch's last dependency change.
+
 > **FINAL STATE OF THIS DEFECT (round 38 of this goal; supersedes the block below and every earlier closing note).**
 >
 > **One sentence**: when the client's stream pool is at its ceiling, **a channel request that is refused produces no event the
