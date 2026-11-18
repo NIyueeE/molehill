@@ -86,7 +86,21 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.449 (what the failed fix actually proves: the fin's condition is right, and the defect is the acknowledgement).**
+> **§4.450 (the fin never waits — so the eight seconds belong to the visitor's connection).** The new field on the fin line, on a
+> run whose product arm wedged **nine** times (worst 65 s): over **511** fin sends, `waited_ms` is **p50 0, p90 0, max 1**. The
+> fin goes out the instant the application finishes; `unacked` is already zero.
+>
+> **So §4.449 is wrong and is withdrawn**: the close is not waiting for an acknowledgement. With the fin immediate and
+> retirement 0–6 ms after the peer's fin (§4.445), and the server's own half 2 ms (§4.447), **every part of the close is
+> fast**. The only thing left that can take eight seconds is the one interval never questioned: **from the stream opening to
+> the visitor closing** — the visitor's own connection.
+>
+> **Which inverts the picture this record has carried for a hundred rounds.** The occupancy is not streams waiting to die;
+> it is **visitors staying connected for seconds** — and the churn probe is the one that opens and closes thousands of them.
+> The bench measures each request's round trip and finds milliseconds, so the extra seconds are spent **in the connection,
+> not in the exchange** — between the reply and the close, on the probe's side or in how this end sees it.
+
+> **§4.449 (what the failed fix actually proves; withdrawn by the reading below): the fin's condition is right, and the defect is the acknowledgement).**
 > Sending the fin before its data was acknowledged made streams live **ten times longer** (§4.448), and the only mechanism
 > that explains that is the one the condition exists for: **a fin that overtakes its data leaves the peer waiting for bytes
 > that then have to be retransmitted**, so the stream ends later, not sooner. **So `unacked == 0` is correct behaviour and
