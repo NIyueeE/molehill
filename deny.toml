@@ -37,4 +37,9 @@ yanked = "deny"
 # release. Re-evaluate when rand bumps its chacha20 requirement.
 ignore = [
   { crate = "chacha20@0.10.1", reason = "yanked upstream; no fix available through rand 0.10" },
+  # RUSTSEC-2026-0542: humantime is unmaintained because chrono is, and there is
+  # no safe upgrade. It arrives only through `console-subscriber`, behind the
+  # optional `console` feature, which is neither in the default set nor used by
+  # any release build — no shipped artifact carries it.
+  { id = "RUSTSEC-2026-0542", reason = "unmaintained transitive dep of the optional console feature; no fix exists and no release build enables it" },
 ]
