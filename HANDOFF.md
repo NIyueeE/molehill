@@ -60,7 +60,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
-> **§4.483 (the number that matches: 146 groups, 110 source EOFs, and 36 groups whose send direction never ended).** Counting the
+> **§4.484 (it is the failure path, not the grace: 36 send directions *failed*).** Counting how each direction ended in the same
+> failing case:
+>
+> ```
+> stripe group finished            146
+> stripe source ended: eof         110     ← the send direction ended cleanly
+> stripe send direction failed      36     ← …and these returned an error
+> half-close grace expired           0     ← the grace never ran at all
+> ```
+>
+> **So the 36 are send directions that returned an error, not ones the grace cut** — and the pool reports 35 streams held. §4.483's
+> grace hypothesis is refuted by the same run that produced it: the grace fires **zero** times.
+>
+> **The error path is therefore the one to read**: `spawn_inner` logs `stripe send direction failed` and then calls
+> `recv.abort()`. The question is what happens to the **stream the failed send direction owned** — whether dropping it returns the
+> lease, or whether something else still holds it (the group's `streams` vector, or a handle the aborted task was holding in a
+> shared structure). That is a two-minute read, and it is the last place the 35 can be.
+
+> **§4.483 (superseded: the grace never fires, the failure path does): 146 groups, 110 source EOFs, and 36 groups whose send direction never ended).** Counting the
 > group lifecycle in the failing case:
 >
 > ```
