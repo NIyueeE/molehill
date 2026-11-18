@@ -527,7 +527,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > **`git status` clean**, `just interop` 3/3, `just l3-accept` PASS through its sudo entry point. The only red in the chain is
 > §4.461's advisory, which predates this branch's last dependency change.
 
-> **WHERE THE WORK STANDS (this goal, after the pool fix).**
+> **MHD 定型 (wire 6.0, branch `feat/v1.0.0`) — written at the end of this goal, on evidence from this session.**
+>
+> **The gates are green, all of them, in this session**: `just check` end to end (410 lib tests, 11 pool tests, both clippy builds,
+> deny with **no waiver**, docs alignment, python gates, bench selfcheck); `just interop` **3/3**; `l3-accept` **PASS** through its
+> sudo entry point; `integration_test` **22/22**; the **step grid** 22 ms recovery with **0** SLO breaks and **0** wedges.
+>
+> **The defect this goal was opened for is closed and measured**: `live_gt_10s` **56 → 4**, the ceiling line **54 → 1**,
+> `wedge_count` **→ 0**, on **both** arms, with stream lifetimes at the clean arm's 337/342 ms and `pairing budget expired` at zero.
+> The mechanism was a refused channel open producing no event the server's gather could see (§4.460); the fix is
+> `SessionCmd::ChannelRefused` plus a 50 ms grace before the retry.
+>
+> **And one worse defect was found on the way**: **every mhd lane bypassed `[server.data].max_tunnels`** — the reservation happened
+> only on the rebuild path, so a lane's first establishment charged nothing (§4.497). One word fixed it, and the pool suite went from
+> 8 passed / 3 failed to **11 / 0**. The operator's valve had been inert for mhd lanes.
+>
+> **What is not claimed**: no release, no tag, no product-config change, and **the `full` sweep was not run to completion** — its
+> `step` scenario was run on its own instead (three rounds plus a warmup, 986.7 s), which is what the step numbers above come from.
+> The remaining scenarios of `full` (`timeline`, `capacity`, `soak`, `cost`, `reconnect`, the udp set) are the release ritual and
+> were last measured before this goal's changes.
+
+> **WHERE THE WORK STOOD BEFORE THE FINALISATION (kept as the working record).**
 >
 > **The defect §4.460 named is closed and measured** (`c9ac9a2`, §4.468): `live_gt_10s` **56 → 4**, the ceiling line **54 → 1**,
 > `wedge_count` **→ 0**, on **both** arms, with stream lifetimes back at the clean arm's 337/342 ms mean and `pairing budget
