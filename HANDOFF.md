@@ -60,6 +60,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.492 (the pool really reports two live tunnels under a valve of one — and pruning dead entries does not change it).**
+> `PoolSnapshot.size` is `state.entries.len()` (`multiplex.rs:1991`), and the failing assertion reads `size: 2, count: 2` against
+> `[server.data].max_tunnels = 1`. Making `size()` prune entries whose tunnel is not alive **changed nothing** (still 8 passed,
+> 3 failed), so both entries answer `is_alive()`.
+>
+> **So one of two things is true**, and both matter more than the pool tests:
+> - the valve admits a second multiplexed tunnel when it should refuse it — `server.rs:883` passes `shared.max_tunnels` into
+>   `do_v4_tunnel`, so the check exists and would then be bypassed or mis-counted;
+> - or `is_alive()` is stale for a tunnel the valve already refused, and the pool counts a peer it cannot use.
+>
+> **That is the next question, and it is a real one** — not a deadline, not a test's promise: a pool believing it has two tunnels
+> when the operator allowed one is exactly the kind of thing this whole line has been chasing. **The three failing tests are the
+> only instrument that has ever pointed at it.**
+
 > **§4.491 (the last four were a deadline equal to the product's own timeout — and three more remain, about the valve).** The settle
 > assertion was `Duration::from_secs(15)`, and **`pool::COLD_GROW_WAIT` is also fifteen seconds** (`pool.rs:49`, documented as
 > covering the slowest carrier's dial timeout): an open against a saturated pool waits exactly that long for a growth before it
