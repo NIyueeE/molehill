@@ -35,7 +35,17 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.441: the fin frame is not filtered — it is deferred, and the deferral can last forever.** Reading the receiver: `peer_fin`
+> **§4.442 (the fin fix is in and the wedge survives — reverted).** With `83d332e` in (send the fin as soon as `local_fin`, not
+> after `unacked == 0`), a soak read: product arm **0 wedges / 0 expiries / 1 ceiling line**, twin **6 wedges, 15.015 s, 54
+> expiries, opened_len 59, live_gt_10s 57**. So the wedge is unchanged and the change is **reverted** (`8a1aff3`), both
+> clippy builds green.
+>
+> **And the honest note it forces**: §4.441's evidence was **one diagnostic line, on the clean arm**. A single instance of
+> `local_fin=true, peer_fin=false` does not establish the wedging arm's cause — I read a clean-arm sample as if it were the
+> defect's fingerprint. That is the sixth time in this goal that a conclusion was drawn from one sample or one aggregate and
+> did not survive the next run.
+
+> **§4.441 (the fin frame is not filtered) — it is deferred, and the deferral can last forever.** Reading the receiver: `peer_fin`
 > is set by an **unguarded** `if fin { … }` (conn.rs:3832) — it runs for every frame carrying the flag, duplicates included. So
 > the client's `peer_fin = false` means **no fin frame ever arrived**, not that one was dropped.
 >
