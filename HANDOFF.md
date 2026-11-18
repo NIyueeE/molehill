@@ -33,6 +33,26 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.473 (the numbers pin it precisely, and the fourth investigation is where this stops for now).** Counting the real give-up
+> line (not just the new refusal one) on the failing case:
+>
+> ```
+> pairing asked for a data channel   73
+> pairing budget expired             36
+> No data channel after N requests    0     ← the give-up never runs
+> released a stripe group             0     ← so nothing is ever released
+> ```
+>
+> `PAIR_ATTEMPTS` is **2** (`server.rs:119`) and `PAIR_WAIT_BUDGET` is 5 s, so a group that expires **twice** sheds and sends
+> `ReleaseGroup` — which maps to `ControlChannelCmd::ReleaseStripedGroup` (`server.rs:3016`). **36 expiries with zero give-ups
+> means no group ever expired twice inside the test's window**, so the pairings are still waiting when the 15 s deadline fires,
+> their parked channels with them.
+>
+> **That is why all three fixes were ineffective**: they changed *what happens when a group is abandoned*, and the problem is
+> that **abandonment never happens**. The next question is therefore not "who holds the 35" but **"why does a group expire
+> only once per fifteen seconds"** — and the candidates are the two ways the wait can be restarted or the pairing not polled at
+> all, which needs a per-group timeline rather than another global count.
+
 > **§4.472 (three attempts at the 35 held streams, all ineffective — stopped by the rule).** The rule is three failed attempts on
 > one problem: stop, write it down, move on. What was tried and what it proved:
 >
