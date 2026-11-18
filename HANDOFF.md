@@ -60,6 +60,19 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >
 > **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
 
+> **§4.497 (THE VALVE BUG, FIXED: an mhd lane's first establishment never charged the cap).** `server.rs:2630` registered a lane
+> under `else if claimed_registered` — **the rebuild path only**. A lane's *first* hello took the `else` branch, which reserved
+> nothing, so `[server.data].max_tunnels` never saw it: with the valve at one, a TCP tunnel plus an mhd lane gave **two pool
+> tunnels and zero refusal lines**, exactly as §4.495/§4.496 measured.
+>
+> **The fix is one word** — `else if claimed_registered` became `else`, so every registration reserves, and the debug line that
+> explains the rebuild case is now conditional on it. **The pool suite went from 8 passed and 3 failed to 11 and 0, and
+> `just check` is green end to end for the first time in this goal.**
+>
+> **What it means**: the operator's valve — the knob that bounds how many carrier connections a client may hold — was **bypassed
+> by every mhd lane**, and it took three integration tests failing for a pre-existing reason to find it. **That is the single most
+> valuable thing this goal produced**, and it came from refusing to accept the three failures as "a test's promise".
+
 > **§4.496 (the valve never refused anything in that test — the second tunnel did not go through it).** The arithmetic is right:
 > `try_reserve` refuses when `held >= cap` (`server.rs:238`), so with `max_tunnels = 1` the second reservation must come back
 > `OverCap` and be answered with `refuse_tunnel`. **Counting the refusal lines in the failing test gives zero**: neither
