@@ -86,6 +86,21 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.453 (the parked-writer reading is sound: the lane never made a writer wait).** `mhd stream writer parked for the first time`
+> sits at the top of `poll_write`, immediately before it returns `Pending` for the first time on a stream (`lane.rs:567`–575),
+> and its companion line (`writer was parked`, `parked_us`) prints when the write resumes after ≥ 20 ms. **Neither fires.** So
+> `poll_write` never returned `Pending`: **the lane's write path is not the blocker**, and §4.421's exclusion stands on
+> inspection, not just on a count.
+>
+> **Which leaves the send loop inside `read`** — where a FIN that has arrived wakes it at once. So either the FIN really is
+> late on the wire, or those 1–5 s groups **are not churn at all**: the soak also runs bulk stages, and a bulk stream living
+> one to five seconds is a transfer, not a leak.
+>
+> **That ambiguity has to be removed before anything else is concluded from §4.451**, and the way to remove it is to tag the
+> probe: `stripe source ended: eof` carries `group` but not the scenario, so the pairing cannot say which stage a long
+> connection belongs to. **One field — the stage or the scene name — on the group's own line** settles it without another
+> guess.
+
 > **§4.452 (the probe closes immediately, so the delay is on this end's side).** `series.run_churn` calls `ping(target, size)`,
 > which is a `with socket.create_connection(...)`; the socket closes when `ping` returns and `setup_ms` measures everything up
 > to that return. **So a probe that records milliseconds cannot be holding a connection open for seconds** — the FIN is on
