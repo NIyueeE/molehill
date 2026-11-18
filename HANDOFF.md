@@ -86,6 +86,25 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
+> **§4.447 (split by group lifetime, the anomaly disappears and the server is exonerated).** Groups that live under a second
+> are the churn's; splitting the same log on that:
+>
+> | arm | churn groups | mean |recv − send| | max |
+> |---|---|---|
+> | clean | 14 399 | **1.6 ms** | 954 ms |
+> | wedged | 19 567 | **2.0 ms** | 954 ms |
+>
+> **Two milliseconds on both arms.** So §4.446's 1 279 ms was the **bulk** stages after all (a long transfer's two directions
+> legitimately end seconds apart), and **the server closes a churn channel as promptly as it serves one**.
+>
+> **Which removes the server from the chain for good.** With it gone, the eight seconds a churn stream lives are between the
+> **visitor's EOF** (logged, and prompt) and the **peer's fin arriving** — and the only step in between that can take seconds
+> is the client's own fin: it is emitted from `local_fin && !fin_sent && send.unacked() == 0` (§4.441).
+>
+> **That condition was relaxed once (§4.442) and the wedge count did not change — but the wedge count was the only thing read
+> from that run.** What was never compared is the *lifetime*: `mhd stream retired age_ms` on an arm with the relaxed condition
+> against one without. That is the measurement to redo, and it needs one run and no new code.
+
 > **§4.446 (first reading of the direction stamps): it does not say what I expected.** `stripe group directions ended` carries
 > `send_ms` and `recv_ms`, both relative to the group's start. On a run whose twin wedged **once** (10.01 s) against a clean
 > product arm: mean |recv − send| is **1 279 ms on the clean arm and 79 ms on the wedged one** — the wrong way round.
