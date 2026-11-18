@@ -33,6 +33,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.469 (the four failing pool tests are older than the refusal path, and one attempt at them is reverted).** Running the
+> same suite on `f4de640` — the commit **before** any of this work — gives the identical result: **7 passed, 4 failed**. The
+> failures are `a_saturated_pool_still_serves_the_next_visitor`, `a_valve_held_pool_still_never_reaches_the_stream_cap`,
+> `one_unanswerable_visitor_does_not_park_the_service` and `the_server_tunnel_valve_refuses_a_startup_establishment`, all
+> reporting the same thing: **one tunnel holds 35 streams after a burst of `ENGINE_STREAM_CAP + 8` visitors has gone**, against
+> a pool held at a single tunnel by the valve.
+>
+> **An attempt to fix it by dropping orphan channels was written and reverted**: `ChannelQueue` grew a `dead` set and `bury()`,
+> and `try_take` dropped any channel whose group had been abandoned. It changed the failing count not at all (still 7/4), so
+> the 35 are **not** queued orphans of abandoned groups — they are held somewhere else, and the next step is to find which
+> component holds them (the client's parked stripes for a released group is the first candidate, since
+> `ReleaseStripedGroup` is the message the server sends when it gives up).
+>
+> **Both changes that do matter are in and measured**: the refused-open event (§4.466) and its retry-after-a-short-grace form
+> (§4.468, `c9ac9a2`).
+
 > **§4.468 (THE DEFECT IS CLOSED — every criterion met on both arms).** Third run, with the refusal costing the *attempt*
 > rather than the visitor (`3b89641`):
 >
