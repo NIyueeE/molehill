@@ -86,7 +86,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.458 (the wait is `stripes.register`, and it is before the forwarder exists).** The client's path is `client.rs:1922`:
+> **§4.459 (correction before any code moves: the client has no visitor socket, so `frames=0` means the backend never wrote).**
+> Reading `client.rs:1922` again without assuming: when the group completes the client makes **one local connection** to
+> `done.local_addr` — the **service's** address — and that connection is the group's *source*. So on the client,
+> `stripe source ended: eof` is the **backend** closing, and `frames` counts **backend → server** bytes.
+>
+> **Which means `frames = 0` on those 1 735 groups says the backend never sent a byte** — because the request never reached
+> it. The visitor is not held on the client at all; it is held on the **server**, which has the public listener.
+>
+> **So §4.458's "the wait is `stripes.register`" is withdrawn as the location of the visitor's wait**: the register is on the
+> client's side of the tunnel and produces the *backend* connection, not the visitor's. The empty groups are the downstream
+> symptom of a request that never made it across, and the place to look is the server's own path from its accepted visitor to
+> the group it is gathering.
+>
+> **This is the correction that matters more than a fix**: changing the client's register on the model in §4.458 would have
+> been a change to the wrong end of the wire.
+
+> **§4.458 (withdrawn as the location of the visitor's wait; see the correction below), and it is before the forwarder exists).** The client's path is `client.rs:1922`:
 > the server sends `StartForwardStripedTcp`, `stripes.register(group, index, count, …)` returns `Some(done)` **only when the
 > last stripe of the group has arrived**, and only then is the local connection made and `spawn_group_tagged` called.
 >
