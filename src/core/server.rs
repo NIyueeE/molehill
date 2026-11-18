@@ -95,6 +95,14 @@ const CHAN_SIZE: usize = 2048; // The capacity of various chans
 /// the accept loop, which stalls the whole service (see `serve_tcp_visitor`).
 const PAIR_WAIT_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long a gather waits before re-asking after a **refused** channel.
+///
+/// A refusal is the pool saying it has nothing now, so the retry must not be
+/// instantaneous: a saturated pool would be asked again and again, and every
+/// attempt parks a channel (`HANDOFF.md` §4.469). Two orders of magnitude under
+/// the budget it replaced, which is the part that mattered.
+const PAIR_RETRY_GRACE: Duration = Duration::from_millis(50);
+
 /// How many `PAIR_WAIT_BUDGET` waits one visitor gets before it is shed.
 ///
 /// **Two tries is 10 s**, and it is a latency bound rather than a patience one.
@@ -4686,10 +4694,9 @@ where
                 _ = stops.shutdown.recv() => None,
                 _ = stops.control.changed() => None,
                 // A refused channel costs **this attempt**, not the visitor: it is
-                // the one failure the gather can see without waiting, so the retry
-                // that a budget expiry pays five seconds for can start at once
-                // (`HANDOFF.md` §4.460). Shedding the visitor here instead made every
-                // transient refusal fatal, which cost more visitors than the wait did.
+                // the one failure the gather can see without waiting, so the retry a
+                // budget expiry pays five seconds for can start after a short grace
+                // (`HANDOFF.md` §4.460, §4.469).
                 () = data_ch_rx.refused(group) => {
                     attempts += 1;
                     debug!(
@@ -4697,7 +4704,7 @@ where
                         attempts,
                         gathered = gathered.len(),
                         stripe_count,
-                        "a channel of this group was refused; retrying at once"
+                        "a channel of this group was refused; retrying"
                     );
                     if attempts >= PAIR_ATTEMPTS {
                         debug!("Refused {attempts} times; dropping the visitor");
@@ -4706,6 +4713,10 @@ where
                         let _ = data_ch_req_tx.send(DataChannelRequest::ReleaseGroup(group_bytes));
                         return Ok(false);
                     }
+                    // The refusal says the pool had nothing **now**, not that it never
+                    // will: re-asking at once spins a saturated pool and leaves a
+                    // channel parked per attempt. Short next to the budget it replaces.
+                    time::sleep(PAIR_RETRY_GRACE).await;
                     if ask_missing(data_ch_req_tx, group_bytes, stripes, gathered.len())? {
                         return Ok(true);
                     }
