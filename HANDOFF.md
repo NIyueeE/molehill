@@ -33,6 +33,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > already carries precedent (`chacha20@0.10.1`). **Choosing between those is a project decision, not a defect fix**, so it
 > goes to the user rather than into this session.
 
+> **§4.474 (regressions after the pool fix: integration green, stage profile clean, `step` grid still to run).**
+>
+> | gate | result |
+> |---|---|
+> | `cargo test --test integration_test` | **22 passed** |
+> | `cargo test --lib` | **410 passed** |
+> | both clippy builds | **0 errors** |
+> | `cargo deny check` | **all ok**, no waiver |
+> | `just interop` / `just l3-accept` | 3/3 and PASS (through the sudo entry point) |
+> | `cargo test --test pool_test` | **7 passed, 4 failed** — pre-existing, §4.473 |
+> | `just bench run --profile stage --arms molehill --aa` | **completed**, 12 samples in 389.7 s, no SLO or drift verdict raised; one noise note (`cost|run rtt_samples` resolves 0.2 % against a 0 % floor) |
+>
+> **`step` is a scenario, not a profile** — `--profile step` is refused with the profile list (smoke, dev, full, stage, soak, screen, nobulk, carrier, sweep). The step grid (`step_recovery_ms`) therefore needs a **full** run, which has not been done since the pool fix.
+
 > **§4.473 (the numbers pin it precisely, and the fourth investigation is where this stops for now).** Counting the real give-up
 > line (not just the new refusal one) on the failing case:
 >
