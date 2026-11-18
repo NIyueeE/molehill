@@ -35,7 +35,20 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > second × any plausible hold). So hundreds of streams are charged that the workload does not need, and **every
 > aggregate that could have shown them was censored** (§4.409, §4.411: `held_*` counts *completed* leases).
 >
-> **§4.437: the five seconds are *after* the exchange, not during it.** The churn probe measures its own request end to end and
+> **§4.438 (the interval is bounded on both sides now): the visitor's EOF *is* seen, and the retirement follows it seven seconds
+> later.** The forwarder already logs its EOF (`stripe source ended: eof`, `stripe.rs:521`) and the counts match the
+> retirements almost exactly — clean arm **19 196 vs 19 209**, wedged arm **9 099 vs 9 115**, the handful of difference being
+> the lane root and long-lived channels.
+>
+> **So every stream does learn that its visitor has gone.** The seven seconds are therefore **after** that EOF: the send
+> direction finished, `sender.finish()` went out, and the stream waited **seven seconds for the peer's fin** — a round trip
+> that should be milliseconds.
+>
+> **That names the last interval exactly**: client fin → server receives it → server closes toward the echo → echo EOF →
+> server sends its fin → client receives it. **Seven seconds for that chain is the defect**, and each hop has a line except
+> the transition from the server's `recv_loop` seeing the fin to its `send_loop` sending one.
+
+> **§4.437 (the five seconds are *after* the exchange, not during it)** The churn probe measures its own request end to end and
 > records `setup_ms` — a median of milliseconds and a p99 near one second in earlier runs — while the stream that carried it
 > lives **8.4 seconds on average** on the wedged arm. **So the stream outlives the request it served by about seven
 > seconds**, and that interval is the one thing this defect is.
