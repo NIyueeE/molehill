@@ -13,6 +13,49 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.505 (the pool's carrier choice, judged — and the cell the objective named cannot answer the half it was asked for).**
+> **The judgement, on the mixed `cost` cell the objective names** (two rounds, each run's own A/A twin, the condition on
+> the leg the carrier crosses, nothing pinned, only `MOLEHILL_DATA_CARRIER` distinguishing the two baselines):
+>
+> | `cost` | bulk Gbit/s | rtt p50 | rtt p99 | p99 range |
+> |---|---|---|---|---|
+> | `loss1`, pinned mhd | **2.632** | 41.4 ms | 98.5 ms | 97–104 |
+> | `loss1`, the pool's own choice | 2.081 | 41.2 | **90.5** | 41–95 |
+> | `loss1`, pinned tcp | **5.876** | 56.8 | 246.6 ms | 150–292 |
+> | `loss5`, pinned mhd | 0.482 | 404.7 | 1 194 ms | 401–1 448 |
+> | `loss5`, the pool's own choice | 0.522 | **401.7** | 1 437 | 401–1 505 |
+> | `loss5`, pinned tcp | 0.480 | 633.4 | 2 606 ms | 1 756–2 948 |
+>
+> **The latency half is met on both conditions**: the pool's own choice tracks the datagram carrier (98.5 → 90.5 ms at
+> 1 % loss; 404.7 → 401.7 ms at 5 %) and not the kernel one (246.6 and 633.4 ms). **The throughput half is not, and the
+> cell cannot deliver it**: every bulk channel in `cost` is opened in the stage's first instant, before any megabyte has
+> been carried, so the class does not exist yet when they are placed and no policy could have moved them. The 2.08 against
+> 2.63 is that, not a regression — and at 5 % loss all three arms collide at 0.48–0.52 because the shaper dominates.
+>
+> **So the throughput half was judged on the cell that can express it**: two bulk cells in one session, the same service,
+> back to back — `bulk-1` then `bulk-n`, three rounds:
+>
+> | one session, `loss1` | `bulk-1` | `bulk-n` |
+> |---|---|---|
+> | pinned mhd | 0.727 | 2.189 |
+> | **the pool's own choice** | 0.713 | **5.876** |
+> | pinned tcp | 2.168 | 7.684 |
+>
+> The first cell rides the datagram carrier because there is no evidence yet — the conservative prior doing exactly what it
+> is for — and the second, whose channels are placed after the first has carried its gigabytes, carries **2.7× what the
+> datagram carrier manages and 76 % of the pure kernel-carrier rate**.
+>
+> **What this means for the objective's own wording**: "the interactive p99 stays at mhd's level while bulk throughput moves
+> to TCP's" is true, but not in one cell. The p99 half is `cost`'s; the throughput half needs a service whose channels are
+> opened *after* its class is known, which in this model is a second bulk cell in the same round. **The measurement was
+> corrected, not the claim.**
+>
+> **Two quality items recorded rather than hidden.** Convergence churns: each step adds a spare and trims one tunnel of the
+> over-represented carrier, so reaching a 3-of-4 split costs three dials and waits for three idle tunnels (measured: three
+> cycles in `cost`, six seconds in a quiet pool). And `cost`'s p99 at 5 % loss spans 401–1 505 ms across four samples, so
+> the 1 437 against the pinned arm's 1 194 is inside that cell's own scatter — this cell cannot resolve a latency difference
+> at that condition, which is why §4.500's latency claims were made on the `rr` cells.
+
 > **§4.504 (the pool now decides a carrier per service, from what it carried — and its actuator is one slot short).**
 > **The rule.** A service is **conversational** or **bulk**, read from what its channels moved: a channel reports one
 > observation per megabyte it crosses (bulk) and one when it ends below 64 KiB (an exchange). Eight observations make a
