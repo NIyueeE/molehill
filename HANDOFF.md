@@ -527,6 +527,30 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > **`git status` clean**, `just interop` 3/3, `just l3-accept` PASS through its sudo entry point. The only red in the chain is
 > §4.461's advisory, which predates this branch's last dependency change.
 
+> **§4.499 (the carrier's case, measured: it loses on a clean path, ties under loss, and leads under jitter).** Same build, same host,
+> `MOLEHILL_DATA_CARRIER` pinning one carrier per run, three rounds each; the clean batch is §4.498 (four scenarios), the impaired
+> batches are three scenarios with `--condition loss1` and `--condition jitter` on the visitor leg (1186 s, 1185 s, 1516 s, 1516 s).
+>
+> | scenario · metric | clean mhd / tcp | loss1 mhd / tcp | jitter mhd / tcp |
+> |---|---|---|---|
+> | bulk-1 throughput (Gbit/s) | 3.51 / **4.90** | 3.35 / 3.62 | **3.44** / 3.24 |
+> | bulk-1 CPU per Gbit (s) | 0.76 / **0.48** | 0.77 / **0.46** | 0.77 / **0.48** |
+> | rr-1 rate (req/s) | 6 278 / **10 213** | **40.7** / 39.5 | 24.7 / 24.6 |
+> | rr-1 rtt p50 (ms) | 0.147 / **0.088** | 20.70 / 20.69 | **40.31** / 40.76 |
+> | rr-1 rtt p99 (ms) | 0.187 / **0.121** | 245.2 / 246.7 | **57.47** / 57.57 |
+> | rr-16 rate (req/s) | 22 305 / **27 631** | 603 / 614 | 394.2 / 394.4 |
+> | rr-16 rtt p50 (ms) | 0.645 / **0.518** | 20.42 / 20.57 | 40.53 / 40.51 |
+> | rr-16 rtt p99 (ms) | 1.673 / **1.363** | 246.1 / 245.9 | 57.69 / 57.67 |
+>
+> **Reading it honestly**: on a clean loopback TCP is ahead everywhere. **Under 1 % loss the two converge to the impairment's own floor**
+> (p50 ≈ 20.7 ms, p99 ≈ 246 ms on both) and the carrier stops mattering — the interactive rate is a dead heat (40.7 against 39.5).
+> **Under jitter mhd leads**: bulk **+6 %** (3.44 against 3.24 Gbit/s), interactive p50 40.31 against 40.76 and p99 57.47 against
+> 57.57, with the sixteen-connection rate equal (394.2 against 394.4).
+>
+> **So the carrier's reason to exist is real but narrow**: it never loses when the path is impaired, ties under loss,
+> and its advantage under jitter is a few percent — while it costs **2.1–3.4× the CPU** and **3× the RSS** on every path, clean or not.
+> That is the honest summary, and it is the first time this repository has it measured in one batch across three conditions.
+
 > **§4.498 (mhd against TCP, same build and host, one batch): TCP is ahead on every axis on a clean loopback path.** Both runs use the
 > `dev` profile's four scenarios, three rounds, one arm (`molehill`), with `MOLEHILL_DATA_CARRIER` pinning one carrier per run — the
 > switch the bench documents for exactly this. 190.1 s and 155.7 s, 32 samples each.
