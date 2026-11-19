@@ -1226,6 +1226,43 @@ struct TunnelPoolInner {
 }
 
 impl TunnelPoolInner {
+    /// The extra tunnel the mix may hold while it converges on the short
+    /// carrier, if it is owed one.
+    ///
+    /// **Why a spare and not a drain.** A pinned pool dials its whole count
+    /// before any service has carried a byte, so a mix is never reachable by
+    /// dialling and always needs a slot. Handing one over — stop placing, wait
+    /// for the tunnel to empty, dial its replacement — is the cheap route and the
+    /// one the carrier rule uses, but it needs the tunnel to *empty*, and a cell
+    /// whose every tunnel holds a long-lived stream never gives one back: measured
+    /// on the mixed `cost` cell, the move was requested 30 ms after the class
+    /// flipped and then hit its drain budget with the tunnel still busy
+    /// (`HANDOFF.md` §4.504). A spare has no such precondition: the second carrier
+    /// exists immediately, and the over-represented tunnel is removed when it
+    /// empties on its own.
+    ///
+    /// Bounded by construction: at most one, only while the mix is unsatisfied,
+    /// and it is given back by [`TunnelPool::trim_step`] as soon as a tunnel of
+    /// the over-represented carrier is idle.
+    fn spare_owed(&self, entries: &[PoolEntry], count: usize) -> Option<Carrier> {
+        if entries.len() != count {
+            return None;
+        }
+        let (mhd_target, tcp_target) = self.target_mix(count)?;
+        let mhd = entries
+            .iter()
+            .filter(|entry| entry.carrier == Carrier::Mhd)
+            .count();
+        let tcp = entries.len().saturating_sub(mhd);
+        if mhd > mhd_target && tcp < tcp_target {
+            Some(Carrier::Tcp)
+        } else if tcp > tcp_target && mhd < mhd_target {
+            Some(Carrier::Mhd)
+        } else {
+            None
+        }
+    }
+
     /// How many of the pool's tunnels each carrier should hold, when this
     /// session carries both kinds of service.
     ///
@@ -2927,11 +2964,12 @@ impl TunnelPool {
         let Some(dial) = self.inner.dial.clone() else {
             return Err("the pool has no dialer".to_owned());
         };
-        let (size, count) = {
+        let (size, count, spare) = {
             let state = self.inner.state.lock();
-            (state.entries.len(), state.count)
+            let spare = self.inner.spare_owed(&state.entries, state.count);
+            (state.entries.len(), state.count, spare)
         };
-        if size >= count {
+        if size >= count + usize::from(spare.is_some()) {
             return Err(format!("already at the configured tunnel count ({count})"));
         }
         // A deliberate replacement follows the requested target even when the
@@ -2953,7 +2991,7 @@ impl TunnelPool {
         };
         let (tunnel, shutdown) = dial(wanted).await?;
         let mut state = self.inner.state.lock();
-        if state.entries.len() >= state.count {
+        if state.entries.len() >= state.count + usize::from(spare.is_some()) {
             return Err("the pool reached its configured tunnel count while dialing".to_owned());
         }
         let from = state.entries.len();
@@ -3075,65 +3113,76 @@ impl TunnelPool {
         #[cfg(feature = "client")]
         self.carrier_rule_step();
         self.reap_dead();
-        self.mix_step();
+        self.trim_step();
         self.handover_step();
         self.repair().await;
     }
 
-    /// Move one tunnel to the carrier the mix is short of, once a session has
-    /// shown it carries both kinds of traffic.
+    /// Give the mix's spare tunnel back once the over-represented carrier has
+    /// one to spare.
     ///
-    /// This is the only thing that gives the traffic-class rule an actuator: a
-    /// pool dials its whole count at establishment, before any service has
-    /// carried a byte, so a mix can never be reached by dialling alone — the
-    /// pool is always full. A full pool that is one carrier short therefore
-    /// converts one tunnel, through the same drain-and-replace path the carrier
-    /// rule and the diagnostic hatch use: the tunnel stops taking new streams,
-    /// its live streams finish where they are, and the repair dials its
-    /// replacement on the carrier the mix wants.
-    fn mix_step(&self) {
-        let (size, count) = {
-            let state = self.inner.state.lock();
-            (state.entries.len(), state.count)
-        };
-        // A short pool is the repair's business: it is already dialling, and the
-        // dial follows `wanted_carrier`.
-        if size < count {
+    /// The spare is taken by [`Self::repair`] and this is its only way home: a
+    /// tunnel of the carrier the mix has too many of is removed when it holds no
+    /// stream, no reserved open and no pinned UDP peer, which is the same
+    /// emptiness test every other move uses. Nothing that is carrying traffic is
+    /// ever removed — a live stream finishes on the tunnel it started on.
+    ///
+    /// If no such tunnel is idle the pool keeps the spare and stays one wide: a
+    /// pool one over its configured count is bounded, visible in `size` against
+    /// `count`, and strictly better than a mix that can never be reached.
+    fn trim_step(&self) {
+        let mut state = self.inner.state.lock();
+        let count = state.count;
+        if state.entries.len() <= count {
             return;
         }
         let Some((mhd_target, tcp_target)) = self.inner.target_mix(count) else {
             return;
         };
-        let (mhd, tcp) = {
-            let state = self.inner.state.lock();
-            if state.handover.is_some() {
-                return;
-            }
-            let mhd = state
-                .entries
-                .iter()
-                .filter(|entry| entry.carrier == Carrier::Mhd)
-                .count();
-            (mhd, state.entries.len().saturating_sub(mhd))
+        let mhd = state
+            .entries
+            .iter()
+            .filter(|entry| entry.carrier == Carrier::Mhd)
+            .count();
+        let tcp = state.entries.len().saturating_sub(mhd);
+        let over = if mhd > mhd_target {
+            Carrier::Mhd
+        } else if tcp > tcp_target {
+            Carrier::Tcp
+        } else {
+            return;
         };
-        if mhd > mhd_target && tcp < tcp_target {
-            if self.begin_handover(Carrier::Mhd, Carrier::Tcp) {
-                info!(
-                    pool = %self.inner.shared.key,
-                    mhd, tcp, mhd_target, tcp_target,
-                    "pool-stats: this session carries both kinds of service; handing one tunnel to TCP"
-                );
-            }
-        } else if tcp > tcp_target
-            && mhd < mhd_target
-            && self.begin_handover(Carrier::Tcp, Carrier::Mhd)
-        {
-            info!(
-                pool = %self.inner.shared.key,
-                mhd, tcp, mhd_target, tcp_target,
-                "pool-stats: this session carries both kinds of service; handing one tunnel back to mhd"
-            );
-        }
+        let pins = self.inner.pins.counts();
+        let Some(index) = state.entries.iter().position(|entry| {
+            entry.carrier == over
+                && entry.phase == TunnelPhase::Serving
+                && entry.load().streams == 0
+                && entry.load().pending == 0
+                && pins.get(&entry.tunnel.id()).copied().unwrap_or(0) == 0
+        }) else {
+            return;
+        };
+        let from = state.entries.len();
+        let entry = state.entries.remove(index);
+        let to = state.entries.len();
+        drop(entry);
+        drop(state);
+        self.inner
+            .shared
+            .shrinks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.shared.push_event(PoolEvent {
+            grow: false,
+            reason: "mix",
+            from,
+            to,
+        });
+        info!(
+            pool = %self.inner.shared.key,
+            carrier = over.as_str(),
+            from, to,
+            "pool-stats: the mix converged; giving the spare tunnel back"
+        );
     }
 
     /// Dial until the pool holds its configured count again.
@@ -3144,12 +3193,20 @@ impl TunnelPool {
     /// [`crate::transport::pool::GROW_FAILURE_COOLDOWN`] rather than letting a
     /// 50 ms tick become a dial storm.
     async fn repair(&self) {
-        let (size, target) = {
+        let (size, count, spare) = {
             let state = self.inner.state.lock();
-            (state.entries.len(), state.count)
+            let spare = self.inner.spare_owed(&state.entries, state.count);
+            (state.entries.len(), state.count, spare)
         };
-        if size >= target || self.growth_held_off() {
+        if size >= count + usize::from(spare.is_some()) || self.growth_held_off() {
             return;
+        }
+        if let Some(carrier) = spare {
+            info!(
+                pool = %self.inner.shared.key,
+                carrier = carrier.as_str(),
+                "pool-stats: this session carries both kinds of service; adding one tunnel on the short carrier"
+            );
         }
         self.grow(GrowReason::Repair).await;
     }
@@ -5039,47 +5096,73 @@ mod tests {
         assert_eq!(pool.inner.target_mix(1), None);
     }
 
-    /// A pool that is full, on one carrier, with both kinds of service in the
-    /// session, hands exactly one tunnel to the other carrier — through the same
-    /// drain-and-replace path every other move uses, so a live stream finishes
-    /// where it is.
+    /// A full pool on one carrier, with both kinds of service in the session,
+    /// takes **one** extra tunnel on the short carrier and gives it back as soon
+    /// as a tunnel of the over-represented carrier is idle.
+    ///
+    /// This is the mix end to end without a socket: the class, the spare, the
+    /// dial, and the trim.
     #[tokio::test]
-    async fn a_mixed_session_hands_one_tunnel_to_the_other_carrier() {
+    async fn a_mixed_session_adds_one_tunnel_on_the_short_carrier_and_gives_it_back() {
         use crate::transport::pool::{CLASS_WINDOW, Observation};
         let pool = growable_pool_on(Carrier::Mhd, 4, 4);
-        // One kind only: a full pool has nothing to rebalance.
+        let bulk = crate::protocol::ServiceId::new(1);
+        let chat = crate::protocol::ServiceId::new(2);
+        let spare = || {
+            let state = pool.inner.state.lock();
+            pool.inner.spare_owed(&state.entries, state.count)
+        };
+        // One kind of service only: nothing to converge on.
         for _ in 0..(CLASS_WINDOW * 2) {
-            pool.inner
-                .shared
-                .note_observation(crate::protocol::ServiceId::new(1), Observation::Bulk);
+            pool.inner.shared.note_observation(bulk, Observation::Bulk);
         }
-        pool.mix_step();
-        assert!(
-            pool.inner.state.lock().handover.is_none(),
-            "a session with one kind of service must not move a tunnel"
-        );
-        // The conversational service appears, and now one tunnel goes.
+        assert_eq!(spare(), None);
+        // The conversational service appears, and the pool owes the kernel
+        // carrier one tunnel.
         for _ in 0..(CLASS_WINDOW * 2) {
-            pool.inner
-                .shared
-                .note_observation(crate::protocol::ServiceId::new(2), Observation::Small);
+            pool.inner.shared.note_observation(chat, Observation::Small);
         }
-        pool.mix_step();
-        let state = pool.inner.state.lock();
-        let handover = state
-            .handover
-            .as_ref()
-            .expect("the mix asks for a second carrier");
-        assert_eq!(handover.target, Carrier::Tcp);
-        assert_eq!(
-            state
-                .entries
-                .iter()
-                .filter(|entry| entry.phase == TunnelPhase::Draining)
-                .count(),
-            1,
-            "one tunnel drains and the other three keep serving"
-        );
+        assert_eq!(spare(), Some(Carrier::Tcp));
+        // The repair dials it: one more tunnel, riding the short carrier.
+        pool.repair().await;
+        {
+            let state = pool.inner.state.lock();
+            assert_eq!(
+                state.entries.len(),
+                5,
+                "the spare is one tunnel, not a resize"
+            );
+            assert_eq!(
+                state
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.carrier == Carrier::Tcp)
+                    .count(),
+                1,
+                "the spare rides the carrier the mix was short of"
+            );
+        }
+        // A second spare is not owed while the first is out.
+        assert_eq!(spare(), None);
+        // Every tunnel is idle, so the over-represented carrier gives one back.
+        pool.trim_step();
+        {
+            let state = pool.inner.state.lock();
+            assert_eq!(
+                state.entries.len(),
+                4,
+                "the pool returns to its configured count"
+            );
+            assert_eq!(
+                state
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.carrier == Carrier::Tcp)
+                    .count(),
+                1,
+                "and keeps the tunnel the mix bought"
+            );
+        }
     }
 
     /// A short pool is the repair's business, and the repair dials the carrier
