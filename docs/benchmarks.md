@@ -804,17 +804,20 @@ Stated so a reader does not ask a chart for something it never measured:
   the configuration surface, so no cell on this page shows mhd ahead of frp or
   rathole. What the carrier buys — per-stream recovery over an unreliable
   datagram, no head-of-line blocking across the pool's streams, optional datagram
-  semantics — is **not measured by any scenario here**: the loss cells tie because
-  the shaper dominates, and the reorder-window cell does not exist. See
+  semantics — is **not compared against another tool by any scenario here**: the
+  loss cells move mhd's own tail (see ["Where mhd wins"](#where-mhd-wins-and-where-it-loses-2026-11-19)) but every
+  arm in them is molehill, and the reorder-window cell does not exist. See
   [HANDOFF.md](../HANDOFF.md) §4.134 and §4.145.
 
-- **Whether a loss is random or caused by the carrier's own rate.** On a carrier path that drops 5 % of
-  datagrams at random, mhd carries about a quarter of what the same cell carries clean, and the counters say
-  why: its window reaches 1.47 MB against a 16 MiB ceiling, which over a 200 ms round trip is 236 Mbit/s — the
-  measured 290 — while retransmissions stay at 4.3 %, the loss rate. The window grows one packet per window
-  after the first loss, so on a long path it recovers slowly. **No cell here makes loss depend on the offered
-  rate**, so nothing can say whether a window that responded to loss would help or hurt: `loss1_rate100` shapes
-  a rate and adds loss, but its queue is deep enough that the drops are the shaper's, not the sender's.
+- **Whether a loss is random or caused by the carrier's own rate.** The counters can
+  now answer what they could not when this was written: the per-lane window line
+  reports the share of a lane's wire that was a range already sent (`rep`), and on a
+  path that drops 1 % of datagrams it reads **3–7 %** — larger than the loss, which is
+  the duplicate-send cost of declaring a range lost on a timer. What no cell does is
+  make the loss depend on the offered rate: `loss1_rate100` shapes a rate and adds
+  loss, but its queue is deep enough that the drops are the shaper's, not the
+  sender's. The mechanism, and the window's own limit on a lossy path, are stated in
+  [internals](internals.md#multiplexing).
 
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
@@ -1058,57 +1061,45 @@ bulk transfer costs **37 µs at the median and 2.7 ms at the ninety-ninth percen
 Those are cross-run readings, each with its own A/A pair inside it, so they are
 directional at the percent level the two files' floors resolve.
 
-### Where mhd wins, and where it loses (2026-11-07)
+### Where mhd wins, and where it loses (2026-11-19)
 
-The carrier question has an answer per path condition, and it is not one carrier. Same binary, same
-round, `--scenarios timeline`, one arm per carrier with `MOLEHILL_DATA_CARRIER` pinning each.
+The carrier question has an answer **per path condition, and it is not one carrier**. Same binary, one arm, three
+rounds, one `MOLEHILL_DATA_CARRIER` pin per run, **the condition imposed on the leg the carrier crosses**
+(`--condition-leg tunnel`), ten-second bulk samples, no instrumentation switches.
 
-**Every row but `clean` was measured with the condition on the visitor leg** — the leg the carrier
-does not cross. Those rows therefore describe *a visitor-side impairment with a clean carrier path*,
-not the carrier on an impaired path:
-
-| cell | what the condition is | mhd p99 | TCP p99 | mhd Gbit/s | TCP Gbit/s | verdict |
+| cell | condition | mhd p99 | TCP p99 | mhd Gbit/s | TCP Gbit/s | verdict |
 |---|---|---|---|---|---|---|
-| `clean` | nothing shaped | **59.0 ms** | **14.4 ms** | 8.61 | 8.50 | **TCP**, by 4× on the tail |
-| `rtt100` | 100 ms added delay | 403.2 | 410.1 | 2.57 | 2.51 | parity |
-| `rate100` / `rate20` | shaped to a rate | 233.2 / 549.1 | 228.1 / 508.0 | 0.09 / 0.02 | 0.09 / 0.02 | parity |
-| `loss1` | 1 % loss | 1 061.1 | 1 052.1 | **4.79** | **6.07** | **TCP**, on throughput |
-| `jitter` | 20 ms ± jitter | **118.0** | **171.8** | 4.02 | **5.82** | mixed — mhd's tail, TCP's throughput |
-| `loss5` | 5 % loss | **1 454.9** | **2 100.8** | **1.11** | **0.30** | **mhd**, both axes |
+| `clean` | nothing shaped | 0.163 ms | **0.119 ms** | 3.71 | **4.80** | **TCP**, on every axis |
+| `loss1` | 10 ms + 1 % loss | **22.7 ms** | 247 ms | 0.74 | **2.10** | **mhd** on the tail, TCP on throughput |
+| `loss5` | 100 ms + 5 % loss | **288 ms** | 1 096 ms | 0.11 | **0.13** | **mhd** on the tail, parity on throughput |
 
-**Read it as one sentence.** In that shape, mhd's own recovery beats a TCP carrier inside a tunnel once
-the shaped leg loses enough to make the kernel stack collapse — at 5 % loss it hands over **3.7× the
-throughput and a 31 % tighter tail** — and it loses everywhere the path is clean, by **4× on the
-tail**, because a new visitor channel pays a Noise handshake of its own (1 129 µs at the median,
-168 ms in the worst second) while a TCP tunnel folds that step into the connection it already has.
+**Read it as one sentence.** On a path that loses packets, mhd removes the kernel's retransmission penalty from
+small flows — **the interactive tail is 11× tighter at 1 % loss and 3.8× at 5 %** — and it carries **less bulk than
+TCP at both**; on a path that loses nothing, TCP wins every axis.
 
-**The 5 % ratio does not travel to the leg the carrier crosses.** That row shaped the visitor leg; the
-carrier's own path was clean, so what it prices is the composition, not the carrier's behaviour on a
-lossy path. Two later runs measured the carrier's own leg (`--condition-leg tunnel`): mhd alone reads
-**0.074–0.174 Gbit/s** there against 1.19 with nothing shaped, and **the TCP carrier has not been run
-on that leg at all** — so no ratio between the two carriers exists on the path they share. Producing
-one is a matter of running the same cell twice with `MOLEHILL_DATA_CARRIER` pinning each arm, which is
-how every row above was gathered.
+**Why the tail moves.** TCP's p99 of 247 ms on a 20 ms path is its **200 ms minimum retransmission timeout**: one
+lost segment costs a request ten round trips. mhd declares the loss on the path's own round trip, re-sends that one
+range, and the request finishes inside the next round trip. With sixteen flows at once the same cells read 1.62
+against 1.34 ms (`clean`), **24.8 against 49.3** (1 % loss) and **206 against 866** (5 % loss).
 
-So the honest statement for an operator is not "one carrier is better". It is: **which carrier is
-faster is a property of the path, and exactly one row above compares them where neither is impaired** —
-`clean`, where the TCP carrier's tail is four times tighter. The default tries mhd and falls back to
-TCP when a session cannot be established, which is a statement about *establishment*, not about speed.
+**What it costs.** On the clean bulk cell mhd spends **1.46× the CPU per carried Gbit** (0.70 against 0.48
+CPU-seconds) and **3.2× the resident memory** (54 against 17 MiB). On the 1 %-loss cell it carries a third of the
+bytes and spends **3.7× the CPU per Gbit** (1.62 against 0.44), because the window stops opening after the first
+loss: [internals](internals.md#multiplexing) states that defect and the eight mechanisms that failed to move it.
 
-Two things this table does **not** say. It does not compare either carrier against other tools — that
-is the sweep's job, and on the same `clean` cell the peers measured 1.02–1.09 ms at p50 against both
-molehill carriers' 2.63–2.82 (§"The carrier axis is a path condition now" above explains why the pool
-pays that). And it is loopback in a container: the loss and jitter cells are shaped, the clean one is
-not, so `clean` is a lower bound on what a real path does to both carriers.
+**Two method notes, because they change how a row reads.** An earlier version of this table imposed every condition
+but `clean` on the **visitor** leg — the path the carrier does not cross — so it priced a visitor-side impairment
+with a clean carrier path, and it read p99 1 061 ms on mhd against 1 052 on TCP, a dead heat, where the same cell
+on the carrier's own leg reads **22.7 against 247**. `--condition-leg` defaults to `visitor`; a carrier measurement
+has to name `tunnel`. And the bulk window matters at high latency: on five-second samples the `loss5` row reads mhd
+*ahead* (0.087 against 0.068) because the TCP arm is still leaving slow start, which is why a high-latency cell uses
+ten.
 
-**The rows measured on a shaped path predate two fixes that only move them in the product's favour**, so
-they are a lower bound for the `mhd` carrier and cannot be used to claim a regression. A sealed channel on
-an established lane no longer waits for an opening acknowledgement, which removed one round trip from every
-channel setup (a visitor's setup fell from 400 ms to 200 ms on a 100 ms path, and a channel open from
-p50 200 213 µs to 24 µs); and a stream with a small flight now keeps credit back from bulk writers and is
-judged on the path's own round trip rather than on the lane's timeout ladder. Re-deriving this table on a
-current build is a sweep of its own, and the numbers for the two changes are in `HANDOFF.md` §4.303 and
-§4.310 until it is run.
+**What this table does not say.** It is not a comparison against other tools — that is the sweep's job, and the
+published sweep is v0.11.2, which predates this carrier. It is loopback in a container, so `clean` is a lower bound
+on what a real path does to both carriers. And it does not tell you which carrier to run: the product decides at
+runtime, falling back to TCP when a session cannot be established, and `MOLEHILL_DATA_CARRIER` exists to separate
+the two for exactly this measurement.
 
 ### Warm and cold
 

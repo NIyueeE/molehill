@@ -142,16 +142,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   numbers they produce are the carrier's alone: an mhd stream opens in 3 µs
   against a TCP connect's 48, and a round trip costs 2.5× the bare socket's.
 
-- **A lossy path costs mhd most of its throughput, and that is an open defect rather
-  than a documented trade-off.** On a carrier path that drops 5 % of datagrams, mhd
-  carries about a quarter of what the same cell carries clean — 0.29 Gbit/s against
-  1.19 — as a level over six rounds, not a scatter. On a 100 Mbit queue about 11 ms
-  deep the same lane drops two orders of magnitude more than a TCP-based peer while
-  carrying 19 % less, so the loss follows the sender's own rate rather than the
-  shaper's. The cause is under measurement, not fixed: the window does grow after the
-  first loss, but a repair is admitted **outside** that window, and no counter in the
-  tree yet says what share of a lane's wire is a byte already sent once.
-  [Benchmarks](docs/benchmarks.md) says what the model still cannot answer about it.
+- **A lossy path costs mhd most of its bulk throughput, and that is an open defect
+  rather than a documented trade-off.** On the leg the carrier crosses, a 5 %-loss
+  100 ms path carries **0.11 Gbit/s** against the clean cell's 3.71, and a 1 %-loss
+  20 ms path carries **0.74** against the other carrier's 2.10. The cause is
+  measured: the window's growth phase ends at the connection's first loss and never
+  resumes, so on that 1 %-loss cell it sits at **1.1 MB against its own 5 MiB
+  ceiling**, refusing 1 900 writes a second with 3.4 MB queued behind it. Eight
+  mechanisms have failed to move it, and the eighth — ending the growth phase only
+  when the loss came with a standing queue — bought 66 % on the 5 %-loss cell and
+  cost 16 % interactive failures on a rotating path, so it was reverted
+  (`HANDOFF.md` §4.501). [Internals](docs/internals.md#multiplexing) states the
+  defect and what it means: nothing above the window decides a rate, so the window's
+  growth rule is the whole send-rate policy.
 - **This is a re-baseline release for the benchmark.** The engine changed —
   `bench/src/bench/model.py` gained the `l4-plain` arm and `Arm.noise_data`, so
   runs can measure the plain data plane, and the registry gained
@@ -163,17 +166,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [docs/release.md](docs/release.md) and, for what the new metric means and when
   it is absent, [Benchmarks](docs/benchmarks.md).
 
-- **Each carrier now has a stated path condition, measured rather than assumed.** mhd
-  wins on a lossy path and TCP wins on a clean one. On an unshaped cell TCP's tail is
-  4× tighter (14.4 ms against 59.0 ms at p99). A shaped 5 %-loss cell has mhd at 3.7×
-  the throughput with a 31 % tighter tail, **but that ratio is not currently
-  established**: the row was gathered with the condition on the visitor leg, and the
-  same method on the leg the carrier crosses reads the TCP side four times higher.
-  The fallback keeps its meaning — it fires when a session cannot be *established*,
-  which is a different question from which carrier is faster — so the documentation
-  now says which path each one is for instead of leaving the comparison to the
-  reader. The table, its conditions and its caveat are in
-  [Benchmarks](docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-07).
+- **Each carrier now has a stated path condition, measured on the leg the carrier
+  crosses.** mhd is the carrier for an impaired path and TCP is the carrier for a
+  clean one and for bulk. On an unshaped cell TCP is ahead on every axis (4.80
+  against 3.71 Gbit/s, 0.12 against 0.16 ms at p99, and less than half the CPU per
+  carried Gbit). On a path that loses packets mhd's interactive tail is **11×
+  tighter at 1 % loss and 3.8× at 5 %** — one lost segment costs the kernel TCP
+  carrier its 200 ms minimum retransmission timeout, while mhd repairs inside the
+  next round trip — and it carries **less bulk at both loss rates** (0.74 against
+  2.10 Gbit/s, 0.11 against 0.13). The fallback keeps its meaning: it fires when a
+  session cannot be *established*, which is a different question from which carrier
+  is faster. The table, its method and its costs are in
+  [Benchmarks](docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-19).
 
 - **The congestion window's ceiling follows the path** rather than sitting at a flat
   2 MiB. A loopback path's bandwidth-delay product is a small fraction of that, and
