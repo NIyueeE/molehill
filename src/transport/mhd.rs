@@ -33,9 +33,14 @@
 //!   update drifts nothing;
 //! - **the stream is the unit of fairness**: a round-robin cursor over streams,
 //!   not a send queue ordered by arrival;
-//! - **no congestion window is cut on loss** (the rate-based controller lives
-//!   above this layer), which is the change that makes a lossy path usable
-//!   without halving the pipe for every reordering event.
+//! - **no congestion window is cut on loss**, which is the change that makes a
+//!   lossy path usable without halving the pipe for every reordering event. The
+//!   window that replaces one lives in [`conn`]: it opens on confirmed delivery
+//!   up to a ceiling scaled by the path's own minimum round trip, and nothing
+//!   here closes it. **The rate decision that was meant to sit above this layer
+//!   has never been written** — there is no pacing, no delivery-rate estimate and
+//!   no cross-stream view anywhere in the carrier — so the window's growth rule
+//!   is the whole of the send-rate policy;
 //!
 //! ## Security
 //!

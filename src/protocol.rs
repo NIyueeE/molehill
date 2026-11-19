@@ -426,7 +426,7 @@ pub const MAX_SESSION_CMD_LEN: usize = MAX_REGISTRATION_LEN + 64;
 /// A v4 session carries acks and commands on one stream, and the client tells
 /// them apart from the first byte: a framed ack starts with its length's *high*
 /// byte, which is `0` while the frame stays under 256 bytes, whereas every
-/// command tag a session can receive is `1..=5` (the v3-only tag `0` is never
+/// command tag a session can receive is `1..=8` (the v3-only tag `0` is never
 /// sent in a session). A longer reason would move that high byte into the
 /// command-tag range and make the two frames indistinguishable, so the writer
 /// shortens the reason instead: the ack frame is `2 + 1 (tag) + varint(len) +

@@ -183,20 +183,21 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
   long-lived interactive stream stopped for **105 seconds** when one bulk reader stalled, and a 20 Mbit/s rate
   step read p99 4 946 ms against the control arm's 502 until the timer was keyed the same way.
 - **A lane's window grows additively after its first loss.** Until the path drops something, every acknowledged
-  byte buys a byte of window, so the flight doubles per round trip; the first loss latches slow start off **for
-  good**, and from there the window grows by one packet per `cwnd` worth of acknowledged bytes. Nothing cuts it on
-  a loss — the loss is repaired, not charged to the window. Two consequences follow, and both are measured on the
-  carrier's own path. A **repair is admitted outside the window**, so a lane that is losing packets carries a
-  flight several times its `cwnd` and the window climbs faster than "one packet per round trip" would suggest —
-  ≈28 KB/s on a 200 ms path. And the lane then carries much less than the path could: a 5 %-loss tunnel leg gives
-  0.29 Gbit/s against 1.19 on a clean one, and on a 100 Mbit queue about 11 ms deep the same lane drops two orders
-  of magnitude more than its TCP peers while carrying 19 % less. **That is an open defect, and it has resisted every
-  mechanism tried against it**: moving the window to the send point (three times), a rate driven by delay (twice), a
-  rate driven by delivery, the burst size, and the kernel send buffer — each measured, each either slower or neutral.
-  What they share is the finding: the carrier sends at the path's rate into a buffer smaller than the path's
-  bandwidth-delay product, and nothing it can change about *how* it sends alters that. The cell's own round-to-round
-  spread is the same order as most of those differences, so the peers' gap is the only part of it worth quoting
-  (`HANDOFF.md` §4.249–§4.265). The per-lane window line carries the numbers that price it: `sent` against `ack`, `rep` as the
+  byte buys a byte of window, so the flight doubles per round trip; the first loss ends that phase **for good**,
+  and from there the window grows by one packet per `cwnd` worth of acknowledged bytes — about 65 KB/s on a 20 ms
+  path, where the 5 MiB ceiling that path implies is then never reached. Nothing cuts the window on a loss — the
+  loss is repaired, not charged to it. Two consequences follow, and both are measured on the leg the carrier
+  crosses. A **repair is admitted outside the window**, so a lane that is losing packets carries a flight several
+  times its `cwnd` — measured at 2.3 MB against a 1.1 MB window on a 1 %-loss 20 ms path. And the lane then
+  carries much less than the path could: the same cell gives **0.73 Gbit/s against the TCP carrier's 1.94**, and a
+  5 %-loss 100 ms path **0.108 against 0.133** (ten-second samples, three rounds, one carrier pinned per run). The
+  first of those two is the window freezing wherever the first drop landed: 1.1 MB of window, 1 906 refused writes
+  a second and 3.4 MB queued with nothing to carry it. **That is an open defect, and eight mechanisms have failed to
+  move it**: the seven in `HANDOFF.md` §4.249–§4.279, and an eighth that ended the growth phase on a standing queue
+  rather than on a loss — which bought 66 % on the 5 %-loss cell and cost 16 % interactive failures on a rotating
+  path, so it was reverted (§4.501). What those readings say is not that the growth rule is wrong: it is that
+  **nothing above the window decides a rate**, so every attempt to make the window play that part trades one cell
+  against another. The per-lane window line carries the numbers that price it: `sent` against `ack`, `rep` as the
   share of what left that was a range already sent, `late` for acknowledgements that landed after the lane had
   declared the packet lost, and `refus`/`stop` for the bound or budget that ended the passes. A controller is
   written only if those say the window is the limit (`HANDOFF.md` §4.179–§4.180).

@@ -19,19 +19,19 @@ handshake is fresh, so each connection derives its own keys.
 Run `molehill --genkey` on each host. It prints an X25519 private
 key and its public key:
 
-`sh
+```sh
 $ molehill --genkey
 Private Key:
 cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q=
 
 Public Key:
 GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE=
-`
+```
 
 (Do not use a keypair from the Internet, including this one.) Each host keeps
 its own private key and writes the **other** host's public key.
 
-`toml
+```toml
 # Server side
 [server.noise]
 private_key = "the server's private key"
@@ -42,7 +42,7 @@ public_key = "the client's public key"
 private_key = "the client's private key"
 public_key = "the server's public key"
 data_enable = true
-`
+```
 
 Both keys are required in both blocks and must decode to 32 bytes, or the
 daemon refuses to start and names the block and the key. The same pair also
@@ -76,12 +76,12 @@ The **data channels** follow `data_enable`:
   end-to-end protection in that deployment, and this hop spends no CPU on a
   second encryption. The control channel stays encrypted either way.
 
-`toml
+```toml
 [client.noise]
 private_key = "the client's private key"
 public_key = "the server's public key"
 data_enable = false # data channels are plain; the control channel is still KK
-`
+```
 
 The server needs no switch: it accepts a plain data channel from a client that
 chose `data_enable = false` and a Noise one from everyone else, on the same
@@ -92,7 +92,7 @@ listener.
 A forwarding service may override the pair (to dial another server with its own
 keypair) and the data switch. Unset fields inherit `[client.noise]`:
 
-`toml
+```toml
 [client.services.ssh]              # inherits the client pair and data_enable
 
 [client.services.bulk]
@@ -104,7 +104,7 @@ remote_addr = "region-b.example.com:2333"
 [client.services.region-b.noise]
 private_key = "this client's other private key"
 public_key = "region-b's public key"
-`
+```
 
 The pair is the session's identity: services with the same endpoint and the
 same pair share one control connection, and a different pair gets a session of
@@ -117,7 +117,7 @@ control channel is KK; its lanes default to **plain**
 (`data_enable = false`), because what a lane carries is the visitor's own IP
 packets and the visitor's TLS is the end-to-end protection:
 
-`toml
+```toml
 [transparent.noise]
 private_key = "the client's private key"
 public_key = "the server's public key"
@@ -128,7 +128,7 @@ remote_bind_addr = "10.99.0.1:8443"
 
 [transparent.claims.web.noise]
 data_enable = true                 # only this claim's lanes are encrypted
-`
+```
 
 A claim may also override the keypair to reach a second server; unset fields
 inherit `[transparent.noise]`.

@@ -16,19 +16,19 @@
 
 在每台主机上运行 `molehill --genkey`,它会打印 X25519 私钥与对应公钥:
 
-`sh
+```sh
 $ molehill --genkey
 Private Key:
 cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q=
 
 Public Key:
 GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE=
-`
+```
 
 (不要使用来自互联网的密钥对,包括上面这一对。)每台主机保留自己的私钥,写
 **对方**的公钥。
 
-`toml
+```toml
 # 服务端
 [server.noise]
 private_key = "服务端的私钥"
@@ -39,7 +39,7 @@ public_key = "客户端的公钥"
 private_key = "客户端的私钥"
 public_key = "服务端的公钥"
 data_enable = true
-`
+```
 
 两个块里的两把密钥都必填,且都必须解码为 32 字节,否则守护进程拒绝启动并点
 名该块与该键。同一对密钥也用于数据面,所以通常每台主机一对密钥。
@@ -65,12 +65,12 @@ BLAKE2s;仍写这些键的配置会被拒绝,并给出替代写法(或说明没�
 - `false` 让数据通道走明文。此时访客自己的 TLS/SSH 就是端到端保护,
   这一跳不再为第二次加密花 CPU。控制通道无论如何都是加密的。
 
-`toml
+```toml
 [client.noise]
 private_key = "客户端的私钥"
 public_key = "服务端的公钥"
 data_enable = false # 数据通道走明文;控制通道仍为 KK
-`
+```
 
 服务端不需要开关:它在同一个监听器上接受选择 `data_enable = false` 的客户端的
 明文数据通道,以及其他客户端的 Noise 数据通道。
@@ -80,7 +80,7 @@ data_enable = false # 数据通道走明文;控制通道仍为 KK
 转发服务可以覆盖密钥对(用另一套密钥连另一台服务器)和数据开关。未设置的字段
 继承 `[client.noise]`:
 
-`toml
+```toml
 [client.services.ssh]              # 继承客户端密钥对与 data_enable
 
 [client.services.bulk]
@@ -92,7 +92,7 @@ remote_addr = "region-b.example.com:2333"
 [client.services.region-b.noise]
 private_key = "这个客户端的另一把私钥"
 public_key = "region-b 的公钥"
-`
+```
 
 密钥对是会话的身份:端点相同、密钥对相同的服务共用一条控制连接,不同的密钥对
 得到自己的会话。单靠 `data_enable` 永远不会拆分会话。
@@ -103,7 +103,7 @@ L3 客户端把同样的三个键写在 `[transparent.noise]` 下。它的控制
 lane 默认**明文**(`data_enable = false`),因为 lane 承载的是访客自己的
 IP 包,访客的 TLS 就是端到端保护:
 
-`toml
+```toml
 [transparent.noise]
 private_key = "客户端的私钥"
 public_key = "服务端的公钥"
@@ -114,7 +114,7 @@ remote_bind_addr = "10.99.0.1:8443"
 
 [transparent.claims.web.noise]
 data_enable = true                 # 只加密这个 claim 的 lane
-`
+```
 
 claim 也可以覆盖密钥对去连第二台服务器;未设置的字段继承
 `[transparent.noise]`。
