@@ -509,13 +509,43 @@ pub(crate) struct StreamLease {
     service: Option<crate::protocol::ServiceId>,
     /// Bytes this channel has carried, both directions together.
     bytes: std::sync::atomic::AtomicU64,
-    /// Whether this channel has already reported itself as bulk, so a transfer
-    /// costs one observation and not one per megabyte.
-    bulk_reported: std::sync::atomic::AtomicBool,
+    /// The next byte count at which this channel reports another megabyte.
+    ///
+    /// Per megabyte rather than per channel: a bulk service's channel is one
+    /// long transfer, so a rule that waited for it to *end* would learn nothing
+    /// until the transfer it was supposed to place was already over.
+    next_bulk_mark: std::sync::atomic::AtomicU64,
     /// The pool this stream came from, for the capacity wake-up: an open that
     /// found every tunnel at its ceiling is waiting for exactly this drop, and
     /// a weak reference cannot keep a dead pool alive.
     pool: std::sync::Weak<PoolShared>,
+}
+
+/// Stamp a lease: the stream, the slot it was charged to, and the service whose
+/// traffic it will report.
+///
+/// One constructor for both arms of an open's fall-through — the reserved tunnel
+/// and the next candidate — so a lease cannot be built with one field set and
+/// another forgotten.
+fn stamp_lease(
+    service: Option<crate::protocol::ServiceId>,
+    charged_at: std::time::Instant,
+    stream: CarrierStream,
+    tunnel_id: usize,
+    counters: std::sync::Arc<TunnelCounters>,
+    pool: std::sync::Weak<PoolShared>,
+) -> StreamLease {
+    StreamLease {
+        id: StreamLease::next_id(),
+        charged_at,
+        stream,
+        tunnel_id,
+        counters,
+        service,
+        bytes: std::sync::atomic::AtomicU64::new(0),
+        next_bulk_mark: std::sync::atomic::AtomicU64::new(crate::transport::pool::BULK_BYTES),
+        pool,
+    }
 }
 
 /// The next lease number.
@@ -555,10 +585,22 @@ impl StreamLease {
             .bytes
             .fetch_add(moved, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(moved);
-        if total >= crate::transport::pool::BULK_BYTES
-            && !self
-                .bulk_reported
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        let mark = self
+            .next_bulk_mark
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // One report per megabyte, and at most one per call: a poll never moves
+        // more than a copy buffer, so the exchange cannot lose a crossing and the
+        // loop cannot run away.
+        if total >= mark
+            && self
+                .next_bulk_mark
+                .compare_exchange(
+                    mark,
+                    total.saturating_add(crate::transport::pool::BULK_BYTES),
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
             && let (Some(pool), Some(service)) = (self.pool.upgrade(), self.service)
         {
             pool.note_observation(service, crate::transport::pool::Observation::Bulk);
@@ -587,11 +629,8 @@ impl Drop for StreamLease {
             // observation a request/response flow ever produces. A channel between
             // the two marks leaves none, which is the conservative answer for a
             // rule that only ever moves *new* channels.
-            if !self
-                .bulk_reported
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && self.bytes.load(std::sync::atomic::Ordering::Relaxed)
-                    < crate::transport::pool::SMALL_BYTES
+            if self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+                < crate::transport::pool::SMALL_BYTES
                 && let Some(service) = self.service
             {
                 pool.note_observation(service, crate::transport::pool::Observation::Small);
@@ -1022,12 +1061,28 @@ impl PoolShared {
         service: crate::protocol::ServiceId,
         observation: crate::transport::pool::Observation,
     ) {
-        self.profiles
+        let mut profiles = self
+            .profiles
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(service)
-            .or_default()
-            .observe(observation);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = profiles.entry(service).or_default();
+        let before = profile.class();
+        profile.observe(observation);
+        let after = profile.class();
+        drop(profiles);
+        if before != after {
+            // A class change is what moves a service's *new* channels to another
+            // carrier, so an operator who watches a pool split needs to see why.
+            // Once per change, and a change needs two agreeing windows of
+            // evidence, so this cannot repeat.
+            tracing::info!(
+                pool = %self.key,
+                service = ?service,
+                from = before.as_str(),
+                to = after.as_str(),
+                "pool-stats: a service's traffic class changed"
+            );
+        }
     }
 
     /// The traffic class this session has earned for one service.
@@ -1168,6 +1223,69 @@ struct TunnelPoolInner {
     preferred: PreferredCarrier,
     /// The client's UDP pin accounting: which peers end on which tunnel (D30).
     pins: std::sync::Arc<PinRegistry>,
+}
+
+impl TunnelPoolInner {
+    /// How many of the pool's tunnels each carrier should hold, when this
+    /// session carries both kinds of service.
+    ///
+    /// `None` is the answer for every session that carries one kind — which is
+    /// most of them, and every session before its first megabyte — and it means
+    /// "nothing to rebalance": the pool rides the endpoint's preferred carrier
+    /// exactly as it did before this policy existed. The mix only appears where
+    /// the trade it exists for is real, a session serving a conversational
+    /// service and a bulk one at once.
+    ///
+    /// A quarter of the tunnels go to the kernel carrier, at least one and never
+    /// all of them: one is where the bulk traffic lands (placement sends it
+    /// there), and keeping one on the datagram carrier is what leaves the
+    /// conversational services their tail even while bulk is being carried.
+    fn target_mix(&self, total: usize) -> Option<(usize, usize)> {
+        let (bulk, conversational) = {
+            let profiles = self
+                .shared
+                .profiles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bulk = profiles
+                .values()
+                .any(|profile| profile.class() == crate::transport::pool::ServiceClass::Bulk);
+            let conversational = profiles.values().any(|profile| {
+                profile.class() == crate::transport::pool::ServiceClass::Conversational
+            });
+            (bulk, conversational)
+        };
+        if !bulk || !conversational || total < 2 {
+            return None;
+        }
+        let tcp = (total / 4).clamp(1, total - 1);
+        Some((total - tcp, tcp))
+    }
+
+    /// The carrier the next dial should establish.
+    ///
+    /// Three answers in order: the endpoint's own preference (which is what the
+    /// fallback moves and every pool rode before this policy), then whichever
+    /// carrier the mix is short of. A pool that is at its count in total but
+    /// short of one carrier is the handover's business, not a dial's.
+    fn wanted_carrier(&self, entries: &[PoolEntry], total: usize) -> Carrier {
+        let preferred = (self.preferred)();
+        let Some((mhd_target, tcp_target)) = self.target_mix(total) else {
+            return preferred;
+        };
+        let mhd = entries
+            .iter()
+            .filter(|entry| entry.carrier == Carrier::Mhd)
+            .count();
+        let tcp = entries.len().saturating_sub(mhd);
+        if mhd < mhd_target {
+            Carrier::Mhd
+        } else if tcp < tcp_target {
+            Carrier::Tcp
+        } else {
+            preferred
+        }
+    }
 }
 
 impl TunnelPool {
@@ -2651,17 +2769,14 @@ impl TunnelPool {
                 // negative on a single-tunnel pool, which is what caught this).
                 placement.chosen_load = counters.load();
                 PlacementStats::record(placement, started.elapsed(), None);
-                Ok(StreamLease {
-                    id: StreamLease::next_id(),
-                    charged_at: started,
-                    stream,
-                    tunnel_id: tunnel.id(),
-                    counters,
+                Ok(stamp_lease(
                     service,
-                    bytes: std::sync::atomic::AtomicU64::new(0),
-                    bulk_reported: std::sync::atomic::AtomicBool::new(false),
+                    started,
+                    stream,
+                    tunnel.id(),
+                    counters,
                     pool,
-                })
+                ))
             }
             Err(e) => {
                 counters.release();
@@ -2706,17 +2821,14 @@ impl TunnelPool {
                                 started.elapsed(),
                                 Some("fallback"),
                             );
-                            return Ok(StreamLease {
-                                id: StreamLease::next_id(),
-                                charged_at: started,
-                                stream,
-                                tunnel_id: next.tunnel.id(),
-                                counters,
+                            return Ok(stamp_lease(
                                 service,
-                                bytes: std::sync::atomic::AtomicU64::new(0),
-                                bulk_reported: std::sync::atomic::AtomicBool::new(false),
-                                pool: next.pool,
-                            });
+                                started,
+                                stream,
+                                next.tunnel.id(),
+                                counters,
+                                next.pool,
+                            ));
                         }
                         Err(e) => {
                             next.tunnel.counters().release();
@@ -2824,15 +2936,21 @@ impl TunnelPool {
         }
         // A deliberate replacement follows the requested target even when the
         // endpoint choice has not committed yet; ordinary repairs follow the
-        // current preference, including a fallback that happened mid-dial.
-        let wanted = self
-            .inner
-            .state
-            .lock()
-            .handover
-            .as_ref()
-            .filter(|handover| handover.phase == HandoverPhase::Dialing)
-            .map_or_else(|| (self.inner.preferred)(), |handover| handover.target);
+        // current preference, including a fallback that happened mid-dial — and,
+        // when this session carries both kinds of service, the carrier the mix is
+        // short of rather than the endpoint's one answer for both.
+        let wanted = {
+            let state = self.inner.state.lock();
+            let total = state.count;
+            state
+                .handover
+                .as_ref()
+                .filter(|handover| handover.phase == HandoverPhase::Dialing)
+                .map_or_else(
+                    || self.inner.wanted_carrier(&state.entries, total),
+                    |handover| handover.target,
+                )
+        };
         let (tunnel, shutdown) = dial(wanted).await?;
         let mut state = self.inner.state.lock();
         if state.entries.len() >= state.count {
@@ -2957,8 +3075,65 @@ impl TunnelPool {
         #[cfg(feature = "client")]
         self.carrier_rule_step();
         self.reap_dead();
+        self.mix_step();
         self.handover_step();
         self.repair().await;
+    }
+
+    /// Move one tunnel to the carrier the mix is short of, once a session has
+    /// shown it carries both kinds of traffic.
+    ///
+    /// This is the only thing that gives the traffic-class rule an actuator: a
+    /// pool dials its whole count at establishment, before any service has
+    /// carried a byte, so a mix can never be reached by dialling alone — the
+    /// pool is always full. A full pool that is one carrier short therefore
+    /// converts one tunnel, through the same drain-and-replace path the carrier
+    /// rule and the diagnostic hatch use: the tunnel stops taking new streams,
+    /// its live streams finish where they are, and the repair dials its
+    /// replacement on the carrier the mix wants.
+    fn mix_step(&self) {
+        let (size, count) = {
+            let state = self.inner.state.lock();
+            (state.entries.len(), state.count)
+        };
+        // A short pool is the repair's business: it is already dialling, and the
+        // dial follows `wanted_carrier`.
+        if size < count {
+            return;
+        }
+        let Some((mhd_target, tcp_target)) = self.inner.target_mix(count) else {
+            return;
+        };
+        let (mhd, tcp) = {
+            let state = self.inner.state.lock();
+            if state.handover.is_some() {
+                return;
+            }
+            let mhd = state
+                .entries
+                .iter()
+                .filter(|entry| entry.carrier == Carrier::Mhd)
+                .count();
+            (mhd, state.entries.len().saturating_sub(mhd))
+        };
+        if mhd > mhd_target && tcp < tcp_target {
+            if self.begin_handover(Carrier::Mhd, Carrier::Tcp) {
+                info!(
+                    pool = %self.inner.shared.key,
+                    mhd, tcp, mhd_target, tcp_target,
+                    "pool-stats: this session carries both kinds of service; handing one tunnel to TCP"
+                );
+            }
+        } else if tcp > tcp_target
+            && mhd < mhd_target
+            && self.begin_handover(Carrier::Tcp, Carrier::Mhd)
+        {
+            info!(
+                pool = %self.inner.shared.key,
+                mhd, tcp, mhd_target, tcp_target,
+                "pool-stats: this session carries both kinds of service; handing one tunnel back to mhd"
+            );
+        }
     }
 
     /// Dial until the pool holds its configured count again.
@@ -4831,7 +5006,135 @@ mod tests {
 
     /// A pool that starts with `n` in-memory tunnels and is configured for
     /// `count`: every repair dials one more, until the count is reached.
+    /// The mix is owed only to a session that carries both kinds of traffic, and
+    /// it is a quarter of the pool on the kernel carrier — one tunnel at the
+    /// smallest pool that can hold two carriers, never all of them.
+    #[tokio::test]
+    async fn a_mixed_session_owes_the_kernel_carrier_a_quarter_of_the_pool() {
+        use crate::transport::pool::{CLASS_WINDOW, Observation, ServiceClass};
+        let pool = growable_pool(4, 4);
+        let bulk = crate::protocol::ServiceId::new(1);
+        let chat = crate::protocol::ServiceId::new(2);
+        // No evidence at all: nothing to rebalance, whatever the pool's width.
+        assert_eq!(pool.inner.target_mix(4), None);
+        // One class only — here bulk — is still one answer for the whole session.
+        for _ in 0..(CLASS_WINDOW * 2) {
+            pool.inner.shared.note_observation(bulk, Observation::Bulk);
+        }
+        assert_eq!(
+            pool.inner.shared.class_of(bulk),
+            ServiceClass::Bulk,
+            "two windows of bulk evidence classify the service"
+        );
+        assert_eq!(pool.inner.target_mix(4), None);
+        // The other kind appears, and now the pool owes the kernel carrier a
+        // quarter of its tunnels.
+        for _ in 0..(CLASS_WINDOW * 2) {
+            pool.inner.shared.note_observation(chat, Observation::Small);
+        }
+        assert_eq!(pool.inner.target_mix(4), Some((3, 1)));
+        assert_eq!(pool.inner.target_mix(8), Some((6, 2)));
+        assert_eq!(pool.inner.target_mix(2), Some((1, 1)));
+        // A pool of one cannot hold two carriers, so the mix gives way.
+        assert_eq!(pool.inner.target_mix(1), None);
+    }
+
+    /// A pool that is full, on one carrier, with both kinds of service in the
+    /// session, hands exactly one tunnel to the other carrier — through the same
+    /// drain-and-replace path every other move uses, so a live stream finishes
+    /// where it is.
+    #[tokio::test]
+    async fn a_mixed_session_hands_one_tunnel_to_the_other_carrier() {
+        use crate::transport::pool::{CLASS_WINDOW, Observation};
+        let pool = growable_pool_on(Carrier::Mhd, 4, 4);
+        // One kind only: a full pool has nothing to rebalance.
+        for _ in 0..(CLASS_WINDOW * 2) {
+            pool.inner
+                .shared
+                .note_observation(crate::protocol::ServiceId::new(1), Observation::Bulk);
+        }
+        pool.mix_step();
+        assert!(
+            pool.inner.state.lock().handover.is_none(),
+            "a session with one kind of service must not move a tunnel"
+        );
+        // The conversational service appears, and now one tunnel goes.
+        for _ in 0..(CLASS_WINDOW * 2) {
+            pool.inner
+                .shared
+                .note_observation(crate::protocol::ServiceId::new(2), Observation::Small);
+        }
+        pool.mix_step();
+        let state = pool.inner.state.lock();
+        let handover = state
+            .handover
+            .as_ref()
+            .expect("the mix asks for a second carrier");
+        assert_eq!(handover.target, Carrier::Tcp);
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|entry| entry.phase == TunnelPhase::Draining)
+                .count(),
+            1,
+            "one tunnel drains and the other three keep serving"
+        );
+    }
+
+    /// A short pool is the repair's business, and the repair dials the carrier
+    /// the mix is short of — so the mix is reachable without a handover whenever
+    /// a tunnel dies.
+    #[tokio::test]
+    async fn a_repair_dials_the_carrier_the_mix_is_short_of() {
+        use crate::transport::pool::{CLASS_WINDOW, Observation};
+        let pool = growable_pool(4, 4);
+        for _ in 0..(CLASS_WINDOW * 2) {
+            pool.inner
+                .shared
+                .note_observation(crate::protocol::ServiceId::new(1), Observation::Bulk);
+            pool.inner
+                .shared
+                .note_observation(crate::protocol::ServiceId::new(2), Observation::Small);
+        }
+        // Everything rides the pool's carrier; the mix wants a quarter elsewhere.
+        let (wanted, uniform) = {
+            let state = pool.inner.state.lock();
+            let wanted = pool.inner.wanted_carrier(&state.entries, 4);
+            let uniform = state
+                .entries
+                .first()
+                .map(|entry| entry.carrier)
+                .expect("the fixture has tunnels");
+            assert!(
+                state.entries.iter().all(|entry| entry.carrier == uniform),
+                "the fixture is uniform, so the short carrier is the other one"
+            );
+            (wanted, uniform)
+        };
+        assert!(
+            wanted != uniform,
+            "a uniform pool is short of the carrier the mix wants, so that is the one dialled"
+        );
+        // And the target it is dialling towards is the mix's own.
+        let (mhd_target, tcp_target) = pool
+            .inner
+            .target_mix(4)
+            .expect("a mixed session owes a mix");
+        match wanted {
+            Carrier::Mhd => assert_eq!(mhd_target, 3),
+            Carrier::Tcp => assert_eq!(tcp_target, 1),
+        }
+    }
+
     fn growable_pool(n: usize, count: usize) -> TunnelPool {
+        growable_pool_on(Carrier::Tcp, n, count)
+    }
+
+    /// The same fixture, riding the carrier the test needs: the mix policy is
+    /// about which carrier a pool holds, so a test that shows it moving one has to
+    /// start from a pool that rides the other.
+    fn growable_pool_on(carrier: Carrier, n: usize, count: usize) -> TunnelPool {
         let dial: Dialer = std::sync::Arc::new(|_: Carrier| {
             Box::pin(async move {
                 Ok((
@@ -4852,7 +5155,7 @@ mod tests {
             })
             .collect();
         TunnelPool::with_dialer(
-            Carrier::Tcp,
+            carrier,
             "stripes".to_owned(),
             initial,
             count,

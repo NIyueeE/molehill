@@ -217,6 +217,16 @@ pub(crate) enum ServiceClass {
     Bulk,
 }
 
+impl ServiceClass {
+    /// The class as the telemetry line writes it.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conversational => "conversational",
+            Self::Bulk => "bulk",
+        }
+    }
+}
+
 /// One thing a channel proved about the service it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Observation {
