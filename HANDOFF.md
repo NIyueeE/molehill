@@ -13,6 +13,129 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **MHD 定型 — written 2026-11-19, with one floor named as open.**
+>
+> **What it means here**: the carrier's behaviour on the leg it crosses is measured against its own TCP carrier, every runtime
+> gate is green, and each row of the plan's §一 table below carries the reading that decided it.
+>
+> | criterion (plan §一) | target | reading | |
+> |---|---|---|---|
+> | clean mixed interactive `rtt_p99_ms` | ≤ 20 ms | **5.48 ms** (`cost` cell, clean, two rounds; A/A twin 1.99) | met |
+> | `loss5` mixed interactive `rtt_p99_ms` | halve 2 085 / 2 337 | **1 286 ms** (1 125–1 448; twin 832) | met |
+> | `loss5` tunnel `bulk-1` | ≥ 0.11 Gbit/s | **0.1194** (0.0731–0.1267, six rounds) | met |
+> | clean `bulk-n` ≥ 85 % of the same build unsealed | ≥ 9.40 of 11.06 | **9.460 / 11.056 = 85.6 %** (six rounds each) | met |
+> | error rate / wedge / soak drift | level with the baseline, zero | soak `wedge_count` **5**, `wedge_max_s` 60 s; `rtt100` interactive failures 1.7 % | **open** |
+> | `dropped_packets` (health, not a gate) | recorded | §4.502 | recorded |
+>
+> **The gates, all run on this tree today**: `just check` green end to end (410 lib tests, 11 pool tests, both clippy builds,
+> `cargo deny` with no waiver, docs alignment, the python gates, `bench selfcheck`); `just interop` **3/3**; `l3-accept` **PASS**
+> on all sixteen checks; `integration_test` **22/22 on each carrier** — and it must be run serially (`-- --test-threads=1`, as
+> `just test` does), because in parallel the suites collide on their fixed ports and read as 17 failures that look like defects.
+>
+> **What the carrier is, in one sentence**: on the leg it crosses it removes the kernel's retransmission penalty from small
+> flows — **11× tighter interactive p99 at 1 % loss, 3.8–4.2× at 5 %**, with 23–42 % more completed requests — and it carries
+> **less bulk than TCP at both** (0.733 against 1.940 Gbit/s at 1 % loss; 0.119 against 0.133 at 5 %), for **1.7–3.9× the CPU**
+> (1.71 against 0.44 CPU-seconds per Gbit on the 1 %-loss bulk cell) and **4.8× the RSS** (124 against 25.7 MiB).
+>
+> **The open floor is neither this goal's nor new.** The soak's wedge appears on the unmodified build as well (5 there against 9
+> with the reverted experiment of §4.501), and the plan's own 2026-11-12 correction records it alternates between arms across
+> runs. Settling it needs the experiment the plan says it does not contain — two product arms and no twin.
+>
+> **What is not claimed**: no release, no tag, no product-config change, and **no sweep against the reference tools** — `frp`,
+> `rathole` and `nps` have not been run against this build, so the published comparison on `docs/benchmarks.md` still describes
+> v0.11.2. The carrier comparison in §4.500 is this build against itself on two legs, which is the only comparison that page's
+> numbers may now be read against.
+
+> **§4.500 (the carrier comparison, this time on the leg the carrier crosses: the interactive tail is 4–11× tighter and bulk is behind).**
+> **§4.498/§4.499 are retracted as carrier evidence.** Both batches shaped the **visitor** leg — `--condition-leg` defaults to
+> `visitor` (`bench/src/bench/cli.py:1276`) and the runs recorded `condition_leg: "visitor"` in their own `method` block — and both ran
+> with **`MOLEHILL_MHD_STATS=1`**, which `MHD-FINALIZATION-PLAN.md` §五 forbids for a performance conclusion. The leg the carrier does
+> not cross is the one thing a carrier comparison may not use. The tell is in the numbers: the visitor-leg `loss1` batch read **rr-1 p99
+> 245.2 ms on both arms**, and the tunnel-leg TCP arm below reads **247.0** — the first batch was measuring the visitor's own kernel TCP.
+>
+> **Method now.** Build `8fd13c5`, one `MOLEHILL_DATA_CARRIER` pin per run, **no stats switches**, `--condition-leg tunnel`, `dev` profile
+> (5 s bulk samples), 3 rounds plus each run's A/A twin, three scenarios.
+>
+> | `loss1` (10 ms, 1 %) · tunnel leg | mhd | tcp |
+> |---|---|---|
+> | bulk-1 Gbit/s | **0.733** (0.715–0.756) | **2.077** (1.878–2.171) |
+> | bulk-1 CPU s/Gbit | 1.71 | **0.44** |
+> | bulk-1 RSS MiB | 124 | **25.7** |
+> | bulk-1 wire bytes / visitor byte | 1.072 | **1.002** |
+> | rr-1 rtt p50 / p99 (ms) | 20.44 / **22.66** | 20.66 / **247.0** |
+> | rr-1 completed /s | **48.7** | 39.6 |
+> | rr-16 rtt p50 / p99 (ms) | 20.26 / **24.80** | 20.39 / **49.28** |
+> | rr-16 completed /s | **777** | 704 |
+>
+> | `loss5` (100 ms, 5 %) · tunnel leg | mhd | tcp |
+> |---|---|---|
+> | bulk-1 Gbit/s (5 s samples) | **0.0874** (0.080–0.111) | 0.0678 (0.018–0.129) |
+> | bulk-1 Gbit/s (10 s samples) | 0.1084 (0.0958–0.1251) | **0.1332** (0.0632–0.1600) |
+> | rr-1 rtt p50 / p99 (ms) | 200.47 / **287.9** | 200.71 / **1 095.7** |
+> | rr-1 completed /s | **4.9** | 3.9 |
+> | rr-16 rtt p50 / p99 (ms) | 200.28 / **206.3** | 200.83 / **865.5** |
+> | rr-16 completed /s | **79.5** | 55.9 |
+>
+> **What it says.** The interactive tail is the carrier's case and it is now measured on the right leg: **11× tighter at 1 % loss and 3.8–4.2×
+> tighter at 5 %**, with 23–42 % more completed requests. The mechanism is visible in the numbers — TCP's p99 of 247 ms on a 20 ms path is
+> its 200 ms minimum retransmission timeout, so one lost segment costs a request ten round trips, while mhd repairs inside the next one.
+> **Bulk is the opposite story**: 2.8× behind at 20 ms and 19 % behind at 200 ms (10 s samples; the 5 s sample has mhd ahead, which is the
+> slow-start artefact the plan's budget rule warns about). Both are far outside each run's own A/A scatter (`throughput_gbps` 4–6 %,
+> `rtt_p99_ms` 0.4–23 %).
+>
+> **So the carrier's reason to exist is latency, not throughput**, and the clean batch (§4.498, valid — a clean leg is the same leg) says
+> TCP wins there on every axis. A `carrier = auto` policy that wants both has to choose per workload, which the product does not let it do
+> today (the carrier is per data endpoint, not per service).
+
+> **§4.501 (the bulk gap was the window, and the fix is refuted — the eighth member of the same family).**
+> **The diagnosis.** A `MOLEHILL_MHD_STATS=1` diagnostic of `bulk-1` on the 1 %-loss tunnel leg (a diagnostic, never a
+> performance claim) reads the sender's window at **1 121 076 bytes against its own 5 242 880-byte ceiling**, **1 906 writes a
+> second refused for want of window**, and **3.42 MB** of the writer's bytes queued with nothing to carry them:
+> `slow_start=false`, `grow=104 598` bytes/s, `srtt` 20.1 ms against `min` 20.0 ms. The growth phase had ended at the
+> connection's first loss, and the additive rule that follows opens the window at **≈65 KB/s** on a 20 ms path — 76 seconds to
+> double. **Ending the growth phase on a loss is a TCP inference** ("the path dropped, so its capacity was found") and this
+> carrier's own doctrine says a loss is not capacity, so the experiment was to end it only when the loss came with a standing
+> queue (`smoothed > 1.25 × min`), the only evidence in the tree that a queue exists.
+>
+> **What it bought (10 s samples, 3 rounds, same run length).** `loss5` tunnel `bulk-1` **0.1084 → 0.1799 (+66 %)**, above both
+> the other carrier's 0.1332 and the plan's 0.11; that cell's `rr-1` p99 **287.9 → 206.5 ms**; `loss1` bulk 0.7349 → 0.7712
+> (+4.9 %, inside noise); clean bulk unchanged (3.70 Gbit/s); the `rate100_shallow` A/B against the pre-change binary
+> indistinguishable (0.0812 vs 0.0801 Gbit/s, 8 881 vs 8 439 drops, both arms' own scatter).
+>
+> **What it cost, and why it is reverted.**
+>
+> | reading | guarded build | pre-change build |
+> |---|---|---|
+> | soak `rtt100` interactive failures | **16.0 %** | 1.74 % |
+> | soak `loss5` interactive p99 | **3 916 ms** | 391 ms |
+> | soak `loss1` interactive p99 | 77.1 ms | 40.9 ms |
+> | soak `wedge_count` / `wedge_max_s` | **9 / 50.0** | 5 / 60.2 |
+> | step grid (`step_recovery_ms`, first arm) | **1 360 / 1 661 / 905** | 131 / 2 |
+>
+> **The mechanism is the one this record already carries**: with no rate decision above it, a window that only opens turns every
+> shaped path into a standing queue, and the interactive stream drowns in it — 16 % of a soak's pings timing out is the same
+> defect as §4.298's second-long tails, at a larger window. The isolated loss cell rewards a big window; the rotating path
+> punishes it, and the rotating path is the one a deployment runs on.
+>
+> **So the window keeps ending its growth phase at the first loss**, and the +66 % on one cell is recorded as unavailable at
+> that price. That is the eighth member of the `cwnd`/rate family (§九) and it failed the same way as the first seven: **the
+> carrier has no send-rate policy, and every attempt to give it one inside the window's arithmetic is a trade between cells
+> rather than an improvement.**
+>
+> **A method finding of its own**: `step_recovery_ms` cannot resolve a build difference at three rounds. In the interleaved A/B
+> the guarded build's *own twin* read **8 and 26 ms** in the same run where the first arm read **1 360–1 661**, so the cell is
+> dominated by arm position and by whether a round hits its six-second cap. Any future claim on that grid needs more rounds and
+> a balanced order, and §4.489's 22 ms is a lucky draw rather than a stable reading.
+
+> **§4.502 (the shallow-queue cell's drop count no longer matches its P2 record, and nothing in this goal changed it).**
+> P2 recorded `rate100_shallow` at **0.0932 Gbit/s with 14–18 drops** (§4.292's table). On this build the same cell reads
+> **0.081–0.084 Gbit/s with 8 400–8 900 drops**, and the pre-change binary reads the same **8 439** — so the change is not
+> the cause and the regression happened somewhere between P2 and `8fd13c5`. The twin in one run read **2 261** drops against the
+> product arm's **8 881** with the *same binary*, so the cell is also far noisier than the record implies. Recorded, not
+> investigated: the plan demoted `dropped_packets` from a gate to a health reading (§一), and this cell has no other claim
+> attached to it. **Whoever picks this up should first run it with six rounds and a twin, because at three rounds the same
+> binary spans 2 261–8 881.**
+
 > **§4.462 (the runtime regressions are green on this tree).** `just interop` — **3 passed** (new server refuses old client and
 > keeps serving; old server refuses new client and says so; old server rejects an unknown dialect and survives). `just l3-accept`
 > via `sudo -n bash bench/src/bench/utils/l3/run.sh` (the recipe itself skips with 77 without root) — **PASS** on the policy
