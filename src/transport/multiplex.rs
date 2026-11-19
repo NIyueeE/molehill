@@ -1284,18 +1284,42 @@ impl TunnelPoolInner {
                 .profiles
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let bulk = profiles
-                .values()
-                .any(|profile| profile.class() == crate::transport::pool::ServiceClass::Bulk);
-            let conversational = profiles.values().any(|profile| {
-                profile.class() == crate::transport::pool::ServiceClass::Conversational
-            });
+            // The weight of a class is what its services have carried: a bulk
+            // observation is a megabyte, a small one is the top of its range, so
+            // this is a byte share and not a channel count — a chat service that
+            // opens a thousand small channels must not outvote the backup that
+            // moves a gigabyte through one.
+            let mut bulk: u64 = 0;
+            let mut conversational: u64 = 0;
+            for profile in profiles.values() {
+                let (bulk_units, small_units) = profile.weights();
+                match profile.class() {
+                    crate::transport::pool::ServiceClass::Bulk => {
+                        bulk = bulk.saturating_add(bulk_units.max(small_units));
+                    }
+                    crate::transport::pool::ServiceClass::Conversational => {
+                        conversational = conversational.saturating_add(small_units);
+                    }
+                }
+            }
             (bulk, conversational)
         };
-        if !bulk || !conversational || total < 2 {
+        if bulk == 0 || conversational == 0 || total < 2 {
             return None;
         }
-        let tcp = (total / 4).clamp(1, total - 1);
+        // The kernel carrier takes the bulk's share of the pool, and never all of
+        // it: a session with both kinds keeps at least one tunnel on the datagram
+        // carrier, which is where the conversational services' tail comes from.
+        // Integer arithmetic, rounded: the quantities are tunnel counts and
+        // megabyte marks, and a float here would be a rounding rule nobody can
+        // read back from the number.
+        let units = bulk.saturating_add(conversational);
+        let scaled = u128::from(bulk)
+            .saturating_mul(u128::try_from(total).unwrap_or(u128::MAX))
+            .saturating_add(u128::from(units) / 2);
+        let tcp = usize::try_from(scaled / u128::from(units))
+            .unwrap_or(total)
+            .clamp(1, total - 1);
         Some((total - tcp, tcp))
     }
 
@@ -2664,10 +2688,6 @@ impl TunnelPool {
         // falls through every tunnel in turn — so a pool that cannot satisfy it (it
         // rides one carrier, or its member refuses) serves the open exactly as it
         // did before this rule existed.
-        if prefer.is_some() {
-            let carriers: Vec<Carrier> = state.entries.iter().map(|entry| entry.carrier).collect();
-            order = crate::transport::pool::prefer_carrier(&order, &carriers, prefer);
-        }
         // While a carrier probe runs, every new stream the visitor opens is
         // routed to the probe tunnel first: the comparison is meaningless
         // unless the probed carrier carries traffic, and a probe that sits
@@ -2697,7 +2717,9 @@ impl TunnelPool {
         // have yet, and only when every tunnel is already part of the group (a
         // pool the group cannot spread over) does the exclusion give way — the
         // group must still forward, exactly as it did before it had a name.
-        let candidates = crate::transport::pool::order_candidates_for(&order, tried, avoid);
+        let carriers: Vec<Carrier> = state.entries.iter().map(|entry| entry.carrier).collect();
+        let candidates =
+            crate::transport::pool::order_placement(&order, &carriers, tried, avoid, prefer);
         // The least-loaded untried tunnel with pending budget left; when every
         // candidate is at its budget, the least-loaded untried one still takes
         // the open — refusing a visitor outright is worse than queueing it
@@ -5063,36 +5085,45 @@ mod tests {
 
     /// A pool that starts with `n` in-memory tunnels and is configured for
     /// `count`: every repair dials one more, until the count is reached.
-    /// The mix is owed only to a session that carries both kinds of traffic, and
-    /// it is a quarter of the pool on the kernel carrier — one tunnel at the
-    /// smallest pool that can hold two carriers, never all of them.
+    /// The split follows what each kind of traffic carried, not a fixed quarter:
+    /// a session whose bulk dominates gives the kernel carrier most of the pool,
+    /// and one that carries equal parts splits it evenly — either way the datagram
+    /// carrier keeps at least one tunnel.
     #[tokio::test]
-    async fn a_mixed_session_owes_the_kernel_carrier_a_quarter_of_the_pool() {
-        use crate::transport::pool::{CLASS_WINDOW, Observation, ServiceClass};
+    async fn a_mixed_session_splits_the_pool_by_what_each_kind_carried() {
+        use crate::transport::pool::{Observation, ServiceClass};
         let pool = growable_pool(4, 4);
         let bulk = crate::protocol::ServiceId::new(1);
         let chat = crate::protocol::ServiceId::new(2);
-        // No evidence at all: nothing to rebalance, whatever the pool's width.
-        assert_eq!(pool.inner.target_mix(4), None);
-        // One class only — here bulk — is still one answer for the whole session.
-        for _ in 0..(CLASS_WINDOW * 2) {
+        // One class only — here bulk — is one answer for the whole session: there
+        // is nothing to split against.
+        for _ in 0..8 {
             pool.inner.shared.note_observation(bulk, Observation::Bulk);
         }
+        assert_eq!(pool.inner.target_mix(4), None);
         assert_eq!(
             pool.inner.shared.class_of(bulk),
-            ServiceClass::Bulk,
-            "two windows of bulk evidence classify the service"
+            ServiceClass::Conversational
         );
-        assert_eq!(pool.inner.target_mix(4), None);
-        // The other kind appears, and now the pool owes the kernel carrier a
-        // quarter of its tunnels.
-        for _ in 0..(CLASS_WINDOW * 2) {
+        for _ in 0..8 {
+            pool.inner.shared.note_observation(bulk, Observation::Bulk);
+        }
+        assert_eq!(pool.inner.shared.class_of(bulk), ServiceClass::Bulk);
+        assert_eq!(pool.inner.target_mix(4), None, "still one kind");
+        // The other kind appears with the same weight: half the pool each.
+        for _ in 0..16 {
             pool.inner.shared.note_observation(chat, Observation::Small);
         }
-        assert_eq!(pool.inner.target_mix(4), Some((3, 1)));
-        assert_eq!(pool.inner.target_mix(8), Some((6, 2)));
+        assert_eq!(pool.inner.target_mix(4), Some((2, 2)));
+        // More bulk volume moves the split towards the kernel carrier, and the
+        // datagram carrier keeps one tunnel to itself.
+        for _ in 0..56 {
+            pool.inner.shared.note_observation(bulk, Observation::Bulk);
+        }
+        assert_eq!(pool.inner.target_mix(4), Some((1, 3)));
+        assert_eq!(pool.inner.target_mix(8), Some((1, 7)));
         assert_eq!(pool.inner.target_mix(2), Some((1, 1)));
-        // A pool of one cannot hold two carriers, so the mix gives way.
+        // A pool of one cannot hold two carriers.
         assert_eq!(pool.inner.target_mix(1), None);
     }
 
@@ -5166,22 +5197,23 @@ mod tests {
     }
 
     /// A short pool is the repair's business, and the repair dials the carrier
-    /// the mix is short of — so the mix is reachable without a handover whenever
-    /// a tunnel dies.
+    /// the mix is short of — so the mix is reachable without a spare whenever a
+    /// tunnel dies.
     #[tokio::test]
     async fn a_repair_dials_the_carrier_the_mix_is_short_of() {
-        use crate::transport::pool::{CLASS_WINDOW, Observation};
+        use crate::transport::pool::Observation;
         let pool = growable_pool(4, 4);
-        for _ in 0..(CLASS_WINDOW * 2) {
+        for _ in 0..16 {
             pool.inner
                 .shared
                 .note_observation(crate::protocol::ServiceId::new(1), Observation::Bulk);
+        }
+        for _ in 0..16 {
             pool.inner
                 .shared
                 .note_observation(crate::protocol::ServiceId::new(2), Observation::Small);
         }
-        // Everything rides the pool's carrier; the mix wants a quarter elsewhere.
-        let (wanted, uniform) = {
+        let (wanted, uniform, targets) = {
             let state = pool.inner.state.lock();
             let wanted = pool.inner.wanted_carrier(&state.entries, 4);
             let uniform = state
@@ -5193,21 +5225,18 @@ mod tests {
                 state.entries.iter().all(|entry| entry.carrier == uniform),
                 "the fixture is uniform, so the short carrier is the other one"
             );
-            (wanted, uniform)
+            (wanted, uniform, pool.inner.target_mix(4))
         };
-        assert!(
-            wanted != uniform,
+        assert_ne!(
+            wanted, uniform,
             "a uniform pool is short of the carrier the mix wants, so that is the one dialled"
         );
-        // And the target it is dialling towards is the mix's own.
-        let (mhd_target, tcp_target) = pool
-            .inner
-            .target_mix(4)
-            .expect("a mixed session owes a mix");
-        match wanted {
-            Carrier::Mhd => assert_eq!(mhd_target, 3),
-            Carrier::Tcp => assert_eq!(tcp_target, 1),
-        }
+        let (mhd_target, tcp_target) = targets.expect("a mixed session owes a split");
+        let short = match wanted {
+            Carrier::Mhd => mhd_target,
+            Carrier::Tcp => tcp_target,
+        };
+        assert!(short >= 1, "the carrier it dials is one the mix asked for");
     }
 
     fn growable_pool(n: usize, count: usize) -> TunnelPool {

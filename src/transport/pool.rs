@@ -276,6 +276,15 @@ pub(crate) struct TrafficProfile {
     seen: usize,
     /// Consecutive completed windows whose reading disagreed with `class`.
     disagree: u8,
+    /// How much traffic of each kind this service has ever shown, in observation
+    /// units: a bulk observation is one megabyte ([`BULK_BYTES`]), a small one is
+    /// the top of its range ([`SMALL_BYTES`]).
+    ///
+    /// This is what the *split* between the carriers is made of, and it is why a
+    /// session whose bulk service dominates gets most of the tunnels while a chat
+    /// that happens to sit beside it still keeps the one it needs.
+    bulk_units: u64,
+    small_units: u64,
     /// Observations this service has ever produced, so a caller can tell "no
     /// evidence" from "evidence that says conversational".
     total: u64,
@@ -288,6 +297,8 @@ impl Default for TrafficProfile {
             bulk: 0,
             seen: 0,
             disagree: 0,
+            bulk_units: 0,
+            small_units: 0,
             total: 0,
         }
     }
@@ -299,12 +310,24 @@ impl TrafficProfile {
         self.class
     }
 
+    /// How much traffic of each kind this service has shown, in observation
+    /// units: `(bulk, small)`.
+    pub(crate) const fn weights(&self) -> (u64, u64) {
+        (self.bulk_units, self.small_units)
+    }
+
     /// Add one observation, and re-read the class when a window completes.
     pub(crate) fn observe(&mut self, observation: Observation) {
         self.total = self.total.saturating_add(1);
         self.seen += 1;
-        if observation == Observation::Bulk {
-            self.bulk += 1;
+        match observation {
+            Observation::Bulk => {
+                self.bulk += 1;
+                self.bulk_units = self.bulk_units.saturating_add(1);
+            }
+            Observation::Small => {
+                self.small_units = self.small_units.saturating_add(1);
+            }
         }
         if self.seen < CLASS_WINDOW {
             return;
@@ -341,35 +364,62 @@ pub(crate) fn carrier_for(class: ServiceClass) -> Option<Carrier> {
     }
 }
 
-/// Reorder one placement's candidates so the preferred carrier's tunnels come
-/// first, keeping every other candidate behind them.
+/// The candidate order for one placement, given the carrier its service's traffic
+/// asked for and the two things it must skip.
 ///
-/// A preference, never a constraint: the walk still falls through every tunnel in
-/// turn, so a pool whose preferred carrier has no member (or whose member refuses)
-/// serves the open exactly as it would have. That is the property that makes this
-/// rule safe to add to a pool that holds one carrier — it changes nothing there.
-pub(crate) fn prefer_carrier(
+/// Four tiers, in this order, and each one is a *floor* under the one before it —
+/// the open only ever falls through to the next when the previous is empty, so a
+/// placement is never refused for its class:
+///
+/// 1. the wanted carrier, not already tried, not already in the group;
+/// 2. the wanted carrier, not already tried — a bulk group **shares** a tunnel of
+///    its carrier instead of spilling onto the other one;
+/// 3. any carrier, not tried, not in the group (the rule as it was before the
+///    class existed);
+/// 4. any carrier, not tried.
+///
+/// Tier 2 is why this replaced a plain reorder: with one tunnel on the wanted
+/// carrier and eight stripes to place, a reorder put the first stripe there and
+/// every later one back on the other carrier, because the group's spread
+/// preference outranked the class — measured as a policy that moved no bulk
+/// traffic at all (`HANDOFF.md` §4.505).
+pub(crate) fn order_placement(
     order: &[usize],
     carriers: &[Carrier],
+    tried: &[usize],
+    avoid: &[usize],
     wanted: Option<Carrier>,
 ) -> Vec<usize> {
-    let Some(wanted) = wanted else {
-        return order.to_vec();
-    };
-    let mut preferred: Vec<usize> = Vec::with_capacity(order.len());
-    let mut rest: Vec<usize> = Vec::with_capacity(order.len());
-    for index in order {
-        if carriers.get(*index) == Some(&wanted) {
-            preferred.push(*index);
-        } else {
-            rest.push(*index);
+    let free = |index: &usize| !tried.contains(index);
+    let unshared = |index: &usize| free(index) && !avoid.contains(index);
+    if let Some(wanted) = wanted {
+        let on_carrier = |index: &usize| carriers.get(*index) == Some(&wanted);
+        let best: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|index| on_carrier(index) && unshared(index))
+            .collect();
+        if !best.is_empty() {
+            return best;
+        }
+        let shared: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|index| on_carrier(index) && free(index))
+            .collect();
+        if !shared.is_empty() {
+            return shared;
         }
     }
-    if preferred.is_empty() {
-        return order.to_vec();
+    let candidates: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|index| unshared(index))
+        .collect();
+    if candidates.is_empty() && !avoid.is_empty() {
+        return order.iter().copied().filter(|index| free(index)).collect();
     }
-    preferred.extend(rest);
-    preferred
+    candidates
 }
 
 /// Order the candidate indices for one open: least-loaded first (by
@@ -387,40 +437,6 @@ pub(crate) fn order_candidates(loads: &[TunnelLoad], start: usize) -> Vec<usize>
         (loads[*i].total(), offset)
     });
     order
-}
-
-/// The candidate order for one placement, given what it must skip.
-///
-/// Two kinds of skip, deliberately different:
-///
-/// - `tried` — tunnels this open already tried and that refused the stream.
-///   They are never revisited, or the fall-through loop would retry a tunnel it
-///   knows is dead or full;
-/// - `avoid` — the tunnels a stripe group already occupies. That one is a
-///   *preference*, not a constraint: when every candidate is in it (a pool
-///   smaller than the group's stripe count — a pinned pool cannot dial more for
-///   it), the unfiltered order answers instead. A group that cannot spread must
-///   still forward — correctness first, exactly as before the group had a name
-///   (D24).
-///
-/// Pure on purpose: the exclusion rule is the part of stripe placement that can
-/// be checked without a socket, and the pool's own state lock is the only other
-/// input the caller has to supply.
-pub(crate) fn order_candidates_for(
-    order: &[usize],
-    tried: &[usize],
-    avoid: &[usize],
-) -> Vec<usize> {
-    let eligible = |i: &usize| !tried.contains(i) && !avoid.contains(i);
-    let candidates: Vec<usize> = order.iter().copied().filter(eligible).collect();
-    if candidates.is_empty() && !avoid.is_empty() {
-        return order
-            .iter()
-            .copied()
-            .filter(|i| !tried.contains(i))
-            .collect();
-    }
-    candidates
 }
 
 #[cfg(test)]
@@ -483,30 +499,27 @@ mod tests {
     #[test]
     fn stripe_candidates_avoid_the_groups_tunnels_until_none_are_left() {
         let order = vec![2, 0, 1];
+        let mhd = [Carrier::Mhd; 3];
+        let pick =
+            |tried: &[usize], avoid: &[usize]| order_placement(&order, &mhd, tried, avoid, None);
 
         // Nothing excluded: the ordinary order, unchanged.
-        assert_eq!(order_candidates_for(&order, &[], &[]), order);
+        assert_eq!(pick(&[], &[]), order);
         // The group's own tunnels are skipped, in the best-first order.
-        assert_eq!(order_candidates_for(&order, &[], &[2]), vec![0, 1]);
-        assert_eq!(order_candidates_for(&order, &[], &[2, 0]), vec![1]);
+        assert_eq!(pick(&[], &[2]), vec![0, 1]);
+        assert_eq!(pick(&[], &[2, 0]), vec![1]);
         // Every tunnel is the group's: the exclusion gives way, so the group
         // still forwards (the fallback the brief calls correctness first).
-        assert_eq!(order_candidates_for(&order, &[], &[0, 1, 2]), order);
+        assert_eq!(pick(&[], &[0, 1, 2]), order);
         // A tried tunnel stays excluded even when the exclusion is dropped:
         // that one is a refusal, not a preference.
-        assert_eq!(order_candidates_for(&order, &[1], &[0, 1, 2]), vec![2, 0]);
+        assert_eq!(pick(&[1], &[0, 1, 2]), vec![2, 0]);
         // Tried and avoided together leave the third candidate.
-        assert_eq!(order_candidates_for(&order, &[2], &[0]), vec![1]);
+        assert_eq!(pick(&[2], &[0]), vec![1]);
         // Nothing eligible at all (everything tried): empty, so the caller
         // reports the refusal it has rather than reserving a dead tunnel.
-        assert_eq!(
-            order_candidates_for(&order, &[0, 1, 2], &[]),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            order_candidates_for(&order, &[0, 1, 2], &[0]),
-            Vec::<usize>::new()
-        );
+        assert_eq!(pick(&[0, 1, 2], &[]), Vec::<usize>::new());
+        assert_eq!(pick(&[0, 1, 2], &[0]), Vec::<usize>::new());
     }
 
     /// A service nobody has watched is conversational, and stays that way on a
@@ -579,35 +592,59 @@ mod tests {
         assert_eq!(carrier_for(ServiceClass::Bulk), Some(Carrier::Tcp));
     }
 
-    /// The preference reorders and never drops: a pool with no member of the
-    /// wanted carrier, or a preferred member that refuses, still serves the open.
+    /// The class outranks the group's spread, and every tier is a floor: an open
+    /// is never refused for its class, and a pool with no tunnel of the wanted
+    /// carrier places exactly as it did before the rule existed.
     #[test]
-    fn a_carrier_preference_reorders_but_keeps_every_fallback() {
+    fn a_carrier_preference_is_a_filter_with_floors() {
+        // Tunnels 0 and 2 ride the datagram carrier, tunnel 1 the kernel one.
         let order = vec![2, 0, 1];
         let carriers = [Carrier::Mhd, Carrier::Tcp, Carrier::Mhd];
-        // No preference is the identity, allocation-free path included.
-        assert_eq!(prefer_carrier(&order, &carriers, None), order);
-        // A preference moves its members to the front, in the order they had.
+        // No preference: the rule as it was.
         assert_eq!(
-            prefer_carrier(&order, &carriers, Some(Carrier::Tcp)),
-            vec![1, 2, 0]
-        );
-        assert_eq!(
-            prefer_carrier(&order, &carriers, Some(Carrier::Mhd)),
+            order_placement(&order, &carriers, &[], &[], None),
             vec![2, 0, 1]
         );
-        // A pool riding one carrier has no member of the other: unchanged, so the
-        // open falls through exactly as it did before the preference existed.
+        // A wanted carrier takes its own tunnels, in the order they had.
+        assert_eq!(
+            order_placement(&order, &carriers, &[], &[], Some(Carrier::Tcp)),
+            vec![1]
+        );
+        assert_eq!(
+            order_placement(&order, &carriers, &[], &[], Some(Carrier::Mhd)),
+            vec![2, 0]
+        );
+        // **Tier 2**: the group already holds the only tunnel of the wanted
+        // carrier, so the next stripe *shares* it rather than spilling onto the
+        // other carrier — the defect that made the policy move no bulk traffic.
+        assert_eq!(
+            order_placement(&order, &carriers, &[], &[1], Some(Carrier::Tcp)),
+            vec![1]
+        );
+        // A tried tunnel is never revisited, even to satisfy the class: that one
+        // refused the stream, and the fall-through asks again with it added.
+        assert_eq!(
+            order_placement(&order, &carriers, &[1], &[], Some(Carrier::Tcp)),
+            vec![2, 0]
+        );
+        assert_eq!(
+            order_placement(&order, &carriers, &[1, 2], &[], Some(Carrier::Tcp)),
+            vec![0]
+        );
+        // **Tier 3**: a pool with no tunnel of the wanted carrier is unchanged.
         let uniform = [Carrier::Mhd, Carrier::Mhd, Carrier::Mhd];
         assert_eq!(
-            prefer_carrier(&order, &uniform, Some(Carrier::Tcp)),
-            order,
-            "a preference the pool cannot satisfy must not change the order"
+            order_placement(&order, &uniform, &[], &[], Some(Carrier::Tcp)),
+            order
         );
-        // Every candidate still appears exactly once.
-        let reordered = prefer_carrier(&order, &carriers, Some(Carrier::Tcp));
-        let mut sorted = reordered.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, vec![0, 1, 2]);
+        assert_eq!(
+            order_placement(&order, &uniform, &[], &[2], Some(Carrier::Tcp)),
+            vec![0, 1]
+        );
+        // Everything tried: empty, so the caller reports the refusal it has.
+        assert_eq!(
+            order_placement(&order, &carriers, &[0, 1, 2], &[], None),
+            Vec::<usize>::new()
+        );
     }
 }
