@@ -13,6 +13,37 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.504 (the pool now decides a carrier per service, from what it carried — and its actuator is one slot short).**
+> **The rule.** A service is **conversational** or **bulk**, read from what its channels moved: a channel reports one
+> observation per megabyte it crosses (bulk) and one when it ends below 64 KiB (an exchange). Eight observations make a
+> reading, two consecutive readings make a decision, and a service nobody has watched is conversational — which is the
+> product's default carrier, so an unclassified service is placed exactly as it was before the rule existed. Placement
+> takes the class as a *preference*: the matching carrier's tunnels move to the front of the candidate order and every
+> other candidate stays behind them, so a pool that cannot satisfy it serves the open unchanged.
+>
+> **The mix.** A session that has shown both kinds owes the kernel carrier **a quarter of its tunnels** (at least one,
+> never all) — the trade this exists for is only real when both are present, and a session with one kind keeps the
+> endpoint's one answer. Repair dials whichever carrier the mix is short of.
+>
+> **What it does end to end, measured** (`cost`, loss1, the leg the carrier crosses, nothing pinned, one round): the
+> bulk service's class flips 30 ms before the pool asks for the second carrier —
+> ```
+> pool-stats: a service's traffic class changed service=ServiceId([0,0,0,4]) from="conversational" to="bulk"
+> pool-stats: this session carries both kinds of service; handing one tunnel to TCP mhd=4 tcp=0 mhd_target=3 tcp_target=1
+> ```
+>
+> **What it does not do yet, and the next change.** That pool had **no slot to move**: the tunnel it chose held a
+> long-lived bulk stream for the whole stage, so the drain never emptied, its budget expired and the pool resumed its
+> ordinary repair — the log says nothing because a called-off move is a DEBUG line. A pinned pool is always full, so a
+> mix needs one tunnel that can be freed; **the fix is a transient spare**: while the mix is owed and no drain can
+> complete, grow to `count + 1` on the carrier that is short, then shrink back once a tunnel of the over-represented
+> carrier empties. That is the next commit, and the mix's own judgement waits for it: the `cost` cell cannot show a
+> completed move until the pool can make room.
+>
+> **Two guards worth stating.** The class is a *preference* and never a constraint, so a wrong guess costs throughput
+> and never a visitor; and the whole policy is inert under `MOLEHILL_DATA_CARRIER` because the handover's own choke
+> point refuses to move a pinned carrier — which is what keeps the carrier A/B of §4.500 a clean measurement.
+
 > **MHD 定型 — written 2026-11-19, with one floor named as open.**
 >
 > **What it means here**: the carrier's behaviour on the leg it crosses is measured against its own TCP carrier, every runtime
