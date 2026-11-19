@@ -1370,12 +1370,13 @@ enum Tunnels {
 
 #[cfg(feature = "multiplex")]
 impl Tunnels {
-    /// Open the next data channel: a stream from the tunnel pool, placed
-    /// least-loaded-first over the physical tunnels.
-    async fn open_stream(&self) -> Result<TunnelStream> {
+    /// The same open, for a channel that names the service it carries — which is
+    /// what lets the pool place it on the carrier that service's traffic earned
+    /// (see [`TunnelPool::open_stream_for`]).
+    async fn open_stream_for(&self, service: crate::protocol::ServiceId) -> Result<TunnelStream> {
         match self {
             Tunnels::Yamux(pool) => pool
-                .open_stream()
+                .open_stream_for(service)
                 .await
                 .map(TunnelStream::Yamux)
                 .map_err(|e| self.refused(&e)),
@@ -1387,12 +1388,13 @@ impl Tunnels {
     /// fewer (see [`TunnelPool::open_stream_on_distinct`]).
     async fn open_stream_on_distinct(
         &self,
+        service: crate::protocol::ServiceId,
         used: &[usize],
         stripes: usize,
     ) -> Result<TunnelStream> {
         match self {
             Tunnels::Yamux(pool) => pool
-                .open_stream_on_distinct(used, stripes)
+                .open_stream_on_distinct(service, used, stripes)
                 .await
                 .map(TunnelStream::Yamux)
                 .map_err(|e| self.refused(&e)),
@@ -1625,7 +1627,7 @@ async fn run_mux_data_channel(
         .and_then(|r| r),
         None => tokio::time::timeout(
             crate::common::constants::PROLOGUE_BUDGET,
-            tunnel.open_stream(),
+            tunnel.open_stream_for(args.service_id),
         )
         .await
         .map_err(|_| {
@@ -1783,7 +1785,7 @@ async fn open_stripe_stream(
     let used = placement.used();
     let used_at = started.elapsed();
     let stream = tunnel
-        .open_stream_on_distinct(&used, usize::from(stripe.count))
+        .open_stream_on_distinct(args.service_id, &used, usize::from(stripe.count))
         .await?;
     let opened = started.elapsed();
     if placement.record(stream.tunnel_id()) {

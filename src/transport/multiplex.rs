@@ -498,6 +498,20 @@ pub(crate) struct StreamLease {
     /// The id of the tunnel this stream is charged to (unique per process).
     tunnel_id: usize,
     counters: std::sync::Arc<TunnelCounters>,
+    /// The service this channel carries.
+    ///
+    /// The pool's carrier policy reads a service's traffic class from what its
+    /// channels carried (see [`crate::transport::pool::TrafficProfile`]), and a
+    /// channel is the only place that traffic is visible — so the lease carries
+    /// the key and reports the two observations a channel can make: it crossed
+    /// [`crate::transport::pool::BULK_BYTES`], or it ended below
+    /// [`crate::transport::pool::SMALL_BYTES`].
+    service: Option<crate::protocol::ServiceId>,
+    /// Bytes this channel has carried, both directions together.
+    bytes: std::sync::atomic::AtomicU64,
+    /// Whether this channel has already reported itself as bulk, so a transfer
+    /// costs one observation and not one per megabyte.
+    bulk_reported: std::sync::atomic::AtomicBool,
     /// The pool this stream came from, for the capacity wake-up: an open that
     /// found every tunnel at its ceiling is waiting for exactly this drop, and
     /// a weak reference cannot keep a dead pool alive.
@@ -526,8 +540,29 @@ impl StreamLease {
     /// forwarding wrapper ([`crate::core::client::ClientDataChannel::Mux`])
     /// calls this instead of the global registry its predecessor kept — see
     /// [`TunnelCounters::count_bytes`].
+    ///
+    /// The same call is where a channel tells the pool what its service carries:
+    /// the first megabyte is the observation that this service moves bulk, and
+    /// it is reported once (`bulk_reported`), so a hundred-megabyte transfer
+    /// costs the pool one lock and not a hundred.
     pub(crate) fn count_bytes(&self, delivered: u64, written: u64) {
         self.counters.count_bytes(delivered, written);
+        let moved = delivered.saturating_add(written);
+        if moved == 0 {
+            return;
+        }
+        let total = self
+            .bytes
+            .fetch_add(moved, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(moved);
+        if total >= crate::transport::pool::BULK_BYTES
+            && !self
+                .bulk_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            && let (Some(pool), Some(service)) = (self.pool.upgrade(), self.service)
+        {
+            pool.note_observation(service, crate::transport::pool::Observation::Bulk);
+        }
     }
 }
 
@@ -546,6 +581,21 @@ impl Drop for StreamLease {
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.counters.note_held(self.charged_at.elapsed());
         if let Some(pool) = self.pool.upgrade() {
+            // **What a small channel proves.** A channel that never reached the
+            // bulk mark and ended below the small mark is one exchange: it is the
+            // evidence that this service is conversational, and it is the only
+            // observation a request/response flow ever produces. A channel between
+            // the two marks leaves none, which is the conservative answer for a
+            // rule that only ever moves *new* channels.
+            if !self
+                .bulk_reported
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+                    < crate::transport::pool::SMALL_BYTES
+                && let Some(service) = self.service
+            {
+                pool.note_observation(service, crate::transport::pool::Observation::Small);
+            }
             // One stream of capacity came back. `notify_waiters` (not
             // `notify_one`) because every waiter re-reads the whole pool: the
             // wake-up is a hint that the state changed, not a hand-off of one
@@ -880,6 +930,24 @@ struct PoolShared {
     /// Counters for the opt-in telemetry line.
     grows: std::sync::atomic::AtomicU64,
     shrinks: std::sync::atomic::AtomicU64,
+    /// What each service of this session has carried, and the traffic class the
+    /// pool reads from it.
+    ///
+    /// One map per pool, keyed by service, because that is the granularity the
+    /// decision has: a session carries several services and the channels of one
+    /// service are what share a workload. It lives on the shared half rather than
+    /// with the entries so a channel's own drop can report into it — a lease holds
+    /// a `Weak<PoolShared>` and nothing else.
+    ///
+    /// Empty until a channel ends or crosses a megabyte, and the placement rule
+    /// answers "no evidence" the same way it answers "conversational", so an
+    /// unclassified service is placed exactly as it was before this existed.
+    profiles: std::sync::Mutex<
+        std::collections::HashMap<
+            crate::protocol::ServiceId,
+            crate::transport::pool::TrafficProfile,
+        >,
+    >,
     /// The pool timeline, drained once per second by the telemetry task.
     events: std::sync::Mutex<Vec<PoolEvent>>,
     /// Set while the pool is establishing a tunnel, so two repair dials cannot
@@ -941,6 +1009,45 @@ impl PoolShared {
             events.remove(0);
         }
         events.push(event);
+    }
+
+    /// Record what one channel proved about its service.
+    ///
+    /// Called from a channel's own byte counter and from its drop (see
+    /// [`StreamLease`]), so it must stay cheap: one lock, one profile, and the
+    /// profile's own arithmetic — which decides the class only when a window of
+    /// [`crate::transport::pool::CLASS_WINDOW`] observations completes.
+    fn note_observation(
+        &self,
+        service: crate::protocol::ServiceId,
+        observation: crate::transport::pool::Observation,
+    ) {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(service)
+            .or_default()
+            .observe(observation);
+    }
+
+    /// The traffic class this session has earned for one service.
+    ///
+    /// `None` when the service has produced no evidence: a service nobody has
+    /// watched is placed exactly as it was before the policy existed, which is
+    /// what keeps this rule invisible on a deployment that carries one kind of
+    /// traffic.
+    fn class_of(
+        &self,
+        service: crate::protocol::ServiceId,
+    ) -> crate::transport::pool::ServiceClass {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&service)
+            .map_or(
+                crate::transport::pool::ServiceClass::Conversational,
+                crate::transport::pool::TrafficProfile::class,
+            )
     }
 }
 
@@ -1167,6 +1274,7 @@ impl TunnelPool {
             grow_failed_at: std::sync::Mutex::new(None),
             grows: std::sync::atomic::AtomicU64::new(0),
             shrinks: std::sync::atomic::AtomicU64::new(0),
+            profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
             events: std::sync::Mutex::new(Vec::new()),
             resizing: std::sync::atomic::AtomicBool::new(false),
             grown: tokio::sync::Notify::new(),
@@ -2108,8 +2216,18 @@ impl TunnelPool {
     /// maintenance tick. The reservation is charged before the first `await`,
     /// which is what makes back-to-back opens land on distinct tunnels while the
     /// pool has them.
-    pub(crate) async fn open_stream(&self) -> Result<StreamLease, OpenError> {
-        self.open_avoiding(&[]).await
+    /// The same open for a channel whose service is known, so the pool can place
+    /// it on the carrier that service's traffic has earned.
+    ///
+    /// A service with no evidence is placed exactly as [`Self::open_stream`]
+    /// places it: the class is a *preference* handed to the placement rule, and a
+    /// pool riding one carrier cannot satisfy any preference, so this parameter
+    /// changes nothing until the pool holds both carriers.
+    pub(crate) async fn open_stream_for(
+        &self,
+        service: crate::protocol::ServiceId,
+    ) -> Result<StreamLease, OpenError> {
+        self.open_avoiding(Some(service), &[]).await
     }
 
     /// Open one stream for a stripe of a group, on a tunnel the group does not
@@ -2126,19 +2244,24 @@ impl TunnelPool {
     /// stripes share them rather than failing.
     pub(crate) async fn open_stream_on_distinct(
         &self,
+        service: crate::protocol::ServiceId,
         used: &[usize],
         stripes: usize,
     ) -> Result<StreamLease, OpenError> {
         // `stripes` stays in the signature because the caller still sizes the
         // request by it; placement reads only the group's occupied tunnels.
         let _ = stripes;
-        self.open_avoiding(used).await
+        self.open_avoiding(Some(service), used).await
     }
 
     /// The body of every open: `avoid` names tunnels this request must not
     /// take while it can take another (only a stripe group passes a non-empty
     /// list — see [`Self::open_stream_on_distinct`]).
-    async fn open_avoiding(&self, avoid: &[usize]) -> Result<StreamLease, OpenError> {
+    async fn open_avoiding(
+        &self,
+        service: Option<crate::protocol::ServiceId>,
+        avoid: &[usize],
+    ) -> Result<StreamLease, OpenError> {
         // Where a visitor's five to eight milliseconds actually go. The stream
         // open itself is measured on the lane (`hs_us`) and stays under five; this
         // interval is everything **in front of** it — reserving a slot in the pool,
@@ -2158,7 +2281,14 @@ impl TunnelPool {
         }
         let ceiling = self.ceiling();
         let avoid = self.indices_of(avoid);
-        let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
+        // **What this service's traffic has earned.** The class is read once per
+        // open, from the pool's own record of what the service carried; a service
+        // with no evidence, or one that reads conversational, asks for no carrier
+        // at all and is placed exactly as it was before this rule existed.
+        let prefer = service
+            .map(|service| self.inner.shared.class_of(service))
+            .and_then(crate::transport::pool::carrier_for);
+        let Some(reservation) = self.reserve(prefer, &[], &avoid, ceiling) else {
             // Nothing under the ceiling. An empty pool is a different failure
             // from a full one — the dialer could not bring a tunnel up — and
             // reporting it as `AtCapacity` would blame the load for the
@@ -2175,12 +2305,12 @@ impl TunnelPool {
             // Register before the second look, or a retirement landing in
             // between would be lost and this open would sleep out the budget.
             freed.as_mut().enable();
-            if self.reserve(&[], &avoid, ceiling).is_none() {
+            if self.reserve(prefer, &[], &avoid, ceiling).is_none() {
                 let before = std::time::Instant::now();
                 let _ = tokio::time::timeout(crate::transport::pool::CAPACITY_WAIT, freed).await;
                 waited = before.elapsed();
             }
-            let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
+            let Some(reservation) = self.reserve(prefer, &[], &avoid, ceiling) else {
                 // The final refusal: every serving tunnel is at the ceiling,
                 // and no stream retired inside the budget. During a handover,
                 // this is short-lived placement pressure, not pool saturation.
@@ -2189,9 +2319,12 @@ impl TunnelPool {
                 }
                 return Err(OpenError::AtCapacity);
             };
-            return self.place(placing, waited, reservation, &avoid).await;
+            return self
+                .place(service, prefer, placing, waited, reservation, &avoid)
+                .await;
         };
-        self.place(placing, waited, reservation, &avoid).await
+        self.place(service, prefer, placing, waited, reservation, &avoid)
+            .await
     }
 
     /// Complete one placement, reporting it when it was slow.
@@ -2202,6 +2335,8 @@ impl TunnelPool {
     /// stream open or inside it — and neither is read on a healthy open.
     async fn place(
         &self,
+        service: Option<crate::protocol::ServiceId>,
+        prefer: Option<Carrier>,
         placing: std::time::Instant,
         waited: std::time::Duration,
         reservation: Reservation,
@@ -2216,7 +2351,7 @@ impl TunnelPool {
                 "mhd pool placement"
             );
         }
-        self.complete(reservation, avoid).await
+        self.complete(service, prefer, reservation, avoid).await
     }
 
     /// The concurrent streams one tunnel of this pool may carry.
@@ -2349,7 +2484,13 @@ impl TunnelPool {
     /// what makes back-to-back opens land on distinct tunnels — and what makes
     /// a stripe group's concurrent placements spread even when a sibling has
     /// not recorded its tunnel yet.
-    fn reserve(&self, tried: &[usize], avoid: &[usize], ceiling: usize) -> Option<Reservation> {
+    fn reserve(
+        &self,
+        prefer: Option<Carrier>,
+        tried: &[usize],
+        avoid: &[usize],
+        ceiling: usize,
+    ) -> Option<Reservation> {
         let mut state = self.inner.state.lock();
         let loads: Vec<TunnelLoad> = state.entries.iter().map(PoolEntry::load).collect();
         let cursor = state.next_cursor;
@@ -2363,6 +2504,15 @@ impl TunnelPool {
                     .is_some_and(|entry| entry.phase == TunnelPhase::Serving)
             })
             .collect();
+        // **The carrier this service's traffic asked for.** A preference, never a
+        // constraint: `prefer_carrier` only reorders, and the walk below still
+        // falls through every tunnel in turn — so a pool that cannot satisfy it (it
+        // rides one carrier, or its member refuses) serves the open exactly as it
+        // did before this rule existed.
+        if prefer.is_some() {
+            let carriers: Vec<Carrier> = state.entries.iter().map(|entry| entry.carrier).collect();
+            order = crate::transport::pool::prefer_carrier(&order, &carriers, prefer);
+        }
         // While a carrier probe runs, every new stream the visitor opens is
         // routed to the probe tunnel first: the comparison is meaningless
         // unless the probed carrier carries traffic, and a probe that sits
@@ -2461,6 +2611,8 @@ impl TunnelPool {
     /// fails a healthy run with one ERROR.
     async fn complete(
         &self,
+        service: Option<crate::protocol::ServiceId>,
+        prefer: Option<Carrier>,
         reservation: Reservation,
         avoid: &[usize],
     ) -> Result<StreamLease, OpenError> {
@@ -2505,6 +2657,9 @@ impl TunnelPool {
                     stream,
                     tunnel_id: tunnel.id(),
                     counters,
+                    service,
+                    bytes: std::sync::atomic::AtomicU64::new(0),
+                    bulk_reported: std::sync::atomic::AtomicBool::new(false),
                     pool,
                 })
             }
@@ -2538,7 +2693,7 @@ impl TunnelPool {
                 let mut last = e;
                 let mut tried = vec![index];
                 let ceiling = self.ceiling();
-                while let Some(mut next) = self.reserve(&tried, avoid, ceiling) {
+                while let Some(mut next) = self.reserve(prefer, &tried, avoid, ceiling) {
                     tried.push(next.index);
                     next.placement.fallback = true;
                     match next.tunnel.open_stream().await {
@@ -2557,6 +2712,9 @@ impl TunnelPool {
                                 stream,
                                 tunnel_id: next.tunnel.id(),
                                 counters,
+                                service,
+                                bytes: std::sync::atomic::AtomicU64::new(0),
+                                bulk_reported: std::sync::atomic::AtomicBool::new(false),
                                 pool: next.pool,
                             });
                         }
@@ -4247,7 +4405,11 @@ mod tests {
         let (pool, _rxs) = duplex_pool(2, 2);
         let mut streams = Vec::new();
         for _ in 0..2 {
-            streams.push(pool.open_stream().await.expect("an open"));
+            streams.push(
+                pool.open_stream_for(crate::protocol::ServiceId::new(1))
+                    .await
+                    .expect("an open"),
+            );
         }
         // Two polls on the first tunnel, one on the second, on both sides of
         // the counter: the pairs add up apart, never mixed.
@@ -4745,7 +4907,7 @@ mod tests {
         let mut streams = Vec::with_capacity(stripes);
         for _ in 0..stripes {
             let stream = pool
-                .open_stream_on_distinct(&used, stripes)
+                .open_stream_on_distinct(crate::protocol::ServiceId::new(1), &used, stripes)
                 .await
                 .expect("a stripe of the group must open");
             used.push(stream.tunnel_id());
@@ -4860,7 +5022,11 @@ mod tests {
         let (pool, _rxs) = duplex_pool(4, 4);
         let mut streams = Vec::new();
         for _ in 0..3 {
-            streams.push(pool.open_stream().await.expect("an open"));
+            streams.push(
+                pool.open_stream_for(crate::protocol::ServiceId::new(1))
+                    .await
+                    .expect("an open"),
+            );
         }
         let used: Vec<usize> = pool
             .snapshot()
@@ -4891,7 +5057,11 @@ mod tests {
         let (pool, _rxs) = duplex_pool(2, 2);
         let mut streams = Vec::new();
         for _ in 0..4 {
-            streams.push(pool.open_stream().await.expect("an open"));
+            streams.push(
+                pool.open_stream_for(crate::protocol::ServiceId::new(1))
+                    .await
+                    .expect("an open"),
+            );
         }
         assert_eq!(streams.len(), 4, "every open still produced a stream");
         let used: Vec<usize> = pool
@@ -4917,7 +5087,7 @@ mod tests {
         let mut streams = Vec::new();
         for _ in 0..4 {
             let lease = pool
-                .open_stream_on_distinct(&used, 4)
+                .open_stream_on_distinct(crate::protocol::ServiceId::new(1), &used, 4)
                 .await
                 .expect("every stripe must still open");
             used.push(lease.tunnel_id());
@@ -4950,7 +5120,10 @@ mod tests {
     #[tokio::test]
     async fn a_closed_stream_leaves_the_tunnel_count() {
         let (pool, _rxs) = duplex_pool(1, 1);
-        let stream = pool.open_stream().await.expect("one open");
+        let stream = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await
+            .expect("one open");
         assert_eq!(pool.snapshot().streams(), 1);
         drop(stream);
         assert_eq!(pool.snapshot().streams(), 0);
@@ -4972,7 +5145,11 @@ mod tests {
 
         let mut held = Vec::new();
         for _ in 0..ceiling {
-            held.push(pool.open_stream().await.expect("an open under the ceiling"));
+            held.push(
+                pool.open_stream_for(crate::protocol::ServiceId::new(1))
+                    .await
+                    .expect("an open under the ceiling"),
+            );
         }
         assert_eq!(
             pool.snapshot()
@@ -4984,7 +5161,9 @@ mod tests {
             "every stream slot this pool has is taken"
         );
 
-        let refusal = pool.open_stream().await;
+        let refusal = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await;
         assert!(
             matches!(&refusal, Err(OpenError::AtCapacity)),
             "a pool at its ceiling must refuse with AtCapacity after the wait: {:?}",
@@ -5012,7 +5191,7 @@ mod tests {
         // exists, with no dial and no new tunnel.
         held.pop();
         let next = pool
-            .open_stream()
+            .open_stream_for(crate::protocol::ServiceId::new(1))
             .await
             .expect("a retiring stream must let the next visitor in");
         assert_eq!(pool.size(), 1, "the pool never dialed for the visitor");
@@ -5059,7 +5238,7 @@ mod tests {
         );
 
         let first = pool
-            .open_stream()
+            .open_stream_for(crate::protocol::ServiceId::new(1))
             .await
             .expect("the first open repairs a tunnel");
         assert_eq!(pool.size(), 1, "the open dialed exactly one tunnel");
@@ -5195,7 +5374,10 @@ mod tests {
 
         let mut live = Vec::new();
         for i in 0..OPENS {
-            let mut s = pool.open_stream().await.unwrap();
+            let mut s = pool
+                .open_stream_for(crate::protocol::ServiceId::new(1))
+                .await
+                .unwrap();
             // Eight bytes, one payload per open: the receiving tunnel echoes
             // without needing to know its ordinal.
             s.write_all(format!("msg{i:05}").as_bytes()).await.unwrap();
@@ -5220,7 +5402,10 @@ mod tests {
         // More opens than the pool is wide: they are placed on the tunnels
         // that exist, and the pinned pool never dials a third.
         for i in 0..OPENS {
-            let mut s = pool.open_stream().await.unwrap();
+            let mut s = pool
+                .open_stream_for(crate::protocol::ServiceId::new(1))
+                .await
+                .unwrap();
             s.write_all(format!("more{i:04}").as_bytes()).await.unwrap();
             s.flush().await.unwrap();
             let mut ok = [0u8; 2];
@@ -5276,9 +5461,15 @@ mod tests {
         );
 
         // Sanity: both tunnels work.
-        let mut a = pool.open_stream().await.unwrap();
+        let mut a = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await
+            .unwrap();
         a.write_all(b"aaaa").await.unwrap();
-        let mut b = pool.open_stream().await.unwrap();
+        let mut b = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await
+            .unwrap();
         b.write_all(b"bbbb").await.unwrap();
         let mut got = Vec::new();
         for rx in [&mut rx1, &mut rx2] {
@@ -5298,7 +5489,10 @@ mod tests {
         // Once the driver is gone the pool's fall-through is deterministic.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         for _ in 0..4 {
-            let mut s = pool.open_stream().await.unwrap();
+            let mut s = pool
+                .open_stream_for(crate::protocol::ServiceId::new(1))
+                .await
+                .unwrap();
             s.write_all(b"cccc").await.unwrap();
         }
         for _ in 0..4 {
@@ -5376,8 +5570,14 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (pool, dials) = handover_pool("handover");
-        let held = pool.open_stream().await.unwrap();
-        let anchor = pool.open_stream().await.unwrap();
+        let held = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await
+            .unwrap();
+        let anchor = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await
+            .unwrap();
         assert_ne!(
             held.tunnel_id(),
             anchor.tunnel_id(),
@@ -5430,7 +5630,10 @@ mod tests {
             );
             (anchor, held)
         };
-        let replacement_stream = pool.open_stream().await.unwrap();
+        let replacement_stream = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await
+            .unwrap();
         assert_eq!(replacement_stream.tunnel_id(), serving_id);
         assert_eq!(
             dials.load(Ordering::SeqCst),
@@ -5484,7 +5687,11 @@ mod tests {
         let (pool, dials) = handover_pool("convicted");
         let mut leases = Vec::new();
         for _ in 0..3 {
-            leases.push(pool.open_stream().await.unwrap());
+            leases.push(
+                pool.open_stream_for(crate::protocol::ServiceId::new(1))
+                    .await
+                    .unwrap(),
+            );
         }
         // The busier tunnel is the one the evidence names: the generic
         // least-loaded selection would drain the other one, so this is what
@@ -5650,7 +5857,10 @@ mod tests {
         // Hold a stream, so the tunnel is busy when its peer goes away: a
         // death is repaired whether or not the tunnel was carrying, and the
         // held stream must not keep the corpse in the pool.
-        let held = pool.open_stream().await.unwrap();
+        let held = pool
+            .open_stream_for(crate::protocol::ServiceId::new(1))
+            .await
+            .unwrap();
         assert_eq!(pool.size(), 1);
         assert_eq!(dials.load(Ordering::Relaxed), 0);
 
@@ -5702,7 +5912,7 @@ mod tests {
 
         // The replacement serves visitors.
         let served = pool
-            .open_stream()
+            .open_stream_for(crate::protocol::ServiceId::new(1))
             .await
             .expect("the replacement must serve the next visitor");
         drop(served);

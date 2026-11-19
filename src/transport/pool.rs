@@ -13,6 +13,8 @@
 //! and keeps them; the only runtime establishment is *repair* (a dead tunnel
 //! is re-dialed), so this module no longer carries growth or shrink rules.
 
+use crate::transport::carrier::Carrier;
+
 /// How often a live pool reconciles its size against its configured count.
 pub(crate) const MAINTAIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -190,6 +192,176 @@ pub(crate) struct Placement {
     pub(crate) fallback: bool,
 }
 
+/// What a service's traffic looks like, as the pool reads it from what it carried.
+///
+/// The choice between the two carriers is a property of the *workload* as much as
+/// of the path, and the operator cannot be asked for it: one deployment carries a
+/// chat connection and a backup over one client. So the pool reads the answer from
+/// what each service actually did, and the two classes it tells apart are the two
+/// the carriers differ on.
+///
+/// The difference is measured, not assumed (`HANDOFF.md` §4.500; ten-second
+/// samples, the condition on the leg the carrier crosses): a conversational flow's
+/// tail is **11× tighter** on the datagram carrier at 1 % loss, because one lost
+/// segment costs the kernel carrier its 200 ms minimum retransmission timeout,
+/// while a bulk flow's rate is **2.8× better** on the kernel carrier at the same
+/// loss and 1.2× better at 5 %.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ServiceClass {
+    /// Many small exchanges: the tail is the experience. This is also the prior,
+    /// because the datagram carrier is the product's default and a service nobody
+    /// has watched yet must not be moved on no evidence.
+    #[default]
+    Conversational,
+    /// A few large transfers: the rate is the experience.
+    Bulk,
+}
+
+/// One thing a channel proved about the service it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Observation {
+    /// The channel carried at least [`BULK_BYTES`].
+    Bulk,
+    /// The channel ended having carried less than [`SMALL_BYTES`].
+    Small,
+}
+
+/// The bytes in one channel that make it a bulk transfer rather than an exchange.
+///
+/// A megabyte is far above any request/response an interactive protocol produces
+/// (the bench's is 64 bytes; a chat message is kilobytes) and far below what a
+/// file transfer or a backup moves (the bench's bulk cell carries tens of
+/// megabytes). Nothing between the two is decided: a channel that ends between
+/// [`SMALL_BYTES`] and this leaves no observation at all, which is the
+/// conservative answer for a class that only ever moves *new* channels.
+pub(crate) const BULK_BYTES: u64 = 1024 * 1024;
+
+/// The bytes below which a channel counts as a small exchange.
+pub(crate) const SMALL_BYTES: u64 = 64 * 1024;
+
+/// How many observations one class reading is made of.
+pub(crate) const CLASS_WINDOW: usize = 8;
+
+/// How many of a window's observations must be bulk for the reading to say so.
+pub(crate) const CLASS_BULK_MARKS: usize = 4;
+
+/// How many consecutive windows must agree before the class changes.
+///
+/// Two, so a single burst cannot move a service: an occasional large transfer
+/// through an otherwise conversational service needs two windows of evidence, and
+/// the actuator it would drive is expensive (a tunnel handover, a fresh handshake
+/// and a drain).
+pub(crate) const CLASS_CONFIRMATIONS: u8 = 2;
+
+/// What one service has carried, and the class the pool reads from it.
+///
+/// Pure: the pool hands it observations and asks it for a class, so the rule that
+/// decides a carrier is testable without a socket, a tunnel or a clock.
+#[derive(Debug)]
+pub(crate) struct TrafficProfile {
+    class: ServiceClass,
+    /// Bulk observations in the window being filled.
+    bulk: usize,
+    /// Observations in the window being filled.
+    seen: usize,
+    /// Consecutive completed windows whose reading disagreed with `class`.
+    disagree: u8,
+    /// Observations this service has ever produced, so a caller can tell "no
+    /// evidence" from "evidence that says conversational".
+    total: u64,
+}
+
+impl Default for TrafficProfile {
+    fn default() -> Self {
+        Self {
+            class: ServiceClass::Conversational,
+            bulk: 0,
+            seen: 0,
+            disagree: 0,
+            total: 0,
+        }
+    }
+}
+
+impl TrafficProfile {
+    /// The class this service's traffic has earned.
+    pub(crate) const fn class(&self) -> ServiceClass {
+        self.class
+    }
+
+    /// Add one observation, and re-read the class when a window completes.
+    pub(crate) fn observe(&mut self, observation: Observation) {
+        self.total = self.total.saturating_add(1);
+        self.seen += 1;
+        if observation == Observation::Bulk {
+            self.bulk += 1;
+        }
+        if self.seen < CLASS_WINDOW {
+            return;
+        }
+        let reading = if self.bulk >= CLASS_BULK_MARKS {
+            ServiceClass::Bulk
+        } else {
+            ServiceClass::Conversational
+        };
+        self.seen = 0;
+        self.bulk = 0;
+        if reading == self.class {
+            self.disagree = 0;
+            return;
+        }
+        self.disagree += 1;
+        if self.disagree >= CLASS_CONFIRMATIONS {
+            self.class = reading;
+            self.disagree = 0;
+        }
+    }
+}
+
+/// The carrier a class asks for, or `None` when the pool should not care.
+///
+/// A conversational flow stays on whatever the pool already rides: the datagram
+/// carrier is the product's default, and the kernel one is only 44 µs better on a
+/// *clean* path, which is inside the noise of every cell that measures it. A bulk
+/// flow asks for the kernel carrier, which is the one that carries more bytes.
+pub(crate) fn carrier_for(class: ServiceClass) -> Option<Carrier> {
+    match class {
+        ServiceClass::Conversational => None,
+        ServiceClass::Bulk => Some(Carrier::Tcp),
+    }
+}
+
+/// Reorder one placement's candidates so the preferred carrier's tunnels come
+/// first, keeping every other candidate behind them.
+///
+/// A preference, never a constraint: the walk still falls through every tunnel in
+/// turn, so a pool whose preferred carrier has no member (or whose member refuses)
+/// serves the open exactly as it would have. That is the property that makes this
+/// rule safe to add to a pool that holds one carrier — it changes nothing there.
+pub(crate) fn prefer_carrier(
+    order: &[usize],
+    carriers: &[Carrier],
+    wanted: Option<Carrier>,
+) -> Vec<usize> {
+    let Some(wanted) = wanted else {
+        return order.to_vec();
+    };
+    let mut preferred: Vec<usize> = Vec::with_capacity(order.len());
+    let mut rest: Vec<usize> = Vec::with_capacity(order.len());
+    for index in order {
+        if carriers.get(*index) == Some(&wanted) {
+            preferred.push(*index);
+        } else {
+            rest.push(*index);
+        }
+    }
+    if preferred.is_empty() {
+        return order.to_vec();
+    }
+    preferred.extend(rest);
+    preferred
+}
+
 /// Order the candidate indices for one open: least-loaded first (by
 /// `streams + pending`), the round-robin cursor (`start`) only breaking ties.
 ///
@@ -325,5 +497,107 @@ mod tests {
             order_candidates_for(&order, &[0, 1, 2], &[0]),
             Vec::<usize>::new()
         );
+    }
+
+    /// A service nobody has watched is conversational, and stays that way on a
+    /// window of small exchanges. The prior is the product's default carrier, so a
+    /// wrong guess here costs nothing an unmodified tree does not already pay.
+    #[test]
+    fn a_conversational_service_stays_conversational() {
+        let mut profile = TrafficProfile::default();
+        assert_eq!(profile.class(), ServiceClass::Conversational);
+        for _ in 0..(CLASS_WINDOW * 4) {
+            profile.observe(Observation::Small);
+        }
+        assert_eq!(profile.class(), ServiceClass::Conversational);
+    }
+
+    /// Bulk evidence has to clear a whole window *and* be confirmed by a second
+    /// one, so one large transfer through a chat service cannot move it.
+    #[test]
+    fn a_service_moves_to_bulk_only_after_two_agreeing_windows() {
+        let mut profile = TrafficProfile::default();
+        for _ in 0..CLASS_WINDOW {
+            profile.observe(Observation::Bulk);
+        }
+        // One window is a reading, not a decision.
+        assert_eq!(profile.class(), ServiceClass::Conversational);
+        for _ in 0..CLASS_WINDOW {
+            profile.observe(Observation::Bulk);
+        }
+        assert_eq!(profile.class(), ServiceClass::Bulk);
+    }
+
+    /// A window that does not read the same way cancels the pending change: the
+    /// confirmations are consecutive, not cumulative.
+    #[test]
+    fn a_disagreeing_window_cancels_a_pending_change() {
+        let mut profile = TrafficProfile::default();
+        for _ in 0..CLASS_WINDOW {
+            profile.observe(Observation::Bulk);
+        }
+        for _ in 0..CLASS_WINDOW {
+            profile.observe(Observation::Small);
+        }
+        assert_eq!(profile.class(), ServiceClass::Conversational);
+        for _ in 0..CLASS_WINDOW {
+            profile.observe(Observation::Bulk);
+        }
+        // The earlier bulk window was cancelled, so this is the first of two again.
+        assert_eq!(profile.class(), ServiceClass::Conversational);
+    }
+
+    /// A mixed window is decided by the marks, and four of eight is the line.
+    #[test]
+    fn four_bulk_marks_in_a_window_are_enough() {
+        let mut profile = TrafficProfile::default();
+        for i in 0..(CLASS_WINDOW * 2) {
+            profile.observe(if i % 2 == 0 {
+                Observation::Bulk
+            } else {
+                Observation::Small
+            });
+        }
+        assert_eq!(profile.class(), ServiceClass::Bulk);
+    }
+
+    /// The class names the carrier, and a conversational service asks for nothing —
+    /// which is what makes the rule inert on a pool riding one carrier.
+    #[test]
+    fn the_class_names_a_carrier() {
+        assert_eq!(carrier_for(ServiceClass::Conversational), None);
+        assert_eq!(carrier_for(ServiceClass::Bulk), Some(Carrier::Tcp));
+    }
+
+    /// The preference reorders and never drops: a pool with no member of the
+    /// wanted carrier, or a preferred member that refuses, still serves the open.
+    #[test]
+    fn a_carrier_preference_reorders_but_keeps_every_fallback() {
+        let order = vec![2, 0, 1];
+        let carriers = [Carrier::Mhd, Carrier::Tcp, Carrier::Mhd];
+        // No preference is the identity, allocation-free path included.
+        assert_eq!(prefer_carrier(&order, &carriers, None), order);
+        // A preference moves its members to the front, in the order they had.
+        assert_eq!(
+            prefer_carrier(&order, &carriers, Some(Carrier::Tcp)),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            prefer_carrier(&order, &carriers, Some(Carrier::Mhd)),
+            vec![2, 0, 1]
+        );
+        // A pool riding one carrier has no member of the other: unchanged, so the
+        // open falls through exactly as it did before the preference existed.
+        let uniform = [Carrier::Mhd, Carrier::Mhd, Carrier::Mhd];
+        assert_eq!(
+            prefer_carrier(&order, &uniform, Some(Carrier::Tcp)),
+            order,
+            "a preference the pool cannot satisfy must not change the order"
+        );
+        // Every candidate still appears exactly once.
+        let reordered = prefer_carrier(&order, &carriers, Some(Carrier::Tcp));
+        let mut sorted = reordered.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2]);
     }
 }
