@@ -527,6 +527,32 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > **`git status` clean**, `just interop` 3/3, `just l3-accept` PASS through its sudo entry point. The only red in the chain is
 > §4.461's advisory, which predates this branch's last dependency change.
 
+> **§4.498 (mhd against TCP, same build and host, one batch): TCP is ahead on every axis on a clean loopback path.** Both runs use the
+> `dev` profile's four scenarios, three rounds, one arm (`molehill`), with `MOLEHILL_DATA_CARRIER` pinning one carrier per run — the
+> switch the bench documents for exactly this. 190.1 s and 155.7 s, 32 samples each.
+>
+> | scenario | metric | **mhd** | **tcp** | mhd vs tcp |
+> |---|---|---|---|---|
+> | bulk-1 | throughput | **3.51 Gbit/s** | **4.90** | −28 % |
+> | bulk-1 | CPU per Gbit | **0.759 s** | **0.483** | +57 % |
+> | bulk-1 | wire bytes per visitor byte | 1.057 | 1.009 | +4.8 % |
+> | bulk-1 | peak RSS | **65.5 MiB** | **19.5** | ×3.4 |
+> | rr-1 | completed requests | **6 278 /s** | **10 213** | −39 % |
+> | rr-1 | rtt p50 / p99 | **0.147 / 0.187 ms** | **0.088 / 0.121** | +67 % / +55 % |
+> | rr-1 | CPU per Gbit | **213 s** | **62 s** | ×3.4 |
+> | rr-16 | completed requests | **22 305 /s** | **27 631** | −19 % |
+> | rr-16 | rtt p50 / p99 | **0.645 / 1.673 ms** | **0.518 / 1.363** | +25 % / +23 % |
+> | churn-16 | requests | **2 385 /s** | **2 545** | −6 % |
+> | churn-16 | rtt p50 / p99 | **6.568 / 7.357 ms** | **6.158 / 6.878** | +6.7 % / +7 % |
+> | churn-16 | setup p50 | 0.077 ms | 0.072 | +7 % |
+> | churn-16 | CPU per Gbit | **405 s** | **196 s** | ×2.1 |
+>
+> **What this says and does not say**: on a **clean loopback** path the userspace carrier is 19–39 % behind in completed work, 23–67 %
+> behind in latency, **2.1–3.4× more expensive in CPU** and **3× in RSS**, while spending 5 % more bytes on the wire in bulk. That is
+> the expected direction — kernel TCP on loopback has no packet loss to repair and no userspace copies to pay for — and **it is not a
+> verdict on the carrier's reason to exist**: mhd's case is jitter, loss and reordering, which this batch did not impose. A
+> comparison under `--condition loss1` / `jitter` is the measurement that would decide it, and it has not been run.
+
 > **MHD 定型 (wire 6.0, branch `feat/v1.0.0`) — written at the end of this goal, on evidence from this session.**
 >
 > **The gates are green, all of them, in this session**: `just check` end to end (410 lib tests, 11 pool tests, both clippy builds,
