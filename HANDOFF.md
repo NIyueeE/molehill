@@ -136,6 +136,31 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > attached to it. **Whoever picks this up should first run it with six rounds and a twin, because at three rounds the same
 > binary spans 2 261–8 881.**
 
+> **§4.503 (the carrier choice, decided on the measurements: the default stays, and the key that would fix it stays unopened).**
+> The three mechanisms that decide a carrier were read against §4.500's numbers.
+>
+> - **The fallback** (`carrier.rs`) fires only when an mhd session **cannot be established** — UDP blocked, a middlebox
+>   eating it, the attempt's two-second budget spent. A path that carries UDP and *loses* packets never leaves mhd, so a
+>   deployment moving bulk over a lossy path stays on the carrier that carries 0.74 against the other one's 2.10. That is
+>   by design: the fallback answers "can this path carry the carrier at all", not "which one is faster".
+> - **The pool's carrier rule** (`MOLEHILL_TUNNEL_CARRIER_RULE`, off by default) hands a tunnel to TCP when its
+>   retransmit share clears **4 % for three windows**. Measured, mhd's share on a 1 %-loss path is **3–7 %** (`rep`), so the
+>   threshold sits inside a real deployment's own noise — the rule would flap between carriers on exactly the path where both
+>   work. It is also one-sided by construction (a TCP tunnel's retransmits live in the kernel), so it can only ever move
+>   mhd → TCP, which would take the interactive tail down with the bulk it was trying to rescue.
+> - **The L3 lane policy** moves lanes between *claims*, not between carriers; it does not touch this question.
+>
+> **The decision: the default stays mhd-first.** The plan's priority is latency (§六), the interactive tail is the one axis
+> where either carrier is decisively better and it is better by 4–11×, and the alternative — TCP first — throws that away to
+> recover bulk throughput that a clean path already has. A deployment that knows its path is clean and its traffic is bulk
+> pins `MOLEHILL_DATA_CARRIER=tcp`, which is documented as the measurement switch it is.
+>
+> **What would actually fix the trade is a per-service carrier key**, because the trade is a property of the *workload* as
+> much as of the path: a service is interactive or bulk by its nature, and the config already knows which service is which.
+> The product deliberately refuses that key — "which carrier works is a property of the network, not of the deployment" —
+> and §4.500 is the first measurement that says the sentence is incomplete. **Reversing a configuration-surface decision is
+> not this branch's to make**, so the key is not added here; the evidence for it is this section and the table it cites.
+
 > **§4.462 (the runtime regressions are green on this tree).** `just interop` — **3 passed** (new server refuses old client and
 > keeps serving; old server refuses new client and says so; old server rejects an unknown dialect and survives). `just l3-accept`
 > via `sudo -n bash bench/src/bench/utils/l3/run.sh` (the recipe itself skips with 77 without root) — **PASS** on the policy
