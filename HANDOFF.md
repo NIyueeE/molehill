@@ -13,6 +13,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.506 (the plan is amended, and the default carrier stays mhd-first — for a better reason than before).**
+> **The plan carries a sixth-version amendment** (`MHD-FINALIZATION-PLAN.md` §十一, untracked by design): the carrier
+> choice is two-dimensional (path **and** workload), the decision is internal with no configuration key, §六's freeze on
+> the TCP fallback is lifted for it, and — the point of the amendment — **the §一 criterion is corrected**: the `cost`
+> cell answers the latency half, and the throughput half must be judged on two bulk cells in sequence, because `cost`
+> opens every bulk channel before any class exists.
+>
+> **`carrier = auto` therefore stays mhd-first, and §4.503's conclusion survives with a different reason.** §4.503 kept
+> the default because the alternative threw away the tail to recover bulk throughput a clean path already has, and said
+> the real fix was a per-service key that this branch could not open. **The pool now does that job itself**: a session
+> that carries both kinds converges on a split measured from its own traffic, so the bulk cost that argued for a key is
+> recovered inside the session — 5.876 against 2.189 Gbit/s on the second bulk cell (§4.505). A key would now be a way
+> for an operator to *override* a decision the product makes better than they can, which is the opposite of what the
+> configuration surface is for.
+>
+> **What was changed to make convergence cheap**: up to two spares while the split is short (a three-tunnel move cost
+> three cycles of "add, wait for one to empty, remove"), and at most one pool-size change per tick so `size` stops
+> bouncing between two values while the split moves. Measured on the mixed cell at 1 % loss: two spares nineteen seconds
+> apart, then two trims, ending at the configured count with the split the evidence asked for. Each step still costs one
+> dial; whether that is worth a standing extra tunnel is untested and is written down as such.
+
 > **§4.505 (the pool's carrier choice, judged — and the cell the objective named cannot answer the half it was asked for).**
 > **The judgement, on the mixed `cost` cell the objective names** (two rounds, each run's own A/A twin, the condition on
 > the leg the carrier crosses, nothing pinned, only `MOLEHILL_DATA_CARRIER` distinguishing the two baselines):
