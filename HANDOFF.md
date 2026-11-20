@@ -155,6 +155,40 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > and never a visitor; and the whole policy is inert under `MOLEHILL_DATA_CARRIER` because the handover's own choke
 > point refuses to move a pinned carrier — which is what keeps the carrier A/B of §4.500 a clean measurement.
 
+> **MHD 定型 (re-issued 2026-11-20 on build `64de4fd`; supersedes the 2026-11-19 block below).**
+>
+> **What changed since that block**: the pool learned a traffic class from what each service carried and now
+> decides a carrier per service with no configuration key (§4.504–§4.506); isolation moved from the carrier to the
+> tunnel's own occupancy (`64de4fd`); `Recovery::arm` stopped scanning the in-flight table per packet (`a58e105`);
+> and the product was measured against the peers on the release-shaped sweep (§4.507).
+>
+> | criterion (plan §一) | target | reading on this build | |
+> |---|---|---|---|
+> | clean mixed interactive `rtt_p99_ms` | ≤ 20 ms | **4.56 ms** — interleaved A/B, 4 rounds, `p123-ab` | met |
+> | `loss5` mixed interactive `rtt_p99_ms` | halve 2 085 / 2 337 | **1 286 ms** (1 125–1 448) — `p105` | met |
+> | `loss5` tunnel `bulk-1` | ≥ 0.11 Gbit/s | **0.1239** — six rounds, 10 s samples, `p120` | met |
+> | clean `bulk-n` ≥ 85 % of this build unsealed | ≥ 85 % | **9.96 / 11.85 = 84.0 %** — `p120` | **missed by 1 point** |
+> | error rate / wedge / soak drift | level with the baseline, zero | soak `wedge_count` **5** (5 on the untouched build too) | **open** |
+> | `dropped_packets` (health, not a gate) | recorded | §4.502 | recorded |
+>
+> **The gates, on this tree**: `just check` green end to end (**420** lib tests, 11 pool tests, both clippy builds,
+> `cargo deny` with no waiver, docs alignment, the python gates, `bench selfcheck` 812 checks); `just interop` **3/3**;
+> `l3-accept` **PASS** on all sixteen checks; `integration_test` **22/22 on each carrier** (serial).
+>
+> **The carrier, in one sentence**: it owns the interactive tail on an impaired path (11× tighter at 1 % loss, 3.8× at
+> 5 %), it is level with the best of the four tools on five of eight sweep stages and wins the two where a peer collapses
+> (`loss5` 2 034 against rathole's 4 068, `clean#2` 1.9 against 2.4), and **it is 2–3× behind rathole on bulk throughput on
+> every stage** — priced at 22 % for the AEAD and 22 % for the pool width, with the rest in the per-stream path.
+>
+> **Two claims from yesterday are corrected here.** The capacity ramp's **3 → 8 levels** came from one run and does not
+> reproduce as a fix: interleaved against itself, both variants drift to 39–70 ms at the second level in one round and sit
+> at 1.4–2.9 ms in the next, so that cell is bimodal and the improvement was a lucky draw (§4.508's correction). And the
+> sealing floor now reads **84.0 %** where it read 85.6 % two runs earlier — the same cell, inside the AEAD's own scatter,
+> so the floor is met-or-missed on any given day and is recorded as missed rather than as passed.
+>
+> **What is not claimed**: no release, no tag, no product-config change, and no full sweep against the peers with rounds
+> and A/A — the peer comparison is one round of a single sweep profile, which the model's own verdict calls exploratory.
+
 > **MHD 定型 — written 2026-11-19, with one floor named as open.**
 >
 > **What it means here**: the carrier's behaviour on the leg it crosses is measured against its own TCP carrier, every runtime
