@@ -392,6 +392,16 @@ pub(crate) struct Recovery {
     /// Kept as a counter rather than computed, because the timer arms on every
     /// send and a scan of the table there would grow with the flight.
     live: usize,
+    /// In-flight records that are small and have not been declared lost.
+    ///
+    /// The timer asks this on every send — "is a small record in flight" decides
+    /// which floor the retransmission timer gets — and answering it by scanning
+    /// the table cost **9.4 % of the carrier's cycles** on a clean bulk transfer
+    /// (`perf`, 2 500 records in flight, one scan per packet:
+    /// `HANDOFF.md` §4.508). A counter is exact if every place that inserts a
+    /// record, retires one, or marks one lost adjusts it, and a test below pins
+    /// the counter against the scan it replaces.
+    small_live: usize,
     /// Stream bytes the table holds, kept exact by [`Self::retire`].
     flight_bytes: u64,
     /// How much of [`Self::flight_bytes`] is repairs of ranges already sent.
@@ -416,6 +426,7 @@ impl Recovery {
             in_flight: BTreeMap::new(),
             lost: BTreeSet::new(),
             live: 0,
+            small_live: 0,
             flight_bytes: 0,
             repair_flight_bytes: 0,
             rtt: Rtt::default(),
@@ -586,6 +597,9 @@ impl Recovery {
             self.lost.remove(&(at, number));
         } else {
             self.live = self.live.saturating_sub(1);
+            if sent.small {
+                self.small_live = self.small_live.saturating_sub(1);
+            }
             self.retire(&sent);
         }
         Some(sent)
@@ -607,6 +621,9 @@ impl Recovery {
         entry.lost_at = Some(now);
         let sent = *entry;
         self.live = self.live.saturating_sub(1);
+        if sent.small {
+            self.small_live = self.small_live.saturating_sub(1);
+        }
         self.retire(&sent);
         self.lost.insert((now, number));
         Some(sent)
@@ -688,6 +705,9 @@ impl Recovery {
             }
             self.in_flight.insert(number, sent);
             self.live += 1;
+            if small {
+                self.small_live += 1;
+            }
         }
         // The packet's own nature arms the timer, not the lane's size: a re-sent
         // opening must get the cheap floor here as well, because this is the call
@@ -714,10 +734,7 @@ impl Recovery {
         // and nothing is multiplied onto it, because re-sending one datagram that
         // nothing can be reordered behind costs a duplicate and no more
         // (`HANDOFF.md` §4.311).
-        let small_record = self
-            .in_flight
-            .values()
-            .any(|sent| sent.small && sent.lost_at.is_none());
+        let small_record = self.small_live > 0;
         let rto = if small_record && !small {
             self.rtt.rto(true)
         } else {
@@ -1048,12 +1065,55 @@ impl Recovery {
 
 #[cfg(test)]
 mod tests {
+
     #![expect(
         clippy::unwrap_used,
         reason = "tests unwrap values they just constructed"
     )]
     use super::*;
     use crate::transport::mhd::wire::ReceivedRun;
+
+    /// The small-in-flight counter is what replaced a scan of the whole table on
+    /// every send (9.4 % of the carrier's cycles, `HANDOFF.md` §4.508). It has to
+    /// agree with that scan after every kind of change a record can see: a send,
+    /// a retirement, and a loss.
+    #[test]
+    fn the_small_in_flight_counter_matches_the_scan_it_replaced() {
+        let payload = |len: u16| {
+            Some(SentRange {
+                stream: 1,
+                offset: 0,
+                len,
+                fin: false,
+            })
+        };
+        let scan = |r: &Recovery| {
+            r.in_flight
+                .values()
+                .filter(|sent| sent.small && sent.lost_at.is_none())
+                .count()
+        };
+        let mut r = Recovery::new();
+        let now = Instant::now();
+        // Every third packet is small, so the table holds a mixture.
+        for number in 0..12u32 {
+            r.on_sent(now, number, payload(100), false, false, number % 3 == 0);
+            assert_eq!(r.small_live, scan(&r), "after sending {number}");
+        }
+        assert_eq!(r.small_live, 4);
+        // A retirement of a small record and of a wide one.
+        r.take(0);
+        assert_eq!(r.small_live, scan(&r));
+        r.take(1);
+        assert_eq!(r.small_live, scan(&r));
+        // A loss takes a small record out of the count, and the record stays.
+        r.declare_lost(now, 3);
+        assert_eq!(r.small_live, scan(&r));
+        // Retiring it later (a late acknowledgement) must not decrement twice.
+        r.take(3);
+        assert_eq!(r.small_live, scan(&r));
+        assert_eq!(r.small_live, 2);
+    }
 
     fn range(offset: u64) -> SentRange {
         SentRange {
