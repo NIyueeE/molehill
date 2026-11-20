@@ -13,6 +13,31 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.509 (where the TCP carrier's bulk time goes: a third of it is the record cipher, and the faster one is already in the tree).**
+> The same `perf` sample as §4.508, taken on the **kernel carrier** instead — `bulk-n`, clean, `MOLEHILL_DATA_CARRIER=tcp`
+> — because after the mix that is the path bulk actually rides. Splitting ~9 700 samples by image and symbol:
+>
+> | what | share of cycles |
+> |---|---|
+> | the kernel (unresolved under `perf_event_paranoid=2`) | **45.9 %** |
+> | `ring_core…chacha20_poly1305_open_avx2` | **17.4 %** |
+> | `ring_core…chacha20_poly1305_seal_avx2` | **15.4 %** |
+> | everything else in user space (copies, yamux, stripe, pool) | 21.3 % |
+>
+> **So a third of this carrier's bulk CPU is one cipher**, and the tree already carries a measured faster one: `tests/primitives_test.rs`
+> prices ring's AES-256-GCM at **671 ns** per 1 400-byte record against ChaCha20-Poly1305's **1 017** — the pair that made mhd's
+> sealing affordable in P1, which is why the datagram carrier pays 12.6 % of its cycles for a cipher the kernel carrier pays
+> 32.7 % for. **The next structural step is therefore a record-layer cipher change**: keep the Noise KK handshake exactly as
+> it is (it is the authentication), derive two AES-256-GCM keys from the handshake hash with HKDF — the same shape the lane
+> root already uses — and seal records with the faster primitive. **It is a wire change**, so it belongs to dialect 6.0 while
+> that is unreleased, and it is not done here: at 33 % of the total it is worth roughly **+10 % throughput** on every encrypted
+> path, which is real but does not close a 2.6× gap, and it is a change to the confidentiality path that wants a session with
+> room to verify it rather than the end of one.
+>
+> **What that leaves as the honest account of the gap**: 46 % kernel and copies neither carrier can avoid, 33 % a cipher with
+> a known-faster replacement, and the remaining fifth the mux/stripe/pool layers. None of those is a parameter, and all three
+> are now measured rather than guessed.
+
 > **§4.508 (two experiments this round: one kept, one refuted — and the profiler that made both possible).**
 > **`perf` is installed now** (`apt install linux-perf`, 6.12.117, matching the kernel; the host had none, and
 > `perf_event_paranoid` is 2 so user symbols resolve and kernel ones do not). The first clean-bulk sample put **56 %** of the
