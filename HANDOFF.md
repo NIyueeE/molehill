@@ -13,6 +13,42 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.508 (two experiments this round: one kept, one refuted — and the profiler that made both possible).**
+> **`perf` is installed now** (`apt install linux-perf`, 6.12.117, matching the kernel; the host had none, and
+> `perf_event_paranoid` is 2 so user symbols resolve and kernel ones do not). The first clean-bulk sample put **56 %** of the
+> cycles in the kernel and, in user space, **`mhd::recovery::Recovery::arm` at 9.4 %**: it walks the whole in-flight table on
+> **every packet sent** to answer "is a small record in flight", which decides the retransmission timer's floor. Replaced by
+> a counter exact by construction (insert +1, retirement −1, loss −1) with a test that drives a mixture through all three
+> and pins the counter against the scan it replaced. **Clean `bulk-n`: 8.87 → 9.63 Gbit/s, 1.156 → 1.091 CPU-s/Gbit.**
+> Kept (`a58e105`).
+>
+> **Refuted: a channel warmed ahead of the visitor.** The arrival's own round trip — the server asking for a channel and
+> this end opening one — is the tail the record names (p50 37 µs, p99 2.7 ms), so the client was made to open one channel
+> per TCP service at activation with **group zero**, which lands in that service's shared queue where `take_for` already
+> falls back to it; the server labels it with the visitor's group on adoption and the client refills. It works: the
+> integration suite passes 22/22 and the mechanism adopts and refills. **It does not help** — interleaved A/B, three rounds,
+> clean path:
+>
+> | cell | no warm channel | warm channel |
+> |---|---|---|
+> | `churn-16` rtt p50 / p99 | 6.317 / 7.022 ms | 6.546 / 7.300 |
+> | `churn-16` completed /s | 2 482 | 2 394 |
+> | `rr-1` rtt p50 / p99 | **0.122 / 0.159 ms** | 0.165 / 0.202 |
+> | `rr-1` completed /s | **7 514** | 5 685 |
+>
+> The arrival cell it was built for is unchanged (and 3–4 % worse inside its own scatter), and the single-connection cell is
+> **24 % worse** — which the mechanism cannot explain by cost, so it is placement luck: with a channel parked in the queue,
+> the visitor's first connection lands on the tunnel that was least loaded *at activation* instead of the one least loaded
+> *now*. **Reverted.** What it teaches is worth keeping: the pairing wait this record has chased for many rounds is not
+> what a fresh visitor pays any more — §4.505's open measurements (p50 37 µs) already said so, and this is the experiment
+> that would have found it if it were.
+>
+> **And the isolation question, settled by the same method**: interleaved against itself, the carrier-keyed and
+> tunnel-keyed variants are **indistinguishable** on the clean mixed cell (p99 4.56 against 4.95 ms, throughput 8.86 both),
+> and the capacity ramp is **bimodal in both** — 39–70 ms at the second level in one round, 1.4–2.9 ms in the next. The
+> **3 → 8 level improvement claimed in §4.507 was one lucky round**; the rule is kept because it is the property the cell is
+> about, not because it is measured to win.
+
 > **§4.507 (molehill(auto) against the peers, on the release-shaped sweep, twice — and the isolation defect the first one found).**
 > **Method**: `--profile sweep` (the release ritual's shape: the eight-stage timeline plus the capacity ramp), rounds 1,
 > every arm on the same host and path, nothing pinned. Run 1 was all five arms; run 2 repeated the three that matter after
