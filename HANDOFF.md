@@ -13,6 +13,53 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.507 (molehill(auto) against the peers, on the release-shaped sweep, twice — and the isolation defect the first one found).**
+> **Method**: `--profile sweep` (the release ritual's shape: the eight-stage timeline plus the capacity ramp), rounds 1,
+> every arm on the same host and path, nothing pinned. Run 1 was all five arms; run 2 repeated the three that matter after
+> the fix below. Single-round numbers with no A/A, so **every difference smaller than a few percent here is scatter** —
+> what follows is read at that resolution.
+>
+> **The staged timeline, after the fix** (interactive `rtt_p99_ms` / bulk Gbit/s):
+>
+> | stage | molehill(auto) | frp | rathole |
+> |---|---|---|---|
+> | clean | 2.4 / 7.99 | 5.7 / 6.07 | 2.3 / **24.31** |
+> | rtt100 | 401.6 / 3.40 | 402.4 / 3.38 | 401.5 / 3.42 |
+> | loss1 | 1 064.8 / 9.69 | 1 060.8 / 6.16 | 1 060.9 / **14.56** |
+> | loss5 | **2 034.3** / 1.19 | 2 071.4 / 1.08 | 4 068.2 / 1.08 |
+> | rate100 / rate20 | 195.9 / 433.8 | 196.5 / 426.5 | 197.6 / 430.4 |
+> | jitter | 107.2 / 11.54 | 107.0 / 6.21 | 108.8 / **14.87** |
+> | clean#2 | **1.9** / 10.21 | 18.5 / 6.05 | 2.4 / 24.42 |
+>
+> **Where that leaves the product**: **ahead of frp on every aligned cell** — the tail on `clean` (2.4 against 5.7), on
+> `clean#2` (1.9 against 18.5) and on `loss5` (2 034 against 2 071), and bulk everywhere (7.99 against 6.07, 9.69 against
+> 6.16, 11.54 against 6.21) — and **ahead of nps by two orders of magnitude on both axes** (nps: 101 ms and 0.13 Gbit/s).
+> **Against rathole it is a split**: the tail is level within a millisecond on five stages and molehill wins the two where
+> rathole collapses (`loss5` 2 034 against 4 068, `clean#2` 1.9 against 2.4), while **rathole owns bulk on every stage**
+> (24.31 against 7.99 on `clean`, 14.56 against 9.69, 14.87 against 11.54).
+>
+> **The capacity ramp is where run 1 found a real defect.** Before the fix below, molehill's forwarding arm broke the
+> interactive SLO at the fourth bulk level — 31.6 ms at L2, 44.8 at L3, **69.0 at L4, where the ramp stopped** — while the
+> same product's L3 arm, which never multiplexes a claim's flows together, held **1.4 ms through L8**. The cause was the
+> class preference being one-sided: bulk asked for the kernel carrier and conversational traffic asked for nothing, so an
+> interactive open took the least-loaded tunnel, which after the mix is a kernel one full of bulk. **Both classes now ask**
+> (`244dd90`), and the same ramp reads **every level from L1 to L8 inside the SLO, 1.5–2.9 ms**, carrying 12.6 Gbit/s at
+> the eighth: capacity **3 → 8**, level with l3, frp and rathole, and with a tail far tighter than rathole's at that load
+> (12.6 ms at L8).
+>
+> **The bulk gap is the data path, and its two measured components.** On a clean `bulk-n` cell, the same product arm reads
+> **8.87 Gbit/s at 1.16 CPU-seconds per Gbit**; with the data plane unencrypted (`l4-plain`) **11.35 at 0.87**; with eight
+> tunnels (`l4-mux8`) **10.87 at 1.08**. So **the AEAD costs 22 % and the pool width costs 22 %** — and rathole, at 24.31
+> with **0.32 CPU-seconds per Gbit**, is still 2.2× ahead of the plain figure. What is left is molehill's own path: per
+> byte it spends 3.3× rathole's CPU, and for a single stream 0.49 s/Gbit (kernel carrier) against 1.16 for eight — the
+> cost grows with stream count, which is the signature of per-stream work (task wakes, copies, mux framing), not of the
+> cipher. **Finding the rest needs a profiler and the host has none installed** (`perf` is absent, `perf_event_paranoid` is
+> 2), so the next session starts by installing one, not by guessing.
+>
+> **What is not claimed**: these are single-round sweep numbers with no A/A twin, so no cell here is a claim in the sense
+> the bench model uses — the run's own verdict says exactly that. The table is evidence of *position*, and the capacity
+> change (3 → 8, with the tail measured per level) is evidence of a *fix*.
+
 > **§4.506 (the plan is amended, and the default carrier stays mhd-first — for a better reason than before).**
 > **The plan carries a sixth-version amendment** (`MHD-FINALIZATION-PLAN.md` §十一, untracked by design): the carrier
 > choice is two-dimensional (path **and** workload), the decision is internal with no configuration key, §六's freeze on
