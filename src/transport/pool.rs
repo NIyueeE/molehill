@@ -365,16 +365,25 @@ impl TrafficProfile {
     }
 }
 
-/// The carrier a class asks for, or `None` when the pool should not care.
+/// The carrier a class asks for.
 ///
-/// A conversational flow stays on whatever the pool already rides: the datagram
-/// carrier is the product's default, and the kernel one is only 44 µs better on a
-/// *clean* path, which is inside the noise of every cell that measures it. A bulk
-/// flow asks for the kernel carrier, which is the one that carries more bytes.
-pub(crate) fn carrier_for(class: ServiceClass) -> Option<Carrier> {
+/// Both classes ask: a bulk flow for the kernel carrier, which carries more bytes,
+/// and a conversational one for the datagram carrier, which carries the tail. The
+/// second half is not cosmetic — it is what *isolates* the two kinds when a pool
+/// holds both. Without it a conversational open takes the least-loaded tunnel,
+/// which after the mix is a kernel one full of bulk, and the tail pays for it:
+/// measured on the capacity ramp, the forwarding arm's interactive p99 went from
+/// 1.4 ms to **69 ms** at the fourth level while the same product's L3 arm — which
+/// never multiplexes a claim's flows together — held 1.4 ms to the eighth
+/// (`HANDOFF.md` §4.507).
+///
+/// Asking is still only asking: [`order_placement`]'s four tiers fall through to
+/// every other tunnel when the pool holds none of the wanted carrier, so a pool
+/// riding one carrier behaves exactly as it did before this returned `Some`.
+pub(crate) fn carrier_for(class: ServiceClass) -> Carrier {
     match class {
-        ServiceClass::Conversational => None,
-        ServiceClass::Bulk => Some(Carrier::Tcp),
+        ServiceClass::Conversational => Carrier::Mhd,
+        ServiceClass::Bulk => Carrier::Tcp,
     }
 }
 
@@ -602,8 +611,8 @@ mod tests {
     /// which is what makes the rule inert on a pool riding one carrier.
     #[test]
     fn the_class_names_a_carrier() {
-        assert_eq!(carrier_for(ServiceClass::Conversational), None);
-        assert_eq!(carrier_for(ServiceClass::Bulk), Some(Carrier::Tcp));
+        assert_eq!(carrier_for(ServiceClass::Conversational), Carrier::Mhd);
+        assert_eq!(carrier_for(ServiceClass::Bulk), Carrier::Tcp);
     }
 
     /// The class outranks the group's spread, and every tier is a floor: an open

@@ -2464,9 +2464,9 @@ impl TunnelPool {
         // open, from the pool's own record of what the service carried; a service
         // with no evidence, or one that reads conversational, asks for no carrier
         // at all and is placed exactly as it was before this rule existed.
-        let prefer = service
-            .map(|service| self.inner.shared.class_of(service))
-            .and_then(crate::transport::pool::carrier_for);
+        let prefer = service.map(|service| {
+            crate::transport::pool::carrier_for(self.inner.shared.class_of(service))
+        });
         let Some(reservation) = self.reserve(prefer, &[], &avoid, ceiling) else {
             // Nothing under the ceiling. An empty pool is a different failure
             // from a full one — the dialer could not bring a tunnel up — and
