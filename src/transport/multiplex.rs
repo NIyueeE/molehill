@@ -242,6 +242,15 @@ pub(crate) struct TunnelCounters {
     /// Established streams. Incremented when an open completes, decremented
     /// when the caller drops the stream ([`StreamLease`]).
     streams: std::sync::atomic::AtomicUsize,
+    /// How many of those streams belong to a service the pool has read as **bulk**.
+    ///
+    /// This is what isolates a conversational flow: placement sends one to a
+    /// tunnel that no bulk stream occupies, so an interactive request is never
+    /// queued behind a backup's bytes *on its own lane*. Measured both ways — an
+    /// isolation keyed on the **carrier** cost the long-lived cell 2 → 18.5 ms and
+    /// bought the capacity ramp 69 → 2 ms, because the carrier was only ever a
+    /// proxy for what actually shares a tunnel (`HANDOFF.md` §4.509).
+    bulk: std::sync::atomic::AtomicUsize,
     /// Opens requested but not yet completed on this tunnel.
     pending: std::sync::atomic::AtomicUsize,
     /// Stream slots returned since the last telemetry window, and how long they
@@ -302,6 +311,7 @@ impl TunnelCounters {
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             streams: std::sync::atomic::AtomicUsize::new(0),
+            bulk: std::sync::atomic::AtomicUsize::new(0),
             pending: std::sync::atomic::AtomicUsize::new(0),
             held_count: std::sync::atomic::AtomicU64::new(0),
             held_nanos: std::sync::atomic::AtomicU64::new(0),
@@ -387,6 +397,22 @@ impl TunnelCounters {
     fn reserve(&self) {
         use std::sync::atomic::Ordering;
         self.pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One bulk-class stream now lives on this tunnel (`delta` is +1 or -1).
+    fn note_bulk(&self, delta: isize) {
+        use std::sync::atomic::Ordering;
+        if delta >= 0 {
+            self.bulk.fetch_add(delta.unsigned_abs(), Ordering::Relaxed);
+        } else {
+            self.bulk.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+        }
+    }
+
+    /// How many bulk-class streams this tunnel holds — what a conversational
+    /// open avoids.
+    fn bulk_streams(&self) -> usize {
+        self.bulk.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The open failed or was abandoned: the reservation comes back.
@@ -498,6 +524,9 @@ pub(crate) struct StreamLease {
     /// The id of the tunnel this stream is charged to (unique per process).
     tunnel_id: usize,
     counters: std::sync::Arc<TunnelCounters>,
+    /// Whether this channel's service is **bulk**, so its drop returns the lane's
+    /// bulk count as well as its stream count.
+    bulk: bool,
     /// The service this channel carries.
     ///
     /// The pool's carrier policy reads a service's traffic class from what its
@@ -529,13 +558,18 @@ pub(crate) struct StreamLease {
 /// another forgotten.
 fn stamp_lease(
     service: Option<crate::protocol::ServiceId>,
+    bulk: bool,
     charged_at: std::time::Instant,
     stream: CarrierStream,
     tunnel_id: usize,
     counters: std::sync::Arc<TunnelCounters>,
     pool: std::sync::Weak<PoolShared>,
 ) -> StreamLease {
+    if bulk {
+        counters.note_bulk(1);
+    }
     StreamLease {
+        bulk,
         id: StreamLease::next_id(),
         charged_at,
         stream,
@@ -621,6 +655,9 @@ impl Drop for StreamLease {
         self.counters
             .streams
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if self.bulk {
+            self.counters.note_bulk(-1);
+        }
         self.counters.note_held(self.charged_at.elapsed());
         if let Some(pool) = self.pool.upgrade() {
             // **What a small channel proves.** A channel that never reached the
@@ -2464,10 +2501,15 @@ impl TunnelPool {
         // open, from the pool's own record of what the service carried; a service
         // with no evidence, or one that reads conversational, asks for no carrier
         // at all and is placed exactly as it was before this rule existed.
-        let prefer = service.map(|service| {
-            crate::transport::pool::carrier_for(self.inner.shared.class_of(service))
-        });
-        let Some(reservation) = self.reserve(prefer, &[], &avoid, ceiling) else {
+        let class = service.map(|service| self.inner.shared.class_of(service));
+        let prefer = class.and_then(crate::transport::pool::carrier_for);
+        // **A conversational flow asks for a lane no bulk stream occupies**, which
+        // is what isolates it: the carrier was only ever a proxy for that, and
+        // isolation keyed on the carrier alone cost the long-lived cell 2 → 18.5 ms
+        // while buying the capacity ramp 69 → 2 ms (`HANDOFF.md` §4.509).
+        let prefer_quiet = class == Some(crate::transport::pool::ServiceClass::Conversational);
+        let bulk = class == Some(crate::transport::pool::ServiceClass::Bulk);
+        let Some(reservation) = self.reserve(prefer, prefer_quiet, &[], &avoid, ceiling) else {
             // Nothing under the ceiling. An empty pool is a different failure
             // from a full one — the dialer could not bring a tunnel up — and
             // reporting it as `AtCapacity` would blame the load for the
@@ -2484,12 +2526,15 @@ impl TunnelPool {
             // Register before the second look, or a retirement landing in
             // between would be lost and this open would sleep out the budget.
             freed.as_mut().enable();
-            if self.reserve(prefer, &[], &avoid, ceiling).is_none() {
+            if self
+                .reserve(prefer, prefer_quiet, &[], &avoid, ceiling)
+                .is_none()
+            {
                 let before = std::time::Instant::now();
                 let _ = tokio::time::timeout(crate::transport::pool::CAPACITY_WAIT, freed).await;
                 waited = before.elapsed();
             }
-            let Some(reservation) = self.reserve(prefer, &[], &avoid, ceiling) else {
+            let Some(reservation) = self.reserve(prefer, prefer_quiet, &[], &avoid, ceiling) else {
                 // The final refusal: every serving tunnel is at the ceiling,
                 // and no stream retired inside the budget. During a handover,
                 // this is short-lived placement pressure, not pool saturation.
@@ -2499,11 +2544,29 @@ impl TunnelPool {
                 return Err(OpenError::AtCapacity);
             };
             return self
-                .place(service, prefer, placing, waited, reservation, &avoid)
+                .place(
+                    service,
+                    prefer,
+                    prefer_quiet,
+                    bulk,
+                    placing,
+                    waited,
+                    reservation,
+                    &avoid,
+                )
                 .await;
         };
-        self.place(service, prefer, placing, waited, reservation, &avoid)
-            .await
+        self.place(
+            service,
+            prefer,
+            prefer_quiet,
+            bulk,
+            placing,
+            waited,
+            reservation,
+            &avoid,
+        )
+        .await
     }
 
     /// Complete one placement, reporting it when it was slow.
@@ -2512,10 +2575,18 @@ impl TunnelPool {
     /// was at its ceiling; `place_us` is the whole reservation. Both are evidence
     /// for the one question the visitor's setup asks — is the cost in front of the
     /// stream open or inside it — and neither is read on a healthy open.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one open's whole context, read once: what it is for, what it prefers, and
+                  what it may not take — a struct here would be built per open to be
+                  destructured on the next line"
+    )]
     async fn place(
         &self,
         service: Option<crate::protocol::ServiceId>,
         prefer: Option<Carrier>,
+        prefer_quiet: bool,
+        bulk: bool,
         placing: std::time::Instant,
         waited: std::time::Duration,
         reservation: Reservation,
@@ -2530,7 +2601,8 @@ impl TunnelPool {
                 "mhd pool placement"
             );
         }
-        self.complete(service, prefer, reservation, avoid).await
+        self.complete(service, prefer, prefer_quiet, bulk, reservation, avoid)
+            .await
     }
 
     /// The concurrent streams one tunnel of this pool may carry.
@@ -2666,6 +2738,7 @@ impl TunnelPool {
     fn reserve(
         &self,
         prefer: Option<Carrier>,
+        prefer_quiet: bool,
         tried: &[usize],
         avoid: &[usize],
         ceiling: usize,
@@ -2717,6 +2790,21 @@ impl TunnelPool {
         // have yet, and only when every tunnel is already part of the group (a
         // pool the group cannot spread over) does the exclusion give way — the
         // group must still forward, exactly as it did before it had a name.
+        // **A conversational flow's own lane first.** The tunnels no bulk-class
+        // stream occupies come before the rest, so an interactive request is queued
+        // behind nothing but its own service's traffic. Every other tunnel stays
+        // behind them, so the walk still falls through when they are busy, which is
+        // what makes this an isolation rather than a constraint.
+        if prefer_quiet {
+            let (quiet, busy): (Vec<usize>, Vec<usize>) = order.into_iter().partition(|index| {
+                state
+                    .entries
+                    .get(*index)
+                    .is_some_and(|entry| entry.tunnel.counters().bulk_streams() == 0)
+            });
+            order = quiet;
+            order.extend(busy);
+        }
         let carriers: Vec<Carrier> = state.entries.iter().map(|entry| entry.carrier).collect();
         let candidates =
             crate::transport::pool::order_placement(&order, &carriers, tried, avoid, prefer);
@@ -2790,6 +2878,8 @@ impl TunnelPool {
         &self,
         service: Option<crate::protocol::ServiceId>,
         prefer: Option<Carrier>,
+        prefer_quiet: bool,
+        bulk: bool,
         reservation: Reservation,
         avoid: &[usize],
     ) -> Result<StreamLease, OpenError> {
@@ -2830,6 +2920,7 @@ impl TunnelPool {
                 PlacementStats::record(placement, started.elapsed(), None);
                 Ok(stamp_lease(
                     service,
+                    bulk,
                     started,
                     stream,
                     tunnel.id(),
@@ -2867,7 +2958,9 @@ impl TunnelPool {
                 let mut last = e;
                 let mut tried = vec![index];
                 let ceiling = self.ceiling();
-                while let Some(mut next) = self.reserve(prefer, &tried, avoid, ceiling) {
+                while let Some(mut next) =
+                    self.reserve(prefer, prefer_quiet, &tried, avoid, ceiling)
+                {
                     tried.push(next.index);
                     next.placement.fallback = true;
                     match next.tunnel.open_stream().await {
@@ -2882,6 +2975,7 @@ impl TunnelPool {
                             );
                             return Ok(stamp_lease(
                                 service,
+                                bulk,
                                 started,
                                 stream,
                                 next.tunnel.id(),

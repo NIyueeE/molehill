@@ -380,10 +380,12 @@ impl TrafficProfile {
 /// Asking is still only asking: [`order_placement`]'s four tiers fall through to
 /// every other tunnel when the pool holds none of the wanted carrier, so a pool
 /// riding one carrier behaves exactly as it did before this returned `Some`.
-pub(crate) fn carrier_for(class: ServiceClass) -> Carrier {
+pub(crate) fn carrier_for(class: ServiceClass) -> Option<Carrier> {
     match class {
-        ServiceClass::Conversational => Carrier::Mhd,
-        ServiceClass::Bulk => Carrier::Tcp,
+        // Nothing: isolation is by *tunnel occupancy*, not by carrier (see
+        // [`ServiceClass`] and the pool's `prefer_quiet`).
+        ServiceClass::Conversational => None,
+        ServiceClass::Bulk => Some(Carrier::Tcp),
     }
 }
 
@@ -611,8 +613,8 @@ mod tests {
     /// which is what makes the rule inert on a pool riding one carrier.
     #[test]
     fn the_class_names_a_carrier() {
-        assert_eq!(carrier_for(ServiceClass::Conversational), Carrier::Mhd);
-        assert_eq!(carrier_for(ServiceClass::Bulk), Carrier::Tcp);
+        assert_eq!(carrier_for(ServiceClass::Conversational), None);
+        assert_eq!(carrier_for(ServiceClass::Bulk), Some(Carrier::Tcp));
     }
 
     /// The class outranks the group's spread, and every tier is a floor: an open
