@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The pool decides a carrier per service, from what that service carried.**
+  Which carrier suits a service is a property of the *workload* as much as of the
+  path — measured on the leg the carrier crosses, a conversational flow's
+  interactive tail is 11× tighter on the datagram carrier at 1 % loss while a bulk
+  flow carries 2.8× more on the kernel one — and one deployment carries both. The
+  pool reads each service's class from what its channels moved (a megabyte crossed,
+  or a channel that ended under 64 KiB), sends a bulk service's **new** streams to
+  the kernel carrier and a conversational service's to a tunnel no bulk stream
+  occupies, and needs no configuration key to do it. A service nobody has watched
+  stays where the pool already rides, a stream that is already running is never
+  moved, and the preference always falls through to the least-loaded tunnel, so a
+  wrong guess costs throughput and never a visitor.
 - **A sealed `mhd` channel on an established lane no longer waits for an opening
   acknowledgement.** The plain path dropped that wait when stream registration was
   introduced; the sealed path kept it, so every new channel paid one round trip
