@@ -255,6 +255,20 @@ pub(crate) const CLASS_WINDOW: usize = 8;
 /// How many of a window's observations must be bulk for the reading to say so.
 pub(crate) const CLASS_BULK_MARKS: usize = 4;
 
+/// How many tunnels over its configured count a pool may hold while it
+/// converges on a split.
+///
+/// Two, not one: a mix that wants three of four tunnels on the kernel carrier
+/// converts one per cycle — add a spare, wait for a tunnel of the other carrier
+/// to empty, remove it — and in a pool whose tunnels all hold a long-lived
+/// stream each cycle waits for a connection to end. Measured in the mixed `cost`
+/// cell, one spare per cycle cost three cycles for a three-tunnel move
+/// (`HANDOFF.md` §4.505). Two spares halve the rounds without ever making the
+/// pool more than two connections wide, which is the bound that keeps the
+/// operator's `tunnels` a statement about the deployment and not about a
+/// transient.
+pub(crate) const SPARE_MAX: usize = 2;
+
 /// How many consecutive windows must agree before the class changes.
 ///
 /// Two, so a single burst cannot move a service: an occasional large transfer

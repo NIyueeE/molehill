@@ -1245,7 +1245,7 @@ impl TunnelPoolInner {
     /// and it is given back by [`TunnelPool::trim_step`] as soon as a tunnel of
     /// the over-represented carrier is idle.
     fn spare_owed(&self, entries: &[PoolEntry], count: usize) -> Option<Carrier> {
-        if entries.len() != count {
+        if entries.len() >= count.saturating_add(crate::transport::pool::SPARE_MAX) {
             return None;
         }
         let (mhd_target, tcp_target) = self.target_mix(count)?;
@@ -2986,12 +2986,20 @@ impl TunnelPool {
         let Some(dial) = self.inner.dial.clone() else {
             return Err("the pool has no dialer".to_owned());
         };
+        // The configured count is a promise: ordinary repair stops there, and only
+        // a mix that is owed a second carrier raises the ceiling, by at most
+        // `SPARE_MAX`.
         let (size, count, spare) = {
             let state = self.inner.state.lock();
             let spare = self.inner.spare_owed(&state.entries, state.count);
             (state.entries.len(), state.count, spare)
         };
-        if size >= count + usize::from(spare.is_some()) {
+        let limit = if spare.is_some() {
+            count.saturating_add(crate::transport::pool::SPARE_MAX)
+        } else {
+            count
+        };
+        if size >= limit {
             return Err(format!("already at the configured tunnel count ({count})"));
         }
         // A deliberate replacement follows the requested target even when the
@@ -3013,7 +3021,14 @@ impl TunnelPool {
         };
         let (tunnel, shutdown) = dial(wanted).await?;
         let mut state = self.inner.state.lock();
-        if state.entries.len() >= state.count + usize::from(spare.is_some()) {
+        let limit = if spare.is_some() {
+            state
+                .count
+                .saturating_add(crate::transport::pool::SPARE_MAX)
+        } else {
+            state.count
+        };
+        if state.entries.len() >= limit {
             return Err("the pool reached its configured tunnel count while dialing".to_owned());
         }
         let from = state.entries.len();
@@ -3135,9 +3150,15 @@ impl TunnelPool {
         #[cfg(feature = "client")]
         self.carrier_rule_step();
         self.reap_dead();
-        self.trim_step();
+        // **One pool-size change per tick.** A convergence step is a trim and a
+        // dial, and doing both in the same tick makes the pool bounce between two
+        // sizes while the split moves — visible in `size` against `count` and
+        // worth nothing. The next tick is 50 ms away.
+        let trimmed = self.trim_step();
         self.handover_step();
-        self.repair().await;
+        if !trimmed {
+            self.repair().await;
+        }
     }
 
     /// Give the mix's spare tunnel back once the over-represented carrier has
@@ -3152,14 +3173,14 @@ impl TunnelPool {
     /// If no such tunnel is idle the pool keeps the spare and stays one wide: a
     /// pool one over its configured count is bounded, visible in `size` against
     /// `count`, and strictly better than a mix that can never be reached.
-    fn trim_step(&self) {
+    fn trim_step(&self) -> bool {
         let mut state = self.inner.state.lock();
         let count = state.count;
         if state.entries.len() <= count {
-            return;
+            return false;
         }
         let Some((mhd_target, tcp_target)) = self.inner.target_mix(count) else {
-            return;
+            return false;
         };
         let mhd = state
             .entries
@@ -3172,7 +3193,7 @@ impl TunnelPool {
         } else if tcp > tcp_target {
             Carrier::Tcp
         } else {
-            return;
+            return false;
         };
         let pins = self.inner.pins.counts();
         let Some(index) = state.entries.iter().position(|entry| {
@@ -3182,7 +3203,7 @@ impl TunnelPool {
                 && entry.load().pending == 0
                 && pins.get(&entry.tunnel.id()).copied().unwrap_or(0) == 0
         }) else {
-            return;
+            return false;
         };
         let from = state.entries.len();
         let entry = state.entries.remove(index);
@@ -3205,6 +3226,7 @@ impl TunnelPool {
             from, to,
             "pool-stats: the mix converged; giving the spare tunnel back"
         );
+        true
     }
 
     /// Dial until the pool holds its configured count again.
@@ -3220,7 +3242,12 @@ impl TunnelPool {
             let spare = self.inner.spare_owed(&state.entries, state.count);
             (state.entries.len(), state.count, spare)
         };
-        if size >= count + usize::from(spare.is_some()) || self.growth_held_off() {
+        let limit = if spare.is_some() {
+            count.saturating_add(crate::transport::pool::SPARE_MAX)
+        } else {
+            count
+        };
+        if size >= limit || self.growth_held_off() {
             return;
         }
         if let Some(carrier) = spare {
@@ -5173,9 +5200,20 @@ mod tests {
                 "the spare rides the carrier the mix was short of"
             );
         }
-        // A second spare is not owed while the first is out.
+        // A second spare is still owed while the split is short — two, so that a
+        // move of several tunnels costs fewer rounds of waiting for one to empty.
+        assert_eq!(spare(), Some(Carrier::Tcp), "the split is still short");
+        pool.repair().await;
+        {
+            let state = pool.inner.state.lock();
+            assert_eq!(state.entries.len(), 6, "at most two spares, never more");
+        }
+        // Two is the ceiling: the pool does not grow a third time.
         assert_eq!(spare(), None);
-        // Every tunnel is idle, so the over-represented carrier gives one back.
+        // Every tunnel is idle, so the over-represented carrier gives one back per
+        // tick until the pool is at its configured count again.
+        pool.trim_step();
+        assert_eq!(pool.inner.state.lock().entries.len(), 5);
         pool.trim_step();
         {
             let state = pool.inner.state.lock();
@@ -5190,8 +5228,8 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.carrier == Carrier::Tcp)
                     .count(),
-                1,
-                "and keeps the tunnel the mix bought"
+                2,
+                "and keeps the tunnels the mix bought"
             );
         }
     }
