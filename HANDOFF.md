@@ -44,6 +44,31 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.518 (no lever provokes the wedge on this tree — and every probe attempt now says whether it was late).**
+> Three runs on the provoking shape (`PROFILES["wedge"]`: the product twice, the rotating path, one round) and one with the
+> whole bench confined to **five of twenty cores** (`taskset -c 0-4`, which is severe oversubscription for two subjects'
+> runtimes, three probes, eight iperf3 streams and the backend):
+>
+> | run | `wedge_count` (arm / twin) | `wedge_max_s` | `rtt_timeout_count` | samples per arm |
+> |---|---|---|---|---|
+> | p160 | 0 / 0 | 0 | 0 / 1 | 10 860 / 10 960 |
+> | p161 | 0 / 0 | 0 | 0 / 1 | 10 930 / 11 600 |
+> | p162, five cores | 0 / 0 | 0 | 0 / 0 | 10 990 / 10 790 |
+>
+> Four clean runs now, each ~35 minutes with 11 000 samples per arm, against three historical sightings (5/5, 9/1, 3/9) on a
+> tree from 2026-11-12. **What separates them is the tree, not the load**: the lever the records named (two product arms) and
+> the lever that should emulate the rest (a quarter of the cores) both read zero. The most economical reading is that the
+> wedge has been fixed since those runs by the changes that landed between — the `Recovery::arm` scan, the
+> `DERIVED_REGISTERED_SELECTOR` round trip, the small-flight reserve and timer, the record layer — and that its historical
+> correlation with host load was a correlation with *when those sessions ran*, not a cause.
+>
+> **So the instrument now carries the attribution.** `run_interactive` schedules each attempt and stamps the line with
+> **`late_ms`** — the gap between when the request was due and when it started — on successes and failures alike
+> (`bench/src/bench/probes/series.py`). A silence is made of failures, so this is the number that says whether a wedge was
+> the probe's own starvation or the tool's: if `late_ms` inside a silence is large, the probe was not running; if it is zero
+> and the attempts failed, the path or the tool did. Without it, every silence is ambiguous, which is why four zeroes were
+> not enough to say the floor is met.
+
 > **§4.517 (the wedge now has a profile that points at it — and it reads zero twice, 40 minutes a run).**
 > The harness could not tell "no defect" from "cannot see it", so `PROFILES["wedge"]` names the shape the historical
 > sightings share: **the product twice on one host** (`aa`), the same rotating path, the same probes, one round, ~40 minutes.

@@ -61,8 +61,8 @@ def emit(metric: str, value, **extra) -> None:
     sys.stdout.flush()
 
 
-def emit_error(why: str, started_at: float) -> None:
-    emit("error", 1, why=why[:120], started_at=started_at)
+def emit_error(why: str, started_at: float, late_ms: float = 0.0) -> None:
+    emit("error", 1, why=why[:120], started_at=started_at, late_ms=late_ms)
 
 
 def attempt_deadline(started_at: float) -> float:
@@ -86,7 +86,7 @@ def remaining(started_at: float) -> float:
     return max(attempt_deadline(started_at) - time.time(), 0.001)
 
 
-def ping(target: tuple, size: int) -> tuple[float, float] | None:
+def ping(target: tuple, size: int, late_ms: float = 0.0) -> tuple[float, float] | None:
     """One fresh TCP connection, one echo, timed end to end.
 
     The round trip is also split at the send: `connect_ms` is everything up to and
@@ -119,10 +119,10 @@ def ping(target: tuple, size: int) -> tuple[float, float] | None:
                     break
                 got += len(chunk)
     except OSError as exc:
-        emit_error(f"{type(exc).__name__}: {exc}", started_at)
+        emit_error(f"{type(exc).__name__}: {exc}", started_at, late_ms)
         return None
     if got != size:
-        emit_error(f"short echo: {got} of {size} bytes", started_at)
+        emit_error(f"short echo: {got} of {size} bytes", started_at, late_ms)
         return None
     finished = time.perf_counter()
     connect_ms = round((sent_at - started) * 1000, 4)
@@ -133,6 +133,7 @@ def ping(target: tuple, size: int) -> tuple[float, float] | None:
         started_at=started_at,
         connect_ms=connect_ms,
         echo_ms=echo_ms,
+        late_ms=late_ms,
     )
     return connect_ms, echo_ms
 
@@ -143,14 +144,30 @@ def _deadline(args) -> float:
 
 
 def run_interactive(target: tuple, args) -> None:
+    """One request per period, with **when it was due** recorded beside it.
+
+    `late_ms` is the gap between the attempt's scheduled start and the moment it
+    actually started: a probe that was descheduled reports a silence that is its
+    own, and the wedge metric cannot tell that from a tool that stopped answering.
+    The field is on every line — success and failure alike — because a silence is
+    made of failures, so the number that attributes it has to travel with them
+    (`HANDOFF.md` §4.518).
+    """
     period = args.interval_ms / 1000.0
     end = _deadline(args)
+    next_at = time.perf_counter()
     while time.time() < end:
         started = time.perf_counter()
-        ping(target, args.size)
-        left = period - (time.perf_counter() - started)
+        late_ms = round(max(0.0, started - next_at) * 1000, 4)
+        ping(target, args.size, late_ms)
+        next_at += period
+        left = next_at - time.perf_counter()
         if left > 0:
             time.sleep(left)
+        else:
+            # Fell behind by a whole period: re-anchor rather than accumulate a
+            # backlog, and let `late_ms` on the next line say how far behind.
+            next_at = time.perf_counter()
 
 
 def run_udp(target: tuple, args) -> None:
