@@ -44,6 +44,14 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.528 (§11.4(a) closes below the instrument's threshold).**
+> The question was whether a carrier move's per-step handshake is worth replacing with a permanent spare. Two auto runs with
+> `MOLEHILL_MHD_STATS=1` (`bulk-1` + `bulk-n`, four rounds each) contain **no `mhd pool placement` line at all**, and that line
+> fires only for a single placement of **≥ 1 ms**. Hundreds of stream opens, including the seconds in which the pool converged,
+> and every placement was under a millisecond — which is the mechanism §13.2 argued (the spare is dialled by the maintenance
+> tick and the trim only removes idle tunnels) confirmed by the instrument. A permanent extra lane would buy no visitor-visible
+> latency and would pay for one lane forever.
+
 > **§4.527 (`mhd 定型`, on the restated floor and an independent regression).**
 > Written this round, and only because the regression in it is independent of the criterion rewrite: the floor of §4.524 was
 > restated in one session, so the verdict had to be paid for in another. The evidence, all of it from runs whose method the
