@@ -44,6 +44,29 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.519 (the sighting's own binary reads zero too — so neither the tree nor the lever is the difference).**
+> The last hypothesis §4.518 left open was that the wedge had been fixed between the sightings and now. It is testable in one
+> run: build the sighting commit (`fee56e7`, 2026-11-12, "two arms of one binary — one clean, one silent for 25 seconds") and
+> point the same profile at it. **`wedge_count` 0 / 0**, `wedge_max_s` 0, one timeout on the twin, over **11 270 / 10 520**
+> interactive samples.
+>
+> So the account stands as five clean runs and no reproduction, across three different things that could have been the cause:
+>
+> | run | what it varied | `wedge_count` | samples per arm |
+> |---|---|---|---|
+> | p160, p161 | the shape (two product arms) | 0 / 0, 0 / 0 | ~10 900 |
+> | p162 | the cores (five of twenty) | 0 / 0 | ~10 900 |
+> | p170 | **the tree** (the sighting commit's binary) | 0 / 0 | 11 270 / 10 520 |
+>
+> The 2026-11-12 readings (5/5, 9/1, 3/9) are therefore reproducible by **nothing the harness owns today** — not the shape that
+> provoked them, not a quarter of the cores, not the binary that produced them. What is left is the host state those sessions
+> ran in, and that is not a lever a profile can pull. What the harness *can* now say is that it is looking: the probe asks 16
+> times a second, so a ten-second silence is 160 consecutive failed attempts, and every attempt carries `late_ms`, so the day
+> it returns the silence is attributable to the probe or to the tool on the first run instead of after another round of guessing.
+>
+> **For the plan's floor this is the strongest evidence it can have short of a reproduction**: five runs, ~11 000 samples each,
+> zero silences, zero timeouts on the product arm — and a named way to look again.
+
 > **§4.518 (no lever provokes the wedge on this tree — and every probe attempt now says whether it was late).**
 > Three runs on the provoking shape (`PROFILES["wedge"]`: the product twice, the rotating path, one round) and one with the
 > whole bench confined to **five of twenty cores** (`taskset -c 0-4`, which is severe oversubscription for two subjects'
