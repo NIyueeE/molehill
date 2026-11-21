@@ -42,6 +42,10 @@ use ring::aead::{Aad, BoundKey, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKe
 /// The carrier's MTU-sized payload.
 const DATAGRAM: usize = 1400;
 
+/// The run the lane fills before posting it: its packets are sealed at moving
+/// offsets inside this buffer, which is the shape the last rows price.
+const RUN: usize = 64 * 1024;
+
 /// The record size the carrier's noise layer writes in practice.
 const RECORD: usize = 32 * 1024;
 
@@ -338,6 +342,58 @@ fn primitives() {
         .expect("a tag this key wrote");
         black_box(&opened_big);
     });
+
+    // The lane does not seal a buffer of its own: it seals each packet **inside
+    // the run it is building**, so a 1 400-byte region at a moving offset in a
+    // 64 KiB buffer. These rows price that shape, and the copy that would
+    // replace it if the cold region is what costs (HANDOFF.md §4.523, §4.530).
+    println!("== the same call, in the buffer the lane seals in ==");
+    let mut run = vec![0u8; RUN];
+    bench_per_kib("seal 1400 at a fixed offset in 64 KiB", DATAGRAM, || {
+        let tag = aes
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(NONCE),
+                Aad::empty(),
+                &mut run[..DATAGRAM],
+            )
+            .expect("a buffer the tag is returned from");
+        black_box(&tag);
+        black_box(&run[..DATAGRAM]);
+    });
+    let mut at = 0usize;
+    bench_per_kib("seal 1400 at a rotating offset in 64 KiB", DATAGRAM, || {
+        // Every call lands on a region the previous one evicted, which is what
+        // filling a run does to the buffer's cache lines.
+        at = (at + DATAGRAM) % (RUN - DATAGRAM);
+        let tag = aes
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(NONCE),
+                Aad::empty(),
+                &mut run[at..at + DATAGRAM],
+            )
+            .expect("a buffer the tag is returned from");
+        black_box(&tag);
+        black_box(&run[at..at + DATAGRAM]);
+    });
+    let mut scratch = vec![0u8; DATAGRAM];
+    let mut at_copy = 0usize;
+    bench_per_kib(
+        "seal 1400 hot, then copy into 64 KiB (rotating)",
+        DATAGRAM,
+        || {
+            let tag = aes
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(NONCE),
+                    Aad::empty(),
+                    &mut scratch,
+                )
+                .expect("a buffer the tag is returned from");
+            at_copy = (at_copy + DATAGRAM) % (RUN - DATAGRAM);
+            run[at_copy..at_copy + DATAGRAM].copy_from_slice(&scratch);
+            black_box(&tag);
+            black_box(&run[at_copy..at_copy + DATAGRAM]);
+        },
+    );
 
     #[cfg(feature = "mhd")]
     bench_carrier_aead();

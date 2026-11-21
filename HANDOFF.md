@@ -44,6 +44,28 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.530 (the lane seal's missing 0.4 µs is not the buffer, and not the cipher).**
+> The last named candidate for the lane's per-packet cost was the shape of the buffer it seals in: the product seals each
+> packet *inside the 61 KB run it is filling*, where a 1 400-byte region at a moving offset may be colder than the cost
+> table's hot 1.4 KB loop. Measured, in the table's own shape (`tests/primitives_test.rs`):
+>
+> | shape | per call |
+> |---|---|
+> | 1 400 B, hot | **669.8 ns** |
+> | 1 400 B at a fixed offset in 64 KiB | **669.8 ns** |
+> | 1 400 B at a **rotating** offset in 64 KiB (what filling a run does) | **673.5 ns** |
+> | seal hot, then copy the sealed packet into the run | **717.3 ns** |
+>
+> So coldness is worth **4 ns**, and the copy that would dodge it costs 48 — the candidate fix is refused by its own price.
+> With the schedule (§4.523), the allocation (§4.523) and the algorithm (AES-GCM is faster than ChaCha at both 1 400 B and
+> 32 KiB — the note in §4 A said the opposite and has been corrected) all dismissed, what is left between the product's
+> 1.09 µs and the table's 0.67 is **context**: the same call inside a busy pump thread, at a lower turbo, on cache lines the
+> decode, ack and booking work evicted between calls. A microbenchmark cannot reproduce that by moving a buffer around.
+>
+> Recorded as the end of this line of attack: the next thing that could move it is sealing on a separate task, which is a
+> hand-off per packet and therefore a latency question, not a throughput one — and the lane is the carrier this product
+> exists for.
+
 > **§4.529 (the striping width's growth had no consumer, so it is gone).**
 > `StripePlan::note_stall` ran on every stall, took a mutex-free CAS pair, stored a new target and logged "striping target
 > grew" — and **nothing read the value**. `target()`'s only readers were its own `Debug` impl and tests; the visitor path takes
@@ -687,13 +709,19 @@ Three questions are open on the current tree.
 **Symptom**: mhd carries **79 %** of the kernel carrier's bulk on a clean path (78.9 / 79 / 79, §4.522),
 and the whole gap is the unit of authentication — a lane must let its receiver verify each 1 399-byte
 datagram alone, at **0.78 s of CPU per carried Gbit**, while the record layer's 32 KiB records cost **0.51**.
-**Unknown**: whether a *different algorithm* moves that number. The schedule derivation and the per-packet
-allocation around the call were both measured and dismissed (§4.523); what is left is AES-GCM on a cold
-1.4 KB buffer, twice per-byte the cost of the same call on 32 KiB.
-**Next experiment**: price a stream cipher with a per-packet tag (ChaCha20-Poly1305 is already in the table at
-0.716 ns/B for 1 400 B against AES-GCM's 0.478 — the opposite order from 32 KiB, which is the whole question).
-**Pass**: a lane seal under **0.6 s/Gbit** on the same host, with the same nonce discipline (the packet number)
-and no new failure mode in the loss tests. **Rollback**: the cipher stays; the floor stays restated (§15).
+**Unknown**: what the remaining 0.4 µs a packet is. Everything that could be named has now been measured and
+dismissed: the cipher (AES-GCM is the faster of the two at *both* sizes — 0.478 ns/B at 1 400 B against
+ChaCha's 0.716, and 0.371 against 0.526 at 32 KiB, so "another algorithm" is not the answer and the earlier
+note here that claimed otherwise was wrong), the key schedule, the per-packet allocation, and — measured this
+round — the buffer shape: sealing at a **rotating offset inside a 64 KiB run costs 673.5 ns against 669.8 at a
+fixed offset and 669.8 in a hot 1.4 KB buffer**, and sealing hot then copying costs 717.3, i.e. worse
+(§4.530).
+**What is left is context, not code**: the product's meter reads the same call inside a busy pump thread —
+lower turbo on a loaded box, and cache lines the decode, ack and booking work evicted between packets — and a
+microbenchmark cannot reproduce that by rotating a buffer.
+**Next experiment** (only if the number is worth it): a variant that seals on its own task, to price the
+hand-off against the context. **Pass**: a lane seal under **0.6 s/Gbit** with the same nonce discipline and no
+new failure mode in the loss tests. **Rollback**: the cipher stays where it is; the floor stays restated (§15).
 
 ### B. The soak's wedge is not reproducible
 
