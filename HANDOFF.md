@@ -44,6 +44,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.527 (`mhd 定型`, on the restated floor and an independent regression).**
+> Written this round, and only because the regression in it is independent of the criterion rewrite: the floor of §4.524 was
+> restated in one session, so the verdict had to be paid for in another. The evidence, all of it from runs whose method the
+> plan records: mixed-load interactive p99 **14.4 / 9.4 ms** clean and **1 064 / 1 263 ms** at 5 % loss; `loss5` tunnel `bulk-1`
+> **0.1270 / 0.1317 Gbit/s** against the kernel carrier's 0.106; bulk at **79 %** of the kernel carrier against a **75 %** floor;
+> five soaks with `wedge_count` **0 / 0**; and this round's regression — **22/22 ×9** (default, `mhd`, `tcp`, three runs each),
+> **20/20** striped sealed, **3/3** interop, **16 PASS** L3, `just check` green.
+>
+> Two limits travel with it and are stated in the plan rather than in prose here: the floor's rewrite is this session's work, so
+> the verdict rests on §4.522–§4.523's three refutations rather than on the old wording; and the soak's wedge is **not
+> reproducible on demand** rather than fixed — the floor holds because today's harness cannot see it, not because a fix was
+> found.
+>
+> The plan now has no unwritten section. What remains is product work with its own prices: the lane cipher's 0.78 s/Gbit
+> (another algorithm, not another AEAD unit), whether the first cell's 62 % is worth a prior, and whether a real NIC brings the
+> wedge back.
+
 > **§4.526 (the auto strategy on the plan's own criterion: 62 % of the kernel carrier in the first cell, 81 % in the second).**
 > §11.3 says the carrier decision has to be judged on two bulk cells in one session — `bulk-1` then `bulk-n` — because the
 > first cell's streams open before any class exists. Measured that way, four rounds each, same binary, the switch being the only
