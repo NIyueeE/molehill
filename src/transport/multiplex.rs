@@ -1300,22 +1300,36 @@ impl TunnelPoolInner {
         }
     }
 
-    /// How many of the pool's tunnels each carrier should hold, when this
-    /// session carries both kinds of service.
+    /// How many of the pool's tunnels each carrier should hold.
     ///
-    /// `None` is the answer for every session that carries one kind — which is
-    /// most of them, and every session before its first megabyte — and it means
-    /// "nothing to rebalance": the pool rides the endpoint's preferred carrier
-    /// exactly as it did before this policy existed. The mix only appears where
-    /// the trade it exists for is real, a session serving a conversational
-    /// service and a bulk one at once.
+    /// Three answers, in the order they are decided:
     ///
-    /// A quarter of the tunnels go to the kernel carrier, at least one and never
-    /// all of them: one is where the bulk traffic lands (placement sends it
+    /// - **A session that carries only bulk services** puts the pool on the
+    ///   kernel carrier, one tunnel short of all of it. Nothing in such a session
+    ///   is conversational, so there is no tail to protect, and the kernel carrier
+    ///   is the faster of the two for bulk on every path this repository has
+    ///   measured. The one tunnel left on the datagram carrier is the lane a
+    ///   service would land on if it turned out to be conversational after all —
+    ///   keeping it costs one idle lane, and its absence would cost the first
+    ///   interactive flow a cold grow on the visitor's path.
+    /// - **A session that carries one kind and not the other** answers `None`,
+    ///   which means "nothing to rebalance": the pool rides the endpoint's
+    ///   preferred carrier exactly as it did before this policy existed. That is
+    ///   every session before its first megabyte, and every conversation-only
+    ///   session — the datagram carrier is already where the preference points.
+    /// - **A session that carries both** splits the pool by how much each kind
+    ///   carried, which is where the trade the policy exists for is real.
+    ///
+    /// The bulk-only answer is not taken when the carrier is **forced**
+    /// (`MOLEHILL_DATA_CARRIER`): that switch is a measurement arm or an
+    /// operator's answer, and a policy that overrode it would make both lies.
+    ///
+    /// A quarter of a mixed pool goes to the kernel carrier, at least one and
+    /// never all of it: one is where the bulk traffic lands (placement sends it
     /// there), and keeping one on the datagram carrier is what leaves the
     /// conversational services their tail even while bulk is being carried.
     fn target_mix(&self, total: usize) -> Option<(usize, usize)> {
-        let (bulk, conversational) = {
+        let (bulk, conversational, every_service_bulk) = {
             let profiles = self
                 .shared
                 .profiles
@@ -1328,9 +1342,22 @@ impl TunnelPoolInner {
             // moves a gigabyte through one.
             let mut bulk: u64 = 0;
             let mut conversational: u64 = 0;
+            // Whether *every* service this session has watched is bulk. Counted
+            // separately from the weights because a service with no evidence yet
+            // weighs nothing: a session carrying one measured bulk service and one
+            // service nobody has classified would otherwise look bulk-only, and
+            // move a chat service's lane to the kernel carrier on the strength of
+            // its neighbour's traffic.
+            let mut any = false;
+            let mut every_service_bulk = true;
             for profile in profiles.values() {
+                any = true;
+                let class = profile.class();
+                if class != crate::transport::pool::ServiceClass::Bulk {
+                    every_service_bulk = false;
+                }
                 let (bulk_units, small_units) = profile.weights();
-                match profile.class() {
+                match class {
                     crate::transport::pool::ServiceClass::Bulk => {
                         bulk = bulk.saturating_add(bulk_units.max(small_units));
                     }
@@ -1339,9 +1366,18 @@ impl TunnelPoolInner {
                     }
                 }
             }
-            (bulk, conversational)
+            (bulk, conversational, any && every_service_bulk)
         };
-        if bulk == 0 || conversational == 0 || total < 2 {
+        if total < 2 {
+            return None;
+        }
+        if every_service_bulk && crate::transport::carrier::forced_carrier().is_none() {
+            // Only from the datagram carrier: a pool whose preference is already
+            // the kernel carrier has nothing to move, and one that fell back to it
+            // must not be dragged back.
+            return ((self.preferred)() == Carrier::Mhd).then_some((1, total - 1));
+        }
+        if bulk == 0 || conversational == 0 {
             return None;
         }
         // The kernel carrier takes the bulk's share of the pool, and never all of
@@ -5217,7 +5253,9 @@ mod tests {
         let bulk = crate::protocol::ServiceId::new(1);
         let chat = crate::protocol::ServiceId::new(2);
         // One class only — here bulk — is one answer for the whole session: there
-        // is nothing to split against.
+        // is nothing to split against. This fixture rides the kernel carrier
+        // already, so the bulk-only answer has nothing to move either (the move
+        // itself is its own test below).
         for _ in 0..8 {
             pool.inner.shared.note_observation(bulk, Observation::Bulk);
         }
@@ -5248,6 +5286,68 @@ mod tests {
         assert_eq!(pool.inner.target_mix(1), None);
     }
 
+    /// A session whose only service is bulk moves the pool to the kernel
+    /// carrier, one tunnel short of all of it — and a session that rides the
+    /// kernel carrier already has nothing to move.
+    ///
+    /// This is the conservatism of §11.4(b) of `MHD-FINALIZATION-PLAN.md`
+    /// removed: the class was only ever read for *placement*, so a bulk-only
+    /// session kept every tunnel on the datagram carrier and the bulk traffic
+    /// with it, at the carrier gap the same plan records. The datagram carrier
+    /// keeps one tunnel because the class is a measurement and can be revised —
+    /// a service that turns out conversational lands on a warm lane instead of
+    /// paying a cold grow.
+    #[tokio::test]
+    async fn a_bulk_only_session_moves_the_pool_to_the_kernel_carrier() {
+        use crate::transport::pool::Observation;
+        let bulk = crate::protocol::ServiceId::new(1);
+        let pool = growable_pool_on(Carrier::Mhd, 4, 4);
+        for _ in 0..16 {
+            pool.inner.shared.note_observation(bulk, Observation::Bulk);
+        }
+        assert_eq!(
+            pool.inner.shared.class_of(bulk),
+            crate::transport::pool::ServiceClass::Bulk
+        );
+        assert_eq!(
+            pool.inner.target_mix(4),
+            Some((1, 3)),
+            "bulk-only: the pool moves, and one datagram lane stays warm"
+        );
+        assert_eq!(pool.inner.target_mix(8), Some((1, 7)));
+        assert_eq!(pool.inner.target_mix(2), Some((1, 1)));
+        assert_eq!(
+            pool.inner.target_mix(1),
+            None,
+            "a pool of one cannot hold two carriers"
+        );
+        // The next dial is the carrier the move asked for, and the surplus
+        // datagram tunnels are the ones given back — never a carrying one.
+        {
+            let state = pool.inner.state.lock();
+            assert_eq!(
+                pool.inner.wanted_carrier(&state.entries, 4),
+                Carrier::Tcp,
+                "a bulk-only session dials the kernel carrier"
+            );
+            assert_eq!(
+                pool.inner.spare_owed(&state.entries, state.count),
+                Some(Carrier::Tcp),
+                "and the pool is owed a tunnel on it"
+            );
+        }
+        // A pool that already rides the kernel carrier is not moved anywhere:
+        // the bulk-only answer is about the datagram carrier, not about bulk.
+        let on_tcp = growable_pool_on(Carrier::Tcp, 4, 4);
+        for _ in 0..16 {
+            on_tcp
+                .inner
+                .shared
+                .note_observation(bulk, Observation::Bulk);
+        }
+        assert_eq!(on_tcp.inner.target_mix(4), None);
+    }
+
     /// A full pool on one carrier, with both kinds of service in the session,
     /// takes **one** extra tunnel on the short carrier and gives it back as soon
     /// as a tunnel of the over-represented carrier is idle.
@@ -5264,15 +5364,17 @@ mod tests {
             let state = pool.inner.state.lock();
             pool.inner.spare_owed(&state.entries, state.count)
         };
-        // One kind of service only: nothing to converge on.
-        for _ in 0..(CLASS_WINDOW * 2) {
-            pool.inner.shared.note_observation(bulk, Observation::Bulk);
-        }
-        assert_eq!(spare(), None);
-        // The conversational service appears, and the pool owes the kernel
-        // carrier one tunnel.
+        // One kind of service only: nothing to converge on. The *conversational*
+        // kind, because a session whose only service is bulk is the one case that
+        // does move the pool — it has its own test below.
         for _ in 0..(CLASS_WINDOW * 2) {
             pool.inner.shared.note_observation(chat, Observation::Small);
+        }
+        assert_eq!(spare(), None);
+        // The second kind appears, and the pool owes the kernel carrier one
+        // tunnel.
+        for _ in 0..(CLASS_WINDOW * 2) {
+            pool.inner.shared.note_observation(bulk, Observation::Bulk);
         }
         assert_eq!(spare(), Some(Carrier::Tcp));
         // The repair dials it: one more tunnel, riding the short carrier.

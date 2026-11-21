@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A session that carries only bulk services moves its pool to the kernel
+  carrier.** The pool has read each service's class and used it to place
+  *streams*; the tunnels themselves stayed on whatever carrier the endpoint
+  preferred, so a client whose services are all bulk — a backup host, a mirror —
+  kept every tunnel on the datagram carrier and its bulk traffic with it, at the
+  gap the [benchmarks page](docs/benchmarks.md) records between the two carriers
+  on a clean path. The pool now moves: the spare dial goes out on the kernel
+  carrier and the over-represented carrier's idle tunnels are given back one per
+  tick, so nothing carrying traffic is ever removed and a stream always finishes
+  on the tunnel it started on. One datagram tunnel stays warm, because the class
+  is a measurement that a later service can revise, and a flow that turns out
+  conversational should land on a lane rather than pay a cold grow. A **forced**
+  carrier (`MOLEHILL_DATA_CARRIER`) is outside the policy, so the two measurement
+  arms still measure what they name.
 - **Records are sealed with AES-256-GCM, keyed from the Noise handshake.** The KK
   handshake is unchanged — it is what authenticates both ends and where the
   session's secrets come from — but the cipher that runs on every record is now

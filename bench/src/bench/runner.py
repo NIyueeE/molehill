@@ -766,6 +766,7 @@ def build_results(camp: Campaign, pre: dict, provenance: dict, started: str) -> 
                         "MOLEHILL_L3_STATS",
                         "MOLEHILL_MHD_STATS",
                         "MOLEHILL_TUNNEL_STATS",
+                        "MOLEHILL_MHD_SEAL",
                         "MOLEHILL_POOL_STATS",
                         "MOLEHILL_STRIPE_COUNT",
                     }

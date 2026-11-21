@@ -567,14 +567,21 @@ async fn striped_data_channels() -> Result<()> {
     // channels silently sharing a tunnel.
     //
     // The size is the configured count, not a number the group produced: the
-    // pool was already at four before the first visitor, and it stays there.
+    // pool was already at four before the first visitor. **Plus the spares a
+    // carrier move is allowed** (`SPARE_MAX`, which this test cannot name from
+    // outside the crate): this session serves one bulk service, so the pool is
+    // moving its tunnels to the kernel carrier one spare at a time and giving the
+    // over-represented carrier's idle ones back — a carrying tunnel is never
+    // removed, so while the stripes hold every datagram tunnel the pool sits one
+    // or two over its count. What this assertion is for is that the group did not
+    // collapse onto a single tunnel.
     let sizes: Vec<usize> = molehill_rathole::live_pools()
         .iter()
         .map(|pool| pool.size)
         .collect();
     assert!(
-        sizes.iter().all(|size| *size == 4),
-        "the stripe group's client must keep its four pinned tunnels: {sizes:?}"
+        sizes.iter().all(|size| (4..=6).contains(size)),
+        "the stripe group's client must keep its four pinned tunnels, plus at most the two \n         spares a carrier move may hold: {sizes:?}"
     );
 
     info!("a second visitor gets its own stripe group");
