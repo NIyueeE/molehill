@@ -13,6 +13,57 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.511 (what the kernel's 46 % is made of: two socket syscalls per 24 KiB — and the layer §4.509 blamed for a fifth of the
+> cycles is one percent of them).**
+> Measured on a fixed loopback pair (`/tmp/sysprobe`: server, client, iperf3 through the visitor, `MOLEHILL_DATA_CARRIER=tcp`),
+> with the client a **child** of `perf trace -s` / `perf record`: this container has no `CAP_SYS_PTRACE`, so attaching to a
+> running process is refused and tracing a child is what works. 8 streams carried **19.4 Gbit/s** and 1 stream 5.4 Gbit/s
+> (loopback, no shaping), and the client's syscalls over 30.3 GB each way were:
+>
+> | syscall | calls | time in the syscall |
+> |---|---|---|
+> | `recvfrom` | 1 321 910 | 13.7 s |
+> | `sendto` | 1 229 951 | 17.2 s |
+> | `epoll_wait` | 1 436 911 | 42.7 s (summed over 10 threads) |
+> | `write` | 223 644 | 0.6 s |
+>
+> That is **~24 KiB of payload per socket syscall** and **~1.0 ns of kernel time per byte** (0.5 each way), which is what the
+> 46 % kernel share *is*: two `copy_*_user`s and the TCP stack, not an excess of calls. Cycles by image on the same path:
+> kernel **46.4 %**, the binary **36.5 %** (of which **AES-256-GCM 24.1 %** — §4.510's cipher, now the single largest user-space
+> cost), and a deleted mapping (**libc: the copies and memsets**) **16.7 %**.
+>
+> **So the stripe layer is not the fifth §4.509 called it.** Its own symbols are **0.8 %** (`stripe::recv_loop` 0.40,
+> `stripe_reader` 0.19, the `StripeEvent` send 0.19) and yamux is ~2.3 % (`Active::poll` 1.21, `stream::poll_read` 0.76,
+> `TaggedStream` 0.30); the rest of that fifth was copies and tokio. **A K=1 stripe bypass would buy ~1 %**, and it would
+> duplicate half-close, idle-timeout and shutdown logic to get it: **rejected, priced**. What the same sample did find is
+> in `src/mux/frame/io.rs`: the decoder reads the **12-byte header with its own syscall** and then allocates and zeroes
+> **`vec![0; body_len]` per frame**, so a 32 KiB frame costs ~2-3 reads and one 32 KiB allocation plus memset. At 19 Gbit/s
+> that is ~75 000 frames a second. **That is the next structural target** (one read-ahead buffer, frames parsed out of it,
+> payloads handed out as `Bytes` slices), and it is worth more than either of the two entries this round priced.
+
+> **§4.510 (the record layer seals with AES-256-GCM, keyed from the handshake — §4.509's next step, done and measured).**
+> `src/transport/record.rs`: the KK handshake is untouched (it authenticates and it is where the secrets come from), and the
+> record cipher is now ring's AES-256-GCM under one key per direction — `HKDF(salt = transcript hash, ikm = that direction's
+> half of the split, info = a versioned label + the direction)` — with a per-direction `u64` counter as the nonce and the
+> record's two-byte length header as the associated data (which the handshake's own transport mode never authenticated).
+> Priced with `just primitives`: **32 KiB seal 12.2 µs against ChaCha20-Poly1305's 17.3** (0.371 against 0.526 ns/byte);
+> 1 400 bytes 669 ns against 1 002.
+>
+> Three A/B runs (dev profile, `l4` against a duplicate arm on the new binary, `--aa` twin in each):
+>
+> | run | the cell | `l4` | `l4~b` | A/A twin |
+> |---|---|---|---|---|
+> | p130, 4 rounds, 3 scenarios | **tool-bound** | 12.78 | **15.36** | 12.81 |
+> | p132, 6 rounds, `bulk-n` | visitor-bound at 9.8 Gbit/s | 10.23 | 10.25 | 10.26 |
+> | p133, 6 rounds, `bulk-n` | visitor-bound | 10.31 | 10.30 | 10.34 |
+>
+> `cpu_s_per_gbit` in the tool-bound run: 0.7746 → 0.6765 (**−12.7 %**). The mixed cell's interactive tail did not move
+> (screen profile, 3 rounds: p99 4.07 against 4.96, p50 1.115 against 1.119). **The honest verdict is "real, and not a claim
+> the model can certify"**: 8 streams need more producer than this host's visitors sometimes have, so a host phase where
+> the visitor fills the cell measures nothing — the cell resolves 20 % in one phase and 0 % in another. What is reproduced
+> is the per-byte cipher cost and the tool-bound A/B. Kept (`ed624ff`); gates: `just check`, integration 22/22 under three
+> carrier settings, interop 3/3, L3 16 PASS.
+
 > **§4.509 (where the TCP carrier's bulk time goes: a third of it is the record cipher, and the faster one is already in the tree).**
 > The same `perf` sample as §4.508, taken on the **kernel carrier** instead — `bulk-n`, clean, `MOLEHILL_DATA_CARRIER=tcp`
 > — because after the mix that is the path bulk actually rides. Splitting ~9 700 samples by image and symbol:
