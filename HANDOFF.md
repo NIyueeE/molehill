@@ -44,6 +44,22 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.515 (the phase counters refuse the serialisation hypothesis and point at the run size).**
+> The one-round runs of §4.513 with `MOLEHILL_MHD_STATS=1` carry the sending end's own phases, and they say the opposite of
+> what the +9 % CPU / −21 % throughput shape suggested. Per carried Gbit, with sealing: **`tx_build` 0.26 s/Gbit** against
+> **0.30** without — *cheaper*, and `tx_send` 0.104 against 0.085 — dearer. What separates the two runs is the **run size**:
+> 155 549 send events for 45.5 Gbit sealed against 133 387 for 58.7 unsealed, i.e. **3 400 syscalls per Gbit against 2 272**
+> — the sealed path posts **50 % more, smaller runs** (≈36 KB against ≈55 KB each).
+>
+> So the cost is not the cipher spread over the process's cores *or* serialised on one task; it is **batching**: a sealed
+> packet carries less payload for the same frame, the sender's run-filling rule stops at a packet count rather than at the
+> bytes the path allows, and the difference shows up as syscalls per Gbit. The next instrument is therefore the run-filling
+> rule in `src/transport/mhd/pump.rs` (what closes a run), not the cipher and not the thread layout.
+>
+> Both runs are one round each, on the pre-fix mix policy (§4.514), so the numbers are a direction and not a claim; what
+> makes them worth recording is that they **exclude** the explanation the previous section offered, at no cost — the data was
+> already in the logs.
+
 > **§4.514 (a pinned carrier was not pinned — the mix policy dialled the other carrier under
 > `MOLEHILL_DATA_CARRIER`, and that is a measurement defect, not a feature).**
 > Found while re-running the seal floor: the pinned run's own log says `pool-stats: this session carries both kinds of
