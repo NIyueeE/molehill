@@ -119,25 +119,23 @@ const STRIPE_REORDER_QUEUE: usize = 32;
 /// waiting on the path, and one more stripe would add one more window to it.
 pub const STRIPE_BACKPRESSURE: Duration = Duration::from_millis(250);
 
-/// The minimum spacing between two growth steps of one server's target.
-///
-/// A burst of stalled groups must grow the target by one step per dwell, not
-/// by one step each: fifty visitors meeting a saturated path say "wider" once,
-/// and the next step is taken only if the wider target is still congested a
-/// dwell later.
-pub const STRIPE_GROWTH_DWELL: Duration = Duration::from_millis(500);
-
-/// The server-wide striping target: how many stripes the next visitor's group
-/// gets, and the gate that keeps a stalled burst from growing it fifty times.
+/// The width the next visitor's group gets.
 ///
 /// One plan is shared by every pairing of one server. Only the server holds
 /// one: the client's side of a group has no say in how wide the next group
 /// should be, because it does not pair visitors.
+///
+/// **The width is decided at pairing and never adapts**, and that is a
+/// decision rather than an omission. A group that grows a stripe mid-transfer
+/// would have to move frames between channels, which reorders them; and the
+/// measurement that set the starting width (§4.19: four channels instead of one
+/// cost 8× the arrival latency with no bulk traffic in the run) is about the
+/// width a *visitor* needs, which its own traffic answers within one transfer.
+/// What used to live here — a target that grew one stripe per stalled group —
+/// is gone: its only reader was a `Debug` impl and a log line that said "the
+/// target grew" while no code consumed the value (`HANDOFF.md` §4.529).
 pub struct StripePlan {
     target: std::sync::atomic::AtomicUsize,
-    /// Epoch milliseconds of the last growth step; zero means "never grew", so
-    /// the first stall that clears the dwell grows immediately.
-    last_growth: std::sync::atomic::AtomicU64,
 }
 
 impl StripePlan {
@@ -147,7 +145,6 @@ impl StripePlan {
     pub fn new(target: usize) -> Self {
         StripePlan {
             target: std::sync::atomic::AtomicUsize::new(target.clamp(1, MAX_STRIPES)),
-            last_growth: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -157,39 +154,6 @@ impl StripePlan {
         self.target
             .load(std::sync::atomic::Ordering::Relaxed)
             .clamp(1, MAX_STRIPES)
-    }
-
-    /// One group stayed parked for `stalled` and then made progress: grow the
-    /// target by one stripe when the growth dwell has passed, and report the
-    /// new target. `None` means "nothing to do" — the stall was too short, or
-    /// this server grew a step within the dwell.
-    pub fn note_stall(&self, stalled: Duration) -> Option<usize> {
-        use std::sync::atomic::Ordering;
-        if stalled < STRIPE_BACKPRESSURE {
-            return None;
-        }
-        let now = epoch_millis();
-        let last = self.last_growth.load(Ordering::Relaxed);
-        // `last` is zero only before the first growth, and the epoch is far
-        // past one dwell then, so the subtraction below is safe either way.
-        let dwell = u64::try_from(STRIPE_GROWTH_DWELL.as_millis()).unwrap_or(u64::MAX);
-        if last != 0 && now.saturating_sub(last) < dwell {
-            return None;
-        }
-        if self
-            .last_growth
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return None; // another group took this dwell's step
-        }
-        let next = self
-            .target
-            .load(Ordering::Relaxed)
-            .saturating_add(1)
-            .min(MAX_STRIPES);
-        self.target.store(next, Ordering::Relaxed);
-        Some(next)
     }
 }
 
@@ -310,11 +274,12 @@ impl<W: AsyncWrite + Unpin> StripeSender<W> {
 
     /// A whole frame just completed: one stall, if this group had one, is over.
     ///
-    /// The stall is what the plan wants to hear about — the group could not
-    /// move a frame for that long and then could, which is the shape of a path
-    /// that needs another stripe. Reporting only on completion keeps a dead
-    /// peer from growing the target: no frame ever completes, so nothing is
-    /// reported.
+    /// The stall is reported, not acted on: a group that could not move a frame
+    /// for `STRIPE_BACKPRESSURE` and then could is what a path that needs more
+    /// room looks like, and the line is the evidence a future width policy would
+    /// be built from. It is deliberately **not** wired to the plan's width — see
+    /// [`StripePlan`]. Reporting only on completion keeps a dead peer out of the
+    /// measurement: no frame ever completes, so nothing is reported.
     fn note_progress(&mut self) {
         let Some(since) = self.stalled_since.take() else {
             return;
@@ -322,11 +287,12 @@ impl<W: AsyncWrite + Unpin> StripeSender<W> {
         let Some(plan) = &self.plan else {
             return;
         };
+        let _ = plan;
         let stalled = since.elapsed();
-        if let Some(next) = plan.note_stall(stalled)
+        if stalled >= STRIPE_BACKPRESSURE
             && let Ok(ms) = u64::try_from(stalled.as_millis())
         {
-            debug!(stripes = next, stalled_ms = ms, "striping target grew");
+            debug!(stalled_ms = ms, "stripe group parked and then moved");
         }
     }
 
@@ -1868,11 +1834,16 @@ mod tests {
         }
     }
 
+    /// The width a visitor gets is decided at pairing and never adapts, however
+    /// long its group stalls.
+    ///
+    /// This is a guard on a *removal*: the plan used to grow one stripe per
+    /// stalled group, and nothing read the value it grew (`HANDOFF.md` §4.529).
+    /// A future adaptive width would have to move frames between channels, which
+    /// reorders them — so if someone wires growth back in, this test fails and
+    /// the reordering question has to be answered first.
     #[test]
-    fn a_group_parked_past_the_threshold_grows_the_target() {
-        // One stripe, parked: exactly the shape a visitor's single channel
-        // takes on a path that is windowed. The frame completes as soon as the
-        // path moves, and that is the moment the plan hears about the stall.
+    fn the_width_never_adapts_to_a_stalled_group() {
         let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let plan = std::sync::Arc::new(StripePlan::new(1));
         let mut sender = StripeSender::new(
@@ -1895,46 +1866,11 @@ mod tests {
             fut.as_mut().poll(&mut cx).is_ready(),
             "the frame did not finish after the path opened"
         );
-        assert_eq!(plan.target(), 2, "a parked group did not widen the target");
-    }
-
-    #[test]
-    fn a_group_that_keeps_moving_does_not_grow_the_target() {
-        let plan = std::sync::Arc::new(StripePlan::new(1));
-        let mut sender = StripeSender::new(
-            vec![MockWriter::accepting(4096)],
-            Some(std::sync::Arc::clone(&plan)),
-        );
-        let waker = noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        for seq in 0..32 {
-            let mut fut = Box::pin(sender.send_owned(frame_bytes(seq, b"payload")));
-            assert!(fut.as_mut().poll(&mut cx).is_ready());
-        }
-        assert_eq!(plan.target(), 1, "a moving group widened the target");
-    }
-
-    #[test]
-    fn one_dwell_grows_the_target_by_one_step() {
-        let plan = StripePlan::new(1);
         assert_eq!(
-            plan.note_stall(Duration::from_millis(100)),
-            None,
-            "a stall shorter than the threshold grew the target"
+            plan.target(),
+            1,
+            "a parked group changed the width: growth was removed on purpose"
         );
-        assert_eq!(plan.note_stall(STRIPE_BACKPRESSURE), Some(2));
-        assert_eq!(
-            plan.note_stall(STRIPE_BACKPRESSURE),
-            None,
-            "the same dwell grew the target twice"
-        );
-        std::thread::sleep(STRIPE_GROWTH_DWELL);
-        assert_eq!(plan.note_stall(STRIPE_BACKPRESSURE), Some(3));
-        // The target never passes the maximum, however long the path stays
-        // congested.
-        let plan = StripePlan::new(MAX_STRIPES);
-        std::thread::sleep(STRIPE_GROWTH_DWELL);
-        assert_eq!(plan.note_stall(STRIPE_BACKPRESSURE), Some(MAX_STRIPES));
     }
 
     #[tokio::test]

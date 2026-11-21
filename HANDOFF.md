@@ -44,6 +44,18 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.529 (the striping width's growth had no consumer, so it is gone).**
+> `StripePlan::note_stall` ran on every stall, took a mutex-free CAS pair, stored a new target and logged "striping target
+> grew" — and **nothing read the value**. `target()`'s only readers were its own `Debug` impl and tests; the visitor path takes
+> `initial_stripes()`, which is the environment override or one. So the mechanism was a lie with a log line: it claimed the
+> server was adapting its width while the width could not change.
+>
+> Removed: the growth, its dwell constant, the field it kept, and the three tests that asserted it grew. What stays is the
+> **observation** — a group that parks for `STRIPE_BACKPRESSURE` and then moves still logs `stripe group parked and then moved`,
+> because that is the evidence a future width policy would be built from. A new test guards the removal from the other side:
+> a stalled-then-moved group leaves `target()` at one, so re-wiring growth fails a test that names the reordering question
+> first. Recorded as an invariant in §2.
+
 > **§4.528 (§11.4(a) closes below the instrument's threshold).**
 > The question was whether a carrier move's per-step handshake is worth replacing with a permanent spare. Two auto runs with
 > `MOLEHILL_MHD_STATS=1` (`bulk-1` + `bulk-n`, four rounds each) contain **no `mhd pool placement` line at all**, and that line
@@ -573,6 +585,17 @@ Binding constraints, all still in force:
 - `Carrier::{Tcp, Mhd}`, the `"mhd"` wire tag, the `unsafe` rules, the permission
   boundary, TCP fallback, the L3/UDP forwarding semantics, the log budget
   (`tests/log_budget_test.rs`) and the serial test convention are all fixed.
+- **The carrier decision is settled** (§4.526, §15): read per service from what the
+  service carried; a bulk service's new streams take the kernel carrier, a
+  conversational service's take a tunnel no bulk stream occupies, a session whose
+  *every* service is bulk moves the pool to the kernel carrier (one datagram lane
+  warm), and a forced carrier stands the whole policy down. Measured on the plan's
+  two-cell criterion: **62 %** of the kernel carrier in the first cell, **81 %** in
+  the second. What is still allowed to change is a *prior* (§4 C) and nothing else —
+  no configuration key, no per-arm carrier field, no policy under a pin.
+- **A stripe group's width is decided at pairing and never adapts** (§4.529): the
+  growth that used to run had no consumer, and growing mid-transfer would reorder
+  frames. The parked-and-moved observation stays as a log line.
 - **Never create or push a release tag.** Only a human asks for that; a release
   record is written only when every gate in §7 passes.
 - A change that does not beat its own gate is **reverted whole**, with its
