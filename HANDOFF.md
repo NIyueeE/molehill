@@ -44,6 +44,27 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.526 (the auto strategy on the plan's own criterion: 62 % of the kernel carrier in the first cell, 81 % in the second).**
+> §11.3 says the carrier decision has to be judged on two bulk cells in one session — `bulk-1` then `bulk-n` — because the
+> first cell's streams open before any class exists. Measured that way, four rounds each, same binary, the switch being the only
+> difference:
+>
+> | arm | `bulk-1` | `bulk-n` |
+> |---|---|---|
+> | auto | **3.584 Gbit/s** | **15.299** |
+> | pinned `tcp` | 5.743 | 18.912 |
+> | auto as a share of the kernel carrier | **62 %** | **81 %** |
+>
+> That is the whole of the policy's trade in two numbers. The first cell is the price of starting on the endpoint's preference
+> with no evidence: the streams are already open when the class arrives, and a running stream is never moved. The second is
+> what convergence buys — most of the kernel carrier's throughput, not all of it, because the pool reaches the mix by *adding*
+> a kernel-carrier tunnel and *giving back* an idle datagram one, and the bulk streams holding the other tunnels keep them.
+>
+> Both halves are the documented design rather than a defect (a stream that moved would be reordered), and they are what a
+> "carrier per service" claim should be measured against from now on. The remaining question — whether the first cell's gap is
+> worth closing by starting bulk-looking services on the kernel carrier — is a prior, not a measurement, and the plan's §七
+> records why the prior is the datagram carrier.
+
 > **§4.525 (the path question is settled: the lanes carry it, and the old record-layer count was a multi-round mix).**
 > One pinned run with both instruments on both ends (`MOLEHILL_MHD_STATS=1`, `MOLEHILL_TUNNEL_STATS=1`, `bulk-n`, one round):
 >
