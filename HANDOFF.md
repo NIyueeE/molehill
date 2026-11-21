@@ -44,6 +44,23 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.524 (the plan's last floor is restated, and 定型 is withheld for one more round).**
+> §一's floor asked sealed bulk to reach 85 % of unsealed, and §4.522–§4.523 established that those two arms are two *encryption
+> architectures*: both encrypt, one per 1 399-byte datagram and one per 32 KiB record, at 0.78 against 0.51 s/Gbit, with
+> nothing recoverable around the calls. **85 % is unreachable by construction**, so the floor is restated against what it can
+> mean — mhd carries **≥ 75 % of the kernel carrier's bulk on a clean path** (three measurements: 78.9, 79, 79) — and
+> everything else about bulk stays with the main criteria, which are green.
+>
+> **`mhd 定型` is therefore not written this round, although every floor is green under the restated one.** The reason is the
+> one P5.6 implies rather than says: a criterion rewritten in the same session as its verdict has not been paid for yet. The
+> next round runs the full regression against the rewritten floor (integration ×9, striped ×20, interop, L3, and the two bulk
+> cells) and writes the verdict on that evidence.
+>
+> **And one path question stays open**, recorded in the plan as §14.3: a pinned-mhd run's client holds only mhd lanes while the
+> same run's server seals 305 308 records at payload volume, and the lane's own counters also show the payload. Both cannot be
+> the whole truth, and until one run with `MOLEHILL_TUNNEL_STATS=1` and `MOLEHILL_MHD_STATS=1` on both ends aligns
+> "lane bytes × record seals × iperf delivery", the auto-carrier proof is not made — it would inherit the doubt.
+
 > **§4.523 (the per-call overhead is not there: no allocation, no key schedule, and the lane still pays 1.09 µs a packet).**
 > §4.522 left one attackable claim: a third of the lane cipher's bill looked like per-call overhead, because the lane measured
 > 0.77 ns/B where `just primitives` prices the same call at 0.478. Two candidates, both cheap to test, both measured:
