@@ -96,7 +96,11 @@ pub mod carrier;
 mod noise;
 #[cfg(feature = "noise")]
 pub use noise::NoiseTransport;
-// The u16-framed Noise record stream over tokio IO (vendored from
+// The record layer: what seals and opens every u16-framed record, keyed from
+// the KK handshake (see record.rs).
+#[cfg(feature = "noise")]
+pub(crate) mod record;
+// The u16-framed record stream over tokio IO (vendored from
 // snowstorm 0.4.0, adapted to snow 0.10 — see noise_stream.rs).
 #[cfg(feature = "noise")]
 pub(crate) mod noise_stream;

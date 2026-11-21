@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use super::record::Role;
 use super::{AddrMaybeCached, NoiseStream, TcpTransport, Transport};
 use crate::common::owned_write::AsyncWriteOwned;
 use crate::config::{NoiseConfig, TransportConfig};
@@ -74,7 +75,7 @@ impl NoiseKeys {
     {
         stream.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
         stream.flush().await?;
-        NoiseStream::handshake(stream, self.builder()?.build_initiator()?)
+        NoiseStream::handshake(stream, self.builder()?.build_initiator()?, Role::Initiator)
             .await
             .with_context(|| "Failed to do noise handshake")
     }
@@ -84,7 +85,7 @@ impl NoiseKeys {
     where
         S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
     {
-        NoiseStream::handshake(stream, self.builder()?.build_responder()?)
+        NoiseStream::handshake(stream, self.builder()?.build_responder()?, Role::Responder)
             .await
             .with_context(|| "Failed to do noise handshake")
     }
@@ -105,9 +106,12 @@ impl NoiseKeys {
         stream.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
         stream.flush().await?;
         let payload = payload.to_vec();
-        NoiseStream::handshake_carrying(stream, self.builder()?.build_initiator()?, move |_| {
-            payload
-        })
+        NoiseStream::handshake_carrying(
+            stream,
+            self.builder()?.build_initiator()?,
+            Role::Initiator,
+            move |_| payload,
+        )
         .await
         .with_context(|| "Failed to do noise handshake")
     }
@@ -126,9 +130,14 @@ impl NoiseKeys {
         S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
         F: FnOnce(&[u8]) -> Vec<u8>,
     {
-        NoiseStream::handshake_carrying(stream, self.builder()?.build_responder()?, produce)
-            .await
-            .with_context(|| "Failed to do noise handshake")
+        NoiseStream::handshake_carrying(
+            stream,
+            self.builder()?.build_responder()?,
+            Role::Responder,
+            produce,
+        )
+        .await
+        .with_context(|| "Failed to do noise handshake")
     }
 }
 
@@ -159,9 +168,10 @@ impl NoiseTransport {
 impl Transport for NoiseTransport {
     type Acceptor = TcpListener;
     type RawStream = TcpStream;
-    // `snow` supplies the crypto: the ring-accelerated ChaChaPoly data path
-    // is used for the fixed KK handshake; `NoiseStream` wraps the stream in
-    // tokio IO with the u16-framed message format.
+    // `snow` runs the fixed KK handshake (its ChaChaPoly resolved to ring);
+    // the records that follow are sealed by `super::record`, and
+    // `NoiseStream` wraps the stream in tokio IO with the u16-framed record
+    // format.
     type Stream = super::NoiseStream<TcpStream>;
 
     fn new(config: &TransportConfig) -> Result<Self> {

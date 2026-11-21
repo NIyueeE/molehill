@@ -53,6 +53,36 @@ than the client) rather than a retry loop. A *client* older than the server is
 refused the same way, so upgrading means upgrading both ends, in either order,
 with one refused connection telling you which side is behind.
 
+### The record layer
+
+Every session — the control channel and a TCP lane's data channels alike — is a
+byte stream cut into records: a `u16` little-endian length, the ciphertext, and a
+16-byte tag. The **handshake** is Noise KK and stays exactly that; the **record
+cipher is this project's own**, `ring`'s AES-256-GCM keyed from the handshake
+through HKDF — input key material is the direction's half of the handshake's
+split, the salt is its transcript hash, and the info is a versioned label plus
+the direction (`src/transport/record.rs`). Both ends derive the same pair and use
+opposite halves, and the transcript binds a record key to *this* handshake, which
+is the same argument a lane's root makes for its streams.
+
+Three things follow from owning the layer, and the last one is a measurement:
+
+- **The length header is authenticated**: it is the record's associated data, so a
+  record cannot be re-framed, truncated or moved to another position. The
+  handshake's own transport mode carries no associated data at all.
+- **A nonce is a record's place in the stream**: a per-direction `u64` counter in
+  a 96-bit field, never repeated under one key, and the two ends see the same
+  order because the transport is a byte stream. A session that reaches the end of
+  the counter fails on the record it is on rather than reusing one.
+- **AES-GCM because the handshake's ChaCha20-Poly1305 was a third of the data
+  path.** Sampled on a release build carrying bulk over the kernel carrier,
+  **17.4 %** of the process's cycles were in `chacha20_poly1305_open_avx2` and
+  **15.4 %** in `..._seal_avx2`. At the size a record is, AES-256-GCM takes
+  **12.2 µs** per 32 KiB against ChaCha20-Poly1305's **17.3 µs** (0.371 against
+  0.526 ns per byte), which `tests/primitives_test.rs` prices on this host
+  (`just primitives`). The handshake keeps its ChaChaPoly because it runs once
+  per session and nothing measured rides on its cipher.
+
 ## Forwarding
 
 When a visitor connects to a registered service's endpoint, the server asks the session for one more channel for that service — `CreateDataChannelFor(service_id)`, which names the service because a session carries several. The client opens a data channel back (a fresh connection, a yamux stream inside a TCP tunnel, or one of `mhd`'s own streams inside a lane), and the server marks it with a `StartForwardTcp`/`StartForwardUdp` command; the pair then copies the visitor's bytes bidirectionally.

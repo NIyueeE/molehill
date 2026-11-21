@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Records are sealed with AES-256-GCM, keyed from the Noise handshake.** The KK
+  handshake is unchanged — it is what authenticates both ends and where the
+  session's secrets come from — but the cipher that runs on every record is now
+  `ring`'s AES-256-GCM, under keys derived through HKDF from the handshake's
+  split and transcript (the transcript as salt, the direction's half as input
+  key material), instead of the pattern's ChaCha20-Poly1305. One AEAD was a third
+  of the data path's cycles — 17.4 % opening and 15.4 % sealing, sampled on a
+  release build carrying bulk — and at record size it costs **0.371 ns per
+  byte** against ChaCha20-Poly1305's 0.526 (`just primitives` prices both). On
+  the bench model's eight-stream bulk cell a run that the tool, not the visitor,
+  filled carried **15.36 against 12.78 Gbit/s** and spent **12.7 % less CPU per
+  Gbit**; a host phase where the visitor only offers 9.8 Gbit/s measures no
+  difference on that cell, which is all such a cell can say. The mixed cell's
+  interactive tail is unchanged: p99 4.07 ms against 4.96, inside that run's own
+  scatter, p50 identical. The record's two-byte length header is now
+  authenticated as associated data, which the handshake's own transport mode
+  never did. This is a wire change: **both ends upgrade together** (dialect 6.0).
 - **The pool decides a carrier per service, from what that service carried.**
   Which carrier suits a service is a property of the *workload* as much as of the
   path — measured on the leg the carrier crosses, a conversational flow's

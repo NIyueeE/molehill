@@ -1,10 +1,11 @@
-//! u16-framed Noise record stream over any tokio IO type.
+//! u16-framed record stream over any tokio IO type.
 //!
-//! One Noise transport-mode message per record: a `u16` payload length +
-//! ciphertext (+16-byte tag). Reads are record-oriented; writes encrypt one
-//! record per call. This is the record stream that used to be the
-//! `snowstorm` crate's `NoiseStream`, maintained in-repo since the snow 0.10
-//! upgrade and deliberately leaner than the upstream copy:
+//! One record per message: a `u16` payload length + ciphertext (+16-byte tag).
+//! Reads are record-oriented; writes encrypt one record per call. The cipher is
+//! [`super::record`]'s, keyed from the Noise KK handshake that this module runs
+//! first. This is the record stream that used to be the `snowstorm` crate's
+//! `NoiseStream`, maintained in-repo since the snow 0.10 upgrade and
+//! deliberately leaner than the upstream copy:
 //!
 //! - reads accumulate the length header **and** the ciphertext in one
 //!   buffer — one `poll_read` sweep per record instead of a separate
@@ -45,20 +46,21 @@ use std::{
 };
 
 use pin_project::pin_project;
-use snow::{HandshakeState, TransportState};
+use snow::HandshakeState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use bytes::{Bytes, BytesMut};
 
+use super::record::{LENGTH_FIELD, RecordCipher, Role, TAG};
 use crate::common::owned_write::AsyncWriteOwned;
 
-const TAG_LEN: usize = 16;
+const TAG_LEN: usize = TAG;
 /// Largest Noise message: the wire format carries a `u16` length.
 const MAX_MESSAGE_LEN: usize = u16::MAX as usize;
 /// Bound for a *handshake* message (not a record): every pattern the
 /// config accepts stays far below this — see `handshake_with_verifier`.
 const MAX_HANDSHAKE_MESSAGE: usize = 1024;
-const LENGTH_FIELD_LEN: usize = std::mem::size_of::<u16>();
+const LENGTH_FIELD_LEN: usize = LENGTH_FIELD;
 /// Largest on-wire record: the length header plus a maximal ciphertext.
 const MAX_FRAME_LEN: usize = LENGTH_FIELD_LEN + MAX_MESSAGE_LEN;
 /// Sentinel for "the record's length header has not been decoded yet".
@@ -135,12 +137,17 @@ impl Drop for RecordBuffers {
     }
 }
 
-/// Errors the wrapper surfaces: the handshake or transport state machine
-/// failed, or the underlying IO failed.
+/// Errors the wrapper surfaces: the handshake failed, the record keys could not
+/// be derived from it, or the underlying IO failed.
 #[derive(Debug)]
 #[doc(hidden)]
 pub enum NoiseStreamError {
     Snow(snow::Error),
+    /// The handshake finished but its key material would not expand into a
+    /// record key. Unreachable with a 32-byte HKDF extraction, and fatal rather
+    /// than a fallback: sealing under a key nobody derived is worse than
+    /// failing the session.
+    Derivation,
     Io(std::io::Error),
 }
 
@@ -160,6 +167,9 @@ impl std::fmt::Display for NoiseStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Snow(e) => write!(f, "noise error: {e}"),
+            Self::Derivation => {
+                write!(f, "noise error: the handshake's keys did not derive")
+            }
             Self::Io(e) => write!(f, "io error: {e}"),
         }
     }
@@ -238,24 +248,13 @@ impl Call {
 /// one memset the encrypt immediately overwrites; the alternative (uninitialized
 /// memory handed to the cipher) is not worth an `unsafe` block here.
 fn seal_owned(
-    transport: &mut TransportState,
+    cipher: &mut RecordCipher,
     buf: &[u8],
     payload_len: usize,
 ) -> Result<WriteState, std::io::Error> {
     let mut record = BytesMut::zeroed(LENGTH_FIELD_LEN + payload_len + TAG_LEN);
-    let message_len = transport
-        .write_message(&buf[..payload_len], &mut record[LENGTH_FIELD_LEN..])
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-    // `message_len` is bounded by MAX_MESSAGE_LEN (u16::MAX); an impossible
-    // overrun is an error, not a truncated record.
-    let len = u16::try_from(message_len).map_err(|_| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            "noise record length exceeds the u16 wire format",
-        )
-    })?;
-    record[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
-    record.truncate(LENGTH_FIELD_LEN + message_len);
+    let len = cipher.seal(&buf[..payload_len], &mut record)?;
+    record.truncate(len);
     Ok(WriteState::WritingOwned {
         record: record.freeze(),
         offset: 0,
@@ -266,24 +265,15 @@ fn seal_owned(
 
 /// Seal one record into the pooled framing buffer, for a transport that copies.
 fn seal_in_place(
-    transport: &mut TransportState,
+    cipher: &mut RecordCipher,
     buffer: &mut [u8],
     buf: &[u8],
     payload_len: usize,
 ) -> Result<WriteState, std::io::Error> {
-    let message_len = transport
-        .write_message(&buf[..payload_len], &mut buffer[LENGTH_FIELD_LEN..])
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-    let len = u16::try_from(message_len).map_err(|_| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            "noise record length exceeds the u16 wire format",
-        )
-    })?;
-    buffer[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
+    let end = cipher.seal(&buf[..payload_len], buffer)?;
     Ok(WriteState::WritingMessage {
         start: 0,
-        end: LENGTH_FIELD_LEN + message_len,
+        end,
         payload_len,
         call: Call::of(buf),
     })
@@ -295,7 +285,9 @@ pub struct NoiseStream<T> {
     #[pin]
     inner: T,
 
-    transport: TransportState,
+    /// The record layer: AES-256-GCM under keys derived from the handshake
+    /// below (see [`super::record`]).
+    cipher: RecordCipher,
     read_state: ReadState,
     write_state: WriteState,
     write_clean_waker: Option<Waker>,
@@ -384,10 +376,15 @@ where
     ///
     /// Fails when the peer's frame is malformed or the handshake does not
     /// verify.
-    pub async fn handshake(inner: T, state: HandshakeState) -> Result<Self, NoiseStreamError> {
+    pub(crate) async fn handshake(
+        inner: T,
+        state: HandshakeState,
+        role: Role,
+    ) -> Result<Self, NoiseStreamError> {
         // No payload either way: the caller that has something to say on the
         // opening uses [`Self::handshake_carrying`].
-        let (stream, _theirs) = Self::handshake_carrying(inner, state, |_| Vec::new()).await?;
+        let (stream, _theirs) =
+            Self::handshake_carrying(inner, state, role, |_| Vec::new()).await?;
         Ok(stream)
     }
 
@@ -411,9 +408,10 @@ where
     /// Fails when the peer's frame is malformed, the handshake does not verify,
     /// or the pattern asks for a second payload (KK writes exactly once each
     /// way, so this is a guard rather than a reachable case).
-    pub async fn handshake_carrying<F>(
+    pub(crate) async fn handshake_carrying<F>(
         mut inner: T,
         mut state: HandshakeState,
+        role: Role,
         produce: F,
     ) -> Result<(Self, Vec<u8>), NoiseStreamError>
     where
@@ -437,19 +435,20 @@ where
                 // configuration admits.
                 let mut handshake_hash = [0u8; 32];
                 handshake_hash.copy_from_slice(state.get_handshake_hash());
-                // The secret half, taken before `into_transport_mode` consumes
-                // the state. `dangerously_get_raw_split` only *derives* — it
-                // installs nothing and does not advance the handshake — so this
-                // is the same material the transport mode is about to install,
-                // not a second schedule that could disagree with it. snow answers
-                // it as a pair of keys; the array is what the root mixes.
+                // The secret half of the handshake. `dangerously_get_raw_split`
+                // only *derives* — it installs nothing and does not advance the
+                // handshake — so this is the material a Noise transport mode
+                // would install, and the record layer derives its own keys from
+                // it (salted with the transcript above). snow answers it as a
+                // pair of keys; the array is what the derivations mix.
                 let (initiator, responder) = state.dangerously_get_raw_split();
                 let split = [initiator, responder];
-                let transport = state.into_transport_mode()?;
+                let cipher = RecordCipher::from_handshake(&split, &handshake_hash, role)
+                    .ok_or(NoiseStreamError::Derivation)?;
                 return Ok((
                     Self {
                         inner,
-                        transport,
+                        cipher,
                         read_state: ReadState::ReadingRecord,
                         write_state: WriteState::Idle,
                         write_clean_waker: None,
@@ -523,7 +522,7 @@ where
         let this = self.project();
         let mut inner = this.inner;
         let state = this.write_state;
-        let transport = this.transport;
+        let cipher = this.cipher;
         let write_message_buffer = &mut this.bufs.write;
 
         loop {
@@ -534,13 +533,13 @@ where
                 WriteState::Idle => {
                     let payload_len = buf.len().min(MAX_MESSAGE_LEN - TAG_LEN);
                     if payload_len > 0 && T::TAKES_OWNED {
-                        *state = seal_owned(transport, buf, payload_len)?;
+                        *state = seal_owned(cipher, buf, payload_len)?;
                         continue;
                     }
                     *state = crate::transport::stats::around(
                         crate::transport::stats::enabled(),
                         &crate::transport::stats::PHASES.seal,
-                        || seal_in_place(transport, write_message_buffer, buf, payload_len),
+                        || seal_in_place(cipher, write_message_buffer, buf, payload_len),
                     )?;
                 }
                 WriteState::WritingMessage {
@@ -652,7 +651,7 @@ where
 
         let mut inner = this.inner;
         let state = this.read_state;
-        let transport = this.transport;
+        let cipher = this.cipher;
 
         loop {
             match *state {
@@ -695,61 +694,46 @@ where
                             LENGTH_FIELD_LEN + usize::from(u16::from_le_bytes(header));
                     }
 
-                    // The whole record is buffered: decrypt it straight from
-                    // the accumulation buffer.
+                    // The whole record is buffered: open it straight in the
+                    // accumulation buffer — ciphertext and tag are already
+                    // contiguous there, which is the layout `ring` wants — and
+                    // serve the plaintext that lands in place.
                     if *this.read_expected != UNKNOWN_FRAME_LEN
                         && *this.read_filled - *this.read_start >= *this.read_expected
                     {
                         let start = *this.read_start;
-                        let ciphertext = &this.bufs.scratch
-                            [start + LENGTH_FIELD_LEN..start + *this.read_expected];
-                        let plaintext_len = *this.read_expected - LENGTH_FIELD_LEN - TAG_LEN;
-                        *this.read_start += *this.read_expected;
+                        let record_len = *this.read_expected;
+                        *this.read_start += record_len;
                         *this.read_expected = UNKNOWN_FRAME_LEN;
 
-                        if plaintext_len > 0 && read_buf.remaining() >= plaintext_len {
-                            // The caller's buffer holds the whole record:
-                            // decrypt straight into it, no staging copy. The
-                            // plaintext length is known from the ciphertext
-                            // length (a fixed-size tag), so the output region
-                            // can be sized exactly — and
-                            // `initialize_unfilled_to` is a plain slice view
-                            // for the standard `ReadBuf::new` caller (the
-                            // region is already initialized) that only pays
-                            // a memset for `ReadBuf::uninit` callers.
-                            let out = read_buf.initialize_unfilled_to(plaintext_len);
-                            let n = crate::transport::stats::around(
-                                crate::transport::stats::enabled(),
-                                &crate::transport::stats::PHASES.open,
-                                || transport.read_message(ciphertext, out),
-                            )
-                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-                            if n > 0 {
-                                read_buf.advance(n);
-                                return Poll::Ready(Ok(()));
-                            }
-                            // Zero plaintext from a non-empty record cannot
-                            // happen with an AEAD; consume and continue.
-                            continue;
+                        let opened = crate::transport::stats::around(
+                            crate::transport::stats::enabled(),
+                            &crate::transport::stats::PHASES.open,
+                            || cipher.open(&mut this.bufs.scratch[start..start + record_len]),
+                        )
+                        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+                        let plaintext = &this.bufs.scratch
+                            [start + LENGTH_FIELD_LEN..start + LENGTH_FIELD_LEN + opened];
+
+                        if opened > 0 && read_buf.remaining() >= opened {
+                            // The caller's buffer holds the whole record: hand
+                            // it the plaintext in one copy, with no staging
+                            // buffer involved.
+                            read_buf.put_slice(plaintext);
+                            return Poll::Ready(Ok(()));
                         }
 
                         // The caller's buffer is smaller than the record (or
-                        // the record is empty): stage the plaintext and
-                        // serve it progressively.
-                        let n = crate::transport::stats::around(
-                            crate::transport::stats::enabled(),
-                            &crate::transport::stats::PHASES.open,
-                            || transport.read_message(ciphertext, &mut this.bufs.payload[..]),
-                        )
-                        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-                        *this.payload_len = n;
-                        if n > 0 {
+                        // the record is empty): stage the plaintext and serve
+                        // it progressively.
+                        if opened > 0 {
+                            this.bufs.payload[..opened].copy_from_slice(plaintext);
+                            *this.payload_len = opened;
                             *state = ReadState::ServingPayload { served: 0 };
-                            continue;
                         }
-                        // A zero-length record carries no bytes for the
-                        // caller: fall through to the next record instead
-                        // of surfacing an EOF-shaped empty read.
+                        // A zero-length record carries no bytes for the caller:
+                        // fall through to the next record instead of surfacing
+                        // an EOF-shaped empty read.
                         continue;
                     }
 
@@ -844,8 +828,8 @@ mod tests {
         let init = Builder::new(params.clone()).build_initiator().unwrap();
         let resp = Builder::new(params).build_responder().unwrap();
         let (c, s) = tokio::join!(
-            NoiseStream::handshake(a, init),
-            NoiseStream::handshake(b, resp)
+            NoiseStream::handshake(a, init, Role::Initiator),
+            NoiseStream::handshake(b, resp, Role::Responder)
         );
         (c.unwrap(), s.unwrap())
     }
@@ -859,8 +843,8 @@ mod tests {
         let init = Builder::new(params.clone()).build_initiator().unwrap();
         let resp = Builder::new(params).build_responder().unwrap();
         let (c, s) = tokio::join!(
-            NoiseStream::handshake(OwnedDuplex(a), init),
-            NoiseStream::handshake(OwnedDuplex(b), resp)
+            NoiseStream::handshake(OwnedDuplex(a), init, Role::Initiator),
+            NoiseStream::handshake(OwnedDuplex(b), resp, Role::Responder)
         );
         (c.unwrap(), s.unwrap())
     }
@@ -904,8 +888,8 @@ mod tests {
         let hello = b"hello-in-the-opening-message".to_vec();
         let answer = b"acknowledgement-in-the-reply".to_vec();
         let (c, s) = tokio::join!(
-            NoiseStream::handshake_carrying(a, init, |_| hello.clone()),
-            NoiseStream::handshake_carrying(b, resp, |_| answer.clone()),
+            NoiseStream::handshake_carrying(a, init, Role::Initiator, |_| hello.clone()),
+            NoiseStream::handshake_carrying(b, resp, Role::Responder, |_| answer.clone()),
         );
         let (c, carried_by_client) = c.unwrap();
         let (s, carried_by_server) = s.unwrap();

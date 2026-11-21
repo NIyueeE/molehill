@@ -12,9 +12,11 @@
 //! (AGENTS.md §10). Run it with `just primitives`, which builds release:
 //! an unoptimised copy says nothing about the optimised one.
 //!
-//! The AEAD is `ring`'s, because that is what `snow` uses and therefore what
-//! the profile shows (`chacha20_poly1305_seal_avx2`). A stand-in crate with the
-//! same name would price a different implementation.
+//! Both AEADs are `ring`'s, and they are the two the session actually runs:
+//! ChaCha20-Poly1305 is the handshake's (which `snow` resolves to ring through
+//! its `ring-accelerated` feature, and which is what the profile shows as
+//! `chacha20_poly1305_seal_avx2`), and AES-256-GCM is the record layer's. A
+//! stand-in crate with the same name would price a different implementation.
 
 #![expect(
     clippy::expect_used,
@@ -265,6 +267,38 @@ fn primitives() {
         )
         .expect("a tag this key wrote");
         black_box(&opened_aes);
+    });
+    // The record layer's own size, which is where a per-byte difference in the
+    // cipher becomes the difference between two throughputs. Same shape as the
+    // ChaCha rows above, so the two are comparable.
+    let mut block_big = vec![0u8; RECORD];
+    bench_per_kib("seal 32 KiB in place (AES-256-GCM)", RECORD, || {
+        aes.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(NONCE),
+            Aad::empty(),
+            &mut block_big,
+        )
+        .expect("a buffer with room for the tag");
+        black_box(&block_big);
+        block_big.truncate(RECORD);
+    });
+    let mut sealed_big = block_big.clone();
+    aes.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(NONCE),
+        Aad::empty(),
+        &mut sealed_big,
+    )
+    .expect("a buffer with room for the tag");
+    let mut opened_big = vec![0u8; sealed_big.len()];
+    bench_per_kib("open 32 KiB in place (AES-256-GCM)", RECORD, || {
+        opened_big.copy_from_slice(&sealed_big);
+        aes.open_in_place(
+            Nonce::assume_unique_for_key(NONCE),
+            Aad::empty(),
+            &mut opened_big,
+        )
+        .expect("a tag this key wrote");
+        black_box(&opened_big);
     });
 
     #[cfg(feature = "mhd")]

@@ -4,7 +4,10 @@ The control channel always speaks Noise, and it speaks one handshake:
 **Noise_KK_25519_ChaChaPoly_BLAKE2s**. KK authenticates both ends — the
 client knows the server's static key and the server knows the client's — so a
 man-in-the-middle cannot impersonate either, and a config cannot select an
-anonymous suite. This page covers the keys, the one switch that controls data
+anonymous suite. Every record of the session — control traffic and a TCP lane's
+data alike — is sealed with **AES-256-GCM** under keys derived from that
+handshake, so the handshake is what authenticates and its own cipher only runs
+once per session. This page covers the keys, the one switch that controls data
 encryption, and the per-service and L3 overrides. The removed tables are on
 [Configuration](configuration.md#migrating-to-0112-one-pool-per-session).
 

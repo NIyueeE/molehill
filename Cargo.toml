@@ -46,13 +46,19 @@ server = []
 client = [ "dep:serde_json"]
 
 # Noise support: the fixed KK handshake (Noise_KK_25519_ChaChaPoly_BLAKE2s).
-# The `snow` dependency pulls the ring-accelerated resolver: the
-# ChaCha20-Poly1305 data path runs ring's hardware-dispatched
-# implementation, while BLAKE2s only runs once per handshake. The u16-framed
-# record stream is vendored in-repo (src/transport/noise_stream.rs,
-# ported from the unmaintained snowstorm crate, adapted to snow 0.10),
-# which needs pin-project.
-noise = ["dep:base64", "dep:snow", "dep:pin-project"]
+# `snow` runs the handshake, and `ring-accelerated` resolves its ChaChaPoly to
+# ring. The record layer's cipher is not the handshake's: `src/transport/record.rs`
+# derives AES-256-GCM keys from the handshake through HKDF, which is why this
+# feature pulls `ring` and `hkdf` as well. The u16-framed record stream is
+# vendored in-repo (src/transport/noise_stream.rs, ported from the unmaintained
+# snowstorm crate, adapted to snow 0.10), which needs pin-project.
+noise = [
+    "dep:base64",
+    "dep:snow",
+    "dep:pin-project",
+    "dep:hkdf",
+    "dep:ring",
+]
 
 # Configuration hot-reload support
 hot-reload = ["dep:notify"]
