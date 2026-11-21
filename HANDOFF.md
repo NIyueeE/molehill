@@ -44,21 +44,28 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
-> **§4.515 (the phase counters refuse the serialisation hypothesis and point at the run size).**
-> The one-round runs of §4.513 with `MOLEHILL_MHD_STATS=1` carry the sending end's own phases, and they say the opposite of
-> what the +9 % CPU / −21 % throughput shape suggested. Per carried Gbit, with sealing: **`tx_build` 0.26 s/Gbit** against
-> **0.30** without — *cheaper*, and `tx_send` 0.104 against 0.085 — dearer. What separates the two runs is the **run size**:
-> 155 549 send events for 45.5 Gbit sealed against 133 387 for 58.7 unsealed, i.e. **3 400 syscalls per Gbit against 2 272**
-> — the sealed path posts **50 % more, smaller runs** (≈36 KB against ≈55 KB each).
+> **§4.516 (§4.515 is wrong: the runs are identical, and the mhd line's `seal_us` cannot be what it says).**
+> The clean pinned pair (three rounds each, `MOLEHILL_MHD_STATS=1`, the pin now honest after §4.514) prints the run-size
+> instrument directly, and it refutes §4.515 at the first look: **`built_p50 = built_p99 = built_max = 44`** in *both* arms.
+> Every pass fills the cap of 44 packets either way, and the cumulative counters agree — **1 399 bytes per datagram** and
+> **44.0 datagrams per send** (7 427 727 / 168 909 sealed, 5 808 805 / 132 116 unsealed). Batching is not the difference.
+> §4.515's "50 % more, smaller runs" came from reading `tx_build_n` as the run count; it counts **every flush**, empty
+> passes included, and the run-size instrument (`built_*`) was already in the line. Throughput on this pair: **9.164 against
+> 11.638 Gbit/s**, CPU **1.127 against 1.009 s/Gbit**, wire per visitor byte **1.074 against 1.047** — so the 21 % is not in
+> the packet size, the run size, or the wire overhead.
 >
-> So the cost is not the cipher spread over the process's cores *or* serialised on one task; it is **batching**: a sealed
-> packet carries less payload for the same frame, the sender's run-filling rule stops at a packet count rather than at the
-> bytes the path allows, and the difference shows up as syscalls per Gbit. The next instrument is therefore the run-filling
-> rule in `src/transport/mhd/pump.rs` (what closes a run), not the cipher and not the thread layout.
+> **And the field that would have answered it is not trustworthy.** The line carries `seal_us=6 677 998 seal_n=305 308`
+> beside `open_us=32 open_n=35`, but `PHASES.seal` has exactly **one timing site in the tree**
+> (`src/transport/noise_stream.rs:541`, the record layer's write path) and `PHASES.open` the matching one — and on a
+> pinned-mhd run the record layer carries only the control channel, which cannot produce 305 308 seals against 35 opens. So
+> either another writer to that phase exists behind an alias, or the pair mixes sources; either way **a reader of that line
+> would attribute CPU to the lane cipher that the counter never measured** — which is what almost happened here. The mhd
+> line's `seal_us`/`open_us` fields need to be explained or removed before any further seal accounting is read from them;
+> the reproduction is two pinned runs of `bulk-n` with `MOLEHILL_MHD_STATS=1`.
 >
-> Both runs are one round each, on the pre-fix mix policy (§4.514), so the numbers are a direction and not a claim; what
-> makes them worth recording is that they **exclude** the explanation the previous section offered, at no cost — the data was
-> already in the logs.
+> What stands after this round: the sealed lane costs **21 % of its throughput for ~10 % more CPU per Gbit**, with identical
+> packets, identical runs and 2.6 % more wire bytes. The remaining candidates are timing — post rate, ack pacing, or the
+> receive path — and the instrument to settle it is not the phase line as it stands.
 
 > **§4.514 (a pinned carrier was not pinned — the mix policy dialled the other carrier under
 > `MOLEHILL_DATA_CARRIER`, and that is a measurement defect, not a feature).**
