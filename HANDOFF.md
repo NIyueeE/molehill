@@ -44,6 +44,30 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.521 (the two seals are now two meters, and the lane's own number is 1.08 µs a packet).**
+> §4.520 could not tell which layer sealed a run because the `mhd-stats` line carries **one** `seal_us`, and that one is the
+> record layer's. So the fix was to stop sharing it: `PHASES.lane_seal` times `cipher.seal` at the lane's own call site
+> (`src/transport/mhd/conn.rs`), and the line prints `lane_seal_us`/`lane_seal_n` beside `seal_us`/`seal_n`.
+>
+> One pinned run (`bulk-n`, one round, `MOLEHILL_MHD_STATS=1`) now says which layer did the work:
+>
+> | counter | value | what it is |
+> |---|---|---|
+> | `seal_n` | **24** | the record layer — the control channel, and nothing else |
+> | `lane_seal_n` | **5 677 562** | the lane — equal to `tx_datagrams` 5 677 557, so **one seal per datagram** |
+> | `lane_seal_us` | **6.11 s** | **1.08 µs per 1 399-byte packet**, 0.77 ns/B, on 7.94 GB |
+>
+> Two things follow. The lane cipher is **0.77 s of CPU per carried Gbit** on this host — twice the 0.371 ns/B the
+> primitives table gives for a 32 KiB AES-GCM call, which is what a per-packet call at 1.4 KB should cost — and that is the
+> number the seal floor is actually about. And §4.520's arithmetic was wrong: it compared the lane's `tx_bytes` with its
+> `rx_bytes`, i.e. two directions of one stream, and concluded the lanes carried 7.9 MB of 10.4 GB. In the run behind it the
+> record layer sealed 305 308 records, so *that* run was the one not on the lane; this one is, and the meters now say so on
+> the first line a reader looks at.
+>
+> **The floor is therefore still open, but for the first time it has a measured cost instead of a confounded ratio**: the lane
+> cipher is a known 0.77 s/Gbit, and what the next round has to explain is why the sealed arm loses 21 % of its throughput
+> when it pays only that.
+
 > **§4.520 (the seal floor's runs never measured the lane: 10.4 GB was sealed by the record layer while the lanes carried 7.9 MB).**
 > Chasing §4.516's impossible counter (`seal_n` 305 308 against `open_n` 35) produced the answer, and it is not about the
 > instrument. Per second in the *pinned-mhd* server's own log:

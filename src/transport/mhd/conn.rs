@@ -640,7 +640,13 @@ fn seal_stream_payload(
     };
     // This packet's header alone: what the receiver has in front of the payload.
     let header = out[packet_start..payload_at].to_vec();
-    let Some(tag) = cipher.seal(u64::from(number), &header, &mut out[payload_at..]) else {
+    let sampled = crate::transport::stats::enabled();
+    let sealed = crate::transport::stats::around(
+        sampled,
+        &crate::transport::stats::PHASES.lane_seal,
+        || cipher.seal(u64::from(number), &header, &mut out[payload_at..]),
+    );
+    let Some(tag) = sealed else {
         // Nothing half-built reaches the wire: the caller gets its room back
         // rather than a payload in the clear.
         out.truncate(payload_at);

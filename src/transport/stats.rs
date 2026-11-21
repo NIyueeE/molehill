@@ -133,6 +133,15 @@ pub(crate) struct Phases {
     pub(crate) write_park: Meter,
     /// Sealing one record (the Noise write path), copied and encrypted.
     pub(crate) seal: Meter,
+    /// Sealing one **lane** packet (the mhd carrier's own cipher), which is a
+    /// different layer with a different key schedule.
+    ///
+    /// Its own meter because the two were read as one: the `seal_us` of the
+    /// `mhd-stats` line is the record layer's, so a reader of that line had no
+    /// way to tell which layer did the work — and a pinned-mhd run whose
+    /// payload never reached the record layer still grew that counter
+    /// (`HANDOFF.md` §4.520, §4.521).
+    pub(crate) lane_seal: Meter,
     /// Opening one record (the Noise read path), verified and decrypted.
     pub(crate) open: Meter,
     /// Runs received, and the runs, datagrams and bytes they carried.
@@ -170,6 +179,7 @@ impl Phases {
             io_write: Meter::new(),
             write_park: Meter::new(),
             seal: Meter::new(),
+            lane_seal: Meter::new(),
             open: Meter::new(),
             rx_runs: Meter::new(),
             tx_runs: Meter::new(),
@@ -1289,6 +1299,8 @@ fn report_phases() {
         io_write_n = PHASES.io_write.read().1,
         seal_us = PHASES.seal.micros(),
         seal_n = PHASES.seal.read().1,
+        lane_seal_us = PHASES.lane_seal.micros(),
+        lane_seal_n = PHASES.lane_seal.read().1,
         open_us = PHASES.open.micros(),
         open_n = PHASES.open.read().1,
         "mhd-stats: cumulative phase timings"
