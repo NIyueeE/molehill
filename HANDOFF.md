@@ -44,6 +44,30 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.522 (the seal floor compares two encryption *architectures*, and now both costs are measured).**
+> With the two meters in place, one pinned pair on the same topology (8 streams, 10 s, `MOLEHILL_MHD_STATS=1`, carrier pinned
+> to mhd) says what the arms actually are:
+>
+> | arm | throughput | lane cipher | record layer |
+> |---|---|---|---|
+> | `MHD_SEAL=1` | 9.246 Gbit/s | **11 334 710 seals** = `tx_datagrams`, **12.33 s** → **0.78 s/Gbit** | 17 seals (control only) |
+> | `MHD_SEAL=0` | 11.705 Gbit/s | 0 | **582 222 seals**, **12.60 s** → **0.51 s/Gbit** |
+>
+> **Both arms encrypt.** The switch does not turn encryption off: it gates whether the lane's root is installed, and without it a
+> later stream falls back to its own Noise KK and carries its payload in a `NoiseStream` — so the unsealed arm seals **32 KiB
+> records** while the sealed arm seals **1 399-byte datagrams**. The payload moves the same 15.9 against 19.9 GB; the difference
+> is the unit of AEAD work, not its presence.
+>
+> So the floor's 79 % is **per-datagram AEAD against per-record AEAD**, and the excess is now a number rather than a mystery:
+> **0.78 against 0.51 s/Gbit of cipher — 0.27 s of CPU per carried Gbit** — on a budget near 1.0 s/Gbit, which is the 21 %.
+> That also retires every earlier reading of this floor as a cipher cost: the cipher is the same AES-GCM in both arms; what
+> differs is that a datagram carrier must authenticate each of its ~23 packets per 32 KiB independently.
+>
+> What is left to attack is therefore narrow and worth stating: the lane's seal costs **0.77 ns/B** where the same call on a
+> 32 KiB buffer costs **0.478** (`just primitives`), so a third of the lane's crypto bill is per-call overhead rather than
+> per-byte work. Whether that headroom is reachable — a cheaper tag layout, or a batched seal that keeps per-datagram
+> authentication — is the next measurement, and the floor's 85 % may be unreachable by construction if it is not.
+
 > **§4.521 (the two seals are now two meters, and the lane's own number is 1.08 µs a packet).**
 > §4.520 could not tell which layer sealed a run because the `mhd-stats` line carries **one** `seal_us`, and that one is the
 > record layer's. So the fix was to stop sharing it: `PHASES.lane_seal` times `cipher.seal` at the lane's own call site
