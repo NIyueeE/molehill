@@ -37,7 +37,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+use ring::aead::{Aad, BoundKey, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 
 /// The carrier's MTU-sized payload.
 const DATAGRAM: usize = 1400;
@@ -48,6 +48,17 @@ const RECORD: usize = 32 * 1024;
 /// The record layer seals every record under a fresh nonce; this table uses one
 /// fixed value, because it prices the cipher and not the counter.
 const NONCE: [u8; 12] = [0u8; 12];
+
+/// A nonce sequence that always answers the same nonce: `SealingKey` owns its
+/// sequence, and the cost table prices the cipher rather than the counter.
+struct ConstantNonce(u64);
+
+impl ring::aead::NonceSequence for ConstantNonce {
+    fn advance(&mut self) -> Result<Nonce, ring::error::Unspecified> {
+        self.0 = self.0.wrapping_add(1);
+        Ok(Nonce::assume_unique_for_key(NONCE))
+    }
+}
 
 /// How long each case runs. Long enough that a scheduling hiccup is a fraction
 /// of a percent; short enough that the whole table is a coffee break.
@@ -289,6 +300,33 @@ fn primitives() {
         &mut sealed_big,
     )
     .expect("a buffer with room for the tag");
+    // `LessSafeKey` re-derives what the fast keys precompute -- the AES key
+    // schedule and the GHASH key -- on every call. At a record's size that is
+    // amortised; at a datagram's it is not, which is the lane cipher's shape.
+    println!("== the same host, AES-256-GCM with a precomputed schedule ==");
+    // `SealingKey` owns the nonce sequence, which is the price of the
+    // precomputed schedule: [`ConstantNonce`] answers one constant value,
+    // because the table prices the cipher and not the counter.
+    let mut sealing = ring::aead::SealingKey::new(
+        UnboundKey::new(&ring::aead::AES_256_GCM, &[9u8; 32]).expect("a 32-byte key"),
+        ConstantNonce(0),
+    );
+    let mut small = vec![0u8; DATAGRAM];
+    bench_per_kib("seal 1400 in place (SealingKey)", DATAGRAM, || {
+        let tag = sealing
+            .seal_in_place_separate_tag(Aad::empty(), &mut small)
+            .expect("a buffer the tag is returned from");
+        black_box(&tag);
+        black_box(&small);
+    });
+    let mut big_fast = vec![0u8; RECORD];
+    bench_per_kib("seal 32 KiB in place (SealingKey)", RECORD, || {
+        let tag = sealing
+            .seal_in_place_separate_tag(Aad::empty(), &mut big_fast)
+            .expect("a buffer the tag is returned from");
+        black_box(&tag);
+        black_box(&big_fast);
+    });
     let mut opened_big = vec![0u8; sealed_big.len()];
     bench_per_kib("open 32 KiB in place (AES-256-GCM)", RECORD, || {
         opened_big.copy_from_slice(&sealed_big);

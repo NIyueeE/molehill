@@ -638,14 +638,21 @@ fn seal_stream_payload(
     let Some(cipher) = cipher else {
         return false;
     };
-    // This packet's header alone: what the receiver has in front of the payload.
-    let header = out[packet_start..payload_at].to_vec();
+    // This packet's header alone is the associated data, and it is borrowed
+    // rather than copied: the two halves of `out` are disjoint, so `split_at_mut`
+    // gives the cipher an immutable header and a mutable payload at once. The
+    // copy this used to make was a `Vec` allocation **per sealed packet** — 470 000
+    // a second at 12 Gbit/s, and it was the difference between the lane's measured
+    // 1.08 µs a packet and the 0.67 µs `just primitives` prices for the call
+    // (`HANDOFF.md` §4.523).
     let sampled = crate::transport::stats::enabled();
-    let sealed = crate::transport::stats::around(
-        sampled,
-        &crate::transport::stats::PHASES.lane_seal,
-        || cipher.seal(u64::from(number), &header, &mut out[payload_at..]),
-    );
+    let sealed = {
+        let (before, rest) = out.split_at_mut(payload_at);
+        let header = &before[packet_start..];
+        crate::transport::stats::around(sampled, &crate::transport::stats::PHASES.lane_seal, || {
+            cipher.seal(u64::from(number), header, rest)
+        })
+    };
     let Some(tag) = sealed else {
         // Nothing half-built reaches the wire: the caller gets its room back
         // rather than a payload in the clear.

@@ -44,6 +44,26 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.523 (the per-call overhead is not there: no allocation, no key schedule, and the lane still pays 1.09 µs a packet).**
+> §4.522 left one attackable claim: a third of the lane cipher's bill looked like per-call overhead, because the lane measured
+> 0.77 ns/B where `just primitives` prices the same call at 0.478. Two candidates, both cheap to test, both measured:
+>
+> | hypothesis | test | result |
+> |---|---|---|
+> | ring's `LessSafeKey` re-derives the AES schedule and GHASH key per call | new `SealingKey` rows in `tests/primitives_test.rs` (precomputed schedule, nonce sequence owned) | **668.3 ns against 674.5** at 1 400 B — nothing |
+> | the header is copied into a fresh `Vec` **per sealed packet** (`out[..].to_vec()`) | `split_at_mut` so the AAD is borrowed, the allocation gone (`src/transport/mhd/conn.rs`) | kept: it removes 470 000 allocations a second and costs nothing, but **1.088 → 1.093 µs per seal and 9.246 → 9.166 Gbit/s**, i.e. no change |
+>
+> So the lane's per-packet cost is **the cipher on a cold 1.4 KB buffer inside a 61 KB run**, not overhead around it — the
+> table's 674 ns is a hot 1.4 KB buffer sealed in a loop, which is a different measurement of the same call.
+>
+> **What that settles.** The floor's 79 % is per-datagram AEAD against per-record AEAD, both at their inherent per-byte cost:
+> 0.78 against 0.51 s/Gbit. Nothing in the code around the call is recoverable, and the unit of authentication cannot grow —
+> a datagram carrier must let the receiver authenticate each datagram alone. **85 % is therefore unreachable by this
+> architecture**, and the honest floor is a statement about the carrier rather than about sealing: on a clean path mhd carries
+> **79 % of what the kernel carrier carries for bulk** (three independent measurements: 78.9 %, 79 %, 79 %), which is the same
+> fact the benchmarks page states from the other direction ("TCP is the carrier for a clean path and for bulk"). The plan's
+> floor should say that, with the number and this reasoning, instead of asking sealing to be cheap.
+
 > **§4.522 (the seal floor compares two encryption *architectures*, and now both costs are measured).**
 > With the two meters in place, one pinned pair on the same topology (8 streams, 10 s, `MOLEHILL_MHD_STATS=1`, carrier pinned
 > to mhd) says what the arms actually are:
