@@ -44,6 +44,33 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.520 (the seal floor's runs never measured the lane: 10.4 GB was sealed by the record layer while the lanes carried 7.9 MB).**
+> Chasing §4.516's impossible counter (`seal_n` 305 308 against `open_n` 35) produced the answer, and it is not about the
+> instrument. Per second in the *pinned-mhd* server's own log:
+>
+> | second | `seal_n` | `seal_us / seal_n` | `tx_bytes` |
+> |---|---|---|---|
+> | 1 | 34 821 | 21.8 µs | 1.14 GB |
+> | 2 | 79 655 | 21.8 µs | 2.66 GB |
+> | 3 | 124 645 | 21.9 µs | 4.21 GB |
+>
+> `seal_n` grows with the payload, one seal per **~35 KB**, at **21.8 µs** each — which is the record layer sealing the whole
+> transfer. And the same log's mhd counters say the lanes carried **7.9 MB of 10.4 GB** (`rx_datagrams` 25 209). So the bulk
+> did **not** ride the mhd carrier in the run that was pinned to it: it rode TCP data channels through the record layer, and
+> `PHASES.seal` was never mysterious — my §4.516 inference ("the record layer carries only the control channel") was wrong,
+> and the counter was telling the truth.
+>
+> **What that does to the seal floor.** `MOLEHILL_MHD_SEAL` switches *lane* sealing. In a run whose payload never touched a
+> lane, switching it cannot move throughput — yet the two arms differed by 21 %. So the comparison is **confounded**: the arms
+> differ by something the switch does not name, and the floor's 78.9 % must not be read as "the lane cipher costs a fifth of
+> the throughput" until it is re-measured on a run where the lanes are provably carrying it (`MOLEHILL_MHD_STATS=1`:
+> `rx_datagrams × 1 399` must account for the payload). That is the first thing the next round does, and it is the same class
+> of mistake the model's §10 rule exists for — the path under test was not the path claimed.
+>
+> Why a pinned pool (four `carrier="mhd"` tunnels, `established=4`, no short-carrier line) still served the visitor over TCP
+> channels is **open**: the candidates are a direct (unpooled) data channel for this service and a session split the log does
+> not show. The next round starts there, because every "pinned mhd" reading in these records inherits the question.
+
 > **§4.519 (the sighting's own binary reads zero too — so neither the tree nor the lever is the difference).**
 > The last hypothesis §4.518 left open was that the wedge had been fixed between the sightings and now. It is testable in one
 > run: build the sighting commit (`fee56e7`, 2026-11-12, "two arms of one binary — one clean, one silent for 25 seconds") and
