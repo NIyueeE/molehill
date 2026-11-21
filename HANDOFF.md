@@ -763,7 +763,9 @@ either answer closes the question. **Rollback**: none to make; nothing was chang
 | mhd (pinned) | **12.65 ms** | 1.18 | 8.42 Gbit/s | 0.968 s/Gbit |
 | kernel (pinned) | **1.89 ms** | 1.09 | **14.51** | **0.570** |
 
-`dropped_packets` is **0** in both, so the mhd arm's tail is not loss repair — it is queueing inside the lane. And the
+`dropped_packets` is **0** in both, so the mhd arm's tail is not loss repair — it is queueing inside the lane. Neither run
+carried an A/A twin (each arm was one pinned carrier), so this is a two-run comparison rather than a claim: 6.7× is an order
+above anything this cell has shown, and the two runs differ in the switch and in nothing else the fingerprint records. And the
 policy sends *conversational* services to mhd by design (§2), where the carrier exists for the tail it gives on **impaired**
 paths (1 % and 5 % loss, where it is 11× and 3.8× tighter than the kernel carrier). On a clean path it is **6.7× worse in
 the tail and 1.7× worse in throughput**, and every deployment that is not losing packets pays that.
