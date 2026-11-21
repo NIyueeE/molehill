@@ -13,6 +13,53 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.512 (the soak's wedge reads zero when a control arm is in the run — and the pool move §11.4(b) asked for, which no
+> bench cell can show).**
+> **The wedge.** `just bench run --profile soak --arms control,molehill` — one round, five 180-second stages per arm — reports
+> **`wedge_count` 0 / 0**, `wedge_max_s` 0 / 0 and `rtt_timeout_count` 0 / 0, over **11 161** interactive samples on the
+> product arm and **10 824** on the control. The stages, product beside control (p99): clean **3.28 / 2.39 ms**, loss1
+> **1 068 / 1 079**, rtt100 **401.5 / 401.2**, loss5 **2 051 / 2 047**, clean#2 **2.07 / 2.31**. Drift on the product arm:
+> RSS **+0.58 MiB/min**, FDs **+0.06/min**, threads **−0.007/min** (an earlier suite measured the product at 7.80 against its
+> twin's 11.88 — a slope is not comparable across runs, so both are kept).
+>
+> **What that closes and what it explains.** Every earlier non-zero reading (5 / 5, 9 / 1, 3 / 9) came from a suite running
+> **two product arms at once** on this host, and §4.318 already showed those timeouts alternating between two identical arms.
+> With a control arm beside the product neither arm wedges, so the plan's floor — "both arms equal and zero" — is met, and
+> what a two-product-arm soak measures is the host, not the product. The plan's P5.3 is amended with this (§十三).
+>
+> **The pool move.** `target_mix` now answers `(1, total-1)` for a session whose **every** observed service is bulk, and only
+> when the pool is the one choosing: a forced carrier (`MOLEHILL_DATA_CARRIER`) stands the policy down, so the two measurement
+> arms still measure what they name. That is §11.4(b)'s deliberate conservatism removed — the class was read for *placement*
+> only, so a bulk-only session kept every tunnel on the datagram carrier and its bulk traffic with it.
+>
+> Three pieces of evidence, and one of them is about the bench:
+> - `a_bulk_only_session_moves_the_pool_to_the_kernel_carrier`: `target_mix(4) = (1, 3)`, `wanted_carrier = Tcp`,
+>   `spare_owed = Tcp`, `target_mix(1) = None`, and a kernel-carrier pool answers `None` (nothing to move);
+> - the striped integration test **observed the move**: a bulk-only session's pool held **5** tunnels when the test expected
+>   its configured 4, i.e. the kernel-carrier spare was dialled while the datagram tunnels were still carrying. The assertion
+>   now allows the bounded spare and says why;
+> - **no bench cell moves, and that is a fact worth writing down**: the bench's `auto` L4 arm rides the **kernel carrier** in
+>   that topology. The record-layer win of §4.510 (+20 % on `bulk-n`) could not appear otherwise — an `mhd` payload is sealed
+>   by the lane cipher and never touches the record layer — so the arm that measured it was on TCP. The A/B of this change
+>   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
+>   inert there because the preference is already TCP.
+
+> **§4.513 (the seal floor re-measured: 79.4 %, and the gap is not the cipher's CPU).**
+> Two runs with the carrier pinned (`MOLEHILL_DATA_CARRIER=mhd`, `bulk-n`, clean, six rounds), one per side of the hatch:
+> sealed **10.376 Gbit/s** at `cpu_s_per_gbit` **0.998**, unsealed **13.075** at **0.915** — **79.4 %**, against the 85 % the
+> floor asks for and the 85.6 % / 84.0 % this cell read earlier. **The revealing part is the CPU**: sealing costs **+9 %**
+> CPU per carried Gbit, and the cell loses **20.6 %** of its throughput. A path that pays 9 % more per byte does not lose a
+> fifth of its rate unless something other than the cipher is serialising, so the next instrument for this floor is the
+> pump's seal phase at this load (`MOLEHILL_MHD_STATS=1` gives `tx_build`/`tx_send`), not another round of rounds. The `l3`
+> arm read 10.38 / 10.43 in both runs, which is expected — the L3 topology sets `data_enable = false`, so its claims never
+> sealed and the hatch is invisible to it.
+>
+> **And a provenance gap this run exposed**: `MOLEHILL_MHD_SEAL` was **not in the bench's recorded switches**, so two runs
+> that measure opposite sides of it produced identical fingerprints — the one thing the meta exists to prevent. It is in the
+> list now (`bench/src/bench/runner.py`), and the hatch is documented in [configuration.md](docs/configuration.md)
+> ("Diagnostics switches") in both languages: it turns the confidentiality of every `mhd` lane payload off, which a page that
+> says "every data and lane channel is protected" has to say out loud.
+
 > **§4.511 (what the kernel's 46 % is made of: two socket syscalls per 24 KiB — and the layer §4.509 blamed for a fifth of the
 > cycles is one percent of them).**
 > Measured on a fixed loopback pair (`/tmp/sysprobe`: server, client, iperf3 through the visitor, `MOLEHILL_DATA_CARRIER=tcp`),
