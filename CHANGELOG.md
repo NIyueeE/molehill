@@ -40,8 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the tunnel it started on. One datagram tunnel stays warm, because the class
   is a measurement that a later service can revise, and a flow that turns out
   conversational should land on a lane rather than pay a cold grow. A **forced**
-  carrier (`MOLEHILL_DATA_CARRIER`) is outside the policy, so the two measurement
-  arms still measure what they name.
+  carrier (`MOLEHILL_DATA_CARRIER`) now stands the whole mix policy down, not only
+  this half of it: before, a run pinned to `mhd` still grew kernel-carrier spares
+  as soon as a second service's class appeared, so a pinned arm did not measure
+  the carrier it named.
 - **Records are sealed with AES-256-GCM, keyed from the Noise handshake.** The KK
   handshake is unchanged — it is what authenticates both ends and where the
   session's secrets come from — but the cipher that runs on every record is now

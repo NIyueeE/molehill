@@ -1329,6 +1329,16 @@ impl TunnelPoolInner {
     /// there), and keeping one on the datagram carrier is what leaves the
     /// conversational services their tail even while bulk is being carried.
     fn target_mix(&self, total: usize) -> Option<(usize, usize)> {
+        // **A forced carrier stands the whole policy down.** The switch means one
+        // carrier for the process — it is how a measurement arm names the path it
+        // measures and how an operator deliberately accepts mhd's failure instead
+        // of a silent downgrade — so a pool that dialled the other carrier anyway
+        // would make both the arm's name and its numbers false. That it *did* was a
+        // measurement defect: a run pinned to mhd still grew kernel-carrier spares
+        // as soon as a second service's class appeared (`HANDOFF.md` §4.514).
+        if crate::transport::carrier::forced_carrier().is_some() {
+            return None;
+        }
         let (bulk, conversational, every_service_bulk) = {
             let profiles = self
                 .shared
@@ -1371,7 +1381,7 @@ impl TunnelPoolInner {
         if total < 2 {
             return None;
         }
-        if every_service_bulk && crate::transport::carrier::forced_carrier().is_none() {
+        if every_service_bulk {
             // Only from the datagram carrier: a pool whose preference is already
             // the kernel carrier has nothing to move, and one that fell back to it
             // must not be dragged back.
