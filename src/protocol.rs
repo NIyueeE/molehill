@@ -412,7 +412,7 @@ pub enum SessionCmd {
     /// channel that never arrives produces no event it can see. A refusal, unlike
     /// a silence, is knowable at once, and the difference is five seconds of a
     /// held visitor plus every channel of that group that did arrive
-    /// (`HANDOFF.md` §4.460). The group is the one the server named in
+    /// (`HANDOFF-archive.md` §4.460). The group is the one the server named in
     /// `CreateDataChannelForStripe`, so both ends mean the same gather.
     ChannelRefused(ServiceId, [u8; 4]),
 }
@@ -2706,7 +2706,7 @@ mod tests {
         assert!(matches!(back, SessionCmd::CancelDrain(..)));
 
         // A refused channel names the group the server asked for, so the pairing
-        // waiting on it can fail that attempt at once (`HANDOFF.md` §4.460).
+        // waiting on it can fail that attempt at once (`HANDOFF-archive.md` §4.460).
         write_session_cmd(
             &mut tx,
             &SessionCmd::ChannelRefused(ServiceId::new(9), [0xde, 0xad, 0xbe, 0xef]),

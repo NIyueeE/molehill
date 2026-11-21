@@ -362,7 +362,7 @@ const ENGINE_STREAM_CAP: usize = 64;
 /// gives up, so a test window of fifteen seconds asked the pool to finish in the same
 /// instant its last waiter stopped waiting. Measured, such a burst settles in about
 /// seventeen seconds — which is exactly the fifteen plus the prologue, and it is why this
-/// assertion failed while nothing leaked (`HANDOFF.md` §4.491).
+/// assertion failed while nothing leaked (`HANDOFF-archive.md` §4.491).
 const SETTLE_WINDOW: Duration = Duration::from_secs(30);
 
 /// The pool's own per-tunnel placement ceiling

@@ -197,7 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mechanisms have failed to move it, and the eighth — ending the growth phase only
   when the loss came with a standing queue — bought 66 % on the 5 %-loss cell and
   cost 16 % interactive failures on a rotating path, so it was reverted
-  (`HANDOFF.md` §4.501). [Internals](docs/internals.md#multiplexing) states the
+  (`HANDOFF-archive.md` §4.501). [Internals](docs/internals.md#multiplexing) states the
   defect and what it means: nothing above the window decides a rate, so the window's
   growth rule is the whole send-rate policy.
 - **This is a re-baseline release for the benchmark.** The engine changed —

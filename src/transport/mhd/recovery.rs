@@ -205,7 +205,7 @@ pub(crate) struct Sent {
     /// while carrying the same bytes again, and the writer then has no room for
     /// data the peer has never seen. [`Recovery::data_flight_bytes`] is what
     /// admission uses, so a repair storm cannot starve the stream it is repairing
-    /// (`HANDOFF.md` §4.292).
+    /// (`HANDOFF-archive.md` §4.292).
     pub(crate) repair: bool,
 }
 
@@ -398,7 +398,7 @@ pub(crate) struct Recovery {
     /// which floor the retransmission timer gets — and answering it by scanning
     /// the table cost **9.4 % of the carrier's cycles** on a clean bulk transfer
     /// (`perf`, 2 500 records in flight, one scan per packet:
-    /// `HANDOFF.md` §4.508). A counter is exact if every place that inserts a
+    /// `HANDOFF-archive.md` §4.508). A counter is exact if every place that inserts a
     /// record, retires one, or marks one lost adjusts it, and a test below pins
     /// the counter against the scan it replaces.
     small_live: usize,
@@ -509,7 +509,7 @@ impl Recovery {
     ///
     /// `flight_bytes` minus the repairs: what admission is measured against, so
     /// that a range being re-sent for the fifth time cannot hold the window
-    /// against the next megabyte of new data (`HANDOFF.md` §4.292).
+    /// against the next megabyte of new data (`HANDOFF-archive.md` §4.292).
     pub(crate) fn data_flight_bytes(&self) -> u64 {
         self.flight_bytes.saturating_sub(self.repair_flight_bytes)
     }
@@ -1074,7 +1074,7 @@ mod tests {
     use crate::transport::mhd::wire::ReceivedRun;
 
     /// The small-in-flight counter is what replaced a scan of the whole table on
-    /// every send (9.4 % of the carrier's cycles, `HANDOFF.md` §4.508). It has to
+    /// every send (9.4 % of the carrier's cycles, `HANDOFF-archive.md` §4.508). It has to
     /// agree with that scan after every kind of change a record can see: a send,
     /// a retirement, and a loss.
     #[test]

@@ -99,9 +99,16 @@ pub(crate) use pump::{MhdLane, MhdListener};
 ///   cipher: `tests/primitives_test.rs` prices three candidates on this host —
 ///   `RustCrypto` `ChaCha20-Poly1305` **2 805** ns a 1 400-byte seal, `ring`'s
 ///   `ChaCha` **1 017**, `ring`'s `AES-256-GCM` **671** — and the sealing path now
-///   uses the last. `bulk-n` on `clean` reads **11.30 off / 9.79 on**: 85 % of
-///   the unsealed throughput instead of 54 %, at 1.06 CPU-seconds per Gbit
-///   against 1.02.
+///   uses the last. `bulk-n` on `clean` reads **11.30 off / 9.79 on** on the tree
+///   that measured it, and **9.25 against 11.71 Gbit/s** on 2026-11-21 — but the
+///   two arms are **two encryption architectures, not two renditions of one**
+///   (`HANDOFF.md` §4.522, and `docs/internals.md` under "Multiplexing"): with the
+///   switch off the lane root is never installed, a later stream falls back to
+///   its own Noise KK, and its payload is sealed as 32 KiB records, while with it
+///   on every 1 399-byte datagram is sealed in the lane cipher. The measured
+///   cost is that unit: **0.78 s of lane cipher per carried Gbit against 0.51**
+///   of record layer, and no per-call overhead is recoverable (both the key's
+///   schedule and the header allocation were measured and dismissed, §4.523).
 pub(crate) fn sealing_enabled() -> bool {
     use std::sync::Once;
     use std::sync::atomic::{AtomicBool, Ordering};

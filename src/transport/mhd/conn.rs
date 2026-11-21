@@ -2546,7 +2546,7 @@ impl Conn {
             // any of them costs the arrival its latency.
             !state.acknowledged,
             // A range already sent once is a repair, and repairs are not what the
-            // window admits (`HANDOFF.md` §4.292).
+            // window admits (`HANDOFF-archive.md` §4.292).
             repair,
             // Its stream's flight, not the lane's: the interactive packet inside a
             // bulk lane is invisible to any predicate on the lane's own count

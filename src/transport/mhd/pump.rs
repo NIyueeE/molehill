@@ -884,7 +884,7 @@ pub(crate) fn spawn(
                 let n = shared
                     .with(|conn| conn.starved_streams(now, std::time::Duration::from_secs(1)));
                 // A stream both directions have finished has nothing left to wait for, and
-                // no event will come back for it (`HANDOFF.md` §4.439).
+                // no event will come back for it (`HANDOFF-archive.md` §4.439).
                 shared.with(|conn| {
                     conn.retire_finished();
                 });
