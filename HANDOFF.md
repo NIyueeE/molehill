@@ -44,6 +44,24 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.517 (the wedge now has a profile that points at it — and it reads zero twice, 40 minutes a run).**
+> The harness could not tell "no defect" from "cannot see it", so `PROFILES["wedge"]` names the shape the historical
+> sightings share: **the product twice on one host** (`aa`), the same rotating path, the same probes, one round, ~40 minutes.
+> Two runs (`p160`, `p161`): **`wedge_count` 0 / 0 in both**, `wedge_max_s` 0, `rtt_timeout_count` 0 on each product arm and
+> **1** on each twin, over **10 860 / 10 960** and **10 930 / 11 600** interactive samples.
+>
+> That is a measurement and not a blind spot: the probe asks 16 times a second, so a silence of the 10 s the metric counts
+> would be 160 consecutive failed attempts — it cannot hide in 11 000 samples. So with the levers the harness owns — a second
+> product arm, the rotating path, the probe load, 15-minute holds — **the wedge does not reproduce**, and the readings of 5/5,
+> 9/1 and 3/9 in earlier sessions came from a host state no profile can create. What they share is load *outside* the bench:
+> the sessions that saw them were busy with other work, and the sessions that read zero were not.
+>
+> **What that leaves.** Three independent clean runs now (control beside the product, and these two), against three
+> historical sightings. The plan's floor stays as written — both arms equal and zero — and the wedge is reclassified from
+> "open defect" to "**not reproducible; the lever is scheduler pressure, and the next attempt has to create it**": the cheap
+> version is to run this profile with the subjects and probes confined (`taskset` to a quarter of the cores), which emulates
+> an oversubscribed host without needing one. That is a profile parameter, not a code change.
+
 > **§4.516 (§4.515 is wrong: the runs are identical, and the mhd line's `seal_us` cannot be what it says).**
 > The clean pinned pair (three rounds each, `MOLEHILL_MHD_STATS=1`, the pin now honest after §4.514) prints the run-size
 > instrument directly, and it refutes §4.515 at the first look: **`built_p50 = built_p99 = built_max = 44`** in *both* arms.

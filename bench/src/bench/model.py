@@ -1837,6 +1837,28 @@ PROFILES |= {
         "arms": ("molehill",),
         "params": {"soak": {"scale": 1.0, "streams": 4}},
     },
+    # The soak's wedge, on the one shape that provokes it. The same scenario
+    # reads **0 / 0** with a control arm beside the product and **3 to 9** when
+    # two product arms share the host, so a soak without a twin can report
+    # "no wedge" and mean "the host was quiet". This profile is the provoking
+    # load and nothing else: the product twice (`aa`), the same rotating path,
+    # the same probes — so a silence here is a silence the harness can see, and
+    # the two arms can be compared for symmetry. **Diagnostic, never a gate**:
+    # it produces `wedge_count` and cannot support a verdict on its own
+    # (HANDOFF.md §4.517).
+    "wedge": {
+        "what": (
+            "the interactive silence the soak reports, provoked: the product "
+            "twice on one host, which is the load at which it appears"
+        ),
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("soak",),
+        "budget_s": 2400.0,
+        "aa": True,
+        "arms": ("molehill",),
+        "params": {"soak": {"scale": 1.0, "streams": 4}},
+    },
     "screen": {
         "what": "a development A/B: one condition, the two builds interleaved",
         "rounds": 3,

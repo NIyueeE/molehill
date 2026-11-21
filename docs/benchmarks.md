@@ -341,6 +341,7 @@ fingerprint, a shortened run can never be mistaken for a published one.
 | `stage` | 2 (+1 warm-up) | ~150 s | one condition, the whole workload: a shape question, minutes |
 | `step` | 1 (+0 warm-up) | ~90 s | the robustness axis: the path changes between stages while one interactive stream runs across both boundaries |
 | `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
+| `wedge` | 1 (+0 warm-up) | ~2400 s | the soak's interactive silence, **provoked**: the product twice on one host, which is the load at which it appears. A diagnostic, not a gate |
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
 | `sweep` | 1 (+0 warm-up) | ~3000 s | the release sweep: the staged schedule and the load ramp |
 | `nobulk` | 2 (+1 warm-up) | ~300 s | the same staged timeline with the bulk spine removed: a diagnostic, not a gate |
