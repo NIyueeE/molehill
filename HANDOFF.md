@@ -44,6 +44,24 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.531 (on a clean path the kernel carrier wins both axes, and the policy pays for a benefit it gets only under loss).**
+> Two pinned runs of the `cost` cell — the mixed workload: bulk spine, interactive, churn, UDP — on a clean path:
+>
+> | carrier | p99 | p50 | throughput | CPU per Gbit |
+> |---|---|---|---|---|
+> | mhd | **12.65 ms** | 1.18 | 8.42 Gbit/s | 0.968 s |
+> | kernel | **1.89 ms** | 1.09 | **14.51** | **0.570** |
+>
+> `dropped_packets` 0 on both, so the lane's tail is **queueing in the lane, not repair** — and the kernel carrier is better
+> on *both* axes on this path. The per-service policy puts conversational traffic on the lane by design, where the lane's
+> advantage is measured at 1 % and 5 % loss; on a clean path that design costs **6.7× the p99 and 1.7× the throughput**, with
+> nothing to repair.
+>
+> This is recorded, not acted on: §2 freezes the policy, and the trigger that could fix it — an in-situ rate comparison
+> between the two carriers, which the carrier rule's probe already has — is a policy change that needs the measurement in
+> §4 C's "next experiment" first. What it changes today is the *prior* question (§4 D): the axis is the path, not the class,
+> so a bulk-shaped prior would buy one cell and put a chat service on the wrong carrier everywhere else.
+
 > **§4.530 (the lane seal's missing 0.4 µs is not the buffer, and not the cipher).**
 > The last named candidate for the lane's per-packet cost was the shape of the buffer it seals in: the product seals each
 > packet *inside the 61 KB run it is filling*, where a 1 400-byte region at a moving offset may be colder than the cost
@@ -736,18 +754,41 @@ the tool on the first run that sees one.
 **Pass**: a run with `wedge_count > 0` whose silences carry large `late_ms` (the probe) or near-zero (the tool) —
 either answer closes the question. **Rollback**: none to make; nothing was changed for this.
 
-### C. The first bulk cell rides the carrier it started on (62 %)
+### C. On a clean path the kernel carrier beats mhd on **both** axes, and the policy pays 6.7× the tail for a benefit it only gets under loss
 
-**Symptom**: on the plan's two-cell criterion, auto reads **62 %** of the kernel carrier in `bulk-1` and **81 %**
-in `bulk-n` (§4.526): the class arrives after the streams are open, and a running stream is never moved.
-**Unknown**: whether a *prior* — start a service that has never carried anything on the kernel carrier until it
-proves conversational — is better than the current "the endpoint's preference until evidence".
-**Next experiment**: an arm that seeds the class from the service's first channel (a handshake-sized exchange
-teaches nothing, so the prior has to come from the service's *type* or from configuration, which the policy
-deliberately has none of); measure `bulk-1`, `bulk-n` and the mixed cell's p99 together, because the prior is
-paid for by whatever interactive traffic appears later.
-**Pass**: `bulk-1` at **≥ 85 %** of the kernel carrier with the mixed cell's p99 unmoved and no new
-configuration key. **Rollback**: the prior is removed and §七's argument stands.
+**Symptom**: the same mixed cell (`cost`, bulk spine + interactive + churn + UDP, `clean`), one carrier per run:
+
+| carrier | p99 | p50 | throughput | CPU |
+|---|---|---|---|---|
+| mhd (pinned) | **12.65 ms** | 1.18 | 8.42 Gbit/s | 0.968 s/Gbit |
+| kernel (pinned) | **1.89 ms** | 1.09 | **14.51** | **0.570** |
+
+`dropped_packets` is **0** in both, so the mhd arm's tail is not loss repair — it is queueing inside the lane. And the
+policy sends *conversational* services to mhd by design (§2), where the carrier exists for the tail it gives on **impaired**
+paths (1 % and 5 % loss, where it is 11× and 3.8× tighter than the kernel carrier). On a clean path it is **6.7× worse in
+the tail and 1.7× worse in throughput**, and every deployment that is not losing packets pays that.
+
+**Unknown**: what signal distinguishes "this path is clean, use the kernel carrier" from "this path is impaired, keep the
+lane" *before* the traffic arrives — the existing carrier rule triggers on mhd *losing* traffic (a ≥ 4 % retransmit share),
+which a clean-but-slow path never produces.
+
+**Next experiment**: an in-situ comparison rather than a trigger — the rule already has a probe that compares carried bytes
+between the two carriers; arm it on a *rate* difference (the lane delivering materially less per round trip than a kernel
+probe) rather than on loss, and measure `cost` at `clean` and at `loss1` in the same run. This **changes the policy**, which
+§2 freezes, so it is an open question until that measurement says which way.
+
+**Pass**: `cost` at `clean` within 1.2× of the kernel carrier's p99 **and** `loss1`/`loss5` unmoved. **Rollback**: the policy
+stays as it is, and this section keeps the number that says what it costs on a clean path.
+
+### D. The first bulk cell rides the carrier it started on (62 %)
+
+**Symptom**: on the plan's two-cell criterion, auto reads **62 %** of the kernel carrier in `bulk-1` and **81 %** in `bulk-n`
+(§4.526): the class arrives after the streams are open, and a running stream is never moved.
+**Decided, not measured further**: **no prior.** A prior would start an unobserved service on the kernel carrier to lift
+`bulk-1`, and C is the reason it is not worth it: the axis that matters is the *path*, not the class, so a prior chosen for
+bulk would put a chat service's first channels on a carrier that is only better when the path is clean, and would do nothing
+for `bulk-1` on an impaired one. What would reopen it is a path-aware signal (C), where the same signal answers both.
+**Pass/rollback**: none — the decision is to leave the policy alone (§2).
 
 ## 5. Active architecture decisions
 
