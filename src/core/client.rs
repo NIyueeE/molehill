@@ -976,7 +976,7 @@ struct RunDataChannelArgs {
     /// authenticates with it, not with the session's auth digest.
     session_nonce: Nonce,
     /// Where a failed open reports its group, so the server's gather can fail the
-    /// attempt at once instead of waiting out its budget (`HANDOFF-archive.md` §4.460).
+    /// attempt at once instead of waiting out its budget (§4.460).
     ///
     /// Only the multiplexed path opens channels, so a build without it has no
     /// reader for this sender.
@@ -1641,7 +1641,7 @@ async fn run_mux_data_channel(
         Ok(stream) => stream,
         Err(error) => {
             // The group can never complete, and the server would otherwise wait
-            // out its whole budget to discover that (`HANDOFF-archive.md` §4.460).
+            // out its whole budget to discover that (§4.460).
             let _ = args.refuse_tx.send((args.service_id, group.to_be_bytes()));
             return Err(error);
         }
@@ -1695,7 +1695,7 @@ async fn run_mux_data_channel(
         crate::transport::stats::note_prologue_failed();
         // The open reached the wire but never completed, and the server's gather
         // would wait out its budget for a group this channel can no longer
-        // complete (`HANDOFF-archive.md` §4.460).
+        // complete (§4.460).
         let _ = args.refuse_tx.send((args.service_id, group.to_be_bytes()));
         return Err(error);
     }
@@ -4007,7 +4007,7 @@ struct ClientSession {
     pending_drops: Vec<ServiceId>,
     /// Where a failed channel open reports its group, and the session loop's end
     /// of it: the loop is the only place that can write a session command
-    /// (`HANDOFF-archive.md` §4.465).
+    /// (§4.465).
     #[cfg(feature = "multiplex")]
     refuse_tx: mpsc::UnboundedSender<(ServiceId, [u8; 4])>,
     refuse_rx: mpsc::UnboundedReceiver<(ServiceId, [u8; 4])>,
@@ -4286,7 +4286,7 @@ impl ClientSession {
                 }
                 // A channel this end could not open: tell the server at once, so
                 // the pairing waiting for that group stops waiting instead of
-                // sitting out its budget (`HANDOFF-archive.md` §4.460).
+                // sitting out its budget (§4.460).
                 Some((service, group)) = self.refuse_rx.recv() => {
                     write_session_cmd(&mut wr, &SessionCmd::ChannelRefused(service, group)).await?;
                 }

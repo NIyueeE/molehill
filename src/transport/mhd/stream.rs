@@ -1250,7 +1250,7 @@ mod tests {
     /// hole is filled — that is what makes it safe to send as an acknowledgement.
     /// A finish that overtook a hole must not end the stream.
     ///
-    /// The fifth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+    /// The fifth of the plan's eight lifecycle invariants (`HANDOFF-archive.md` §4.120):
     /// "FIN across a hole does not truncate". The peer's last range can arrive
     /// before the range beneath it — reordering, or a loss with the repair still in
     /// flight — and reporting the stream finished then would hand the visitor a body

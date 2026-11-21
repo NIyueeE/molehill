@@ -249,7 +249,7 @@ pub(crate) struct TunnelCounters {
     /// queued behind a backup's bytes *on its own lane*. Measured both ways — an
     /// isolation keyed on the **carrier** cost the long-lived cell 2 → 18.5 ms and
     /// bought the capacity ramp 69 → 2 ms, because the carrier was only ever a
-    /// proxy for what actually shares a tunnel (`HANDOFF-archive.md` §4.509).
+    /// proxy for what actually shares a tunnel (§4.509).
     bulk: std::sync::atomic::AtomicUsize,
     /// Opens requested but not yet completed on this tunnel.
     pending: std::sync::atomic::AtomicUsize,
@@ -516,7 +516,7 @@ impl TunnelCounters {
 pub(crate) struct StreamLease {
     /// A process-wide number, so one lease's life can be followed from open to drop:
     /// counting opens against drops says how many are outstanding, and the number
-    /// says **which** (`HANDOFF-archive.md` §4.485).
+    /// says **which** (§4.485).
     id: u64,
     stream: CarrierStream,
     /// When the slot was charged, so its whole life can be recorded on drop.
@@ -1274,7 +1274,7 @@ impl TunnelPoolInner {
     /// whose every tunnel holds a long-lived stream never gives one back: measured
     /// on the mixed `cost` cell, the move was requested 30 ms after the class
     /// flipped and then hit its drain budget with the tunnel still busy
-    /// (`HANDOFF-archive.md` §4.504). A spare has no such precondition: the second carrier
+    /// (§4.504). A spare has no such precondition: the second carrier
     /// exists immediately, and the over-represented tunnel is removed when it
     /// empties on its own.
     ///
@@ -1335,7 +1335,7 @@ impl TunnelPoolInner {
         // of a silent downgrade — so a pool that dialled the other carrier anyway
         // would make both the arm's name and its numbers false. That it *did* was a
         // measurement defect: a run pinned to mhd still grew kernel-carrier spares
-        // as soon as a second service's class appeared (`HANDOFF.md` §4.514).
+        // as soon as a second service's class appeared (§4.514).
         if crate::transport::carrier::forced_carrier().is_some() {
             return None;
         }
@@ -2552,7 +2552,7 @@ impl TunnelPool {
         // **A conversational flow asks for a lane no bulk stream occupies**, which
         // is what isolates it: the carrier was only ever a proxy for that, and
         // isolation keyed on the carrier alone cost the long-lived cell 2 → 18.5 ms
-        // while buying the capacity ramp 69 → 2 ms (`HANDOFF-archive.md` §4.509).
+        // while buying the capacity ramp 69 → 2 ms (§4.509).
         let prefer_quiet = class == Some(crate::transport::pool::ServiceClass::Conversational);
         let bulk = class == Some(crate::transport::pool::ServiceClass::Bulk);
         let Some(reservation) = self.reserve(prefer, prefer_quiet, &[], &avoid, ceiling) else {
@@ -2942,7 +2942,7 @@ impl TunnelPool {
         // **The last unsplit interval on a visitor's arrival.** Placement, the
         // pool's reservation and the carrier's own write are each measured and each
         // read fast; what is left is this call, and a round trip hiding inside it
-        // would explain a pairing that costs two of them (`HANDOFF.md` §4.303).
+        // would explain a pairing that costs two of them (`HANDOFF-archive.md` §4.303).
         if crate::transport::stats::enabled()
             && let Ok(_) = &opened
             && opening.elapsed() >= std::time::Duration::from_millis(1)

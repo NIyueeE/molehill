@@ -102,7 +102,7 @@ pub(crate) use pump::{MhdLane, MhdListener};
 ///   uses the last. `bulk-n` on `clean` reads **11.30 off / 9.79 on** on the tree
 ///   that measured it, and **9.25 against 11.71 Gbit/s** on 2026-11-21 — but the
 ///   two arms are **two encryption architectures, not two renditions of one**
-///   (`HANDOFF.md` §4.522, and `docs/internals.md` under "Multiplexing"): with the
+///   (§4.522, and `docs/internals.md` under "Multiplexing"): with the
 ///   switch off the lane root is never installed, a later stream falls back to
 ///   its own Noise KK, and its payload is sealed as 32 KiB records, while with it
 ///   on every 1 399-byte datagram is sealed in the lane cipher. The measured

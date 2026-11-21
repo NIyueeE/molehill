@@ -109,7 +109,7 @@ pub(crate) struct Phases {
     ///
     /// The half of the park that is not the carrier: from `waker.wake()` to the
     /// consumer entering its read. Together with `rx_lock` and `io_read` it divides
-    /// the park into scheduling, contention and copying (`HANDOFF.md` §4.142).
+    /// the park into scheduling, contention and copying (`HANDOFF-archive.md` §4.142).
     pub(crate) rx_wake: Meter,
     /// What a reader pays to *reach* the connection before it can read: the time
     /// from entering `poll_read` to the connection lock being held.
@@ -117,7 +117,7 @@ pub(crate) struct Phases {
     /// Beside `io_read` (the copy inside the lock) this separates "the consumer
     /// was late" from "the consumer was blocked behind the carrier's own work":
     /// the dispatcher takes the same mutex once per datagram, thousands of times a
-    /// second (`HANDOFF.md` §4.139).
+    /// second (`HANDOFF-archive.md` §4.139).
     pub(crate) rx_lock: Meter,
     /// A stream handle's read: the copy out of the receive buffer into the
     /// caller's slice.
@@ -140,7 +140,7 @@ pub(crate) struct Phases {
     /// `mhd-stats` line is the record layer's, so a reader of that line had no
     /// way to tell which layer did the work — and a pinned-mhd run whose
     /// payload never reached the record layer still grew that counter
-    /// (`HANDOFF.md` §4.520, §4.521).
+    /// (§4.520, §4.521).
     pub(crate) lane_seal: Meter,
     /// Opening one record (the Noise read path), verified and decrypted.
     pub(crate) open: Meter,
@@ -846,7 +846,7 @@ pub(crate) fn note_shared() {
 ///
 /// `buffer` was invisible until it had a name: the refusal was classified by
 /// comparing two of the three minima that decide `room`, so a write held by
-/// `MAX_BUFFERED` was counted as held by the window (`HANDOFF.md` §4.179).
+/// `MAX_BUFFERED` was counted as held by the window (`HANDOFF-archive.md` §4.179).
 static REFUSED_CREDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REFUSED_BUFFER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

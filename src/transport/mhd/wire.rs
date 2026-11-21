@@ -83,7 +83,7 @@ pub(crate) const HEAD: usize = 9;
 /// cannot reach is one the sender learns about only from its own timer, while
 /// every number that arrived behind it stays unretired: measured on a
 /// five-percent-loss path, **every** stall line the carrier printed had
-/// `largest - below > 64` (`HANDOFF.md` §4.284). Each run is a
+/// `largest - below > 64` (`HANDOFF-archive.md` §4.284). Each run is a
 /// `(behind, len)` pair — numbers `largest - behind` through
 /// `largest - behind + len - 1` arrived — and `len == 0` means unused.
 pub(crate) const ACK: usize = 36;
@@ -331,7 +331,7 @@ impl AckSet {
     /// Every number below this has arrived.
     ///
     /// Read by the stall line, which needs to know what this end is *telling* the
-    /// peer rather than what it has received (`HANDOFF.md` §4.107).
+    /// peer rather than what it has received (`HANDOFF-archive.md` §4.107).
     pub(crate) const fn below(&self) -> u32 {
         self.below
     }
@@ -345,7 +345,7 @@ impl AckSet {
     /// The frontier this end would advertise: `(largest, below)`.
     ///
     /// Two numbers because the cumulative one is what retires a peer's records and
-    /// a single hole pins it for the connection's life (`HANDOFF.md` §4.344). Read
+    /// a single hole pins it for the connection's life (`HANDOFF-archive.md` §4.344). Read
     /// against `largest`, it says whether the frontier is moving or stuck.
     pub(crate) fn frontier(&self) -> (u32, u32) {
         (self.largest.unwrap_or(0), self.below)

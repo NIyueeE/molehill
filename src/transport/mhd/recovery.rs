@@ -187,7 +187,7 @@ pub(crate) struct Sent {
     /// on `live` cannot see the interactive packet inside it: measured on the
     /// `step` cell, one dropped request waited two to three full timeout steps
     /// (2.4–4.9 s) while the control arm paid the queue and nothing else
-    /// (`HANDOFF.md` §4.311). The flag is the packet's own nature, set at send time
+    /// (`HANDOFF-archive.md` §4.311). The flag is the packet's own nature, set at send time
     /// from the same predicate the credit reserve uses (`Conn::small_flight`).
     small: bool,
     /// Whether this packet is part of a stream's **opening flight**.
@@ -398,7 +398,7 @@ pub(crate) struct Recovery {
     /// which floor the retransmission timer gets — and answering it by scanning
     /// the table cost **9.4 % of the carrier's cycles** on a clean bulk transfer
     /// (`perf`, 2 500 records in flight, one scan per packet:
-    /// `HANDOFF-archive.md` §4.508). A counter is exact if every place that inserts a
+    /// §4.508). A counter is exact if every place that inserts a
     /// record, retires one, or marks one lost adjusts it, and a test below pins
     /// the counter against the scan it replaces.
     small_live: usize,
@@ -493,7 +493,7 @@ impl Recovery {
     ///
     /// For the stall line, and for the question it exists to answer: whether the
     /// numbers a sender is waiting for are ones the peer's acknowledgement block
-    /// can still name at all (`HANDOFF.md` §4.107).
+    /// can still name at all (`HANDOFF-archive.md` §4.107).
     pub(crate) fn number_range(&self) -> Option<(u32, u32)> {
         Some((
             *self.in_flight.keys().next()?,
@@ -517,7 +517,7 @@ impl Recovery {
     /// Retire every record the peer's byte prefix has already confirmed.
     ///
     /// **The escape hatch the design already had, applied to the number that
-    /// gates admission** (`HANDOFF.md` §4.108). A packet number lost for good
+    /// gates admission** (`HANDOFF-archive.md` §4.108). A packet number lost for good
     /// stops the peer's cumulative number frontier, and the acknowledgement
     /// bitmap only carries 64 numbers behind the largest seen — so a record older
     /// than that window can never be reported again by the block. The peer's
@@ -733,7 +733,7 @@ impl Recovery {
         // inside it; when one is in flight the timer is the path's own round trip
         // and nothing is multiplied onto it, because re-sending one datagram that
         // nothing can be reordered behind costs a duplicate and no more
-        // (`HANDOFF.md` §4.311).
+        // (`HANDOFF-archive.md` §4.311).
         let small_record = self.small_live > 0;
         let rto = if small_record && !small {
             self.rtt.rto(true)
@@ -813,7 +813,7 @@ impl Recovery {
         // reaches sixty-four numbers; the two runs reach further back, and they
         // are what lets a number the frontier has not passed yet retire — the
         // case a hole older than sixty-four numbers used to make impossible
-        // (`HANDOFF.md` §4.284).
+        // (`HANDOFF-archive.md` §4.284).
         let mut acked: Vec<u32> = self
             .in_flight
             .range(oldest..=ack.largest)
@@ -927,7 +927,7 @@ impl Recovery {
         let delay = self.rtt.loss_delay();
         // A packet with a small flight behind it is judged on the path's own round
         // trip, not on the reordering allowance: nothing can be reordered *behind*
-        // it, because there is nothing behind it (`HANDOFF.md` §4.311).
+        // it, because there is nothing behind it (`HANDOFF-archive.md` §4.311).
         let small_delay = self.rtt.small_loss_delay();
         let stale: Vec<u32> = self
             .in_flight
@@ -942,7 +942,7 @@ impl Recovery {
             // Nothing is past the reordering window yet: the timer fired early, so
             // this is a probe of a silent path.
             //
-            // **One range, not the flight** (`HANDOFF.md` §4.126). A probe exists to
+            // **One range, not the flight** (`HANDOFF-archive.md` §4.126). A probe exists to
             // elicit an acknowledgement, and one new number does that: the peer's
             // block answers it, the frontier moves, and the rest of the flight is
             // still in the table to be retired by it. Re-sending every outstanding
@@ -1074,7 +1074,7 @@ mod tests {
     use crate::transport::mhd::wire::ReceivedRun;
 
     /// The small-in-flight counter is what replaced a scan of the whole table on
-    /// every send (9.4 % of the carrier's cycles, `HANDOFF-archive.md` §4.508). It has to
+    /// every send (9.4 % of the carrier's cycles, §4.508). It has to
     /// agree with that scan after every kind of change a record can see: a send,
     /// a retirement, and a loss.
     #[test]
@@ -1137,7 +1137,7 @@ mod tests {
     /// Without the runs the sender retires none of them — `below` cannot pass the
     /// hole, and anything more than sixty-four numbers back is outside the
     /// bitmap — so it re-sends them until its timer forgets them, which is the
-    /// repair share `HANDOFF.md` §4.281 measured at 32–36 % of the wire.
+    /// repair share `HANDOFF-archive.md` §4.281 measured at 32–36 % of the wire.
     #[test]
     fn a_received_run_retires_numbers_the_bitmap_cannot_name() {
         let start = Instant::now();
@@ -1334,7 +1334,7 @@ mod tests {
 
     /// The byte prefix retires what the number block can no longer name.
     ///
-    /// The defect this exists for (`HANDOFF.md` §4.108): a number lost for good
+    /// The defect this exists for (`HANDOFF-archive.md` §4.108): a number lost for good
     /// stops the peer's cumulative frontier, and the bitmap only covers 64 numbers
     /// behind the largest seen, so older records can never be acknowledged again.
     /// The flight then keeps `cwnd` closed while the peer has every byte — measured
@@ -1469,7 +1469,7 @@ mod tests {
     /// `Connection::a_lost_opening_packet_is_re_sent_within_the_cheap_timer`; the last
     /// had nothing: it has no later packet to reach the three-packet threshold, and
     /// when it is also the end of the data there is nothing behind it to ack, so the
-    /// loss deadline is the only thing that can name it (`HANDOFF.md` §4.155).
+    /// loss deadline is the only thing that can name it (`HANDOFF-archive.md` §4.155).
     #[test]
     fn the_last_packet_of_a_flight_is_recovered_by_the_timer_alone() {
         let start = Instant::now();
@@ -1657,7 +1657,7 @@ mod tests {
     /// is the rule that survived every bulk A/B.
     /// A probe re-sends **one** range, not the whole flight.
     ///
-    /// §6.2 of the plan (`HANDOFF.md` §4.126): a probe timeout exists to elicit an
+    /// §6.2 of the plan (`HANDOFF-archive.md` §4.126): a probe timeout exists to elicit an
     /// acknowledgement, and one new number does that. Re-sending every outstanding
     /// packet instead multiplies the flight by the number of probes — the window
     /// closes on a path that lost nothing, and each pass re-sends more than the
@@ -2051,7 +2051,7 @@ mod tests {
     /// `declare_lost` reaps before it records, so a lane under a long loss burst cannot grow the set
     /// without limit — and, just as important, the loss it is asked about *now* is the one that gets
     /// recorded rather than silently refused. A refusal would be a packet sent and never repaired,
-    /// which is the one failure this carrier has no other way to notice (`HANDOFF.md` §4.269).
+    /// which is the one failure this carrier has no other way to notice (`HANDOFF-archive.md` §4.269).
     #[test]
     fn the_declared_loss_set_stays_bounded() {
         let mut recovery = Recovery::new();

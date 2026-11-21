@@ -78,7 +78,7 @@ pub(crate) struct Shared {
     /// Epoch microseconds of the last reader wake, or zero when none is pending.
     ///
     /// Taken by `poll_read` on entry to measure how long a woken consumer took to
-    /// come back (`HANDOFF.md` §4.142). One slot, not one per stream: a wake for
+    /// come back (`HANDOFF-archive.md` §4.142). One slot, not one per stream: a wake for
     /// another stream landing first would attribute its wait to this one, which is
     /// why the meter reports a count beside the duration.
     woke_at_us: std::sync::atomic::AtomicU64,
@@ -502,7 +502,7 @@ impl AsyncRead for StreamIo {
             // reading is not the one they went into. Both are invisible from every
             // other counter, and the accept task's ten-second selector timeout is
             // exactly this shape: the creating packet carried the byte, the buffer has
-            // it, and the reader waits (`HANDOFF.md` §4.339).
+            // it, and the reader waits (`HANDOFF-archive.md` §4.339).
             let held = this.shared.with(|conn| conn.held_for(this.id));
             if held > 0 {
                 tracing::debug!(
@@ -564,7 +564,7 @@ impl AsyncWrite for StreamIo {
             // **The first park of a handle, named.** A channel's open writes one
             // selector byte and then waits: if the lane has no room the write parks
             // here, and the channel never reaches the server, so the visitor's
-            // pairing expires with nothing gathered (`HANDOFF.md` §4.331). Whether
+            // pairing expires with nothing gathered (`HANDOFF-archive.md` §4.331). Whether
             // a hung open parks *here* or never gets this far is the difference
             // between the write wake and the open's own acknowledgement wait, and
             // nothing else in the log can tell them apart -- the resume-side line

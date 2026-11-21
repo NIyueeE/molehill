@@ -129,7 +129,7 @@ const STALL_REPAIR_ATTEMPTS: u8 = 5;
 /// several tasks at once, so two opens can reach the wire out of order. Without a
 /// window the lower one is dropped as "retired" -- silently, with one debug line --
 /// which is how a channel open hung for five seconds on the client while the server
-/// kept no record of the stream (`HANDOFF.md` §4.333). Sixty-four is wider than any
+/// kept no record of the stream (`HANDOFF-archive.md` §4.333). Sixty-four is wider than any
 /// pool's concurrent opens and narrower than the distance a long-retired stream's
 /// retransmission would travel.
 const ACCEPT_WINDOW: u32 = 64;
@@ -137,7 +137,7 @@ const ACCEPT_WINDOW: u32 = 64;
 /// Held bytes below this make a stream small enough to be an interactive flow.
 ///
 /// Only the window line uses it: the tail's reading has to skip bulk streams, and
-/// size is the only signal this end has (`HANDOFF.md` §4.300).
+/// size is the only signal this end has (`HANDOFF-archive.md` §4.300).
 const SMALL_STREAM_HELD: u64 = 8 * MAX_STREAM_PAYLOAD as u64;
 
 /// A gap long enough to count as a tail event rather than scheduling noise.
@@ -168,7 +168,7 @@ fn opening(state: &StreamState) -> bool {
 /// one bulk stream with a blocked reader holds the connection's whole credit the
 /// interactive stream's next request has nowhere to go.
 ///
-/// Measured on the new `step` cell (`HANDOFF.md` §4.307, §4.310): a long-lived
+/// Measured on the new `step` cell (`HANDOFF-archive.md` §4.307, §4.310): a long-lived
 /// interactive stream whose request/response had run at 20 a second **stopped for
 /// 105 seconds** the moment the tunnel leg was shaped to 20 Mbit/s under four bulk
 /// streams, while the same cell's control arm kept answering in 390 ms.
@@ -295,10 +295,10 @@ struct StreamState {
     /// The peer finished.
     peer_fin: bool,
     /// When both directions had finished, so the wait to retirement can be told apart
-    /// from the life of the stream (`HANDOFF.md` §4.444).
+    /// from the life of the stream (§4.444).
     closed_at: Option<Instant>,
     /// When this end asked to finish: the wait until the fin can be sent is the wait for
-    /// its own last bytes to be acknowledged (`HANDOFF.md` §4.449).
+    /// its own last bytes to be acknowledged (§4.449).
     finish_at: Option<Instant>,
     /// Set when either end reset the stream.
     reset: Option<ResetCode>,
@@ -358,7 +358,7 @@ struct StreamState {
     /// notices that case: a lost packet's record is forgotten after `LOST_HOLD`,
     /// and a range no record names is never re-sent, because the send point is
     /// past it and the repair queue never held it. Measured as a ten-second
-    /// silence whose wire was 97 % repairs of one range (`HANDOFF.md` §4.285).
+    /// silence whose wire was 97 % repairs of one range (`HANDOFF-archive.md` §4.285).
     prefix_at: Option<Instant>,
     /// When a repair for this stream last went on the wire.
     ///
@@ -546,14 +546,14 @@ pub(crate) struct Stall {
     /// sender stuck waiting for numbers the block can no longer name — anything
     /// more than 64 behind `largest` — is a different defect from one whose
     /// numbers are inside the window and simply not acknowledged
-    /// (`HANDOFF.md` §4.107).
+    /// (`HANDOFF-archive.md` §4.107).
     pub(crate) recv_below: u32,
     pub(crate) recv_largest: u32,
     /// The contiguous byte frontier this end reports, **and the stream it names**.
     ///
     /// The stream matters as much as the number: the prefix is evidence about one
     /// stream only, so a sender stuck on a different one learns nothing from it
-    /// (`HANDOFF.md` §4.109).
+    /// (`HANDOFF-archive.md` §4.109).
     pub(crate) recv_prefix: u64,
     pub(crate) recv_stream: u32,
     /// The lowest and highest packet numbers still in flight here.
@@ -644,7 +644,7 @@ fn seal_stream_payload(
     // copy this used to make was a `Vec` allocation **per sealed packet** — 470 000
     // a second at 12 Gbit/s, and it was the difference between the lane's measured
     // 1.08 µs a packet and the 0.67 µs `just primitives` prices for the call
-    // (`HANDOFF.md` §4.523).
+    // (§4.523).
     let sampled = crate::transport::stats::enabled();
     let sealed = {
         let (before, rest) = out.split_at_mut(payload_at);
@@ -691,7 +691,7 @@ type Opened<'a> = (std::borrow::Cow<'a, [u8]>, Option<StreamKeys>);
 /// recovery defect, not for a small window, and the two want opposite fixes. The
 /// process-wide counters cannot answer it — `stats::note_refused` and
 /// `stats::note_none_reason` sum every lane into one distribution, so four
-/// interleaved lanes read as one that oscillates (`HANDOFF.md` §4.179).
+/// interleaved lanes read as one that oscillates (`HANDOFF-archive.md` §4.179).
 ///
 /// Every field is a count this end can produce from what it already holds: no new
 /// clock read, no new allocation, and two adds per packet on the send path.
@@ -941,7 +941,7 @@ pub(crate) struct Conn {
     /// opening" from "a packet for a stream this end already retired": an unknown
     /// id in the peer's space that is **below** this one cannot be new, and taking
     /// it would open a phantom stream and a phantom accept for a visitor whose
-    /// connection had already closed (`HANDOFF.md` §4.120).
+    /// connection had already closed (`HANDOFF-archive.md` §4.120).
     highest_inbound: Option<u32>,
     /// The last cumulative prefix the peer reported, kept only for reporting: at a
     /// stall the question is whether the sender retired past the peer's word (it
@@ -968,7 +968,7 @@ pub(crate) struct Conn {
     ///
     /// Per lane, and reset once a second by the window line: the numbers are only
     /// useful as *this* lane's series, and the process-wide totals this file used
-    /// to lean on cannot be divided back into lanes (`HANDOFF.md` §4.179).
+    /// to lean on cannot be divided back into lanes (`HANDOFF-archive.md` §4.179).
     ledger: SendLedger,
     /// Acknowledgements this end applied and attached, for the window line.
     acks_applied: u64,
@@ -1368,7 +1368,7 @@ impl Conn {
         // use.** Inserting unconditionally would replace that stream's state — its
         // ciphers, its frontier, its place in the window — with a fresh one, and
         // the visitor reading it would never see an error (invariant 1 of
-        // `HANDOFF.md` §4.120). Probing at most `len() + 1` candidates of one parity
+        // `HANDOFF-archive.md` §4.120). Probing at most `len() + 1` candidates of one parity
         // always finds a free id: only `len()` ids are occupied in total, so by the
         // pigeonhole one of `len() + 1` candidates is free.
         let mut id = self.next_stream;
@@ -1445,7 +1445,7 @@ impl Conn {
         // a bulk writer's room) protects against a sender over-committing, not
         // against a frontier that shrinks after the fact — measured as a
         // 105-second silence on the step cell and a ten-second wedge in the soak
-        // (`HANDOFF.md` §4.314). The receiver accepts this headroom for the same
+        // (`HANDOFF-archive.md` §4.314). The receiver accepts this headroom for the same
         // predicate, so nothing overruns what it can hold.
         let small_writer = self.streams.get(&stream).is_some_and(small_flight);
         if small_writer {
@@ -1455,7 +1455,7 @@ impl Conn {
         // window: every re-send of a range the path keeps dropping sat in
         // `flight_bytes`, so the writer had no room for bytes the peer had never
         // seen — measured as a third of the wire being repairs while the
-        // application carried a sixteenth of the path (`HANDOFF.md` §4.281). The
+        // application carried a sixteenth of the path (`HANDOFF-archive.md` §4.281). The
         // window now bounds new data, and the repairs share what is left.
         let window = self.cwnd.saturating_sub(self.recovery.data_flight_bytes());
         // The buffer ceiling is the third bound: a byte stays buffered until an
@@ -1514,7 +1514,7 @@ impl Conn {
             // point a channel's first byte has nowhere to go and the visitor's
             // pairing expires with nothing gathered — measured as 24 and 47 dropped
             // visitors in one twenty-minute soak, against a client that had already
-            // opened the channel within 1 ms of the request (`HANDOFF.md` §4.331).
+            // opened the channel within 1 ms of the request (`HANDOFF-archive.md` §4.331).
             // `MAX_BUFFERED` is two windows, so the second window absorbs this
             // reserve exactly as it absorbs the frontier's.
             credit
@@ -1563,7 +1563,7 @@ impl Conn {
             self.last_refusal = Some(refusal);
             // Per lane, beside the process-wide counter: four lanes summed into one
             // line cannot say whether *this* writer was parked on the window or on
-            // the buffer (`HANDOFF.md` §4.179).
+            // the buffer (`HANDOFF-archive.md` §4.179).
             match refusal {
                 Refusal::Aged => {
                     self.ledger.refused_aged = self.ledger.refused_aged.saturating_add(1);
@@ -1690,12 +1690,12 @@ impl Conn {
         // left to do either way, and keeping its entry is what fills the lane's
         // stream table: measured on a soak, `opened_len` sat at **56**, the lane's
         // ceiling, on both arms that wedged while a clean arm peaked at 4
-        // (`HANDOFF.md` §4.358).
+        // (`HANDOFF-archive.md` §4.358).
         let closed_both = state.local_fin && state.peer_fin && state.send.unacked() == 0;
         // A stream that was opened and never carried a byte has nothing to hand to
         // the peer and no fin to send, so `abandoned` alone never retired it and the
         // reaper skips it too (nothing held). Measured: one entry per lane whose age
-        // is the whole run (`HANDOFF.md` §4.365).
+        // is the whole run (`HANDOFF-archive.md` §4.365).
         let never_used = state.send.base() == 0 && state.send.unacked() == 0;
         let done = closed_both
             || (state.abandoned && (state.fin_sent || never_used) && state.send.unacked() == 0);
@@ -1718,7 +1718,7 @@ impl Conn {
             self.release_unread(stream);
             // **Say it when a stream leaves**, with the age taken *before* the
             // record that holds it is removed -- read after, every stream in a
-            // soak reported `age_ms=0` and the line said nothing (`HANDOFF.md` §4.342).
+            // soak reported `age_ms=0` and the line said nothing (`HANDOFF-archive.md` §4.342).
             if crate::transport::stats::enabled() {
                 let age_ms = self.stream_opened.get(&stream).map_or(0, |at| {
                     u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -1736,7 +1736,7 @@ impl Conn {
             // **Say it when a stream leaves.** An accept task can be waiting on a
             // stream this end retires -- it then reads a state that no longer
             // exists, sees no bytes, and times out ten seconds later, which is the
-            // selector timeout this line has chased (`HANDOFF.md` §4.341). The line
+            // selector timeout this line has chased (`HANDOFF-archive.md` §4.341). The line
             // carries the age so a stream retired moments after it opened is
             // distinguishable from one that lived its life.
             if let Some(state) = self.streams.remove(&stream) {
@@ -1844,7 +1844,7 @@ impl Conn {
     /// must look at its socket more often: a lane with no live stream has no
     /// visitor to be late for, while one that is carrying something has a reader
     /// whose latency is bounded by how quickly the pump notices a datagram
-    /// (`pump::READ_POLL`, `HANDOFF.md` §4.101).
+    /// (`pump::READ_POLL`, `HANDOFF-archive.md` §4.101).
     ///
     /// A reset stream is not live: both directions are over and it stays in the
     /// table only until its finish is acknowledged. An *abandoned* one still
@@ -1973,7 +1973,7 @@ impl Conn {
     /// those bytes on the wire again: the stream's prefix stops, the writer
     /// blocks on the buffer ceiling, and the lane goes quiet while its wire is
     /// only repairs of that one range — measured as a ten-second silence
-    /// (`HANDOFF.md` §4.285).
+    /// (`HANDOFF-archive.md` §4.285).
     ///
     /// The guard is one range per stream per round trip, so a healthy path never
     /// sees a duplicate from here: its prefix moves every round trip and the
@@ -2182,7 +2182,7 @@ impl Conn {
     /// Whether an id this end does not hold names a stream it has already retired.
     ///
     /// Two rules, and they answer different halves of the same question
-    /// (`HANDOFF.md` §4.120). An id in *our* space that we do not hold is one of our
+    /// (`HANDOFF-archive.md` §4.120). An id in *our* space that we do not hold is one of our
     /// own streams, retired. An id in the *peer's* space is normally a stream it is
     /// opening — unless it sits below one this end already accepted, in which case
     /// stream ids being monotonic means the peer cannot be opening it, so the packet
@@ -2202,7 +2202,7 @@ impl Conn {
         // then arrives "below" it and used to be dropped as retired, silently, with
         // one debug line and no counter. That is a channel the client opened and the
         // server never saw, which is the visitor drop and the ten-second wedge
-        // (`HANDOFF.md` §4.333).
+        // (`HANDOFF-archive.md` §4.333).
         //
         // So an unknown id is stale only when it is far enough below the frontier
         // that no concurrent open could still be in flight for it -- and only when
@@ -2519,7 +2519,7 @@ impl Conn {
             // either a packet the transmit queue never picked or one that left and
             // whose acknowledgement was lost; nothing else in the log separates
             // them, and the write side is already excluded (no stream writer parks
-            // -- `HANDOFF.md` §4.332).
+            // -- `HANDOFF-archive.md` §4.332).
             tracing::debug!(
                 stream = id,
                 number,
@@ -2550,7 +2550,7 @@ impl Conn {
             repair,
             // Its stream's flight, not the lane's: the interactive packet inside a
             // bulk lane is invisible to any predicate on the lane's own count
-            // (`HANDOFF.md` §4.311).
+            // (`HANDOFF-archive.md` §4.311).
             small_flight(state),
         );
         // What this packet cost the wire, and whether the range was new: the pair
@@ -2802,7 +2802,7 @@ impl Conn {
             // Nor is it a repair: it carries no payload to charge a window for.
             false,
             // A finish is judged like the stream it ends, which for an interactive
-            // stream is the cheap rule (`HANDOFF.md` §4.311).
+            // stream is the cheap rule (`HANDOFF-archive.md` §4.311).
             self.streams.get(&id).is_some_and(small_flight),
         );
         self.ack_pending = false;
@@ -2903,7 +2903,7 @@ impl Conn {
         // four lanes into one line and made "no eligible stream" look like a window
         // problem; a lane that stops because it has nothing queued and a lane that
         // stops because its window is shut are opposite findings, and only the
-        // per-lane copy can tell them apart (`HANDOFF.md` §4.179).
+        // per-lane copy can tell them apart (`HANDOFF-archive.md` §4.179).
         match reason {
             "no eligible stream" => {
                 self.ledger.stop_no_stream = self.ledger.stop_no_stream.saturating_add(1);
@@ -3133,7 +3133,7 @@ impl Conn {
     /// The probes ride at most two channels between them (`probes/series.py:191`
     /// is a sequential loop) while a wedged arm holds fifty-six, so something other
     /// than a visitor dials. The tag says which, and it is the only question left
-    /// that a single run can answer (`HANDOFF.md` §4.376).
+    /// that a single run can answer (`HANDOFF-archive.md` §4.376).
     pub(crate) fn opens_by_tag(&self) -> &std::collections::BTreeMap<&'static str, usize> {
         &self.opens_by_tag
     }
@@ -3143,7 +3143,7 @@ impl Conn {
     /// `stream_opened` is written only by `open()`, so a stream in `streams` but not
     /// in it was created by the *peer's* first packet. The distinction decides
     /// whether the 224 channels a wedged arm holds were dialled here or arrived
-    /// (`HANDOFF.md` §4.374).
+    /// (`HANDOFF-archive.md` §4.374).
     pub(crate) fn opened_here(&self) -> usize {
         self.streams
             .keys()
@@ -3172,7 +3172,7 @@ impl Conn {
     /// peer_fin, never_used)` counts.
     ///
     /// Four numbers because the 56 that fill a wedged arm's lanes have to be one of
-    /// these shapes, and which one says who is holding them (`HANDOFF.md` §4.366).
+    /// these shapes, and which one says who is holding them (`HANDOFF-archive.md` §4.366).
     pub(crate) fn opened_flags(&self) -> (usize, usize, usize, usize) {
         let mut out = (0usize, 0usize, 0usize, 0usize);
         for state in self.streams.values() {
@@ -3235,7 +3235,7 @@ impl Conn {
     /// event was the peer's fin has no further event to visit it, so it sat until the
     /// lane's five-minute idle cut. Measured: a stream lived 8.4 seconds on the arm that
     /// wedged against 1.7 on the one that did not, and both ends had closed every
-    /// channel (`HANDOFF.md` §4.438–§4.439).
+    /// channel (§4.438–§4.439).
     pub(crate) fn retire_finished(&mut self) -> usize {
         let finished: Vec<u32> = self
             .streams
@@ -3257,7 +3257,7 @@ impl Conn {
         }
         // **Why the sweep retires nothing.** It runs every second and a soak showed it
         // never firing, so one clause is false for every live stream and the record has
-        // narrowed that to `peer_fin`, `unacked` or `pending` (`HANDOFF.md` §4.441).
+        // narrowed that to `peer_fin`, `unacked` or `pending` (§4.441).
         if crate::transport::stats::enabled() && finished.is_empty() {
             let kept: Vec<(u32, bool, bool, u32, usize)> = self
                 .streams
@@ -3325,7 +3325,7 @@ impl Conn {
     /// should have taken (minutes old, `abandoned` or `fin_sent` set), or sessions
     /// the peer simply never closed (minutes old and live, which is not a defect).
     /// Those three populations are identical from every other number on this line
-    /// (`HANDOFF.md` §4.328), so this prints the one field that separates them.
+    /// (`HANDOFF-archive.md` §4.328), so this prints the one field that separates them.
     pub(crate) fn oldest_stream(&self, now: Instant) -> Option<(u32, Duration, bool, bool)> {
         let (&id, opened) = self.stream_opened.iter().next()?;
         let state = self.streams.get(&id)?;
@@ -3501,14 +3501,14 @@ impl Conn {
     /// `ready_for` above answers for one stream the caller names, and the window
     /// line uses it on the stream with the biggest backlog — which in a mixed cell
     /// is always bulk, so that reading says nothing about the interactive tail
-    /// (`HANDOFF.md` §4.300). This picks the worst wait among streams small enough
+    /// (`HANDOFF-archive.md` §4.300). This picks the worst wait among streams small enough
     /// to be interactive, which is the number the tail question needs.
     pub(crate) fn small_ready_wait(&self, now: Instant) -> Option<(u32, Duration, u64)> {
         // The third number is the stream's own arrival count, and it is what makes
         // the reading usable: "holds eight payloads or fewer" also describes a bulk
         // stream whose reader is blocked long enough for its buffer to drain, so
         // without the bytes a 39-second wait cannot be attributed to either shape
-        // (`HANDOFF.md` §4.300, §4.305).
+        // (`HANDOFF-archive.md` §4.300, §4.305).
         self.streams
             .iter()
             .filter(|(_, state)| state.reset.is_none())
@@ -3740,7 +3740,7 @@ impl Conn {
     /// exists because the artifact says the accepting end's first sighting is number
     /// 1 on every lane — never 0 — so the dialer's first numbered packet is lost on
     /// the way and the cumulative frontier is pinned for the lane's life
-    /// (`HANDOFF.md` §4.182). The frame class is what says whether the listener's
+    /// (`HANDOFF-archive.md` §4.182). The frame class is what says whether the listener's
     /// "an unknown connection may only be opened by a stream frame at offset zero
     /// **carrying bytes**" rule dropped it.
     fn count_seen(&mut self, packet: &super::wire::Packet<'_>) {
@@ -3769,7 +3769,7 @@ impl Conn {
     ///
     /// Its own function because `apply_datagram` is at the length the lint allows and
     /// this arm is the longest of its frames — and because the arrival accounting is
-    /// a question of its own (`HANDOFF.md` §4.183).
+    /// a question of its own (`HANDOFF-archive.md` §4.183).
     fn accept_stream(
         &mut self,
         now: Instant,
@@ -3788,7 +3788,7 @@ impl Conn {
         // own reader is keeping up may still write the reserve past it, which
         // `MAX_BUFFERED`'s second window absorbs. The sender spends exactly this
         // and no more (`Conn::write`), so neither end can overrun the other
-        // (`HANDOFF.md` §4.314).
+        // (`HANDOFF-archive.md` §4.314).
         let small_reader = self
             .streams
             .get(&id)
@@ -3930,7 +3930,7 @@ impl Conn {
                     // -- both expire with `gathered=0` -- and the ten-second selector
                     // timeout is the only line either leaves. This says which packet
                     // opened the stream, with its offset and length, so the two can be
-                    // told apart (`HANDOFF.md` §4.338).
+                    // told apart (`HANDOFF-archive.md` §4.338).
                     tracing::debug!(
                         stream = id,
                         number = packet.number,
@@ -4075,7 +4075,7 @@ impl Conn {
         // prefix is the only acknowledgement that cannot stall on a lost packet
         // number, and the flight is what `write` admits against: freeing the stream
         // buffer while leaving the bytes in the flight closed the window on a lane
-        // whose peer had received everything (`HANDOFF.md` §4.108).
+        // whose peer had received everything (`HANDOFF-archive.md` §4.108).
         //
         // `buffered` is not touched again: `advance_to` above already released those
         // bytes from the stream's buffer, and the flight is a separate total.
@@ -4102,7 +4102,7 @@ impl Conn {
             // retirement — so `Acked::bytes` stays zero, `Acked::progress` stays
             // false, and the growth block below never runs. Measured as a lane
             // frozen at `INITIAL_CWND` for 122 s while it posted twenty times what
-            // it delivered (`HANDOFF.md` §4.181). The prefix is the acknowledgement
+            // it delivered (`HANDOFF-archive.md` §4.181). The prefix is the acknowledgement
             // that cannot stall, so its bytes are as good evidence of delivery as a
             // number, and they buy the window here.
             //
@@ -4213,7 +4213,7 @@ impl Conn {
             .collect();
         // **Why a finished stream is still here.** The retirement rule above is the one
         // this defect needs, and a soak showed it never firing — so the clause that
-        // refuses the entry is the last unknown (`HANDOFF.md` §4.430): `unacked` (our fin
+        // refuses the entry is the last unknown (§4.430): `unacked` (our fin
         // was never acknowledged) or `drained` (bytes the reader has not taken).
         if crate::transport::stats::enabled() {
             let kept: Vec<(u32, u32, usize)> = self
@@ -4351,20 +4351,20 @@ mod tests {
         /// The one-way delay this link imposes, a number the test chooses. A rule about how
         /// long a packet has been outstanding must be judged against a known delay; when the
         /// "round trip" was whatever a batch took to drain it was an artefact
-        /// (`HANDOFF.md` §4.207).
+        /// (`HANDOFF-archive.md` §4.207).
         delay: Duration,
         /// How far past `now` the next polled datagram is stamped.
         ///
         /// A test that polls a batch in a loop is a sender emptying a queue in one
         /// go; stamped with one instant it is a sender that emitted everything
         /// simultaneously, and a rule that reasons about how long a packet has been
-        /// outstanding cannot be exercised against that (`HANDOFF.md` §4.204).
+        /// outstanding cannot be exercised against that (`HANDOFF-archive.md` §4.204).
         sent: Duration,
         /// Drop one datagram in every `loss_every`, in both directions; zero disables it.
         ///
         /// A link that loses its opening and then nothing is not a lossy link — it is a single
         /// accident. The cells that broke the fourth plan's window work all kept losing
-        /// (`HANDOFF.md` §4.249), so the harness has to be able to say so.
+        /// (`HANDOFF-archive.md` §4.249), so the harness has to be able to say so.
         loss_every: usize,
         /// Datagrams the link has carried, for the pattern above.
         carried: usize,
@@ -4446,7 +4446,7 @@ mod tests {
             let mut dropped = 0;
             // **Time passes between datagrams here too.** A pump that polls at one instant is a
             // sender emitting everything at once, and a pacer cannot be exercised against that any
-            // more than a timeout rule can (`HANDOFF.md` §4.204, §4.259).
+            // more than a timeout rule can (`HANDOFF-archive.md` §4.204, §4.259).
             let mut at = now;
             loop {
                 let mut progress = false;
@@ -4493,7 +4493,7 @@ mod tests {
         /// sends everything at once — and no rule that reasons about time can be
         /// exercised against it: a hole and the packets that overtake it would carry
         /// the same send time, so "sent a reordering window earlier" is never true
-        /// (`HANDOFF.md` §4.204). Here each datagram leaves [`SPACING`] after the one
+        /// (`HANDOFF-archive.md` §4.204). Here each datagram leaves [`SPACING`] after the one
         /// before it, and the acknowledgements arrive after the batch, which is the
         /// shape a real pump has.
         fn pump(&mut self, now: Instant) -> usize {
@@ -4518,7 +4518,7 @@ mod tests {
                 // `on_timeout` whenever the connection's own deadline has passed; this one only ever
                 // called `poll_transmit`, so no test of a lost *last* packet could pass — the record
                 // sat in the flight table for ever and it looked like a protocol defect
-                // (`HANDOFF.md` §4.254). Both directions are driven, in the order their deadlines
+                // (`HANDOFF-archive.md` §4.254). Both directions are driven, in the order their deadlines
                 // fall due.
                 for _ in 0..64 {
                     let due = self.a.poll_timeout();
@@ -4612,7 +4612,7 @@ mod tests {
                         // sender answers `None` until its next packet is due, so a harness that
                         // only ever asks at one instant would sit still for ever. This is the
                         // virtual-time equivalent of a pump that wakes at the deadline
-                        // (`HANDOFF.md` §4.219).
+                        // (`HANDOFF-archive.md` §4.219).
                         _ if waited < 4096 => {
                             at += Duration::from_millis(1);
                             waited += 1;
@@ -5411,7 +5411,7 @@ mod tests {
 
     /// **A peer that abandons an accepted stream is told, and the stream is held until it is.**
     ///
-    /// Isolated from the harness on purpose (`HANDOFF.md` §4.266): the state machine alone, no `Link`
+    /// Isolated from the harness on purpose (`HANDOFF-archive.md` §4.266): the state machine alone, no `Link`
     /// and no second clock. An accepted stream owes bytes when it closes, so the close is not
     /// graceful — the stream stays in the table until the hold expires and the peer is owed a reset.
     /// Without that reset the peer keeps a half-open stream for the connection's life, which is the
@@ -5540,7 +5540,7 @@ mod tests {
     ///
     /// The floor one test down drops the opening and nothing else, which is a single accident. The
     /// cells that broke the fourth plan's window work kept losing — `loss1` at one percent, three
-    /// rounds of zero bytes (`HANDOFF.md` §4.249) — so this one drops one datagram in
+    /// rounds of zero bytes (`HANDOFF-archive.md` §4.249) — so this one drops one datagram in
     /// [`SELF::loss_every`] around a lost opening and requires the same completion inside the same
     /// budget.
     ///
@@ -5549,7 +5549,7 @@ mod tests {
     /// eighteen segments the opening reserve let through, not a stall: a write is partial by design,
     /// bounded by the peer's credit and by this engine's buffer, and a reader comes back for the
     /// rest. Written the way a reader writes, the transfer completes in well under a second of
-    /// virtual time (`HANDOFF.md` §4.252).
+    /// virtual time (`HANDOFF-archive.md` §4.252).
     ///
     /// What it pins is therefore a floor the baseline already meets: a lane that loses its opening
     /// and then keeps losing still finishes. The next candidate has to keep clearing it.
@@ -5559,7 +5559,7 @@ mod tests {
         let mut link = Link::new();
         // **Armed before the opening exchange**, so the credit frame and the stream's own naming are
         // both at risk — which is what a real path does and what a pattern armed after `pump(start)`
-        // never tested (`HANDOFF.md` §4.254).
+        // never tested (`HANDOFF-archive.md` §4.254).
         link.loss_every = 20;
         link.pump(start);
         let stream = link.a.open();
@@ -5568,7 +5568,7 @@ mod tests {
         // so the test writes what fits and comes back, which is what a reader does. The first
         // version of this test asserted one whole write and failed on the *write*, not on the wire:
         // its 24 282 bytes were 18 segments the opening reserve let through, not a stall
-        // (`HANDOFF.md` §4.252).
+        // (`HANDOFF-archive.md` §4.252).
         let mut written = 0usize;
         // One datagram in twenty, both directions, from the first one onwards: the opening is among
         // the casualties and the loss never stops. The payload is chosen so the pattern certainly
@@ -5940,7 +5940,7 @@ mod tests {
     /// A packet that arrives after this end retired a stream must not bring it
     /// back.
     ///
-    /// The third of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120). A
+    /// The third of the plan's eight lifecycle invariants (`HANDOFF-archive.md` §4.120). A
     /// visitor connection that closes leaves bytes on the wire in both directions;
     /// if the peer's late data re-created the stream, the connection would hold a
     /// half-open stream that nothing will ever read, and the window those bytes
@@ -5986,7 +5986,7 @@ mod tests {
 
     /// The stream-id minter must never hand out an id a live stream still holds.
     ///
-    /// The first of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120).
+    /// The first of the plan's eight lifecycle invariants (`HANDOFF-archive.md` §4.120).
     /// Ids wrap by two, and `open_at` inserted unconditionally — so an id that
     /// wrapped onto a stream still in use would **replace its state**, and the
     /// visitor reading that stream would lose its frontier, its ciphers and its
@@ -6021,7 +6021,7 @@ mod tests {
     /// first packet can leave before the lower one's. Judged against the inbound
     /// frontier alone the lower id is "below" it and was dropped as retired --
     /// silently, with one debug line -- which is a channel the client opened and the
-    /// server never saw (`HANDOFF.md` §4.333).
+    /// server never saw (`HANDOFF-archive.md` §4.333).
     #[test]
     fn an_out_of_order_open_is_not_mistaken_for_a_retired_stream() {
         let now = Instant::now();
@@ -6111,7 +6111,7 @@ mod tests {
 
     /// Credit goes out even when this end has nothing else to say.
     ///
-    /// The fourth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+    /// The fourth of the plan's eight lifecycle invariants (`HANDOFF-archive.md` §4.120):
     /// a reader that has drained its buffer must be able to tell the peer it may
     /// send more, and it must be able to do so **while its own writer is silent** —
     /// otherwise a one-way flow stalls the moment the receiver is the quiet end.
@@ -6119,7 +6119,7 @@ mod tests {
     /// nothing pinned it.
     #[test]
     fn credit_goes_out_from_an_end_that_has_nothing_else_to_send() {
-        // The fourth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+        // The fourth of the plan's eight lifecycle invariants (`HANDOFF-archive.md` §4.120):
         // a reader that has drained must tell the peer it may send more, and must be
         // able to do so **while its own writer is silent** — otherwise a one-way flow
         // stalls the moment the receiver is the quiet end. `build_packet` checks
@@ -6173,7 +6173,7 @@ mod tests {
     /// stream.
     ///
     /// `apply_datagram` guards this with `if !known`, and *nothing pinned it*
-    /// (`HANDOFF.md` §4.120). It is reachable without any pathological peer: an
+    /// (`HANDOFF-archive.md` §4.120). It is reachable without any pathological peer: an
     /// acknowledgement lost on the way back makes the sender re-send the opening
     /// packet, and a duplicate open that queued a second accept would hand the
     /// visitor's reader a stream the peer never opened — the failure the seam is
@@ -6235,7 +6235,7 @@ mod tests {
         let mut link = Link::new();
         // This test is about admission against the window, not about time: with the link's
         // delay in place a repair is declared and repairs are window-exempt by design, which
-        // is a different invariant (`HANDOFF.md` §4.206). Zero delay keeps the scenario the
+        // is a different invariant (`HANDOFF-archive.md` §4.206). Zero delay keeps the scenario the
         // one the assertion is about.
         link.delay = Duration::ZERO;
         link.pump(now);
@@ -6618,7 +6618,7 @@ mod tests {
     /// The prefix is the second confirmation path, and a lane whose cumulative frontier is pinned by one
     /// lost packet number confirms *everything* through it: `Acked::bytes` stays zero, `progress` stays
     /// false, and before this change the growth block never ran. Measured as a lane frozen at
-    /// `INITIAL_CWND` for 122 s while posting twenty times what it delivered (`HANDOFF.md` §4.181); the
+    /// `INITIAL_CWND` for 122 s while posting twenty times what it delivered (`HANDOFF-archive.md` §4.181); the
     /// question that entry left open is answered here in the code, and the cell measures the answer.
     ///
     /// The guard is what keeps a byte from paying twice: growth from the prefix only when the number path
@@ -6842,7 +6842,7 @@ mod tests {
     /// dialing end read `below=0` for its whole life, so the peer's cumulative
     /// frontier never advanced past the hole. That pins the *sender's* retirement to
     /// the 64-number bitmap and the per-stream byte prefix for the life of every
-    /// lane, which is exactly the shape the lossy cell shows (`HANDOFF.md` §4.181,
+    /// lane, which is exactly the shape the lossy cell shows (`HANDOFF-archive.md` §4.181,
     /// §4.182).
     ///
     /// This is the smallest reproduction: two connections, the dialer's first two
@@ -7090,7 +7090,7 @@ mod tests {
     /// that has carried megabytes over its life looks like bulk to that rule, and
     /// when one bulk stream with a blocked reader holds the connection's credit its
     /// next request waits for the peer to drain — measured as a **105-second**
-    /// silence on the step cell (`HANDOFF.md` §4.310).
+    /// silence on the step cell (`HANDOFF-archive.md` §4.310).
     ///
     /// What makes it interactive is its *flight*, not its history: between two
     /// requests it has nothing unacknowledged, and that is what the reserve is for.
@@ -7120,7 +7120,7 @@ mod tests {
     /// stream on the lane: the bulk stream whose visitor stopped reading holds the
     /// buffer, and the interactive stream's next request has no room. Measured as a
     /// 105-second silence on the step cell and a ten-second wedge in the soak
-    /// (`HANDOFF.md` §4.314). The reserve is what keeps that request moving, and it
+    /// (`HANDOFF-archive.md` §4.314). The reserve is what keeps that request moving, and it
     /// must not become room for bulk.
     #[test]
     fn a_frozen_frontier_admits_a_small_stream_and_refuses_bulk() {
@@ -7155,7 +7155,7 @@ mod tests {
     /// whose reader is slow can hold the lane's whole `MAX_BUFFERED`, and with
     /// `held` at zero a new channel's selector byte has nowhere to go: the channel
     /// opens on the client and never arrives, so the visitor's pairing expires with
-    /// nothing gathered (`HANDOFF.md` §4.331).
+    /// nothing gathered (`HANDOFF-archive.md` §4.331).
     #[test]
     fn a_full_buffer_still_admits_a_fresh_stream() {
         let mut conn = Conn::new(23, true);

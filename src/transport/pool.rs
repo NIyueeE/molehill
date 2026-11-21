@@ -200,7 +200,7 @@ pub(crate) struct Placement {
 /// what each service actually did, and the two classes it tells apart are the two
 /// the carriers differ on.
 ///
-/// The difference is measured, not assumed (`HANDOFF-archive.md` §4.500; ten-second
+/// The difference is measured, not assumed (§4.500; ten-second
 /// samples, the condition on the leg the carrier crosses): a conversational flow's
 /// tail is **11× tighter** on the datagram carrier at 1 % loss, because one lost
 /// segment costs the kernel carrier its 200 ms minimum retransmission timeout,
@@ -263,7 +263,7 @@ pub(crate) const CLASS_BULK_MARKS: usize = 4;
 /// to empty, remove it — and in a pool whose tunnels all hold a long-lived
 /// stream each cycle waits for a connection to end. Measured in the mixed `cost`
 /// cell, one spare per cycle cost three cycles for a three-tunnel move
-/// (`HANDOFF-archive.md` §4.505). Two spares halve the rounds without ever making the
+/// (§4.505). Two spares halve the rounds without ever making the
 /// pool more than two connections wide, which is the bound that keeps the
 /// operator's `tunnels` a statement about the deployment and not about a
 /// transient.
@@ -375,7 +375,7 @@ impl TrafficProfile {
 /// measured on the capacity ramp, the forwarding arm's interactive p99 went from
 /// 1.4 ms to **69 ms** at the fourth level while the same product's L3 arm — which
 /// never multiplexes a claim's flows together — held 1.4 ms to the eighth
-/// (`HANDOFF-archive.md` §4.507).
+/// (§4.507).
 ///
 /// Asking is still only asking: [`order_placement`]'s four tiers fall through to
 /// every other tunnel when the pool holds none of the wanted carrier, so a pool
@@ -407,7 +407,7 @@ pub(crate) fn carrier_for(class: ServiceClass) -> Option<Carrier> {
 /// carrier and eight stripes to place, a reorder put the first stripe there and
 /// every later one back on the other carrier, because the group's spread
 /// preference outranked the class — measured as a policy that moved no bulk
-/// traffic at all (`HANDOFF-archive.md` §4.505).
+/// traffic at all (§4.505).
 pub(crate) fn order_placement(
     order: &[usize],
     carriers: &[Carrier],

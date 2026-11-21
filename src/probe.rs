@@ -145,7 +145,7 @@ impl Lane {
     /// keys its connection table by — is the engine's own and unique per process
     /// (`pump::next_wire_id`). The pool label a caller used to pass here only
     /// ever named a lane in a log, and exposing it invited exactly the collision
-    /// it could not prevent (`HANDOFF.md` §4.100).
+    /// it could not prevent (`HANDOFF-archive.md` §4.100).
     ///
     /// The nonce is zero: a bare lane carries no tunnel hello, so it names no
     /// session — see the module docs for why that is the honest boundary rather
@@ -222,7 +222,7 @@ impl std::fmt::Debug for Listener {
 /// offset a datagram names. The decoder that knows is the carrier's own, so this exposes
 /// it read-only instead of letting the instrument re-implement the header — a second
 /// decoder is a second thing to be wrong, and the one that lies would be the one
-/// measuring (`HANDOFF.md` §4.189, §4.191).
+/// measuring (`HANDOFF-archive.md` §4.189, §4.191).
 ///
 /// `None` for anything this carrier cannot decode, including another protocol's bytes: a
 /// relay that guessed would report timings for traffic it does not understand.
@@ -279,7 +279,7 @@ pub fn describe(datagram: &[u8]) -> Option<Carried> {
 ///
 /// The product starts it from its own runtime, so the phase and reader-park
 /// lines are invisible to a separate crate like the bench harness — which is
-/// where the receive path has to be measured (`HANDOFF.md` §4.137). The switch
+/// where the receive path has to be measured (`HANDOFF-archive.md` §4.137). The switch
 /// is the product's own: with `MOLEHILL_MHD_STATS` unset this does nothing, so
 /// an ordinary harness run is unchanged.
 ///

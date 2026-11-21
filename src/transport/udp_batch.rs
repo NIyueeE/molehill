@@ -276,7 +276,7 @@ impl SendBatch {
             // the receiver gets fragments of a packet instead of the packet. That is how a
             // lane's first stream packet — the run is [credit, stream@0] — arrived as five
             // 17-byte fragments and was refused by the decoder on every lane
-            // (`HANDOFF.md` §4.210). The caller falls back to one datagram per span.
+            // (`HANDOFF-archive.md` §4.210). The caller falls back to one datagram per span.
             if n + 1 != limit || spans[n].len() > segment {
                 return Ok(0);
             }

@@ -80,7 +80,7 @@ enum Role {
     /// Its own role because the cell is not a workload — it is a state. Two lanes, one
     /// stream, three packets in flight, the middle one dropped, and the question is how
     /// long the carrier takes to re-send it *after a later packet has already proved it
-    /// missing* (`HANDOFF.md` §4.191). Nothing above the carrier is involved, and no
+    /// missing* (`HANDOFF-archive.md` §4.191). Nothing above the carrier is involved, and no
     /// product setting is touched: the drop happens in a relay socket this process owns.
     Shallow,
 }
@@ -108,7 +108,7 @@ struct Args {
     ///
     /// The cell is worthless without it: a lane with no round-trip sample has
     /// `loss_delay` at its millisecond floor, so the drop is declared before the path
-    /// has said anything (`HANDOFF.md` §4.193). One exchange first seeds the estimate.
+    /// has said anything (`HANDOFF-archive.md` §4.193). One exchange first seeds the estimate.
     warmup_ms: u64,
     /// Which stream the drop box takes its victim from, counting distinct streams.
     ///
@@ -121,7 +121,7 @@ struct Args {
     /// The idle cost of a live lane had no instrument at all: the pump wakes at
     /// `READ_POLL` (1 ms) while any stream is live, so the design says up to a
     /// thousand wake-ups a second per lane, and nobody had measured what that
-    /// costs (`HANDOFF.md` §4.147). This holds the stream open so the process's
+    /// costs (`HANDOFF-archive.md` §4.147). This holds the stream open so the process's
     /// own CPU can be sampled.
     hold_ms: u64,
 }
@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
     init_tracing();
     // The product's own per-second carrier lines: phases, reader parks, wake latency.
     // Gated on `MOLEHILL_MHD_STATS` inside, so an ordinary run prints nothing
-    // (`HANDOFF.md` §4.137).
+    // (`HANDOFF-archive.md` §4.137).
     molehill_rathole::probe::start_stats();
     let args = parse_args()?;
     match (args.role, args.mode) {
@@ -534,7 +534,7 @@ async fn client_tcp(args: &Args) -> Result<()> {
 /// The shallow-flight cell: two lanes, a drop box, and how late the repair is.
 ///
 /// **What it measures.** The carrier's loss detection, at the shape RACK was refused
-/// for (`HANDOFF.md` §4.189): a stream whose flight is three packets. The box drops the
+/// for (`HANDOFF-archive.md` §4.189): a stream whose flight is three packets. The box drops the
 /// second stream datagram, timestamps the next one through (which is later evidence that
 /// the dropped range is missing), and timestamps the first datagram that carries that
 /// range again. The difference between those two is the number a delivery-time-based
@@ -836,7 +836,7 @@ async fn client_mhd(args: &Args) -> Result<()> {
 
     // **The warm-up, before anything is measured.** A lane with no round-trip sample
     // declares a loss at `loss_delay`'s millisecond floor, which is a statement about a
-    // state no shaped path stays in (`HANDOFF.md` §4.193). One throwaway exchange on
+    // state no shaped path stays in (`HANDOFF-archive.md` §4.193). One throwaway exchange on
     // this lane seeds the estimate; its echo is never read, and the exchange it belongs
     // to is the one the drop box ignores (`--drop-stream`).
     if args.warmup_ms > 0 {
@@ -908,7 +908,7 @@ async fn client_mhd(args: &Args) -> Result<()> {
         bail!("{failed} of {} requests failed", args.requests);
     }
     // Hold the lane open and idle, so its polling cost can be sampled from
-    // outside (`HANDOFF.md` §4.151). **A stream has to be open for that to be the
+    // outside (`HANDOFF-archive.md` §4.151). **A stream has to be open for that to be the
     // cost it claims to measure**: the requests above finish their streams, so a
     // plain hold is an idle *connection* with no streams — measured as `live=false`
     // on both ends, and a different (cheaper) thing.

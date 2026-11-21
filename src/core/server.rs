@@ -99,7 +99,7 @@ const PAIR_WAIT_BUDGET: Duration = Duration::from_secs(5);
 ///
 /// A refusal is the pool saying it has nothing now, so the retry must not be
 /// instantaneous: a saturated pool would be asked again and again, and every
-/// attempt parks a channel (`HANDOFF-archive.md` §4.469). Two orders of magnitude under
+/// attempt parks a channel (§4.469). Two orders of magnitude under
 /// the budget it replaced, which is the part that mattered.
 const PAIR_RETRY_GRACE: Duration = Duration::from_millis(50);
 
@@ -1334,7 +1334,7 @@ async fn handle_session_cmd(
         // A refusal is the one thing a gather can learn without waiting for the
         // budget: the group can never complete, so the pairing that is waiting
         // for it is told at once rather than five seconds from now
-        // (`HANDOFF-archive.md` §4.460).
+        // (§4.460).
         Ok(SessionCmd::ChannelRefused(id, group)) => {
             if let Ok(queues) = ctx.queues.lock()
                 && let Some(queue) = queues.get(&id)
@@ -1379,7 +1379,7 @@ async fn answer_lane_drain(
 /// server-side policy every registration is checked against.
 struct SessionCtx {
     /// Each registered service's data-channel queue, so a `ChannelRefused` can
-    /// reach the pairing waiting on that group (`HANDOFF-archive.md` §4.460).
+    /// reach the pairing waiting on that group (§4.460).
     queues: std::sync::Mutex<HashMap<ServiceId, std::sync::Arc<ChannelQueue<DataChannel>>>>,
     nonce: Nonce,
     /// The session credential — the server's default token bound to the nonce.
@@ -2424,7 +2424,7 @@ async fn wrap_mhd_stream(
     let mut claimed_registered = false;
     // **Which stream this task is reading, before it reads.** A selector timeout is
     // the only line a stuck channel leaves, and it carries no id, so it cannot be
-    // joined to the packet that created the stream (`HANDOFF.md` §4.339). This can.
+    // joined to the packet that created the stream (`HANDOFF-archive.md` §4.339). This can.
     if crate::transport::stats::enabled() {
         tracing::debug!(stream = stream_id_now, "mhd accept: reading the selector");
     }
@@ -2433,7 +2433,7 @@ async fn wrap_mhd_stream(
         // **The stuck channel, named where it gives up.** The timeout's own line
         // carries no id, so it could not be joined to the packet that created the
         // stream or to the line that retired it -- and those three are the whole
-        // question (`HANDOFF.md` §4.342).
+        // question (`HANDOFF-archive.md` §4.342).
         tracing::debug!(
             stream = stream_id_now,
             "mhd accept: selector deadline reached"
@@ -2456,7 +2456,7 @@ async fn wrap_mhd_stream(
         // registration, so a later sealed stream has nothing new to hear back either.
         // Without it the sealed path waited for an acknowledgement the plain path had
         // already stopped waiting for, at one round trip per channel open
-        // (`HANDOFF.md` §4.303).
+        // (`HANDOFF-archive.md` §4.303).
         crate::protocol::REGISTERED_SELECTOR | crate::protocol::DERIVED_REGISTERED_SELECTOR => {
             claimed_registered = true;
             stream
@@ -2632,7 +2632,7 @@ async fn serve_mhd_stream(
                 // registration here), so a lane's **first** establishment never charged
                 // `[server.data].max_tunnels` — measured with the valve at one: a
                 // TCP tunnel plus an mhd lane, and the pool reporting two tunnels while
-                // the valve had refused nothing at all (`HANDOFF-archive.md` §4.496).
+                // the valve had refused nothing at all (§4.496).
                 // **The peer says the lane is registered; this end holds none.**
                 // That happens when a lane was rebuilt — a repair, a restart of the
                 // session's lane — while the client's claim, derived from its own
@@ -3783,7 +3783,7 @@ pub(crate) struct ChannelQueue<C> {
     ///
     /// A refusal is the one thing a gather can learn **without waiting**: a
     /// channel that never arrives looks exactly like a slow one, so the pairing
-    /// had to sit out its whole budget (`HANDOFF-archive.md` §4.460). A group in here can
+    /// had to sit out its whole budget (§4.460). A group in here can
     /// never complete, so the pairing sheds its visitor at once.
     refused: std::sync::Mutex<std::collections::HashSet<u32>>,
     /// Wakes the pairings waiting on `refused`: `notify_waiters` rather than one,
@@ -4704,7 +4704,7 @@ where
                 // A refused channel costs **this attempt**, not the visitor: it is
                 // the one failure the gather can see without waiting, so the retry a
                 // budget expiry pays five seconds for can start after a short grace
-                // (`HANDOFF-archive.md` §4.460, §4.469).
+                // (§4.460, §4.469).
                 () = data_ch_rx.refused(group) => {
                     attempts += 1;
                     debug!(

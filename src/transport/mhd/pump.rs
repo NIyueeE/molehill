@@ -245,7 +245,7 @@ fn report_window(shared: &Arc<Shared>) {
         // **The tail's own reading.** `worst_ready_ms` above keys on the biggest
         // backlog, which in a mixed cell is bulk by construction; this one keys on
         // streams small enough to be interactive, and is the number the interactive
-        // tail question actually needs (`HANDOFF.md` §4.300).
+        // tail question actually needs (`HANDOFF-archive.md` §4.300).
         let (small_ready_stream, small_ready_ms, small_ready_bytes) = conn
             .small_ready_wait(now)
             .map_or((0, 0, 0), |(id, waited, bytes)| {
@@ -292,7 +292,7 @@ fn report_window(shared: &Arc<Shared>) {
             repairs_above = conn.repair_sides().1,
             // Its own field: `repairs_at_base` counts every frontier repair, which
             // is the ordinary loss path, so the rescue's rate cannot be read out
-            // of it (`HANDOFF.md` §4.289).
+            // of it (`HANDOFF-archive.md` §4.289).
             stall_rescues = conn.stall_rescues(),
             parked_writers = conn
                 .parked_writers(now, std::time::Duration::from_millis(50))
@@ -340,14 +340,14 @@ fn report_window(shared: &Arc<Shared>) {
             // ceiling of streams, and an open refused by that ceiling is refused
             // *without* a placement wait — measured as a visitor's dial refused for
             // three minutes while the pool read size 4 with no placement line and no
-            // size change at all (`HANDOFF.md` §4.322).
+            // size change at all (`HANDOFF-archive.md` §4.322).
             streams = conn.stream_count(),
             // The frontier this end advertises, and the largest number it has seen:
             // a `below` that sits still while `largest` climbs pins every above it
-            // and is the loop §4.343 found (`HANDOFF.md` §4.344).
+            // and is the loop §4.343 found (`HANDOFF-archive.md` §4.344).
             // The queues an instance carries, beside the streams it holds: the one
             // family of numbers that is not measured anywhere and is the shape an
-            // accumulation would take (`HANDOFF.md` §4.357).
+            // accumulation would take (`HANDOFF-archive.md` §4.357).
             inbound_len = conn.queue_sizes().0,
             finishing_len = conn.queue_sizes().1,
             opened_len = conn.queue_sizes().2,
@@ -374,7 +374,7 @@ fn report_window(shared: &Arc<Shared>) {
             ack_largest = conn.ack_frontier().0,
             // The oldest resident and why it is still there, beside the count: a
             // full lane is `streams=` alone, and which population filled it is this
-            // (`HANDOFF.md` §4.328).
+            // (`HANDOFF-archive.md` §4.328).
             oldest_stream_ms = conn
                 .oldest_stream(now)
                 .map_or(0, |(_, age, _, _)| {
@@ -477,7 +477,7 @@ fn format_cycle(passes: &[u64; 14]) -> String {
 /// pass; it cannot answer "was this pass late", because a pass that posts 64
 /// bytes 21 ms after the writer asked for them still took microseconds once it
 /// ran. Joined to the writer's own epoch stamp this is the leg between *queued*
-/// and *on the wire* (`HANDOFF.md` §4.100).
+/// and *on the wire* (`HANDOFF-archive.md` §4.100).
 ///
 /// Only a small run is stamped: a request/response lane posts one or two
 /// datagrams per pass, while a bulk lane posts a full run per pass and would turn
@@ -500,7 +500,7 @@ fn note_run_posted(sampled: bool, sent: usize) {
 ///
 /// Its own function because `flush` is at the lint's line budget, and because the
 /// fields answer one question rather than describing a step of the pass: which
-/// stream, why, and — since `HANDOFF.md` §4.107 — whether the numbers this end
+/// stream, why, and — since `HANDOFF-archive.md` §4.107 — whether the numbers this end
 /// waits for can still be named by the peer's acknowledgement block at all.
 fn log_stall(shared: &Arc<Shared>) {
     let Some(stall) = shared.with(|conn| conn.stall_report(Instant::now())) else {
@@ -510,7 +510,7 @@ fn log_stall(shared: &Arc<Shared>) {
     // **The lane, because a stall line without one cannot be paired with the other
     // end.** Reading these fields beside a window line from a *different* lane is
     // exactly the mistake that made "this end receives nothing" look true for a
-    // minute (`HANDOFF.md` §4.109).
+    // minute (`HANDOFF-archive.md` §4.109).
     let lane = shared.with(|conn| conn.wire_id());
     tracing::debug!(
         lane,
@@ -533,7 +533,7 @@ fn log_stall(shared: &Arc<Shared>) {
         // and the numbers this end is still waiting for. A flight number more
         // than 64 below the peer's `largest` can never be named again, which is
         // the difference between "not acknowledged yet" and "cannot be
-        // acknowledged" (`HANDOFF.md` §4.107).
+        // acknowledged" (`HANDOFF-archive.md` §4.107).
         recv_below = stall.recv_below,
         recv_largest = stall.recv_largest,
         recv_prefix = stall.recv_prefix,
@@ -744,7 +744,7 @@ fn drain_ready(socket: &UdpSocket, _batch: &mut (), shared: &Arc<Shared>, peer: 
 /// once per wake-up therefore caps a reader at its own loop rate, and that cap was
 /// the striped stall: the listener was woken about 690 times a second, took one
 /// datagram each time, and the kernel dropped 97 % of a direction that arrived at
-/// ten times that rate (`HANDOFF.md` §4.114).
+/// ten times that rate (`HANDOFF-archive.md` §4.114).
 ///
 /// So one wake-up reads until the socket is empty. A `WouldBlock` ends the drain
 /// and — because it comes out of `try_io` — clears the cached readiness, which is
@@ -813,7 +813,7 @@ enum Wake {
 /// **A bound on a recovery cost, not a fix for its cause.** A lone datagram
 /// arriving on a parked pump is sometimes not seen until the pump's own timer
 /// fires, and that timer is the retransmission deadline: 20 ms with one packet in
-/// flight. Measured on loopback (`HANDOFF.md` §4.101), the boundary is exact — a
+/// flight. Measured on loopback (`HANDOFF-archive.md` §4.101), the boundary is exact — a
 /// 1 349-byte request (one datagram) stalls 19–23 times in 120, and a 1 350-byte
 /// request (two datagrams) never does, because a second datagram is a second
 /// readiness edge and one of them is always seen.
@@ -884,7 +884,7 @@ pub(crate) fn spawn(
                 let n = shared
                     .with(|conn| conn.starved_streams(now, std::time::Duration::from_secs(1)));
                 // A stream both directions have finished has nothing left to wait for, and
-                // no event will come back for it (`HANDOFF-archive.md` §4.439).
+                // no event will come back for it (§4.439).
                 shared.with(|conn| {
                     conn.retire_finished();
                 });
@@ -1199,7 +1199,7 @@ impl MhdLane {
     ///   registration, so a later sealed stream has nothing new to hear back either.
     ///   This case was missing, and it cost **one round trip inside every channel
     ///   open** on a shaped path: 200 213 µs at p50 over 264 opens in a round
-    ///   (`HANDOFF.md` §4.303).
+    ///   (`HANDOFF-archive.md` §4.303).
     ///
     /// A lane that has **not** registered still waits, and so does a Noise lane that
     /// carries its hello in the handshake (it pays nothing extra for the answer).
@@ -1264,7 +1264,7 @@ impl MhdLane {
             // has registered says so, and the server then owes it no acknowledgement
             // — the same rule the plain path has had since `REGISTERED_SELECTOR`, and
             // the one whose absence made every sealed open wait a round trip
-            // (`HANDOFF.md` §4.303).
+            // (`HANDOFF-archive.md` §4.303).
             let selector = if self.registered.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::protocol::DERIVED_REGISTERED_SELECTOR
             } else {
@@ -1692,7 +1692,7 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
 /// Split from the pump's count because one `receive` serves both readers: summing
 /// them together made a listener that read 20 000 a second indistinguishable from
 /// a pump that did, and those are different defects in different places
-/// (`HANDOFF.md` §4.113).
+/// (`HANDOFF-archive.md` §4.113).
 static LISTENER_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Datagrams taken from a **dialing lane's** own socket, since the last report.
@@ -1712,7 +1712,7 @@ static ROUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// not opening a stream, is discarded with no counter and no line — which is
 /// indistinguishable from a sender that never posted it, and for a whole round
 /// that ambiguity hid a direction losing 97 % of its datagrams
-/// (`HANDOFF.md` §4.111).
+/// (`HANDOFF-archive.md` §4.111).
 static UNROUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Default)]
@@ -1795,7 +1795,7 @@ pub(crate) struct MhdListener {
     _sockets: Vec<Arc<UdpSocket>>,
     /// One handle per dispatcher, so a test can wait for the task to **end**
     /// rather than infer it from the stop channel having been set
-    /// (`HANDOFF.md` §4.172). Dropping a handle detaches, which is what the
+    /// (`HANDOFF-archive.md` §4.172). Dropping a handle detaches, which is what the
     /// listener did before it kept them.
     #[cfg_attr(
         not(test),
@@ -1883,7 +1883,7 @@ fn spawn_dispatcher(
                         // datagram of one direction looked exactly like one that
                         // received none — the difference between "the sender never
                         // posted it" and "the receiver threw it away"
-                        // (`HANDOFF.md` §4.111). It feeds the same per-second
+                        // (`HANDOFF-archive.md` §4.111). It feeds the same per-second
                         // refusal line the connection-level rejects use.
                         crate::transport::stats::note_rejected("malformed_decode");
                         return;
@@ -1948,7 +1948,7 @@ fn spawn_dispatcher(
                             // path logged it, so a lane whose opening datagram was
                             // refused said nothing at all — and the artifact shows
                             // every accepting end's first sighting one number too
-                            // high (`HANDOFF.md` §4.182). A refusal on the admitting
+                            // high (`HANDOFF-archive.md` §4.182). A refusal on the admitting
                             // call is the one place that can explain a missing number
                             // zero.
                             if let Err(reason) = conn.on_datagram(now, datagram) {
@@ -2081,7 +2081,7 @@ impl MhdListener {
     /// here: this takes `&self`, and a struct that cleared its own handles would
     /// have to be `&mut`. So the port is free once the listener is gone, which is
     /// what a shutting-down server does — `close_all` then drop — and the
-    /// rebound-port test (`HANDOFF.md` §4.172) exercises exactly that order.
+    /// rebound-port test (`HANDOFF-archive.md` §4.172) exercises exactly that order.
     pub(crate) fn close_all(&self) {
         let _ = self.stop.send(true);
         let mut table = self.registry.lock();
@@ -2117,7 +2117,7 @@ impl Drop for MhdListener {
 /// the first lane of *every* client, and the second client's packets were
 /// delivered to the first one's connection, which accepted them because
 /// `apply_datagram` only rejects a packet whose id differs from its own
-/// (`HANDOFF.md` §4.100).
+/// (`HANDOFF-archive.md` §4.100).
 ///
 /// A random *seed* rather than a random value per lane: the sequence keeps one
 /// process's own lanes distinct by construction, so the only way to collide is
@@ -2680,7 +2680,7 @@ mod tests {
 
     /// Closing a lane lets its pump go, and with it the socket.
     ///
-    /// The sixth of the plan's eight lifecycle invariants (`HANDOFF.md` §4.120):
+    /// The sixth of the plan's eight lifecycle invariants (`HANDOFF-archive.md` §4.120):
     /// "close releases pump, dispatcher, socket and receive". Nothing asserted any
     /// of the four, and a pump that outlives its lane keeps the port bound — under
     /// `SO_REUSEPORT` a restarted server's traffic can land on the dead one.
@@ -2691,7 +2691,7 @@ mod tests {
     /// task ends, and it drops its handle on the socket on the way out.
     /// A closed listener's dispatchers **end**, and the port is released with them.
     ///
-    /// The sixth lifecycle invariant (`HANDOFF.md` §4.120, #6, closed in §4.172):
+    /// The sixth lifecycle invariant (`HANDOFF-archive.md` §4.120, #6, closed in §4.172):
     /// "close releases pump, dispatcher, socket and receive". The pump half is
     /// `a_closed_lane_lets_its_pump_go`; this is the dispatcher half, and it asserts
     /// the *task ends* and its socket handle goes — setting the stop channel is what
@@ -2767,7 +2767,7 @@ mod tests {
 
     /// A connection table at its cap refuses a new id and inserts nothing.
     ///
-    /// §4.120 #7's admission half (`HANDOFF.md` §4.172): the refusal path is where a
+    /// §4.120 #7's admission half (`HANDOFF-archive.md` §4.172): the refusal path is where a
     /// leak would live — a table that grows past `MAX_CONNECTIONS`, or one that
     /// inserts and then reports failure, both look the same from a counter.
     #[test]
