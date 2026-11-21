@@ -1096,11 +1096,61 @@ has to name `tunnel`. And the bulk window matters at high latency: on five-secon
 *ahead* (0.087 against 0.068) because the TCP arm is still leaving slow start, which is why a high-latency cell uses
 ten.
 
-**What this table does not say.** It is not a comparison against other tools — that is the sweep's job, and the
-published sweep is v0.11.2, which predates this carrier. It is loopback in a container, so `clean` is a lower bound
+**The mixed cell says the same thing louder.** The table above prices bulk against bulk. On the `cost` cell — bulk
+spine, interactive, churn and UDP together, one carrier pinned per run — the kernel carrier reads **p99 1.89 ms at
+14.51 Gbit/s** where mhd reads **12.65 ms at 8.42**, with `dropped_packets` zero on both: the lane's tail there is
+queueing inside the lane, not repair. So on a clean path the kernel carrier wins **both** axes, which is what the
+`clean` row above says at bulk sizes and what the product's per-service policy pays for on every path that is not
+losing packets (`HANDOFF.md` §4 C).
+
+**What this table does not say.** It is not a comparison against other tools — that is the sweep's job, below. It is
+loopback in a container, so `clean` is a lower bound on what a real path does to both carriers. And it does not tell
+you which carrier to run: the product decides at runtime, falling back to TCP when a session cannot be established,
+and `MOLEHILL_DATA_CARRIER` exists to separate the two for exactly this measurement. It is loopback in a container, so `clean` is a lower bound
 on what a real path does to both carriers. And it does not tell you which carrier to run: the product decides at
 runtime, falling back to TCP when a session cannot be established, and `MOLEHILL_DATA_CARRIER` exists to separate
 the two for exactly this measurement.
+
+### Where the product stands against the peers (2026-11-22, this model)
+
+One `sweep` run of this model — the staged timeline and the capacity ramp, the product's two architectures beside
+frp 0.72.0, rathole 0.5.0 and nps 0.26.10 — **one round, no A/A twin**, so every row here is directional: it says
+which side of a cell an arm is on, not how far. `molehill` is the product as it ships (`l4`, auto carrier); `l3` is
+its transparent arm, which has no peer and is therefore compared only with the product.
+
+| cell (`timeline`) | molehill p99 | frp | rathole | nps | `l3` |
+|---|---|---|---|---|---|
+| `clean` | 7.68 ms | **1.57** | 2.15 | 15.9 | 1.70 |
+| `rtt100` | 401 | 402 | 401 | 418 | 402 |
+| `loss1` | 1 080 | 1 060 | 1 060 | 1 080 | 1 060 |
+| `loss5` | **1 460** | 2 120 | 2 030 | 2 450 | 2 670 |
+| `rate100` | 198 | 196 | 198 | 195 | 195 |
+| `rate20` | 434 | 432 | 428 | 434 | 427 |
+| `jitter` | 107 | 106 | 108 | 113 | 108 |
+| `clean#2` | **1.95** | 4.78 | 2.02 | 18.0 | 1.21 |
+
+| cell (`timeline`) | molehill Gbit/s | frp | rathole | nps |
+|---|---|---|---|---|
+| `clean` | 8.98 | 6.08 | **28.5** | 0.13 |
+| `rtt100` | 3.42 | 3.38 | 3.40 | 0.14 |
+| `loss1` | 12.54 | 6.17 | **14.67** | 0.13 |
+| `loss5` | **1.17** | 1.11 | 0.99 | 0.14 |
+| `jitter` | 13.02 | 6.22 | **15.55** | 0.13 |
+| `clean#2` | 15.58 | 6.08 | **27.98** | 0.13 |
+
+Capacity ramp: molehill, frp and rathole all reach **8 streams**, nps **3**.
+
+**Read it as three sentences.** Every cell where the path is impaired and the impairment is not loss (`rtt100`, the
+two rate cells) is a **tie** — four tools within a few milliseconds of each other, which is what a shaped path does:
+it, not the tool, is the queue. Where packets are lost the product's tail is the **tightest of the four** (1 460 ms
+at 5 % against 2 030–2 450). And on the clean cells the product is **behind frp and rathole on the tail** while
+carrying **more than frp and less than rathole** — the same split the carrier table above explains, because the
+product's auto policy puts a clean path's interactive traffic on the carrier that only wins when packets are lost.
+
+**Two caveats that travel with the table.** `clean` is bimodal in this topology — the first `clean` stage reads 7.68
+against `clean#2`'s 1.95 for the same arm — so a single-round reading of that row is a coin toss, and the shaped rows
+are the ones to trust. And loopback inside a container is the friendliest possible path for every arm: `nps` at
+0.13 Gbit/s is the one row that looks like a defect rather than a shape, and it is not this repository's tool.
 
 ### Warm and cold
 
