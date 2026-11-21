@@ -44,6 +44,26 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.525 (the path question is settled: the lanes carry it, and the old record-layer count was a multi-round mix).**
+> One pinned run with both instruments on both ends (`MOLEHILL_MHD_STATS=1`, `MOLEHILL_TUNNEL_STATS=1`, `bulk-n`, one round):
+>
+> | end | `tx_bytes` (lane) | `lane_seal_n` | `seal_n` (record layer) |
+> |---|---|---|---|
+> | server | **8.05 GB** | **5 758 954** = `tx_datagrams` | **24** |
+> | client | 4.9 MB | 16 | 18 |
+>
+> So the payload rides the lane, seal and all, and the record layer sees the control channel only — 6.14 s of lane cipher for
+> 8.05 GB, **0.76 s/Gbit**, the same figure as §4.521.
+>
+> Which means §4.520's puzzle was not a contradiction at all: that run's log was **cumulative across a warm-up and three measured
+> rounds**, and a round that starts before the pool has established a lane opens **direct TCP+Noise channels** for its first
+> visitors. The record layer's 305 308 seals were those rounds' traffic, and the client's `carrier="mhd"` lines described the
+> pool, both truthfully, in one file. A single-round run removes the ambiguity — and it also means any counter read from a
+> multi-round workdir has to say which round it belongs to before it is used.
+>
+> Nothing in the floor's numbers changes: the sealed arm's lane cost is 0.76–0.78 s/Gbit across four independent runs, the
+> record-sealed arm's is 0.51, and the difference is the AEAD unit.
+
 > **§4.524 (the plan's last floor is restated, and 定型 is withheld for one more round).**
 > §一's floor asked sealed bulk to reach 85 % of unsealed, and §4.522–§4.523 established that those two arms are two *encryption
 > architectures*: both encrypt, one per 1 399-byte datagram and one per 32 KiB record, at 0.78 against 0.51 s/Gbit, with
