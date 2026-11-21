@@ -44,21 +44,39 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
-> **§4.513 (the seal floor re-measured: 79.4 %, and the gap is not the cipher's CPU).**
-> Two runs with the carrier pinned (`MOLEHILL_DATA_CARRIER=mhd`, `bulk-n`, clean, six rounds), one per side of the hatch:
-> sealed **10.376 Gbit/s** at `cpu_s_per_gbit` **0.998**, unsealed **13.075** at **0.915** — **79.4 %**, against the 85 % the
-> floor asks for and the 85.6 % / 84.0 % this cell read earlier. **The revealing part is the CPU**: sealing costs **+9 %**
-> CPU per carried Gbit, and the cell loses **20.6 %** of its throughput. A path that pays 9 % more per byte does not lose a
-> fifth of its rate unless something other than the cipher is serialising, so the next instrument for this floor is the
-> pump's seal phase at this load (`MOLEHILL_MHD_STATS=1` gives `tx_build`/`tx_send`), not another round of rounds. The `l3`
-> arm read 10.38 / 10.43 in both runs, which is expected — the L3 topology sets `data_enable = false`, so its claims never
-> sealed and the hatch is invisible to it.
+> **§4.514 (a pinned carrier was not pinned — the mix policy dialled the other carrier under
+> `MOLEHILL_DATA_CARRIER`, and that is a measurement defect, not a feature).**
+> Found while re-running the seal floor: the pinned run's own log says `pool-stats: this session carries both kinds of
+> service; adding one tunnel on the short carrier`, under `MOLEHILL_DATA_CARRIER=mhd`. The pin set the *preference* only,
+> and the mix branch of `target_mix` never consulted it — so any pinned run whose session showed both traffic classes
+> (a bulk scenario beside a liveness probe on the echo service is enough) grew kernel-carrier spares mid-run. **Every
+> pinned-mhd reading in these records is therefore a reading of a mixed pool**, and the ones taken since the class policy
+> landed are suspect by that much.
 >
-> **And a provenance gap this run exposed**: `MOLEHILL_MHD_SEAL` was **not in the bench's recorded switches**, so two runs
-> that measure opposite sides of it produced identical fingerprints — the one thing the meta exists to prevent. It is in the
-> list now (`bench/src/bench/runner.py`), and the hatch is documented in [configuration.md](docs/configuration.md)
-> ("Diagnostics switches") in both languages: it turns the confidentiality of every `mhd` lane payload off, which a page that
-> says "every data and lane channel is protected" has to say out loud.
+> Fixed at the root: `target_mix` now returns `None` whenever the carrier is forced, so a pinned process keeps one carrier
+> for the whole run — which is what the switch says it does ("an operator who asked for mhd gets mhd's failure rather than a
+> silent downgrade"). It cannot be unit-tested in-process (`forced_carrier()` is `None` under `#[cfg(test)]` by design, so a
+> test binary does not read the environment it inherited); the evidence is the pinned runs' logs before and after, and the
+> integration suites under both pins.
+
+> **§4.513 (the seal floor: 78.9 %, and the gap is not the cipher's CPU).**
+> Two runs with the carrier pinned (`MOLEHILL_DATA_CARRIER=mhd`, `bulk-n`, clean, six rounds), one per side of the hatch, and
+> **after** §4.514's fix so both sides are honestly single-carrier: sealed **10.367 Gbit/s** at `cpu_s_per_gbit` **1.008**,
+> unsealed **13.141** at **0.910** — **78.9 %**, against the 85 % the floor asks for and the 85.6 % / 84.0 % this cell read
+> earlier. Both runs now record `MOLEHILL_MHD_SEAL` in their fingerprint (it was missing from the bench's switch list until
+> this round: two runs measuring its two sides had identical fingerprints).
+>
+> **The revealing part is the CPU**: sealing costs **+9 %** CPU per carried Gbit and the cell loses **21 %** of its
+> throughput. A path that pays 9 % more per byte does not lose a fifth of its rate unless something other than the cipher
+> is serialising — and the shape fits one thing: a lane's send path builds and seals its runs on **one** task, so the cipher
+> is on a serialised critical path, not spread over the process's cores. That is the hypothesis the next instrument has to
+> settle, and the instrument is the pump's own phase line (`tx_build`/`tx_send`); the first attempt to read it through
+> `just bench phases` reported "no carrier counters in this round" while the logs carry the line (`tx_build_us=0
+> tx_build_n=0` on the *client*, which is the receiving end of this upload) — so the tool's rule for which line belongs to
+> a round needs the same look before the number can be read.
+>
+> The `l3` arm read 10.38 / 10.43 in both runs, as expected: the L3 topology sets `data_enable = false`, so its claims never
+> sealed and the hatch is invisible to it.
 
 > **§4.511 (what the kernel's 46 % is made of: two socket syscalls per 24 KiB — and the layer §4.509 blamed for a fifth of the
 > cycles is one percent of them).**
