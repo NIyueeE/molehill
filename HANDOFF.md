@@ -38,7 +38,10 @@ Read `AGENTS.md` first for the rules; read this for the state.
 > the visitor leg tie (1 045 against 1 084). That is the controlled comparison the schedule is for, and it is the same direction
 > §4 G measured at full scale.
 > **Cost, stated because it is real**: ~35 s of drain per stage on top of a 120 s hold, so the release sweep is **~4 hours** for
-> five arms. `docs/release.md` and the profiles table say so.
+> five arms (budget raised to 15 000 s accordingly). `docs/release.md` and the profiles table say so. And **the tree is frozen
+> while a release run is in flight**: two plotter/list commits landed three minutes into the first attempt at this run and made
+> its record unusable for a release (`githooks/pre-tag` diffs the record's revision against the tag commit under
+> `bench/src/bench/`), so that attempt was killed at minute ten and replaced.
 
 > **§4.533 (the release audit: `just tag-check` goes from three failures to a pass, and the sweep withdrew one published claim).**
 > **What the tag review wanted was not code.** `[Unreleased]` held 24 entries the dated `## [1.0.0] - 2026-11-01` section did not
