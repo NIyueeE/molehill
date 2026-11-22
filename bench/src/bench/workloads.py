@@ -60,7 +60,7 @@ UDP_PROBE = HERE / "probes" / "udp.py"
 #: travels through the same queue, so the writer cannot finish ahead of the
 #: bytes that preceded it.
 ECHO_SRC = """
-import queue, socket, sys, threading
+import queue, socket, sys, threading, time
 from contextlib import suppress
 
 port = int(sys.argv[1])
@@ -78,6 +78,70 @@ QUEUE_DEPTH = 64
 ANNOUNCE_OVER = 64 << 10
 
 EOF = object()
+
+#: A probe names itself in its first four bytes, so one backend can serve the
+#: echo and this without a second port or a second service in every arm's
+#: config: `HC01` is a visitor that will half-close its own direction. The peek
+#: is non-destructive, so a plain visitor's bytes are untouched and the echo path
+#: is the one every other scenario already measured.
+HALF_CLOSE = b"HC01"
+#: How much the backend still owes a visitor after that visitor said it is done
+#: sending. A tool that treats a half-close as a close delivers zero.
+TAIL_BYTES = 65536
+
+
+def peek_mode(conn):
+    # The probe's magic if one is coming, else None, without consuming bytes.
+    # A plain visitor may legitimately say nothing for a while (nothing in this
+    # model does, but a backend must not depend on that), so the wait is bounded
+    # and a timeout means "the echo".
+    end = time.time() + 1.0
+    head = b""
+    while len(head) < 4:
+        left = end - time.time()
+        if left <= 0:
+            return None
+        conn.settimeout(left)
+        try:
+            more = conn.recv(4 - len(head), socket.MSG_PEEK)
+        except (OSError, socket.timeout):
+            return None
+        if not more:
+            return None
+        head += more
+    conn.settimeout(None)
+    return head
+
+
+def take(conn, count):
+    # Consume exactly `count` bytes; the peek above promised they are there.
+    got = 0
+    while got < count:
+        more = conn.recv(count - got)
+        if not more:
+            return False
+        got += len(more)
+    return True
+
+
+def serve_half_close(conn):
+    # Read until the visitor half-closes, *then* answer. That is the whole
+    # cell: the answer is only owed after the visitor has said it will send
+    # nothing more, so a tool that forwards a half-close as a close loses it and
+    # one that half-closes the pair delivers it.
+    while True:
+        data = conn.recv(65536)
+        if not data:
+            break
+    pattern = bytes(range(256)) * (TAIL_BYTES // 256)
+    try:
+        conn.sendall(pattern)
+    except OSError:
+        sys.stdout.write(f"HALFCLOSE WROTE 0\\n")
+        sys.stdout.flush()
+        return
+    sys.stdout.write(f"HALFCLOSE WROTE {len(pattern)}\\n")
+    sys.stdout.flush()
 
 
 def udp_echo():
@@ -98,6 +162,12 @@ threading.Thread(target=udp_echo, daemon=True).start()
 def serve(conn, addr):
     sys.stdout.write(f"PEER {addr[0]}:{addr[1]}\\n")
     sys.stdout.flush()
+    mode = peek_mode(conn)
+    if mode == HALF_CLOSE and take(conn, 4):
+        serve_half_close(conn)
+        with suppress(OSError):
+            conn.close()
+        return
     q = queue.Queue(maxsize=QUEUE_DEPTH)
     done = threading.Event()
     taken = [0]
@@ -171,6 +241,60 @@ print(f"ECHO READY {port}", flush=True)
 while True:
     conn, addr = srv.accept()
     threading.Thread(target=serve, args=(conn, addr), daemon=True).start()
+"""
+
+
+#: The visitor-side probe the half-close cell drives. It runs inside the visitor
+#: namespace, so its traffic crosses the same shaped path every other cell's
+#: does, and it prints one JSON line: the runner owns the verdict, the probe owns
+#: only what the sockets did.
+PROBE_SRC = """
+import json, socket, sys, time
+
+mode, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+
+def dial(timeout):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((host, port))
+    return sock
+
+
+def close_quietly(sock):
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def half_close(reps, send_bytes, tail_bytes):
+    out = []
+    for _ in range(reps):
+        started = time.time()
+        row = {"got": 0, "ms": 0.0, "err": ""}
+        try:
+            sock = dial(10.0)
+            sock.sendall(b"HC01")
+            sock.sendall(b"x" * send_bytes)
+            sock.shutdown(socket.SHUT_WR)
+            got = 0
+            while got < tail_bytes:
+                more = sock.recv(65536)
+                if not more:
+                    break
+                got += len(more)
+            close_quietly(sock)
+            row["got"] = got
+        except OSError as exc:
+            row["err"] = str(exc)
+        row["ms"] = round((time.time() - started) * 1000.0, 2)
+        out.append(row)
+    return out
+
+
+rows = half_close(int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]))
+print(json.dumps({"mode": mode, "reps": rows}))
 """
 
 
@@ -757,6 +881,80 @@ def run_two_wave(ctx: Ctx, params: dict) -> list:
                 _iperf_cell(Spot(ctx, window, name), result, metrics, streams=streams)
             )
     return cells
+
+
+def _run_probe(ctx: Ctx, args: list, timeout: float) -> dict:
+    """Run the visitor-side probe inside the visitor namespace, read its line."""
+    argv = ctx.topo.ns_argv(
+        topology.VIS_NS, [sys.executable, "-c", PROBE_SRC, *[str(a) for a in args]]
+    )
+    done = subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, check=False
+    )
+    lines = (done.stdout or "").strip().splitlines()
+    if not lines:
+        detail = (done.stderr or "").strip().splitlines()
+        tail = detail[-1] if detail else f"exit {done.returncode} with no output"
+        raise RuntimeError(tail[:200])
+    try:
+        return json.loads(lines[-1])
+    except ValueError as exc:
+        raise RuntimeError(
+            f"the probe's last line was not JSON: {lines[-1][:120]}"
+        ) from exc
+
+
+def run_half_close(ctx: Ctx, params: dict) -> list:
+    """Does the answer a visitor is owed *after* it half-closed still arrive?
+
+    A visitor may send its request, shut its own direction and still expect the
+    rest of the answer: `curl --data-binary @-` against a streaming endpoint, a
+    shell pipeline into the service, any client that cannot know how much it is
+    owed. That is a shape no latency or throughput cell can fail — the transfer
+    is never slow, it is *cut* — and a proxy that forwards a half-close as a
+    close returns a truncated response with no error anywhere.
+
+    The backend owes the visitor `tail_bytes` only after its read direction ends
+    (`HALF_CLOSE` in `ECHO_SRC`), so the metric is exactly the bytes a tool let
+    through a half-closed pair. The control arm has no tool in the path and
+    therefore states what the cell can read.
+    """
+    port = topology.ECHO_PORT
+    if not wait_dial_port(ctx, port):
+        return [Cell("", False, reason="the tool never listened on the echo port")]
+    reps = int(params["reps"])
+    send_bytes = int(params["send_bytes"])
+    tail_bytes = int(params["tail_bytes"])
+    with measured(ctx, port) as window:
+        try:
+            out = _run_probe(
+                ctx,
+                ["half-close", ctx.arm.dial_host, port, reps, send_bytes, tail_bytes],
+                timeout=20.0 + 15.0 * reps,
+            )
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            return [Cell("", False, reason=f"the probe could not run: {exc}")]
+    rows = out.get("reps") or []
+    if not rows:
+        return [Cell("", False, reason="the probe produced no rep")]
+    got = [int(row.get("got", 0)) for row in rows]
+    return [
+        Cell(
+            "",
+            ok=True,
+            metrics={"half_close_bytes": int(statistics.median(got))},
+            evidence=_evidence(
+                ctx,
+                window,
+                {
+                    "reps": rows,
+                    "send_bytes": send_bytes,
+                    "tail_bytes": tail_bytes,
+                    "delivered_reps": sum(1 for value in got if value > 0),
+                },
+            ),
+        )
+    ]
 
 
 def run_bulk_pair(ctx: Ctx, params: dict) -> list:
@@ -2288,6 +2486,7 @@ RUNNERS = {
     model.Kind.BULK: run_bulk,
     model.Kind.BULK_PAIR: run_bulk_pair,
     model.Kind.TWO_WAVE: run_two_wave,
+    model.Kind.HALF_CLOSE: run_half_close,
     model.Kind.RR: run_rr,
     model.Kind.UDP: run_udp,
     model.Kind.UDP_LADDER: run_udp_ladder,

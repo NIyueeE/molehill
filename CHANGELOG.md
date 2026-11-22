@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A cell asks the one question a rate cannot: does a half-closed visitor still
+  get its answer?** `half-close` sends a request, shuts its own send direction
+  and still expects the rest of the response — the shape a
+  `curl --data-binary @-` pipeline, a shell heredoc into a service, or any client
+  that cannot know how much it is owed produces — so a tool that forwards the
+  half-close as a close returns a truncated response with no error anywhere. The
+  metric is the bytes that still arrive after the half-close; the backend owes
+  them only *after* it has seen the visitor's end (a four-byte self-identification
+  keeps every other scenario's echo path untouched), and the tool-free control
+  arm states that the cell can read all of them. In its first runs it separates
+  the field at once: **two of the three reference tools returned zero bytes on
+  every attempt** while this repository's carrier, one peer and the control arm
+  returned the whole tail.
+
+- **A `stall` cell was built, measured twice, and removed.** It held eight
+  visitors that never read (4 KiB receive buffers, 48 MiB each offered) and timed
+  a ninth — the operator's question "does one broken visitor cost the next one".
+  On a clean path the ninth was served in **0.66–1.28 ms** against the control
+  arm's **0.85**, and on a 1 %-loss path every arm read that path's own round trip
+  (**40.90–41.51 ms** against 40.92). A cell whose readings *are* the control
+  arm's number cannot order anything, so it is not a published metric. The
+  finding — no tool in this set serialises a service's visitors — and the reason
+  are in [Benchmarks](docs/benchmarks.md#what-the-model-cannot-answer).
+
 ## [1.0.0] - 2026-11-22
 
 ### Known gaps

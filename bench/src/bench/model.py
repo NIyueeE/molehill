@@ -323,6 +323,21 @@ METRIC_SPECS: tuple[dict, ...] = (
         "precision": 0,
     },
     {
+        "id": "half_close_bytes",
+        "unit": "byte",
+        "direction": "higher",
+        "definition": (
+            "bytes a visitor still receives after it shut its own send "
+            "direction: a tool that forwards the half-close as a close returns "
+            "zero, and the response is truncated with no error anywhere"
+        ),
+        "denominator": "one half-closed connection",
+        "needs": ("half-close",),
+        "materiality": ("rel", 5.0),
+        "precision": 0,
+        "headline": True,
+    },
+    {
         "id": "udp_recv_mbit",
         "unit": "Mbit/s",
         "direction": "higher",
@@ -1534,6 +1549,17 @@ def scenario_catalog() -> list:
             headline="throughput_gbps",
         ),
         Scenario(
+            id="half-close",
+            kind="half-close",
+            claim=(
+                "whether a tool keeps the server-to-visitor direction alive after "
+                "the visitor has shut its own: a truncated response no latency or "
+                "throughput cell can show"
+            ),
+            params={"reps": 3, "send_bytes": 4096, "tail_bytes": 65536},
+            headline="half_close_bytes",
+        ),
+        Scenario(
             id="bulk-pair",
             kind="bulk-pair",
             claim=(
@@ -1805,6 +1831,7 @@ PROFILES: dict[str, dict] = {
             "bulk-1",
             "bulk-n",
             "bulk-pair",
+            "half-close",
             "rr-1",
             "rr-16",
             "churn-16",
@@ -2022,6 +2049,10 @@ class Kind:
     # and every other bulk scenario opens its streams in the first second
     # (`HANDOFF.md` §4 E).
     TWO_WAVE: ClassVar[str] = "two-wave"
+    #: A visitor that shuts its own send direction and still expects the rest of
+    #: the answer: the classic half-close a proxy can turn into a truncated
+    #: response without an error anywhere.
+    HALF_CLOSE: ClassVar[str] = "half-close"
     RR: ClassVar[str] = "rr"
     UDP: ClassVar[str] = "udp"
     UDP_LADDER: ClassVar[str] = "udp-ladder"
@@ -2035,6 +2066,7 @@ class Kind:
         BULK,
         BULK_PAIR,
         TWO_WAVE,
+        HALF_CLOSE,
         RR,
         UDP,
         UDP_LADDER,

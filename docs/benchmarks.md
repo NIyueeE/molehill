@@ -240,6 +240,7 @@ the definitions are what the report and the verdict render.
 | `rtt_p99_ms` | ms | lower is better | nearest-rank 99th percentile of the probe's round trips | one request/response pair |
 | `rtt_max_ms` | ms | lower is better | worst single round trip the probe observed | one request/response pair |
 | `rtt_samples` | count | context, not a verdict | round trips the percentile is taken over | none (sample count) |
+| `half_close_bytes` | byte | higher is better | bytes a visitor still receives after it shut its own send direction: a tool that forwards the half-close as a close returns zero, and the response is truncated with no error anywhere | one half-closed connection |
 | `udp_recv_mbit` | Mbit/s | higher is better | datagrams the probe received x payload / the probe's own measured window (which for a blast includes the drain) | the probe's receive window |
 | `udp_loss_pct` | % | lower is better | (datagrams sent - datagrams received) / datagrams sent | datagrams the probe sent |
 | `udp_gap_p99_ms` | ms | lower is better | 99th percentile of the gaps between replies the probe received | one received datagram |
@@ -295,6 +296,7 @@ Two conventions the table cannot state, because they belong to the workload:
 | `bulk-n` | `bulk` | whether N streams aggregate, or share one ceiling | `throughput_gbps` |
 | `bulk-pair` | `bulk-pair` | whether two services (or two L3 claims) each carry a full stream, which separates a per-flow ceiling from a per-host one | `throughput_gbps` |
 | `two-wave` | `two-wave` | whether a carrier decision the pool learned during a warm stream reaches the streams that open after it — a settle between the waves is what lets the pool dial and trim before the measured one | `throughput_gbps` |
+| `half-close` | `half-close` | whether a tool keeps the server-to-visitor direction alive after the visitor has shut its own — a truncated response that no latency or throughput cell can show | `half_close_bytes` |
 | `rr-1` | `rr` | the round-trip rate and latency of one strict request/response flow | `rtt_p99_ms` |
 | `rr-16` | `rr` | the same, 16 flows at once: aggregate rate and tail latency | `rate_per_s` |
 | `churn-16` | `rr` | a fresh connection per request: what a visitor pays to arrive, as the first request's round trip on each new connection | `rtt_p99_ms` |
@@ -813,6 +815,28 @@ Stated so a reader does not ask a chart for something it never measured:
   loss cells move mhd's own tail (see ["Where mhd wins"](#where-mhd-wins-and-where-it-loses-2026-11-19)) but every
   arm in them is molehill, and the reorder-window cell does not exist. See
   [HANDOFF.md](../HANDOFF.md) §4.134 and §4.145.
+
+- **A tool's own transport under impairment, on the same leg for every tool.**
+  The staged schedule shapes the **visitor** leg (`condition_leg: visitor`), so
+  the hop a tool does not own carries the queue and each arm's own transport
+  runs clean — which is why every shaped stage on this page is a tie.
+  `--condition-leg tunnel` moves the same conditions onto the hop between the
+  server and the client, where a TCP tunnel multiplexing many streams and a
+  datagram carrier with its own windows face different problems; a run that way
+  is the comparison "who survives when *their* path loses packets", and no
+  published table is that run. What this repository's two carriers do on that
+  leg is ["Where mhd wins"](#where-mhd-wins-and-where-it-loses-2026-11-19).
+
+- **One broken visitor's cost to the next, as a metric.** A `stall` cell was
+  built for it — eight visitors holding connections they never read (4 KiB
+  receive buffers, 48 MiB each offered) while a ninth is timed — and it was
+  **removed rather than published**: on a clean path every arm served the ninth
+  visitor in **0.66–1.28 ms against the control arm's 0.85**, and on a
+  1 %-loss path every arm read that path's own round trip (**40.90–41.51 ms**,
+  control 40.92). A cell whose readings *are* the control arm's own number
+  cannot order anything, and such a cell is removed with the reason rather than
+  shipped as a table. What it established: no tool in this set serialises a
+  service's visitors.
 
 - **Whether a loss is random or caused by the carrier's own rate.** The counters can
   now answer what they could not when this was written: the per-lane window line
