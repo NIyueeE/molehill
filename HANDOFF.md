@@ -13,6 +13,36 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.533 (the release audit: `just tag-check` goes from three failures to a pass, and the sweep withdrew one published claim).**
+> **What the tag review wanted was not code.** `[Unreleased]` held 24 entries the dated `## [1.0.0] - 2026-11-01` section did not
+> have, and neither `benches/records/results-bench-v1.0.0.json` nor `assets/bench-v1.0.0.png` existed. The dated section had also
+> drifted three weeks behind the code it describes: every entry that *defines* this release — native multi-stream `mhd`, dialect
+> 6.0, the per-service carrier policy, the AES record layer — was still in `[Unreleased]`.
+>
+> **The audit found the documentation lying in five places, each fixed with its reason.** `AGENTS.md`'s release line stopped at
+> 0.11.1/v5.1 and its appendix sold a `kcp` feature and "protocol v5.1"; `docs/internals.md` opened with "v5.2" and explained
+> v5.2's frame negotiation as the current dialect; `docs/configuration.md`'s troubleshooting rows pointed a 1.0.0 operator at
+> v5.1/v5.2 and the page had **no 1.0.0 migration note at all** — for a release that changes the wire and renames the carrier;
+> `docs/structure.md` called an mhd lane's sealing "per-stream Noise"; and the benchmark page carried one paragraph **twice** in
+> English and **not at all** in Chinese. Separately, `bd87da4` removed the stripe width's growth and never got a changelog entry.
+>
+> **The sweep.** `just bench --profile sweep`, the five arms the profile names, **87** measured arm/scenario/cell triples,
+> **6 257 s** of a 3 000 s budget, one round and no A/A twin, at revision `c8b8e6f` with a clean tree. `just bench gate` passes
+> the absolute half **without** a baseline — the form `docs/release.md` prescribes for a method-changing release — so this record
+> is the next baseline. The clean cell reproduced the development run's readings inside their own rounding (7.689 against the
+> earlier 7.68, 1.942 against 1.95), which is the evidence that the host was in the same state.
+>
+> **What it withdrew.** The peer table said "where packets are lost the product's tail is **the tightest of the four** (1 460 ms
+> against 2 030–2 450)". The release sweep reads **2 450 — last** — and the record explains both draws: the `loss5` stage
+> completes about **215** requests, so its p99 is the third-worst sample and the arm order moves between runs (§4 F). The claim is
+> withdrawn from both pages; `loss5` is a **tie** at ~2.0–2.5 s, and what actually separates the arms is bulk throughput (12.42
+> against frp's 6.17 at 1 % loss, 9.20 against rathole's 28.57 on the clean cell).
+>
+> **State.** `just tag-check` now passes end to end: version and lockfile, exactly one dated changelog section with prose and an
+> empty `[Unreleased]` — 24 entries folded into the dated one as a move, verified by re-sorting the non-heading lines of both
+> files — both release assets, and the provenance check that no code changed between the measured revision and the reviewed
+> commit. What remains is the human's (`AGENTS.md` §5): pushing `v1.0.0` publishes the release.
+
 > **§4.512 (the soak's wedge reads zero when a control arm is in the run — and the pool move §11.4(b) asked for, which no
 > bench cell can show).**
 > **The wedge.** `just bench run --profile soak --arms control,molehill` — one round, five 180-second stages per arm — reports
@@ -655,24 +685,27 @@ Binding constraints, all still in force:
 
 ## 3. Measured baseline
 
-All numbers below are one run of the `sweep` profile on a freshly built binary,
-one round per arm, five arms, 83 samples — `just bench gate` **PASS** (§7). Treat
-them as the baseline for any structural change, not as a promise about a
-different host.
+All numbers below are one run of the `sweep` profile on a freshly built binary at
+revision `c8b8e6f` (clean tree), one round per arm, five arms, 87 measured
+arm/scenario/cell triples. The record is
+`benches/records/results-bench-v1.0.0.json` — the release artifact, and by
+`docs/release.md` the next baseline — and `just bench gate` **PASSes** it without a
+baseline (§7). Treat them as the baseline for any structural change, not as a
+promise about a different host.
 
 ### 3.1 The clean stages, against the peers (p99, lower is better)
 
 | arm | `timeline[clean]` | `timeline[clean#2]` | what it is |
 |---|---|---|---|
-| **molehill (mhd)** | **22.505 ms** | **23.08 ms** | the subject |
-| rathole | 2.063 ms | — | TCP tunnel, same model, upstream lineage |
-| frp | 2.377 ms | — | TCP tunnel |
-| l3 | 3.475 ms | — | userspace L3 tunnel, same repository |
-| nps | 101.388 ms | — | TCP tunnel (also fails capacity, §3.3) |
+| **molehill (mhd, auto)** | **7.689 ms** | **1.942 ms** | the subject |
+| l3 | 2.150 ms | 1.450 ms | userspace L3 tunnel, same repository |
+| frp | 2.234 ms | 7.362 ms | TCP tunnel |
+| rathole | 2.154 ms | 2.170 ms | TCP tunnel, upstream lineage |
+| nps | 101.266 ms | 72.158 ms | TCP tunnel (also fails capacity, §3.3) |
 
-molehill's own row: **7.57 Gbit/s, 0.0 % errors** on `clean`; `clean#2` 23.08 ms
-with the same zero errors. Both stages are inside the 50 ms SLO **on their own**
-— neither is averaged, and no warm-up stage was added.
+molehill's own row: **9.203 Gbit/s, 0.0 % errors** on `clean` and **15.568** on
+`clean#2`. Both stages are inside the 50 ms SLO **on their own** — neither is
+averaged, and no warm-up stage was added.
 
 What the number *is*: the **interactive series'** p99, where each sample is a fresh
 TCP connection to the tool's exposed port carrying one 64-byte echo (`probes/series.py`'s
@@ -680,41 +713,47 @@ TCP connection to the tool's exposed port carrying one 64-byte echo (`probes/ser
 they are separate metrics (`churn_per_s`, `udp_rtt_p99_ms`) and are never pooled into
 this one (see `HANDOFF-archive.md` §4.39 for the correction that cost this file a wrong conclusion).
 
-The gap this document exists for: a TCP tunnel opens a visitor in **2–3.5 ms**;
-mhd takes **22.5 ms**. Roughly ten times, on the cheapest path there is.
+The gap this document existed for has mostly closed, and the residue is a stage
+order, not a carrier: in `clean#2` mhd reads **1.942 ms**, at parity with the
+fastest TCP tunnel, where the same row in the v0.11.2 baseline read 23.08 ms. The
+first stage's 7.689 ms is the cold end of a cell that is bimodal for every arm that
+forwards in user space — frp draws the slow mode on the *other* stage (7.362 against
+2.234) — so a single round cannot say which arm is ahead, and this record cannot say
+whether a fresh process stays at 7.7 ms or settles in its first minutes.
 
 ### 3.2 The shaped stages (molehill, p99)
 
-| stage | p99 |
-|---|---|
-| `rtt100` | 402.9 ms |
-| `loss1` | 1058.1 ms |
-| `loss5` | 1464.3 ms |
-| `rate100` | 103.1 ms |
-| `rate20` | 184.0 ms |
-| `jitter` | 109.9 ms |
+| stage | molehill p99 | what the other four read |
+|---|---|---|
+| `rtt100` | 401.470 ms | 401.305–402.024 (nps 500.894) |
+| `loss1` | 1073.018 ms | 1061.774–1080.589 |
+| `loss5` | 2450.189 ms | 2042.192–2094.287 (`l3` 2478.847) |
+| `rate100` | 197.008 ms | 194.918–197.831 |
+| `rate20` | 434.016 ms | 425.525–431.594 |
+| `jitter` | 106.208 ms | 105.852–107.056 (nps 165.809) |
 
-Each stage is judged alone. `loss5` and `rate20` are the two the earlier cycle
-spent longest on; both are far from the clean floor and neither is improvable by
-touching that floor.
+Each stage is judged alone. Every row but `loss5` is a **tie within a few
+milliseconds** — the shaped path is the queue, not the tool. `loss5` is a tie too,
+and the reason to distrust its ordering is in the record: a 120-second stage at
+5 % loss completes about **215** interactive requests, so that cell's p99 is its
+third-worst sample and the arm order moves between runs (§4 F).
 
 ### 3.3 Capacity
 
-`molehill sustained 8 of 8 streams`; L1–L8 read 3.1–24.5 ms and the ramp reaches
-eight. The same run gives l3, frp and rathole 8 of 8, and **nps 0 of 8** — the
-peer fails its own capacity, which is worth knowing before quoting it as a
-comparison.
+`molehill sustained 8 of 8 streams`; l3, frp and rathole also reach eight, and
+**nps 4 of 8** — the peer fails its own capacity, which is worth knowing before
+quoting it as a comparison. (This run's per-level cells report no reading; only the
+ramp carries a count, and the gate judges the ramp.)
 
 ### 3.4 What has *not* been measured on this tree
 
-- **bulk-n against a baseline.** The gate only judges the regression half when it
-  is given `--baseline`; that has not been run on this tree. The objective's
-  "within 15 %" is therefore **unproven**, not met.
+- **bulk-n against a baseline.** The gate judges the regression half only when it
+  is given `--baseline`, and this is a method-changing release, so it ran without
+  one (§7). The objective's "within 15 %" is therefore **unproven**, not met.
 - **`churn-16` and `rr-16` across the reconnect/reuse paths** — the two scenarios
   that would show what a reused connection costs, as opposed to a new one.
-- **`MOLEHILL_DATA_CARRIER=tcp` as a matched A/B arm.** The peer arms above are
-  TCP tunnels from other projects; the in-tree TCP carrier under the *same*
-  binary, same method, same round has not been run.
+- **A real path.** Every number above is loopback inside a container, which is the
+  friendliest path for every arm and the least like a deployment.
 
 ---
 
@@ -847,6 +886,20 @@ workload whose streams all open in the first second, the next stream is a churn 
 bulk would put a chat service's first channels on a carrier that is only better when the path is clean, and would do nothing
 for `bulk-1` on an impaired one. What would reopen it is a path-aware signal (C), where the same signal answers both.
 **Pass/rollback**: none — the decision is to leave the policy alone (§2).
+
+### F. The 5 %-loss tail cannot rank arms at this stage length
+
+**Symptom**: the release sweep reads `loss5` p99 as molehill **2 450 ms**, `l3` 2 479, frp 2 088, rathole 2 042, nps 2 094 — and
+the development sweep the day before read the product **first** (1 460 against 2 030–2 450). Same profile, same host, same method.
+
+**Cause, from the record**: that stage completes about **215** interactive requests in its 120-second hold — a serial probe, and the
+median request already costs the path's 401 ms — so the cell's p99 *is* its third-worst sample. The arms' spread (2 042–2 479) is
+the distance between the third-worst samples of five draws from one distribution; their p50s sit within **0.72 ms** of each other.
+
+**Consequence**: `loss5` is a **tie**, and no page ranks the four there any more — `docs/benchmarks.md` and the README say so, and
+the earlier claim ("where packets are lost the product's tail is the tightest of the four") is withdrawn as one draw of three
+samples. What would reopen it: a stage long enough, or a probe concurrent enough, to put a thousand requests in the cell. That is a
+model change and belongs in the plan, not in a release.
 
 ## 5. Active architecture decisions
 

@@ -35,7 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreachable, and this is why the axis stays in the gate rather than being
   declared closed.
 
-
 - **A fresh connection still costs more than TCP's, and the remainder is one
   channel's own work.** `churn-16` — sixteen concurrent workers, each opening a
   fresh connection per request, 6 400 arrivals in a round at about four thousand a
@@ -240,7 +239,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pool that was never given the chance — so the scenario headlines throughput
   and keeps both waves as separate cells.
 
-
 - **A data channel opens in one round trip instead of two.** The Noise handshake
   carries one payload each way now, so a stream whose lane the server already
   knows sends its tunnel hello *inside* the handshake's opening message and reads
@@ -369,7 +367,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seal one closes instead of carrying on with a hole. An unspent number leaves a
   permanent gap in the peer's cumulative frontier, which the sender then repairs for
   ever.
-
 
 - **A stream's close can no longer overtake its own data.** A multiplexed
   stream's FIN went out on a bookkeeping queue that leaves before any payload —
@@ -691,7 +688,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TCP carrier 1.6× ahead on throughput with mhd's interactive tail 20–30 % tighter.
   `docs/configuration.md` says the same in one row.
 
-
 - **The benchmark can price the carrier itself, with nothing above it.** A new
   `transport` scenario runs the protocol harness twice per arm — a raw TCP socket
   on the control arm against an mhd stream on a tool arm — with the listener in
@@ -753,7 +749,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   debug line — and no path consumed it. The observation stays: a parked group
   that then moved is still logged with how long it waited. The width is now
   whatever the pairing decided, `MOLEHILL_STRIPE_COUNT` included.
-
 
 - **Two wire frame classes nothing sent are gone.** A v5 carrier declared an
   unreliable datagram frame and an unreliable whole-IP-packet frame. No sender in
