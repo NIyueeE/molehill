@@ -808,6 +808,26 @@ That is the documented trade ("a pool one over its count is bounded … better t
 but here it is two over, carrying nothing, for as long as the streams last. **Not changed**: §2 freezes the policy, and
 the trade is deliberate.
 
+**And measured against its own kernel carrier, on the same cell, three rounds each with an A/A twin per run:**
+
+| | auto `l4` | its twin | pure `tcp` | its twin |
+|---|---|---|---|---|
+| p50 | 1.113 ms | 1.101 | 1.074 | 1.084 |
+| p99 | 4.356 | 3.536 | 2.132 | **8.985** |
+| worst 1 s | 2.859 | — | 1.490 | 4.970 |
+| throughput | **8.979 Gbit/s** | 9.002 | **14.52** | 14.81 |
+| CPU per Gbit | **0.885 s** | 0.887 | **0.569** | 0.569 |
+
+**Throughput and CPU resolve; the tail does not.** The twins agree within 0.3 % on both throughput and CPU, so pure `tcp`
+carrying **+62 %** at **36 % less CPU per Gbit** is a difference far outside either run's noise. The p99 row is not: this
+run's `tcp` twin read 8.99 ms, worse than auto's arm, so that column's scatter swallows the comparison — the earlier pinned
+pair (§4 C: 1.89 against 12.65) is the reading to use for the tail, and it points the same way.
+
+**Why auto does not get there**: its pool *did* converge — the log has three "adding one tunnel on the short carrier", one
+"the mix converged; giving the spare tunnel back" and the class change — but the streams that carry the bytes were opened on
+the lane before the class existed, and a running stream is never moved. Convergence buys capacity for the *next* stream; on a
+workload whose streams all open in the first second, the next stream is a churn arrival, not the bulk spine.
+
 ### D. The first bulk cell rides the carrier it started on (62 %)
 
 **Symptom**: on the plan's two-cell criterion, auto reads **62 %** of the kernel carrier in `bulk-1` and **81 %** in `bulk-n`
