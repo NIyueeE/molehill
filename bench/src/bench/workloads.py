@@ -1618,21 +1618,14 @@ def _gap_p99(points: list):
 
 
 def _stages_of(params: dict) -> list:
-    """The timeline with its holds scaled, floored, and numbered per condition."""
-    holds = model.timeline_for(params["timeline"], params.get("scale", 1.0))
-    floor = params.get("min_hold_s", 0.0)
-    seen: dict = {}
-    stages = []
-    for condition, secs in holds:
-        # The `campaign` sentinel resolves to the run's own condition, so a
-        # single-point cost run can price the path it names (§12 P1) and its cell
-        # keeps the name `expected_cells` computed from the same params.
-        resolved = model.staged_condition(condition, params)
-        seen[resolved] = seen.get(resolved, 0) + 1
-        occurrence = seen[resolved]
-        label = resolved if occurrence == 1 else f"{resolved}#{occurrence}"
-        stages.append((label, resolved, max(secs, floor)))
-    return stages
+    """The run's stages, with the label rule owned by the model.
+
+    The naming has one home (`model.stages_of`) because the gate checks the cell
+    list `expected_cells` builds from the same function: a stage measured under
+    one name and claimed under another is the class of error that check exists
+    for, not one it should have to catch.
+    """
+    return list(model.stages_of(params))
 
 
 def run_staged(ctx: Ctx, params: dict) -> list:
@@ -1791,9 +1784,12 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     does not leave a hole in the coverage the gate checks. The second attempt is
     what the sample carries; the first one's reason travels in its evidence.
     """
-    condition = stage[1]
-    ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
-    with _RestoresCondition(ctx.topo, ctx.leg):
+    _label, condition, _secs, leg = stage
+    # The stage's own leg: a schedule that shapes the visitor for one stage and
+    # the tunnel for the next is two experiments in one run, and imposing both on
+    # the run's leg would silently measure the second as a repeat of the first.
+    ctx.topo.set_condition(leg, model.CONDITIONS[condition])
+    with _RestoresCondition(ctx.topo, leg):
         cell = _measure_stage(ctx, stage, params, logs)
         # What the instrument said, whether it took the whole cell down with it or
         # only `throughput_gbps`: a stage measured leniently still deserves the
@@ -1811,7 +1807,7 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         cell.evidence["reachable_after_failure"] = wait_dial_port(
             ctx, topology.IPERF_PORT, 5.0
         )
-        ctx.topo.drain(ctx.leg)
+        ctx.topo.drain(leg)
         again = _measure_stage(ctx, stage, params, logs)
         again.evidence["retried_after"] = (first or "")[:200]
         # The first attempt's own evidence is the one that describes the failure;
@@ -1826,8 +1822,8 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
 
 def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     """The body of one stage, with its condition already imposed."""
-    label, condition, secs = stage
-    drain = ctx.topo.drain(ctx.leg)
+    label, condition, secs, leg = stage
+    drain = ctx.topo.drain(leg)
     # Asked before the condition and before this stage's own traffic: was the tool
     # serving anyone at this boundary at all?
     boundary = echo_round_trip(ctx)

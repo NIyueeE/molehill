@@ -678,6 +678,18 @@ Binding constraints, all still in force:
   frames. The parked-and-moved observation stays as a log line.
 - **Never create or push a release tag.** Only a human asks for that; a release
   record is written only when every gate in §7 passes.
+- **The bench is 定型 from v1.0.0 and is the product's only feedback channel.** Its
+  standard is written in `docs/benchmarks.md`, "The standard": a **release record**
+  (one round) may claim only per-cell facts — SLO held, wedges, capacity, a
+  categorical cell, which side of a declared threshold — and never that one arm is
+  faster than another; a **difference claim** belongs to `compare` (rounds + an
+  A/A twin). The schedule covers the deployment classes **on the leg where each
+  happens** (visitor or tunnel), and a reading from one leg is never compared with
+  one from the other. A change under `bench/src/bench/` is a **revision**: reason
+  in CHANGELOG, re-baseline (`just bench gate` without `--baseline`), the affected
+  tables updated in the same commit, and this file told what moved. "Add a
+  scenario to see" is not a revision — measure it as a diagnostic first, and only
+  a scenario that separates arms or asks a categorical question earns a place.
 - A change that does not beat its own gate is **reverted whole**, with its
   measurement kept. More complexity is not more advanced.
 

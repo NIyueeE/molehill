@@ -947,17 +947,66 @@ STAGED_SERIES: tuple = ("interactive", "udp", "churn")
 #: The stage schedules. A timeline is a *list* rather than a dict because the
 #: recovery axis is a repeat: the clean stage at both ends is the run's own
 #: replicate, and its position is part of what it means.
+#: The leg a stage imposes its condition on unless the stage says otherwise: the
+#: visitor's own connection, which is what the user's client experiences. A stage
+#: that names `tunnel` shapes the hop the **tool** owns instead, and that is a
+#: different experiment — it is the only way to measure a carrier's own transport,
+#: and several conditions do nothing at all on the visitor leg while being the
+#: whole question on the tunnel one (a 1 280-byte MTU left every arm's visitor-leg
+#: reading unchanged, because what it constrains is the size of the packets the
+#: *tool* re-sends, not the visitor's TCP; measured 2026-11-22: control 41.39,
+#: rathole 8.96, molehill 3.82 Gbit/s against the clean cell's 40.45 / 9.83 / 4.00).
+DEFAULT_LEG = "visitor"
+
 TIMELINES: dict[str, tuple] = {
-    # The sweep: how a tool behaves as the path degrades, and whether it is
-    # still the tool it was when the path recovers.
+    # **The release schedule.** Every deployment class the product is expected to
+    # survive, on the leg where that class actually happens, bracketed by the same
+    # condition at both ends — the run's own control for "did the tool come back
+    # after all of it", which is the only repeated measure a one-pass release run
+    # has. `docs/benchmarks.md`, "The release schedule", is the table a reader
+    # holds this against; changing either is one change.
+    #
+    # Visitor leg — the path the visitor's own connection crosses:
+    #   clean          the healthy path, and the control for every other row
+    #   rtt100         distance: a long-haul round trip
+    #   loss1          light loss
+    #   loss1_deep     the *same* loss with a queue deep enough not to tail-drop:
+    #                  a controlled pair whose one varying parameter is the queue,
+    #                  so "the tail is repair" and "the tail is the shaper" can be
+    #                  told apart
+    #   loss5          heavy loss
+    #   rate20         a slow uplink (20 Mbit/s)
+    #   rate100        a 100 Mbit/s uplink
+    #   rate100_shallow the same rate with an ~11 ms queue: the second controlled
+    #                  pair, same rate and one varying parameter — bufferbloat
+    #   loss1_rate100  a mobile/hotspot path: loss and a rate cap together
+    #   jitter         delay that moves under the flow
+    # Tunnel leg — the hop the tool owns, where its own carrier lives:
+    #   rtt100         the bandwidth-delay product its windows must open across
+    #   loss1/loss5    loss *under the carrier*: repair inside an RTT, or a timer
+    #   rate100_shallow bufferbloat inside the carrier's own queue
+    #   mtu1280        a tunnel or IPv6-minimum path: do its own packets fit?
+    #   udp_throttled  a network that polices UDP to a few thousand packets a second
+    #   udp_blocked    a network that refuses UDP: the product must fall back, and
+    #                  a datagram-only design must fail
     "sweep": (
         ("clean", 150.0),
         ("rtt100", 120.0),
         ("loss1", 120.0),
+        ("loss1_deep", 120.0),
         ("loss5", 120.0),
-        ("rate100", 120.0),
         ("rate20", 120.0),
+        ("rate100", 120.0),
+        ("rate100_shallow", 120.0),
+        ("loss1_rate100", 120.0),
         ("jitter", 120.0),
+        ("rtt100", 120.0, "tunnel"),
+        ("loss1", 120.0, "tunnel"),
+        ("loss5", 120.0, "tunnel"),
+        ("rate100_shallow", 120.0, "tunnel"),
+        ("mtu1280", 120.0, "tunnel"),
+        ("udp_throttled", 120.0, "tunnel"),
+        ("udp_blocked", 120.0, "tunnel"),
         ("clean", 150.0),
     ),
     # The drift axis: fewer conditions, longer holds.
@@ -1021,10 +1070,58 @@ def staged_condition(name: str, params: dict) -> str:
 
 
 def timeline_for(name: str, scale: float = 1.0) -> tuple:
-    """A timeline with every stage's hold scaled, never the order or the set."""
+    """A timeline with every stage's hold scaled, never the order or the set.
+
+    A stage is `(condition, seconds)` or `(condition, seconds, leg)`, and this is
+    the one place the shape is normalised: `stages_of` builds the run's cells and
+    `expected_cells` builds the list the gate checks from the same triples, so a
+    stage cannot be measured on one leg and claimed on another.
+    """
     if name not in TIMELINES:
         raise SystemExit(f"unknown timeline {name!r}; known: {', '.join(TIMELINES)}")
-    return tuple((cond, round(secs * scale, 2)) for cond, secs in TIMELINES[name])
+    out = []
+    for stage in TIMELINES[name]:
+        condition, secs, *rest = stage
+        leg = rest[0] if rest else DEFAULT_LEG
+        if leg not in LEG_NAMES:
+            raise SystemExit(
+                f"timeline {name!r} puts {condition!r} on an unknown leg {leg!r}; "
+                f"known: {', '.join(LEG_NAMES)}"
+            )
+        if condition != "campaign" and condition not in CONDITIONS:
+            raise SystemExit(
+                f"timeline {name!r} names an unknown condition {condition!r}"
+            )
+        out.append((condition, round(secs * scale, 2), leg))
+    return tuple(out)
+
+
+#: The legs a stage may name. Kept here rather than imported from `topology` so
+#: the *model* refuses a schedule it cannot measure, before a run starts.
+LEG_NAMES: tuple = ("visitor", "tunnel")
+
+
+def stages_of(params: dict) -> tuple:
+    """The staged run's stages: `(label, condition, hold seconds, leg)`.
+
+    One home for the label rule. A condition appears once per leg, so the same
+    condition on the two legs is two cells — `loss1` and `loss1@tunnel` — and a
+    repeat of one of them is numbered (`clean`, `clean#2`) exactly as before.
+    The workload builds its cell names from this and `expected_cells` builds the
+    list the gate checks, so the two cannot disagree.
+    """
+    holds = timeline_for(params["timeline"], params.get("scale", 1.0))
+    floor = params.get("min_hold_s", 0.0)
+    seen: dict = {}
+    stages = []
+    for condition, secs, leg in holds:
+        resolved = staged_condition(condition, params)
+        key = resolved if leg == DEFAULT_LEG else f"{resolved}@{leg}"
+        seen[key] = seen.get(key, 0) + 1
+        occurrence = seen[key]
+        label = key if occurrence == 1 else f"{key}#{occurrence}"
+        stages.append((label, resolved, max(secs, floor), leg))
+    return tuple(stages)
 
 
 # --------------------------------------------------------------------------
@@ -1493,16 +1590,7 @@ def expected_cells(scenario_id: str, params: dict) -> list:
     """
     scenario = SCENARIOS[scenario_id]
     if scenario.kind == Kind.STAGED:
-        holds = timeline_for(params["timeline"], params.get("scale", 1.0))
-        seen: dict = {}
-        cells = []
-        for condition, _ in holds:
-            resolved = staged_condition(condition, params)
-            seen[resolved] = seen.get(resolved, 0) + 1
-            cells.append(
-                resolved if seen[resolved] == 1 else f"{resolved}#{seen[resolved]}"
-            )
-        return [*cells, "run"]
+        return [stage[0] for stage in stages_of(params)] + ["run"]
     if scenario.kind == Kind.CAPACITY:
         return [f"L{n}" for n in range(1, params["streams_max"] + 1)] + ["ramp"]
     if scenario.kind == Kind.TRANSPORT:

@@ -39,6 +39,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finding — no tool in this set serialises a service's visitors — and the reason
   are in [Benchmarks](docs/benchmarks.md#what-the-model-cannot-answer).
 
+### Changed
+
+- **The bench is the product's only feedback channel now, and it says so.** A
+  release record may claim a **per-cell fact** — the SLO held, a wedge or none,
+  the capacity ramp, a categorical cell, which side of a declared threshold a
+  reading falls on — and it may **not** claim that one arm is faster than
+  another: one round carries no noise estimate of its own, and a twin of the same
+  arm has been measured 1.5 % away from itself on a bulk cell. A difference claim
+  belongs to `compare` (three rounds, a warm-up and an A/A twin, ~400 s), and the
+  release record is the coverage and stability artifact. Both rules, the trust
+  checklist behind them and the revision rule are
+  [Benchmarks, "The standard"](docs/benchmarks.md#the-standard-what-this-bench-is-for-and-what-it-may-claim).
+- **The release schedule covers the deployment classes on the leg where each one
+  actually happens.** Eighteen stages: ten on the **visitor's** connection (a
+  healthy path bracketing the walk, distance, light loss and the same loss with a
+  queue that does not tail-drop, heavy loss, a 20 and a 100 Mbit uplink, the same
+  100 Mbit with an 11 ms queue, a mobile path losing and rate-capped at once, and
+  jitter) and seven on the **tunnel's** — the hop the tool owns and the only place
+  a carrier's own transport can be measured (distance, light and heavy loss,
+  bufferbloat, a 1 280-byte MTU, UDP policed, UDP refused). Two of the visitor
+  rows are **pairs that vary one parameter** (a queue depth at one loss rate, then
+  at one rate) and four conditions are walked on **both legs**, which is the
+  controlled comparison the page now states: a reading from one leg is never
+  compared with a reading from the other. The schedule is one release run of about
+  three hours for five arms; `just bench gate` refuses a record missing a declared
+  cell, because a coverage that shrinks silently is the one failure a reader
+  cannot see. Measured before it was written down: a 1 280-byte MTU on the
+  *visitor* leg moved no arm's reading (control 41.39, rathole 8.96, molehill 3.82
+  Gbit/s against the clean cell's 40.45 / 9.83 / 4.00), and 1 % loss with a 100
+  Mbit cap put every arm on the shaper's own number — the class belongs on the
+  leg that owns it or it measures the harness.
+
 ## [1.0.0] - 2026-11-22
 
 ### Known gaps

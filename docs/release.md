@@ -126,10 +126,14 @@ only third-party runtime dependency is the optional `plot` extra.
    and `tree_clean` separately — the revision names the commit, and
    `tree_clean` excludes the results file the run is writing, so an uncommitted
    *source* change is the only thing that makes it false.
-   Budget: the sweep profile's timeline is ~17 minutes per arm plus the ramp,
-   so five arms are a little over two hours on this host. `--scale 0.2` shortens the
-   holds without changing the schedule's *shape*, and the fingerprint records
-   the scale, so a shortened run can never be mistaken for the published one.
+   Budget: the sweep profile's timeline is eighteen stages — ten on the visitor
+   leg, seven on the tunnel leg — which is ~35–45 minutes per arm with the
+   between-stage drains, so five arms are **three to four hours** on this host,
+   plus the ramp. `--scale 0.2` shortens the holds without changing the
+   schedule's *shape*, and the fingerprint records the scale, so a shortened run
+   can never be mistaken for the published one. A record that is missing a cell
+   the schedule declared is refused by `just bench gate`: coverage that shrinks
+   silently is the one failure a reader cannot see.
 4. `just bench plot benches/records/results-bench-vX.Y.Z.json --out-dir assets/`
    — renders the chart set and prints the markdown tables: the master (per
    arm, the interactive stream over the stage schedule with its per-stage
