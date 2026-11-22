@@ -1003,9 +1003,8 @@ the workload learns to measure it, or the condition declares which architectures
 **Two papercuts found while publishing under the standard, both deferred to the next revision because the tree is frozen for
 the measurement:**
 
-- `just bench plot --markdown` prints the headline metric, the per-stage p99, drift and CPU — but **no per-stage throughput
-  table**, so the README's throughput table is extracted from the record with `jq`. A reader cannot reproduce that table from
-  the tool, which is the wrong shape for a published number; the revision adds the table.
+- ~~`just bench plot --markdown` prints no per-stage throughput table~~ — **fixed before the record ran** (`throughput_section`,
+  `6b21240`), because leaving it would have made the README's throughput table a `jq` extraction no reader could reproduce.
 - `just bench plot`'s default `--out-dir` is the results file's own directory, so forgetting `--out-dir` writes charts into
   `benches/records/` beside the evidence (twice, this session). The default should be `assets/`, or the flag should be required.
 
