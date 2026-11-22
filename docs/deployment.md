@@ -777,7 +777,7 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 The image carries the full default feature set (`server`, `client`, `noise`,
 `hot-reload`, `multiplex`, `mhd`, `transparent`), so neither the data plane's
 mhd sessions nor the transparent (L3) services need a different image. Pin a
-release tag (`ghcr.io/niyueee/molehill:v0.11.0`) instead of `:latest` when you
+release tag (`ghcr.io/niyueee/molehill:v1.0.0`) instead of `:latest` when you
 want reproducible upgrades.
 
 Two consequences of running as UID 1000:
