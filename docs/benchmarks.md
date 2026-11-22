@@ -1126,41 +1126,51 @@ and `MOLEHILL_DATA_CARRIER` exists to separate the two for exactly this measurem
 One `sweep` run of this model — the staged timeline and the capacity ramp, the product's two architectures beside
 frp 0.72.0, rathole 0.5.0 and nps 0.26.10 — **one round, no A/A twin**, so every row here is directional: it says
 which side of a cell an arm is on, not how far. `molehill` is the product as it ships (`l4`, auto carrier); `l3` is
-its transparent arm, which has no peer and is therefore compared only with the product.
+its transparent arm, which has no peer and is therefore compared only with the product. The file it comes from is
+`benches/records/results-bench-v1.0.0.json` — the release record for this tag, and the next baseline.
 
 | cell (`timeline`) | molehill p99 | frp | rathole | nps | `l3` |
 |---|---|---|---|---|---|
-| `clean` | 7.68 ms | **1.57** | 2.15 | 15.9 | 1.70 |
-| `rtt100` | 401 | 402 | 401 | 418 | 402 |
-| `loss1` | 1 080 | 1 060 | 1 060 | 1 080 | 1 060 |
-| `loss5` | **1 460** | 2 120 | 2 030 | 2 450 | 2 670 |
-| `rate100` | 198 | 196 | 198 | 195 | 195 |
-| `rate20` | 434 | 432 | 428 | 434 | 427 |
-| `jitter` | 107 | 106 | 108 | 113 | 108 |
-| `clean#2` | **1.95** | 4.78 | 2.02 | 18.0 | 1.21 |
+| `clean` | 7.689 ms | **2.234** | 2.154 | 101.3 | 2.150 |
+| `rtt100` | 401 | 402 | 401 | 501 | 402 |
+| `loss1` | 1 073 | 1 081 | 1 062 | 1 075 | 1 062 |
+| `loss5` | 2 450 | 2 088 | 2 042 | 2 094 | 2 479 |
+| `rate100` | 197 | 195 | 198 | 196 | 198 |
+| `rate20` | 434 | 426 | 427 | 426 | 432 |
+| `jitter` | 106 | 106 | 107 | 166 | 106 |
+| `clean#2` | 1.942 | 7.362 | 2.170 | 72.2 | 1.450 |
 
 | cell (`timeline`) | molehill Gbit/s | frp | rathole | nps |
 |---|---|---|---|---|
-| `clean` | 8.98 | 6.08 | **28.5** | 0.13 |
-| `rtt100` | 3.42 | 3.38 | 3.40 | 0.14 |
-| `loss1` | 12.54 | 6.17 | **14.67** | 0.13 |
-| `loss5` | **1.17** | 1.11 | 0.99 | 0.14 |
-| `jitter` | 13.02 | 6.22 | **15.55** | 0.13 |
-| `clean#2` | 15.58 | 6.08 | **27.98** | 0.13 |
+| `clean` | 9.20 | 6.06 | **28.6** | 0.13 |
+| `rtt100` | 3.40 | 3.37 | 3.39 | 0.14 |
+| `loss1` | 12.42 | 6.17 | **14.70** | 0.13 |
+| `loss5` | 1.07 | 1.15 | **1.20** | 0.14 |
+| `jitter` | 11.67 | 6.18 | **14.20** | 0.13 |
+| `clean#2` | 15.57 | 6.05 | **28.45** | 0.13 |
 
-Capacity ramp: molehill, frp and rathole all reach **8 streams**, nps **3**.
+Capacity ramp: molehill, `l3`, frp and rathole all reach **8 streams**, nps **4**.
 
-**Read it as three sentences.** Every cell where the path is impaired and the impairment is not loss (`rtt100`, the
+**Read it as four sentences.** Every cell where the path is impaired and the impairment is not loss (`rtt100`, the
 two rate cells) is a **tie** — four tools within a few milliseconds of each other, which is what a shaped path does:
-it, not the tool, is the queue. Where packets are lost the product's tail is the **tightest of the four** (1 460 ms
-at 5 % against 2 030–2 450). And on the clean cells the product is **behind frp and rathole on the tail** while
-carrying **more than frp and less than rathole** — the same split the carrier table above explains, because the
-product's auto policy puts a clean path's interactive traffic on the carrier that only wins when packets are lost.
+it, not the tool, is the queue. `loss5` is a tie too, and this run reads the product last of the four (2 450 ms
+against 2 042–2 094) where the run before it read the product first (1 460 against 2 030–2 450): a 120-second stage
+at that loss rate completes about 215 interactive requests, so the cell's p99 *is* its third-worst sample, and the
+arm order there moves between runs — neither table can rank the four. On the clean cells the product is **behind frp
+and rathole on the tail** — bimodally, see below — while carrying **more than frp and less than rathole**, which is
+the split the carrier table above explains: the product's auto policy puts a clean path's interactive traffic on the
+carrier that only wins when packets are lost.
 
-**Two caveats that travel with the table.** `clean` is bimodal in this topology — the first `clean` stage reads 7.68
-against `clean#2`'s 1.95 for the same arm — so a single-round reading of that row is a coin toss, and the shaped rows
-are the ones to trust. And loopback inside a container is the friendliest possible path for every arm: `nps` at
-0.13 Gbit/s is the one row that looks like a defect rather than a shape, and it is not this repository's tool.
+**Bulk separates the arms.** rathole is first on every unshaped cell, the product second on both lossy ones (12.42
+against frp's 6.17 at 1 % loss) and third on the clean one — and its own two clean stages disagree by 69 % (9.20
+against 15.57), the warm-after-cold effect "Warm and cold" describes for the tail. Read the clean bulk number as a
+range for one arm rather than as a ranking.
+
+**Two caveats that travel with the table.** `clean` is bimodal in this topology, and which arm draws the slow mode
+moves between the two clean stages: the product reads 7.689 then 1.942, frp 2.234 then 7.362. A single-round reading
+of that row is a coin toss, and the shaped rows are the ones to trust. And loopback inside a container is the
+friendliest possible path for every arm: `nps` at 0.13 Gbit/s is the one row that looks like a defect rather than a
+shape, and it is not this repository's tool.
 
 ### Warm and cold
 

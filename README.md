@@ -40,7 +40,7 @@ molehill exposes a service on a device behind NAT to the Internet through a serv
 - [molehill](#molehill)
   - [Features](#features)
   - [Benchmarks](#benchmarks)
-    - [The v0.11.2 run](#the-v0112-run)
+    - [The v1.0.0 run](#the-v100-run)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
   - [Deployment](#deployment)
@@ -86,24 +86,23 @@ reproduction: [Benchmarks](./docs/benchmarks.md); the decision tree behind the
 settings, and the two numbers worth measuring on your own path:
 [Configuration](./docs/configuration.md#choosing-your-configuration-decision-tree).
 
-### The v0.11.2 run
+### The v1.0.0 run
 
 Every tool is driven through the identical workload while the path follows the
 stage schedule, changed in place so a session is never rebuilt. This is the
-v0.11.2 sweep on one host, with the v0.11.2 binary's defaults — one multiplexed
-pool of four tunnels per session, the fixed-KK Noise keypair on the control
-channel (a forwarding service's data channels inherit it unless
-`data_enable = false`), and dynamic striping that starts each TCP visitor at one
-data channel and grows only on path backpressure. The v0.11.2 harness is a
-method re-baseline, so these readings are comparable only within this method;
-the comparability rule is in
+v1.0.0 sweep on one host, with the v1.0.0 binary's defaults: the `mhd` carrier
+forwards over a pool of four UDP lanes that each carry their own streams, the
+control channel and every record are sealed with AES-256-GCM, and the pool
+places a service's **new** streams on the carrier that service's traffic suited.
+One round, no A/A twin, so every row here is directional — it says which side of
+a cell an arm is on, not how far. The comparability rule is in
 [Benchmarks](./docs/benchmarks.md#comparability).
 
-![molehill and the peers over the stage schedule](assets/bench-v0.11.2-timeline.png)
+![molehill and the peers over the stage schedule](assets/bench-v1.0.0-timeline.png)
 
 The same run as small multiples — one panel per stage, a lollipop per tool:
 
-![Interactive RTT per stage, per tool](assets/bench-v0.11.2-stages.png)
+![Interactive RTT per stage, per tool](assets/bench-v1.0.0-stages.png)
 
 **Interactive stream RTT p99, per stage** (ms). Every stage after `clean` is
 shaped — the harness installed the queue or the delay that dominates it — so no
@@ -112,28 +111,43 @@ winner is marked in those columns. Sample counts and the full reading rules:
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 30.8 | 401.3 | 1083.4 | 1463.5 | 196.2 | 433.9 | 268.5 | 11.9 |
-| molehill (L3) | 1.4 | 401.4 | 1057.4 | 1451.4 | 196.1 | 419.9 | 263.9 | 1.5 |
-| frp | 1.2 | 401.3 | 1064.8 | 2475.0 | 196.1 | 429.3 | 268.2 | 1.7 |
-| rathole | 1.7 | 401.0 | 1058.0 | 1897.1 | 198.7 | 430.4 | 276.2 | 1.7 |
-| nps | 201.2 | 415.6 | 1065.8 | 1460.7 | 196.3 | 431.5 | 301.1 | 18.3 |
+| molehill (L4) | 7.689 | 401.470 | 1073.018 | 2450.189 | 197.008 | 434.016 | 106.208 | 1.942 |
+| molehill (L3) | 2.150 | 401.667 | 1061.883 | 2478.847 | 197.609 | 431.594 | 106.362 | 1.450 |
+| frp | 2.234 | 402.024 | 1080.589 | 2088.327 | 194.918 | 425.647 | 105.852 | 7.362 |
+| rathole | 2.154 | 401.305 | 1061.774 | 2042.192 | 197.831 | 426.570 | 107.056 | 2.170 |
+| nps | 101.266 | 500.894 | 1075.239 | 2094.287 | 196.248 | 425.525 | 165.809 | 72.158 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 8.641 | 3.370 | 6.950 | 1.136 | 0.094 | 0.019 | 0.019 | 7.066 |
-| molehill (L3) | 5.811 | 3.164 | 4.715 | 1.036 | 0.093 | 0.019 | 0.019 | 5.830 |
-| frp | 6.073 | 3.387 | 6.167 | 1.195 | 0.094 | 0.019 | 0.019 | 6.056 |
-| rathole | 29.038 | 3.401 | 14.746 | 1.202 | 0.094 | 0.019 | 0.019 | 29.153 |
-| nps | 0.134 | 0.136 | 0.134 | 0.136 | 0.094 | 0.019 | 0.019 | 0.134 |
+| molehill (L4) | 9.203 | 3.396 | 12.422 | 1.073 | 0.094 | 0.019 | 11.666 | 15.568 |
+| molehill (L3) | 10.132 | 3.180 | 8.078 | 1.039 | 0.093 | 0.019 | 9.570 | 10.170 |
+| frp | 6.061 | 3.373 | 6.172 | 1.152 | 0.094 | 0.019 | 6.181 | 6.052 |
+| rathole | 28.568 | 3.393 | 14.696 | 1.204 | 0.094 | 0.019 | 14.203 | 28.446 |
+| nps | 0.134 | 0.136 | 0.134 | 0.136 | 0.094 | 0.019 | 0.134 | 0.134 |
 
-**How to read it.** `molehill (L3)` is this project's second architecture, not
-a fifth tool: its comparison is `molehill (L4)` and the tool-free control arm.
-These are one host's v0.11.2 readings; only same-schema, same-method, same-host
-runs compare directly. The stage schedule, the run's own noise floor, the
-capacity ramp, the drift and cost panels, and how to reproduce a run are in
+**How to read it.** On every shaped stage the four forwarding tools are within a
+few per cent of each other: a shaped path is the queue, not the tool. The `loss5`
+column's spread (2042–2479 ms) is three samples wide, because a serial probe
+completes about 220 requests in that stage's 120 s. On the clean cell the
+product's L4 arm reads 7.689 ms in the first stage and 1.942 ms in the last,
+while frp reads the reverse (2.234 then 7.362) — that cell is bimodal for every
+arm that forwards in user space, so one round cannot rank it. Bulk is where the
+arms separate: rathole carries the most on every unshaped stage, the product is
+second on the two lossy ones (12.4 against frp's 6.2 at 1 % loss) and third on
+the clean one, and its own clean figure moves 9.203 → 15.568 between two stages
+of the same condition, the [warm-and-cold effect](./docs/benchmarks.md#warm-and-cold)
+the stage order produces. What the carrier policy itself costs — a session's
+first streams land where the pool already rides — is measured in
+[Benchmarks](./docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-19).
+
+**How to read the arms.** `molehill (L3)` is this project's second architecture,
+not a fifth tool: its comparison is `molehill (L4)` and the tool-free control
+arm. These are one host's v1.0.0 readings; only same-schema, same-method,
+same-host runs compare directly. The stage schedule, the run's own noise floor,
+the capacity ramp, the drift and cost panels, and how to reproduce a run are in
 [Benchmarks](./docs/benchmarks.md).
 
 A deployment that wants the data plane unencrypted sets
@@ -141,9 +155,9 @@ A deployment that wants the data plane unencrypted sets
 control channel; the cost of that choice is measured at
 [Benchmarks](./docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
-The rest of the run's chart set: `bench-v0.11.2-capacity.png` (the load ramp),
-`bench-v0.11.2-drift.png` (RSS, fds and threads over the run) and
-`bench-v0.11.2-cost.png` (CPU-seconds per carried Gbit).
+The rest of the run's chart set: `bench-v1.0.0-capacity.png` (the load ramp),
+`bench-v1.0.0-drift.png` (RSS, fds and threads over the run) and
+`bench-v1.0.0-cost.png` (CPU-seconds per carried Gbit).
 
 ## Quickstart
 
