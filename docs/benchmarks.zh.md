@@ -99,9 +99,9 @@ tag 提交做 diff,所以运行中落地的一个绘图修复就会让这份产�
 ## bench 模型(测量标准)
 
 `bench/src/bench/` 是标准,也是唯一的 runner。发布所公布的 sweep 不是第
-二套仪器:它就是本模型的 `sweep` profile——产品与各参照工具上的 `timeline` 与
-`capacity` 场景——这正是阶段日程与负载斜坡装在同一份结果文件里、同一份 schema
-之下、同一道门禁之后的原因。
+二套仪器:它就是本模型的 `sweep` profile——产品与各参照工具上的 18 阶段双腿
+`timeline`、`capacity` 斜坡与 `half-close` 格子——这正是日程、斜坡与分类格子装在同一
+份结果文件里、同一份 schema 之下、同一道门禁之后的原因。
 
 ```bash
 sudo -n just bench                     # the smoke profile, about a minute
@@ -602,7 +602,7 @@ flight 为 0,也就是说载体是**闲着**,不是坏着。
 sudo -n just bench
 sudo -n just bench --profile dev --aa
 
-# the release sweep: the staged schedule and the load ramp, five arms
+# the release sweep: the two-leg schedule, the load ramp and half-close, five arms
 just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 

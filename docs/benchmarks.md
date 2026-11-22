@@ -130,9 +130,10 @@ gated rather than reported.
 
 `bench/src/bench/` is the standard and the only runner. The sweep the
 release publishes is not a second instrument: it is this model's `sweep`
-profile — the `timeline` and `capacity` scenarios over the product and the
-reference tools — which is why the staged schedule and the load ramp travel in
-one results file, under one schema, behind one gate.
+profile — the eighteen-stage `timeline` over two legs, the `capacity` ramp and the
+`half-close` cell, over the product and the reference tools — which is why the
+schedule, the ramp and the categorical cell travel in one results file, under one
+schema, behind one gate.
 
 ```bash
 sudo -n just bench                     # the smoke profile, about a minute
@@ -752,7 +753,7 @@ with no second attempt.
 sudo -n just bench
 sudo -n just bench --profile dev --aa
 
-# the release sweep: the staged schedule and the load ramp, five arms
+# the release sweep: the two-leg schedule, the load ramp and half-close, five arms
 just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
