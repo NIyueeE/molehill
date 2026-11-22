@@ -44,6 +44,16 @@ Read `AGENTS.md` first for the rules; read this for the state.
 >   (p141, 4 rounds, `bulk-1` + `bulk-n`, the old binary against this one) reads **15.36 against 15.42 Gbit/s**: the policy is
 >   inert there because the preference is already TCP.
 
+> **§4.532 (`just bench phases` was reading a diagnostic line, and the tables were empty for it).**
+> §13.8 recorded the gap as "the tool reports no carrier counters while the logs carry the line". The cause was a selector:
+> `last_stats` took the **last line containing `mhd-stats:`**, and that prefix is also used by diagnostics —
+> `mhd-stats: a group ended having carried almost nothing …`, `mhd-stats: waiting for the connection lock …`. It parsed one
+> of those (two fields), found no phase names, and printed empty tables beside a hundred correct cumulative lines.
+>
+> Fixed by matching the cumulative line's own phrase. The same work directory now reads 38 fields and prices the phases:
+> **`rx_total` 10.65 µs a datagram, `tx_build` 45.25 µs a run, `tx_call` 1.35 µs a packet** on the round it refused before.
+> An instrument defect, not a product one — and the reason §4.523's phase numbers had to be read by hand.
+
 > **§4.531 (on a clean path the kernel carrier wins both axes, and the policy pays for a benefit it gets only under loss).**
 > Two pinned runs of the `cost` cell — the mixed workload: bulk spine, interactive, churn, UDP — on a clean path:
 >

@@ -72,6 +72,15 @@ WHAT: dict[str, str] = {
 
 MARKER = "mhd-stats:"
 
+#: The cumulative line's own phrase.
+#:
+#: Other lines share the marker — `mhd-stats: a group ended having carried almost
+#: nothing …`, `mhd-stats: waiting for the connection lock …` — so a reader that
+#: took the *last* marked line read one of those instead: two fields, no phase
+#: names, and every table empty while the log held a hundred correct ones
+#: (`HANDOFF.md` §4.532).
+CUMULATIVE = "cumulative phase timings"
+
 
 @dataclass
 class Phase:
@@ -146,7 +155,7 @@ def last_stats(path: Path) -> dict[str, float] | None:
     except OSError:
         return None
     for line in text.splitlines():
-        if MARKER in line:
+        if MARKER in line and CUMULATIVE in line:
             found = parse(line)
     return found
 

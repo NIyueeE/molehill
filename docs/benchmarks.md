@@ -706,7 +706,10 @@ meta.
   file>` reads the daemons' cumulative logs and prints seconds per carried Gbit
   and nanoseconds per event for every phase the engine times: the record layer's
   seal and open, the sender's run build and its syscall, the receiver's
-  per-datagram path, and the copies the two stream handles pay. Sampled phases
+  per-datagram path, and the copies the two stream handles pay. It reads the
+  **cumulative** line and ignores the diagnostics that share its marker, so a
+  round whose last `mhd-stats:` line reports "a group ended" still prices its
+  phases. Sampled phases
   are scaled back to the round's real event count, because the meters time one
   datagram in sixteen. It is an attribution, not a measurement — the claim is
   still `cpu_s_per_gbit`, and this only says where that number went.
