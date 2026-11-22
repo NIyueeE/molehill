@@ -664,14 +664,19 @@ poisoning the next sample, applied to a condition instead of a process.
 
 ### The shaping scope
 
-**A condition is applied to one leg of the topology**: `--condition-leg visitor`
-(the default) shapes the link between the visitor and the server, and
-`--condition-leg tunnel` shapes the link the tool's carrier crosses. Both ends
-of the chosen leg are shaped, because netem is egress-only — shaping one end
-would shape one direction. An injected delay is therefore paid once, on the
-visitor's side, where a real deployment's WAN is; the backend leg (the client
-process to the backend it forwards to) stays unshaped, because the backend is
-next to the tool. The leg a run used travels in its results meta.
+**A condition is applied to one leg of the topology, and the leg is a property of
+the stage.** The released schedule sets it per stage: a name without a suffix
+shapes the link between the visitor and the server (the visitor's own connection,
+which is what a user's client experiences), and a `@tunnel` name shapes the link
+the tool's carrier crosses. Everything outside the staged schedule — the
+campaign's own condition, `soak`, `cost`, the capacity ramp — uses the run-wide
+`--condition-leg` (default `visitor`). Both ends of the chosen leg are shaped,
+because netem is egress-only — shaping one end would shape one direction. An
+injected delay is therefore paid once, on the side the stage names, where a real
+deployment's WAN is; the backend leg (the client process to the backend it
+forwards to) stays unshaped, because the backend is next to the tool. The leg a
+cell used travels in the cell's **name**, which is why the two are never pooled in
+a table or a figure.
 
 Only the data plane is shaped. The tool's control channel stays on the unshaped
 path: shaping it kills the heartbeat and turns a capacity measurement into a
