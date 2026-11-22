@@ -265,6 +265,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the flat ceiling read 135–291 ms once the bulk spine passed eight gigabits a
   second. A shaped path keeps its old window, because its product really is
   megabytes.
+- **A stripe group no longer widens, because nothing could use the width it
+  grew.** A group starts on the one data channel the pairing gave it and used to
+  grow one more each time a send direction parked for the dwell and then moved
+  again. A group that widens mid-transfer has to move frames between channels,
+  which reorders them, so the number the growth produced had one reader — a
+  debug line — and no path consumed it. The observation stays: a parked group
+  that then moved is still logged with how long it waited. The width is now
+  whatever the pairing decided, `MOLEHILL_STRIPE_COUNT` included.
 
 ## [1.0.0] - 2026-11-01
 
