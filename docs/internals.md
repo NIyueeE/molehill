@@ -6,7 +6,7 @@
 - **Server**: the publicly accessible host running molehill in server mode
 - **Client**: the host behind NAT running molehill in client mode; it holds the services to be exposed
 - **Visitor**: someone who connects to a service through the server
-- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v5.2). Two services share it when they declare the same endpoint and the same KK key pair — the control channel is always Noise, so a service that overrides `noise` (for another server, or with its own keys) gets a session of its own, while `data_enable` alone never splits one
+- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v6.0). Two services share it when they declare the same endpoint and the same KK key pair — the control channel is always Noise, so a service that overrides `noise` (for another server, or with its own keys) gets a session of its own, while `data_enable` alone never splits one
 - **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, a yamux stream inside a TCP tunnel, or one of `mhd`'s own streams inside a lane. It names what it carries with a prologue: four bytes for a direct channel (the service), eight for a transparent lane (service and lane), twelve for a stream of a multiplexed tunnel (service, tunnel and the stripe group that asked for it); see "Forwarding"
 - **Lane**: one carrier connection of the pool. A TCP lane is a yamux session; an `mhd` lane is a UDP connection with its own packet numbers, acknowledgements and streams, and no multiplexer above it
 - **Tunnel pool**: the lanes one control session keeps for its services — one pool per session, keyed by its data endpoint (see "The tunnel pool")
@@ -31,17 +31,17 @@ A session uses two credentials, which is what lets one connection carry services
 ### Protocol versions
 
 The protocol version rides in every hello, and this build speaks and serves one
-dialect: **v5.2**. The version is two bytes (`major.minor`), so every hello is
-one byte wider than v5.0's and the two dialects cannot be read as each other.
-v5.2 keeps v5's service type (`ServiceType::Transparent`) and adds the
-transparent frame-format negotiation: a registration may declare whether its
-device produces vnet frames, and `DataChannelCmd::StartForwardTransparent`
-carries the format the channel will actually use — `Ip` for one bare IPv4 or IPv6
-packet per frame, or `Vnet` for a Linux device frame (the 10-byte virtio-net
-header plus packet or GSO super-frame). Everything else — the selector byte,
-the session handshake, the service prologue, the striping frames, the UDP
-framing — is v5.0's. (0.8–0.9 spoke v3, 0.10 v4, 0.11.0 v5.0; each dialect was
-dropped by the release that followed it.) The rule — a dialect is defined by a
+dialect: **v6.0**. The version is two bytes (`major.minor`), so a hello is read
+at the width its own dialect declares and two dialects cannot be read as each
+other. v6.0 is the carrier's dialect: the registration carries the data-plane
+carrier's name (`"mhd"`), the carrier's packets are a different engine's — one
+UDP pool whose lanes carry their own sealed streams, instead of KCP segments
+under yamux — and the record layer's cipher changed with it (see "The record
+layer"). Everything above the carrier — the selector byte, the session
+handshake, the service prologue, the striping frames, the UDP framing — is what
+v5.2 had. (0.8–0.9 spoke v3, 0.10 v4, 0.11.0 v5.0, 0.11.1 v5.1, 0.11.2 v5.2;
+each dialect was dropped by the release that followed it.) The rule — a dialect
+is defined by a
 release, its number moves with the tag that introduces it, and no two tags are
 compatible — lives in AGENTS.md §5; what it means on the wire is here: the
 reader checks a three-byte prefix (variant tag plus the two version bytes)

@@ -210,6 +210,26 @@ gone:
 | `[server.data].max_tunnels_per_client` | `[server.data].max_tunnels`: the valve is global now; unset derives it from the open-file limit and 0 is unlimited |
 | `[server.data].stripe_count` | Nothing: a visitor's group starts on one channel, and no configuration key sets how wide it becomes |
 
+### Migrating to 1.0.0: the wire, and the carrier's name
+
+**No configuration key changes.** The data plane's keys were already
+carrier-neutral, so a 0.11.2 `server.toml` / `client.toml` is a 1.0.0
+configuration as it stands. What changed is the wire and the names around the
+carrier:
+
+| What you have | What to do |
+|---|---|
+| a 0.11.2 peer | Upgrade both ends: 1.0.0 speaks wire dialect **6.0**, and a 5.x peer is refused on the connection it happens on, with the version it sent |
+| a build with `--features kcp` | `--features mhd` — the carrier under its own name. Both are in the default set, so a default build needs neither |
+| `MOLEHILL_DATA_CARRIER=kcp` | `MOLEHILL_DATA_CARRIER=mhd` (`tcp` is unchanged) |
+| `MOLEHILL_KCP_STATS=1` | `MOLEHILL_MHD_STATS=1`: the carrier's own phase timings |
+| a status reader watching `kcp_datagrams_out` / `kcp_retransmits` | `mhd_datagrams_out` / `mhd_retransmits`: the same counters for the same tunnels |
+
+The carrier behind those names is a different engine as well as a different
+name: one UDP pool whose lanes carry their own streams, with no yamux above a
+lane and no KCP segment queue below it. What it costs, and how it compares with
+the kernel carrier on the same workload, is on [Benchmarks](benchmarks.md).
+
 ## Choosing your configuration (decision tree)
 
 The first choice is the mode: `[client]` forwards to a local application,
@@ -1067,8 +1087,8 @@ the peer's public key beside your private key.
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
-| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5.1 (0.10 serves v4, 0.11.0 serves v5.0, 0.11.1 serves v5.1), so an older client *or* an older server gets this; upgrade both ends together. |
-| The client stops with `protocol v5.2` after a server's hello never arrives | The server is older than this build: it reads the version, fails its own check and closes that connection. Upgrade the server. |
+| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v6.0 (0.10 serves v4, 0.11.0 serves v5.0, 0.11.1 serves v5.1, 0.11.2 serves v5.2), so an older client *or* an older server gets this; upgrade both ends together. |
+| The client stops with `protocol v6.0` after a server's hello never arrives | The server is older than this build: it reads the version, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
 | Config starts but the connection fails with a resolve error (`failed to lookup address information`) | These address keys are only checked for a `:` in the string, not parsed as socket addresses: `client.control.default_remote_addr`, `client.services.<name>.remote_addr`, `client.data.default_data_addr`, `server.data.bind_addr`. A bare IPv6 literal such as `"::1"` therefore passes startup and has no port, failing when the address is resolved. Always write host **and** port, bracketing IPv6 literals — `"[::1]:2333"`. (A service's `remote_bind_addr` is parsed as a `SocketAddr` and rejected at startup instead.) |

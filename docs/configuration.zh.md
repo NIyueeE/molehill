@@ -187,6 +187,24 @@
 | `[transparent.claims.<name>].retry_interval` | `[transparent.claims.<name>].retry_backoff_max`:不设置则继承 `[transparent.control].retry_backoff_max` |
 | `[transparent.claims.<name>].tunnels` | `[transparent.data].tunnels`:claim 的 lane 数是它在客户端预算中的份额 |
 | `[server.data].max_tunnels_per_client` | `[server.data].max_tunnels`:阀门现在是全局的;不设置由打开文件上限推导,0 = 不限 |
+| `[server.data].stripe_count` | 无需填写:一个访问者的组从一条通道起步,而且没有配置键决定它会长多宽 |
+
+### 迁移到 1.0.0:线协议与 carrier 的名字
+
+**没有任何配置键改变。** 数据面的键本来就把 carrier 抽象掉了,所以一份 0.11.2 的
+`server.toml` / `client.toml` 原样就是 1.0.0 的配置。变的是线协议,以及围绕 carrier 的名字:
+
+| 你现在有的是 | 怎么做 |
+|---|---|
+| 一个 0.11.2 对端 | 两端一起升级:1.0.0 说线协议 **6.0**,5.x 对端会在它发生的那条连接上被拒绝,并带上它发来的版本号 |
+| 用 `--features kcp` 构建 | `--features mhd`:carrier 用自己的名字。两者都在默认特性集里,所以默认构建两个都不用写 |
+| `MOLEHILL_DATA_CARRIER=kcp` | `MOLEHILL_DATA_CARRIER=mhd`(`tcp` 不变) |
+| `MOLEHILL_KCP_STATS=1` | `MOLEHILL_MHD_STATS=1`:carrier 自己的相位计时 |
+| 读 `kcp_datagrams_out` / `kcp_retransmits` 的状态读者 | `mhd_datagrams_out` / `mhd_retransmits`:同样的隧道、同样的计数器 |
+
+这些名字背后的 carrier 换的不只是名字,引擎也换了:一个 UDP 池,每条 lane 自己承载自己的
+流,一条 lane 之上没有 yamux、之下没有 KCP 段队列。它的代价,以及它和内核载体在同一负载上的
+对比,见[基准测试](benchmarks.zh.md)。
 
 
 ## 选择配置(决策树)
@@ -962,8 +980,8 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | 请求的 `remote_bind_addr` 端口未在服务端白名单中,或服务端禁用了动态注册。修复 `allow_ports`。 |
 | `Port N is already in use` | 服务端上另一个服务(或程序)占用了该端口。换一个 `remote_bind_addr` 端口。 |
-| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5.2 的 molehill(0.10 服务 v4,0.11.0 服务 v5.0,0.11.1 服务 v5.1、0.11.2 服务 v5.2),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
-| 客户端在服务端的 hello 始终不到达后以 `protocol v5.2` 停止 | 服务端早于本构建:它读到版本号、自己的版本检查失败并关闭该连接。请升级服务端。 |
+| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v6.0 的 molehill(0.10 服务 v4,0.11.0 服务 v5.0,0.11.1 服务 v5.1、0.11.2 服务 v5.2),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
+| 客户端在服务端的 hello 始终不到达后以 `protocol v6.0` 停止 | 服务端早于本构建:它读到版本号、自己的版本检查失败并关闭该连接。请升级服务端。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |
 | 配置能启动,但连接时报地址解析错误(`failed to lookup address information`) | 这些地址键只检查字符串里有没有 `:`,并不按 socket 地址解析:`client.control.default_remote_addr`、`client.services.<name>.remote_addr`、`client.data.default_data_addr`、`server.data.bind_addr`。因此裸 IPv6 字面量(如 `"::1"`)能通过启动校验,却没有端口,解析地址时才会失败。始终写 `主机:端口`,IPv6 字面量要加方括号——`"[::1]:2333"`。(服务的 `remote_bind_addr` 反而会按 `SocketAddr` 解析,启动时就会拒绝。) |

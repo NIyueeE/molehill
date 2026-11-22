@@ -193,11 +193,15 @@ is the voice contract for writing it.
   dialect's release is still in development its commands may be extended **in
   place** under that number; once the tag exists, the next change is the next
   number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4, 0.11.0 v5.0,
-  0.11.1 v5.1 — each read off its tag's `CURRENT_PROTO_VERSION`. v5.0 is
-  tagged, so its commands are fixed. v5.1 deliberately breaks the v5.0 wire in
-  a patch release (the two-byte version and the transparent frame-format
-  negotiation); `5.1` is a dialect label, not a SemVer-compatible minor. The
-  next wire change is 5.2; a redesign would be 6.0.
+  0.11.1 v5.1, 0.11.2 v5.2 — each read off its tag's
+  `CURRENT_PROTO_VERSION` — and 1.0.0 v6.0, whose tag does not exist yet, so
+  its commands are still extended in place. v5.0 is tagged, so its commands are
+  fixed. v5.1 deliberately breaks the v5.0 wire in a patch release (the two-byte
+  version and the transparent frame-format negotiation); `5.1` is a dialect
+  label, not a SemVer-compatible minor. v6.0 is the carrier's own dialect: the
+  data plane is this repository's `mhd` engine, a lane carries its own streams
+  under a per-lane root, and the registration carries the carrier's name —
+  which is why renaming it was a wire change rather than a cosmetic one.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -446,9 +450,11 @@ pointers, not copies:
   carry forwarded traffic.
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
-  `hot-reload`; `carrier` (the KCP/TCP choice and fallback, implied by
+  `hot-reload`; `carrier` (the mhd/TCP choice and fallback, implied by
   `multiplex` and `transparent`); `multiplex` (yamux, in the default set);
-  `kcp` (KCP-over-UDP data tunnels, in the default set; implies `multiplex`);
+  `mhd` (the datagram carrier: one UDP pool whose lanes carry their own
+  streams, in the default set; implies `multiplex`, and pulls `ring` and
+  `hkdf` for the record layer's AES-256-GCM);
   `transparent` (a client-owned public `ip:port` carried as whole IP packets
   over a TUN device: Linux and macOS run both ends, Windows can serve but not
   claim, in the default set; it implies `carrier` (whose lane budget and
@@ -464,7 +470,7 @@ pointers, not copies:
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Protocol**: v5.1, one control session per endpoint; the rule and the
+- **Protocol**: v6.0, one control session per endpoint; the rule and the
   release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
 - **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at
