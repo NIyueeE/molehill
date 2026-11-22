@@ -1163,8 +1163,8 @@ carrier that only wins when packets are lost.
 
 **Bulk separates the arms.** rathole is first on every unshaped cell, the product second on both lossy ones (12.42
 against frp's 6.17 at 1 % loss) and third on the clean one — and its own two clean stages disagree by 69 % (9.20
-against 15.57), the warm-after-cold effect "Warm and cold" describes for the tail. Read the clean bulk number as a
-range for one arm rather than as a ranking.
+against 15.57) — the stage order disagrees with itself, "Warm and cold" documents the same shape for the tail. Read
+the clean bulk number as a range for one arm rather than as a ranking.
 
 **Two caveats that travel with the table.** `clean` is bimodal in this topology, and which arm draws the slow mode
 moves between the two clean stages: the product reads 7.689 then 1.942, frp 2.234 then 7.362. A single-round reading

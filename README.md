@@ -138,9 +138,10 @@ arm that forwards in user space, so one round cannot rank it. Bulk is where the
 arms separate: rathole carries the most on every unshaped stage, the product is
 second on the two lossy ones (12.4 against frp's 6.2 at 1 % loss) and third on
 the clean one, and its own clean figure moves 9.203 → 15.568 between two stages
-of the same condition, the [warm-and-cold effect](./docs/benchmarks.md#warm-and-cold)
-the stage order produces. What the carrier policy itself costs — a session's
-first streams land where the pool already rides — is measured in
+of the same condition — the stage order disagrees with itself, as
+[warm and cold](./docs/benchmarks.md#warm-and-cold) documents for the tail. What
+the carrier policy itself costs — a session's first streams land where the pool
+already rides — is measured in
 [Benchmarks](./docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-19).
 
 **How to read the arms.** `molehill (L3)` is this project's second architecture,
