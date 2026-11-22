@@ -971,6 +971,33 @@ kernel carrier, and it holds. "Throughput" must never be quoted on a clean path 
 What would turn either into a claim: the same run at six rounds with the endpoints pre-registered (`--primary`), and the tunnel-leg
 staged schedule (which no published table is yet; `docs/benchmarks.md`, "What the model cannot answer").
 
+### H. The first record under the standard — what it replaces, and the merge checklist
+
+The run in flight (`~/tmp/p380-standard-sweep.json`, five arms, `sweep` profile at revision `a1d941e` and later, ~4 h) is the
+**first record under the 定型 bench**. It replaces `benches/records/results-bench-v1.0.0.json` — measured under the eight-stage
+visitor-only schedule, i.e. a method that no longer exists. Since v1.0.0 was never tagged, that file was never *published*: it is
+replaced in place, and the old numbers survive only in this file's history and in `CHANGELOG.md`.
+
+**The merge, in order, once the run lands:**
+
+1. `just bench gate <record>` **without** `--baseline` — a method-changing release re-baselines (§7). Absolute half only:
+   coverage of every declared cell, the endpoint invariant, the SLO on the clean stages, drift and wedges, the ramp.
+2. `just bench plot <record> --out-dir assets/` and rename to the release's names (`bench-v1.0.0*.png`), replacing the set.
+3. Move the record into `benches/records/results-bench-v1.0.0.json` and the charts into `assets/`.
+4. Rewrite **both** published tables — `README.md`/`README.zh.md` and `docs/benchmarks.md`/`.zh.md` — split **by leg**, from
+   `just bench plot … --markdown`'s own output (the tables it prints are already per leg), with the claim discipline stated
+   beside them: one round, so the tables say which side of a threshold a reading falls on and never rank arms by speed.
+5. CHANGELOG: the re-baseline entry (already written) says the next record becomes the baseline; name the file.
+6. Merge this branch into `feat/v1.0.0`, then `just tag-check`. The record's revision and the tag commit must differ only in
+   docs/assets/records — any change under `bench/src/bench/` after the measurement makes the artifact unusable (§0, §4.534).
+7. The tag itself is the human's (`AGENTS.md` §5).
+
+**The risk to watch, and the one thing that must *not* happen.** A stage may produce no cell for an arm — `udp_blocked@tunnel` on
+`l3` is the candidate, because a claim's lanes ride the datagram carrier (though `src/transparent/lanes.rs` can move a lane to TCP,
+so the fallback may well cover it). If the gate then names a missing (arm, cell), the fix is **a revision of the model** — either
+the workload learns to measure it, or the condition declares which architectures it can be imposed on — and the run is repeated.
+**The gate is never relaxed to fit a record**: a coverage check that can be talked out of a missing cell is not a coverage check.
+
 ## 5. Active architecture decisions
 
 > **The governing plan is `MHD-FINALIZATION-PLAN.md`** (checkout root, untracked
