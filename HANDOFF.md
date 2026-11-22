@@ -13,6 +13,33 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.534 (the bench 定型: coverage lands on the leg each class happens on, a claim discipline, a revision rule).**
+> **Why.** The release schedule was eight stages, all imposed on the visitor's connection — the leg **no tool owns** — so every
+> shaped cell tied and a release run could compare arms only on a clean path. The product's own feedback channel therefore could
+> not see the one thing it exists to measure.
+> **What it is now.** Eighteen stages: ten on the visitor leg (healthy path bracketing the walk; distance; light loss; the same
+> loss with a queue that does not tail-drop; heavy loss; 20 and 100 Mbit uplinks; the same 100 Mbit with an 11 ms queue; a mobile
+> path losing and rate-capped at once; jitter) and seven on the tunnel leg, where a carrier's own transport is all there is to
+> measure (distance, light and heavy loss, bufferbloat, a 1 280-byte MTU, UDP policed, UDP refused). Two rows are
+> **single-parameter pairs** (queue depth at one loss rate, then at one rate) and four conditions are walked on **both legs**.
+> **A cell's name carries its leg** (`loss1@tunnel`), the label rule has one home (`model.stages_of`) so the workload and
+> `expected_cells` cannot disagree, `just bench gate` refuses a record missing a declared cell, the master figure draws the leg
+> boundary, and a reading from one leg is never compared with one from the other.
+> **The claim discipline is written down** (`docs/benchmarks.md`, "The standard"): a one-round release record may claim per-cell
+> facts only — SLO held, wedge, capacity, a categorical cell, side of a threshold — and a difference claim needs the `compare`
+> profile (three rounds, warm-up, A/A twin). A change under `bench/src/bench/` is a **revision**: reason in CHANGELOG, gate
+> without `--baseline`, affected tables in the same commit, this file told what moved.
+> **Two measurements forced the leg dimension, and both are negative results.** `mtu1280` on the visitor leg moved no arm
+> (control 41.39, rathole 8.96, molehill 3.82 Gbit/s against clean's 40.45 / 9.83 / 4.00); `loss1_rate100` on the visitor leg put
+> **every** arm on 0.096 Gbit/s and 286 ms, i.e. on the shaper's own number. A class imposed on the leg that does not own it
+> measures the harness.
+> **Validation** (scale 0.1, two arms, two passes — machinery, not evidence): `loss1@tunnel` **51 ms** against the tool-free
+> control's **1 054**, `loss5@tunnel` 605 against 2 479, `rate100_shallow@tunnel` 235 against 2 694, while the same conditions on
+> the visitor leg tie (1 045 against 1 084). That is the controlled comparison the schedule is for, and it is the same direction
+> §4 G measured at full scale.
+> **Cost, stated because it is real**: ~35 s of drain per stage on top of a 120 s hold, so the release sweep is **~4 hours** for
+> five arms. `docs/release.md` and the profiles table say so.
+
 > **§4.533 (the release audit: `just tag-check` goes from three failures to a pass, and the sweep withdrew one published claim).**
 > **What the tag review wanted was not code.** `[Unreleased]` held 24 entries the dated `## [1.0.0] - 2026-11-01` section did not
 > have, and neither `benches/records/results-bench-v1.0.0.json` nor `assets/bench-v1.0.0.png` existed. The dated section had also
