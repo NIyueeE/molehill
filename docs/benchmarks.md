@@ -1105,15 +1105,21 @@ spine, interactive, churn and UDP together, one carrier pinned per run — the k
 14.51 Gbit/s** where mhd reads **12.65 ms at 8.42**, with `dropped_packets` zero on both: the lane's tail there is
 queueing inside the lane, not repair. So on a clean path the kernel carrier wins **both** axes, which is what the
 `clean` row above says at bulk sizes and what the product's per-service policy pays for on every path that is not
-losing packets (`HANDOFF.md` §4 C).
+losing packets.
+
+**What the policy costs while it has no evidence.** Every row above pins one carrier per run; the product does not.
+It reads each service's class from what its channels moved and places **new** streams accordingly, and a stream
+already running is never moved — moving one reorders it. So a session's first streams land where the pool already
+rides and only the ones after the evidence can benefit. Same build, four rounds, the only difference a pin: on
+`bulk-1` the automatic session carries **3.584 Gbit/s against 5.743** (62 % of the kernel carrier), on `bulk-n`
+**15.299 against 18.912** (81 %), and on `two-wave` — a warm stream, a settle, then the measured wave — **81.6 %**.
+The cell that opens cold pays the difference; a deployment that knows its traffic is bulk removes it by pinning
+`MOLEHILL_DATA_CARRIER=tcp`, and the automatic path is for the deployments that carry both kinds.
 
 **What this table does not say.** It is not a comparison against other tools — that is the sweep's job, below. It is
 loopback in a container, so `clean` is a lower bound on what a real path does to both carriers. And it does not tell
 you which carrier to run: the product decides at runtime, falling back to TCP when a session cannot be established,
-and `MOLEHILL_DATA_CARRIER` exists to separate the two for exactly this measurement. It is loopback in a container, so `clean` is a lower bound
-on what a real path does to both carriers. And it does not tell you which carrier to run: the product decides at
-runtime, falling back to TCP when a session cannot be established, and `MOLEHILL_DATA_CARRIER` exists to separate
-the two for exactly this measurement.
+and `MOLEHILL_DATA_CARRIER` exists to separate the two for exactly this measurement.
 
 ### Where the product stands against the peers (2026-11-22, this model)
 

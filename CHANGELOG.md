@@ -19,9 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **3.584 Gbit/s on `bulk-1` against 5.743** pinned to the kernel carrier (62 %),
   **15.299 on `bulk-n` against 18.912** (81 %), and **81.6 %** on the `two-wave`
   scenario, where a warm stream and a settle give the pool the chance the first
-  wave does not. Both halves are the design working as written; a deployment
-  that knows its traffic is bulk should pin `MOLEHILL_DATA_CARRIER=tcp` rather
-  than wait to be taught.
+  wave does not. Both halves are the design working as written, and
+  [Benchmarks](docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-19)
+  prices them; a deployment that knows its traffic is bulk should pin
+  `MOLEHILL_DATA_CARRIER=tcp` rather than wait to be taught.
 - **A wedge was sighted once under a soak and cannot be reproduced on demand,
   so this release does not claim to have fixed it.** A wedge is a visitor
   stream that stops moving while the path and the process both stay up, and the
