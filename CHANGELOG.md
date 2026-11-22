@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-22
+
 ### Known gaps
 
 - **A carrier decision is learned after a session's first streams have opened,
@@ -33,250 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreachable, and this is why the axis stays in the gate rather than being
   declared closed.
 
-### Added
-
-- **A staged run can start a named subset of its probe series**
-  (`just bench run --series interactive`). The three series are three separate
-  measurements of one network — the staged `rtt_p99_ms` comes from the
-  interactive one, `churn_per_s` from the churn one, and the datagram probe's two
-  from its own — so running one at a time is how a diagnostic asks whether a
-  second probe on the same host moves the first one's tail. The probe set travels
-  in the run's fingerprint, and a subset is never a release configuration: a run
-  without the interactive series has no staged `rtt_p99_ms`, and the gate refuses
-  a clean stage it cannot judge.
-- **A staged cell carries the churn series' own shape** — `churn_setup`,
-  `churn_connect`, `churn_echo` and `churn_errors` — as evidence rather than as a
-  metric, so a reader can see whether the arrival rate came with a tail. And a
-  metric whose series could not answer is now absent *with its reason*: never
-  started, started and produced no sample, or every attempt failed. An absent
-  number with no explanation is the shape a dead probe, a lost route and a bug in
-  the analysis all produce.
-- **A scenario asks whether a carrier decision reaches the streams that open
-  after it.** `two-wave` runs a warm stream, waits out a settle, then measures a
-  fresh wave in the same session. The warm wave is what lets the pool read the
-  service's class and converge, so the measured wave is the policy's first
-  chance to place a stream where it belongs. A policy that never converges
-  shows two equal waves, which nothing else in the model can tell apart from a
-  pool that was never given the chance — so the scenario headlines throughput
-  and keeps both waves as separate cells.
-
-### Changed
-
-- **A session that carries only bulk services moves its pool to the kernel
-  carrier.** The pool has read each service's class and used it to place
-  *streams*; the tunnels themselves stayed on whatever carrier the endpoint
-  preferred, so a client whose services are all bulk — a backup host, a mirror —
-  kept every tunnel on the datagram carrier and its bulk traffic with it, at the
-  gap the [benchmarks page](docs/benchmarks.md) records between the two carriers
-  on a clean path. The pool now moves: the spare dial goes out on the kernel
-  carrier and the over-represented carrier's idle tunnels are given back one per
-  tick, so nothing carrying traffic is ever removed and a stream always finishes
-  on the tunnel it started on. One datagram tunnel stays warm, because the class
-  is a measurement that a later service can revise, and a flow that turns out
-  conversational should land on a lane rather than pay a cold grow. A **forced**
-  carrier (`MOLEHILL_DATA_CARRIER`) now stands the whole mix policy down, not only
-  this half of it: before, a run pinned to `mhd` still grew kernel-carrier spares
-  as soon as a second service's class appeared, so a pinned arm did not measure
-  the carrier it named.
-- **Records are sealed with AES-256-GCM, keyed from the Noise handshake.** The KK
-  handshake is unchanged — it is what authenticates both ends and where the
-  session's secrets come from — but the cipher that runs on every record is now
-  `ring`'s AES-256-GCM, under keys derived through HKDF from the handshake's
-  split and transcript (the transcript as salt, the direction's half as input
-  key material), instead of the pattern's ChaCha20-Poly1305. One AEAD was a third
-  of the data path's cycles — 17.4 % opening and 15.4 % sealing, sampled on a
-  release build carrying bulk — and at record size it costs **0.371 ns per
-  byte** against ChaCha20-Poly1305's 0.526 (`just primitives` prices both). On
-  the bench model's eight-stream bulk cell a run that the tool, not the visitor,
-  filled carried **15.36 against 12.78 Gbit/s** and spent **12.7 % less CPU per
-  Gbit**; a host phase where the visitor only offers 9.8 Gbit/s measures no
-  difference on that cell, which is all such a cell can say. The mixed cell's
-  interactive tail is unchanged: p99 4.07 ms against 4.96, inside that run's own
-  scatter, p50 identical. The record's two-byte length header is now
-  authenticated as associated data, which the handshake's own transport mode
-  never did. This is a wire change: **both ends upgrade together** (dialect 6.0).
-- **The pool decides a carrier per service, from what that service carried.**
-  Which carrier suits a service is a property of the *workload* as much as of the
-  path — measured on the leg the carrier crosses, a conversational flow's
-  interactive tail is 11× tighter on the datagram carrier at 1 % loss while a bulk
-  flow carries 2.8× more on the kernel one — and one deployment carries both. The
-  pool reads each service's class from what its channels moved (a megabyte crossed,
-  or a channel that ended under 64 KiB), sends a bulk service's **new** streams to
-  the kernel carrier and a conversational service's to a tunnel no bulk stream
-  occupies, and needs no configuration key to do it. A service nobody has watched
-  stays where the pool already rides, a stream that is already running is never
-  moved, and the preference always falls through to the least-loaded tunnel, so a
-  wrong guess costs throughput and never a visitor.
-- **A sealed `mhd` channel on an established lane no longer waits for an opening
-  acknowledgement.** The plain path dropped that wait when stream registration was
-  introduced; the sealed path kept it, so every new channel paid one round trip
-  before it could carry a byte, and every visitor's channel setup paid it on a
-  high-latency path. `DERIVED_REGISTERED_SELECTOR` (`0x04`) carries the same claim
-  the plain selector makes — sealed, and the lane is already registered, so no
-  answer is owed. Measured with 100 ms each way: a visitor's channel setup falls
-  from 400 ms to **200 ms** (the rest is the channel's own arrival), a channel open
-  from p50 200 213 µs to **24 µs**, and the mixed cell's interactive latency from
-  p50 601 ms / p99 up to 4 179 ms to **p50 401 ms / p99 401 ms** — the same number
-  the control arm with no tool in the path reports. A claim the server cannot honour
-  refuses that one stream, as the plain selector's already does.
-- **A busy lane keeps credit back for a small stream's request.** The opening
-  reserve was keyed on the bytes a stream has ever written, so a chat stream that
-  had carried megabytes over its life looked like bulk to it: when one bulk stream
-  with a blocked reader held the connection's credit, the next request had nowhere
-  to go. Measured on a 20 Mbit/s path under four bulk streams, a long-lived
-  interactive stream **stopped for 105 seconds**; with `SMALL_STREAM_RESERVE`
-  keeping eight payloads for any stream whose unacknowledged flight is small, every
-  measured round carried interactive traffic through the same step. The reserve is
-  taken inside the peer's credit, so no frame overruns the advertised window.
-- **A packet whose stream is small is re-sent on the path's own round trip.** The
-  retransmission timer's small-flight rule tested the *lane's* packet count, and a
-  lane carrying bulk always has a wide flight, so the interactive packet inside it
-  climbed the whole timeout ladder: on the same 20 Mbit/s step the p99 was
-  **2 391–4 946 ms**; judged on the path's round trip with no backoff it reads
-  **215–1 605 ms** in the rounds that measured, against the control arm's 502.
-- **An `mhd` stream no longer pays a Noise handshake of its own.** A lane's first
-  stream runs the KK handshake and its secret becomes the lane root; every later
-  stream on that lane seals with a key derived from `(root, direction, stream id)`.
-  The handshake phase of a channel open falls from 1 221 µs to **11 µs**, a channel
-  open under a bulk transfer from p50 1 414 µs / p99 41 ms to **211 µs / 9 ms**, and
-  the mixed clean cell's interactive p99 from 29–48 ms to **7.4–8.7 ms** — for 13 %
-  of the clean-path throughput. Forward secrecy on this carrier is now per lane
-  rather than per stream; `MOLEHILL_MHD_SEAL=0` turns the path off for one process.
-- **The carrier's AEAD is AES-256-GCM through `ring`**, at **671 ns** for a
-  1 400-byte packet against 2 805 ns for the ChaCha20-Poly1305 it replaces, which is
-  what makes sealing affordable: `bulk-n` on a clean path reads 85 % of its unsealed
-  throughput instead of 54 %.
-- **The carrier comparison states its leg.** The mhd-versus-TCP tables in
-  `docs/benchmarks.md` and its Chinese mirror now say that every row but `clean`
-  was measured with the condition on the *visitor* leg, so those rows price a
-  visitor-side impairment rather than a carrier on an impaired path, and the
-  lossy-path advantage claim is gone: the two carriers had never been compared on
-  the leg they share, and the first such run (5 % loss, 100 ms, `bulk-1`) has the
-  TCP carrier 1.6× ahead on throughput with mhd's interactive tail 20–30 % tighter.
-  `docs/configuration.md` says the same in one row.
-
-### Fixed
-
-- **A lane's first packet now reaches the peer.** The datagram batch was sized from
-  its *first* span and accepted a tail that was shorter, so the kernel split the
-  tail into fragments of the first span's length. A lane opens with a 17-byte credit
-  followed by a full segment, which therefore went out as thousands of 17-byte
-  fragments; the receiver refused them as malformed, **number zero of every lane
-  never arrived**, and the cumulative acknowledgement frontier — the only retirement
-  path that covers an old number — stayed at zero for the lane's whole life. The
-  batch now refuses a tail longer than its segment and the caller sends it whole.
-  Measured on the protocol harness: refusals 13 → 0, `first_seen` 0 on every lane,
-  and the frontier advancing 0 → 11 017 / 12 934 / 15 008.
-- **A staged cell that asked for bulk and carried nothing is a failure, not a fast
-  stage.** Its latency is a measurement of an idle path, so a cell with
-  `streams > 0` and exactly zero carried bytes now reports `ok=False` with that
-  reason, and `just bench gate` refuses it as an unmeasured round. Measured: five
-  of six last-stage cells in one campaign carried nothing while reporting a pass,
-  because a tool that stops forwarding scores its best number on its emptiest
-  stage. The test is exactly zero — a rate-shaped stage legitimately reads small.
-- **A carrier that stopped delivering one direction no longer stalls a transfer.**
-  A lane's reader took one datagram per wake-up, so above roughly 700 datagrams a
-  second its socket queue filled and the kernel dropped the rest — measured as 97 %
-  of one direction — and a bulk transfer through a striped group stopped partway and
-  never resumed. A wake-up now drains the socket until it is empty. Measured on the
-  integration suite: ten of ten runs pass in 2.96–3.90 s, where the same cell
-  previously failed about one run in four after 40–70 s.
-- **A packet that arrives after its stream ended no longer opens a new one.** A
-  retired stream on the accepting side was re-created by a late packet from the
-  peer, which gave the server a channel for a visitor whose connection had already
-  closed and left the window its bytes spent unrecovered. Stream ids are monotonic,
-  so an unknown id below the highest accepted one is late, not new.
-- **A new stream can no longer be given an id a live stream still holds.** Stream
-  ids wrap, and the minter inserted without checking, so a wrapped id could replace
-  a live stream's state — its keys, its reader's position and its place in the
-  window — with no error anywhere. The minter now skips an id that is in use.
-- **A comparison the run cannot pair is reported, not crashed.** `just bench report`
-  raised `StatisticsError` when two arms carried a metric in disjoint rounds; it now
-  returns an `unavailable` verdict whose reason names both arms' rounds.
-- A striped data channel no longer gives up on a frame the carrier is still
-  recovering. The reorder deadline was two seconds, shorter than a carrier stall
-  measured at nearly twelve; a group now waits thirty, so the side that can still
-  make progress decides when a transfer has failed.
-
-- **A transparent (L3) claim is reachable from the first packet.** A claim's first
-  data lane was read twice on the server — once as a stream prologue and again as a
-  lane prologue — so the second read blocked and the lane was dropped as "named no
-  lane". The claim never became routable and a visitor's connection to a claimed
-  `ip:port` timed out. The lane id now travels with the channel: `just l3-accept`
-  passes end to end, including lane lending between claims, `lend = false`, and the
-  operator's lane cap.
-- **A refused packet no longer consumes a packet number**, and a lane that cannot
-  seal one closes instead of carrying on with a hole. An unspent number leaves a
-  permanent gap in the peer's cumulative frontier, which the sender then repairs for
-  ever.
-
-### Changed
-
-- **The benchmark can price the carrier itself, with nothing above it.** A new
-  `transport` scenario runs the protocol harness twice per arm — a raw TCP socket
-  on the control arm against an mhd stream on a tool arm — with the listener in
-  the server namespace and the dialer in the visitor's, so the traffic crosses the
-  shaped path rather than loopback. Four declared metrics come out of it: open,
-  first byte, the wait after the first byte, and the harness's own error rate. The
-  numbers they produce are the carrier's alone: an mhd stream opens in 3 µs
-  against a TCP connect's 48, and a round trip costs 2.5× the bare socket's.
-
-- **A lossy path costs mhd most of its bulk throughput, and that is an open defect
-  rather than a documented trade-off.** On the leg the carrier crosses, a 5 %-loss
-  100 ms path carries **0.11 Gbit/s** against the clean cell's 3.71, and a 1 %-loss
-  20 ms path carries **0.74** against the other carrier's 2.10. The cause is
-  measured: the window's growth phase ends at the connection's first loss and never
-  resumes, so on that 1 %-loss cell it sits at **1.1 MB against its own 5 MiB
-  ceiling**, refusing 1 900 writes a second with 3.4 MB queued behind it. Eight
-  mechanisms have failed to move it, and the eighth — ending the growth phase only
-  when the loss came with a standing queue — bought 66 % on the 5 %-loss cell and
-  cost 16 % interactive failures on a rotating path, so it was reverted
-  (§4.501). [Internals](docs/internals.md#multiplexing) states the
-  defect and what it means: nothing above the window decides a rate, so the window's
-  growth rule is the whole send-rate policy.
-- **This is a re-baseline release for the benchmark.** The engine changed —
-  `bench/src/bench/model.py` gained the `l4-plain` arm and `Arm.noise_data`, so
-  runs can measure the plain data plane, and the registry gained
-  `mhd_lane_dup_pct`, the busiest carrier lane's share of the bytes it re-sent.
-  A published record gathered by a different engine is not a comparable
-  baseline, so `just bench gate` runs **without `--baseline`** and the record
-  this release produces becomes the next baseline; the release notes say that
-  rather than implying a comparison the fingerprints would refuse. See
-  [docs/release.md](docs/release.md) and, for what the new metric means and when
-  it is absent, [Benchmarks](docs/benchmarks.md).
-
-- **Each carrier now has a stated path condition, measured on the leg the carrier
-  crosses.** mhd is the carrier for an impaired path and TCP is the carrier for a
-  clean one and for bulk. On an unshaped cell TCP is ahead on every axis (4.80
-  against 3.71 Gbit/s, 0.12 against 0.16 ms at p99, and less than half the CPU per
-  carried Gbit). On a path that loses packets mhd's interactive tail is **11×
-  tighter at 1 % loss and 3.8× at 5 %** — one lost segment costs the kernel TCP
-  carrier its 200 ms minimum retransmission timeout, while mhd repairs inside the
-  next round trip — and it carries **less bulk at both loss rates** (0.74 against
-  2.10 Gbit/s, 0.11 against 0.13). The fallback keeps its meaning: it fires when a
-  session cannot be *established*, which is a different question from which carrier
-  is faster. The table, its method and its costs are in
-  [Benchmarks](docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-19).
-
-- **The congestion window's ceiling follows the path** rather than sitting at a flat
-  2 MiB. A loopback path's bandwidth-delay product is a small fraction of that, and
-  the difference was a standing queue every small request waited behind: the first
-  clean stage of the staged sweep reads 12.8–23.8 ms at p99 in the good case, where
-  the flat ceiling read 135–291 ms once the bulk spine passed eight gigabits a
-  second. A shaped path keeps its old window, because its product really is
-  megabytes.
-- **A stripe group no longer widens, because nothing could use the width it
-  grew.** A group starts on the one data channel the pairing gave it and used to
-  grow one more each time a send direction parked for the dwell and then moved
-  again. A group that widens mid-transfer has to move frames between channels,
-  which reorders them, so the number the growth produced had one reader — a
-  debug line — and no path consumed it. The observation stays: a parked group
-  that then moved is still logged with how long it waited. The width is now
-  whatever the pairing decided, `MOLEHILL_STRIPE_COUNT` included.
-
-## [1.0.0] - 2026-11-01
-
-### Known gaps
 
 - **A fresh connection still costs more than TCP's, and the remainder is one
   channel's own work.** `churn-16` — sixteen concurrent workers, each opening a
@@ -457,6 +215,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A staged run can start a named subset of its probe series**
+  (`just bench run --series interactive`). The three series are three separate
+  measurements of one network — the staged `rtt_p99_ms` comes from the
+  interactive one, `churn_per_s` from the churn one, and the datagram probe's two
+  from its own — so running one at a time is how a diagnostic asks whether a
+  second probe on the same host moves the first one's tail. The probe set travels
+  in the run's fingerprint, and a subset is never a release configuration: a run
+  without the interactive series has no staged `rtt_p99_ms`, and the gate refuses
+  a clean stage it cannot judge.
+- **A staged cell carries the churn series' own shape** — `churn_setup`,
+  `churn_connect`, `churn_echo` and `churn_errors` — as evidence rather than as a
+  metric, so a reader can see whether the arrival rate came with a tail. And a
+  metric whose series could not answer is now absent *with its reason*: never
+  started, started and produced no sample, or every attempt failed. An absent
+  number with no explanation is the shape a dead probe, a lost route and a bug in
+  the analysis all produce.
+- **A scenario asks whether a carrier decision reaches the streams that open
+  after it.** `two-wave` runs a warm stream, waits out a settle, then measures a
+  fresh wave in the same session. The warm wave is what lets the pool read the
+  service's class and converge, so the measured wave is the policy's first
+  chance to place a stream where it belongs. A policy that never converges
+  shows two equal waves, which nothing else in the model can tell apart from a
+  pool that was never given the chance — so the scenario headlines throughput
+  and keeps both waves as separate cells.
+
+
 - **A data channel opens in one round trip instead of two.** The Noise handshake
   carries one payload each way now, so a stream whose lane the server already
   knows sends its tunnel hello *inside* the handshake's opening message and reads
@@ -532,6 +316,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a hundred-millisecond threshold.
 
 ### Fixed
+
+- **A lane's first packet now reaches the peer.** The datagram batch was sized from
+  its *first* span and accepted a tail that was shorter, so the kernel split the
+  tail into fragments of the first span's length. A lane opens with a 17-byte credit
+  followed by a full segment, which therefore went out as thousands of 17-byte
+  fragments; the receiver refused them as malformed, **number zero of every lane
+  never arrived**, and the cumulative acknowledgement frontier — the only retirement
+  path that covers an old number — stayed at zero for the lane's whole life. The
+  batch now refuses a tail longer than its segment and the caller sends it whole.
+  Measured on the protocol harness: refusals 13 → 0, `first_seen` 0 on every lane,
+  and the frontier advancing 0 → 11 017 / 12 934 / 15 008.
+- **A staged cell that asked for bulk and carried nothing is a failure, not a fast
+  stage.** Its latency is a measurement of an idle path, so a cell with
+  `streams > 0` and exactly zero carried bytes now reports `ok=False` with that
+  reason, and `just bench gate` refuses it as an unmeasured round. Measured: five
+  of six last-stage cells in one campaign carried nothing while reporting a pass,
+  because a tool that stops forwarding scores its best number on its emptiest
+  stage. The test is exactly zero — a rate-shaped stage legitimately reads small.
+- **A carrier that stopped delivering one direction no longer stalls a transfer.**
+  A lane's reader took one datagram per wake-up, so above roughly 700 datagrams a
+  second its socket queue filled and the kernel dropped the rest — measured as 97 %
+  of one direction — and a bulk transfer through a striped group stopped partway and
+  never resumed. A wake-up now drains the socket until it is empty. Measured on the
+  integration suite: ten of ten runs pass in 2.96–3.90 s, where the same cell
+  previously failed about one run in four after 40–70 s.
+- **A packet that arrives after its stream ended no longer opens a new one.** A
+  retired stream on the accepting side was re-created by a late packet from the
+  peer, which gave the server a channel for a visitor whose connection had already
+  closed and left the window its bytes spent unrecovered. Stream ids are monotonic,
+  so an unknown id below the highest accepted one is late, not new.
+- **A new stream can no longer be given an id a live stream still holds.** Stream
+  ids wrap, and the minter inserted without checking, so a wrapped id could replace
+  a live stream's state — its keys, its reader's position and its place in the
+  window — with no error anywhere. The minter now skips an id that is in use.
+- **A comparison the run cannot pair is reported, not crashed.** `just bench report`
+  raised `StatisticsError` when two arms carried a metric in disjoint rounds; it now
+  returns an `unavailable` verdict whose reason names both arms' rounds.
+- A striped data channel no longer gives up on a frame the carrier is still
+  recovering. The reorder deadline was two seconds, shorter than a carrier stall
+  measured at nearly twelve; a group now waits thirty, so the side that can still
+  make progress decides when a transfer has failed.
+
+- **A transparent (L3) claim is reachable from the first packet.** A claim's first
+  data lane was read twice on the server — once as a stream prologue and again as a
+  lane prologue — so the second read blocked and the lane was dropped as "named no
+  lane". The claim never became routable and a visitor's connection to a claimed
+  `ip:port` timed out. The lane id now travels with the channel: `just l3-accept`
+  passes end to end, including lane lending between claims, `lend = false`, and the
+  operator's lane cap.
+- **A refused packet no longer consumes a packet number**, and a lane that cannot
+  seal one closes instead of carrying on with a hole. An unspent number leaves a
+  permanent gap in the peer's cumulative frontier, which the sender then repairs for
+  ever.
+
 
 - **A stream's close can no longer overtake its own data.** A multiplexed
   stream's FIN went out on a bookkeeping queue that leaves before any payload —
@@ -759,6 +597,163 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symptom beyond the sender reporting that the peer's credit was blocking it.
 
 ### Changed
+
+- **A session that carries only bulk services moves its pool to the kernel
+  carrier.** The pool has read each service's class and used it to place
+  *streams*; the tunnels themselves stayed on whatever carrier the endpoint
+  preferred, so a client whose services are all bulk — a backup host, a mirror —
+  kept every tunnel on the datagram carrier and its bulk traffic with it, at the
+  gap the [benchmarks page](docs/benchmarks.md) records between the two carriers
+  on a clean path. The pool now moves: the spare dial goes out on the kernel
+  carrier and the over-represented carrier's idle tunnels are given back one per
+  tick, so nothing carrying traffic is ever removed and a stream always finishes
+  on the tunnel it started on. One datagram tunnel stays warm, because the class
+  is a measurement that a later service can revise, and a flow that turns out
+  conversational should land on a lane rather than pay a cold grow. A **forced**
+  carrier (`MOLEHILL_DATA_CARRIER`) now stands the whole mix policy down, not only
+  this half of it: before, a run pinned to `mhd` still grew kernel-carrier spares
+  as soon as a second service's class appeared, so a pinned arm did not measure
+  the carrier it named.
+- **Records are sealed with AES-256-GCM, keyed from the Noise handshake.** The KK
+  handshake is unchanged — it is what authenticates both ends and where the
+  session's secrets come from — but the cipher that runs on every record is now
+  `ring`'s AES-256-GCM, under keys derived through HKDF from the handshake's
+  split and transcript (the transcript as salt, the direction's half as input
+  key material), instead of the pattern's ChaCha20-Poly1305. One AEAD was a third
+  of the data path's cycles — 17.4 % opening and 15.4 % sealing, sampled on a
+  release build carrying bulk — and at record size it costs **0.371 ns per
+  byte** against ChaCha20-Poly1305's 0.526 (`just primitives` prices both). On
+  the bench model's eight-stream bulk cell a run that the tool, not the visitor,
+  filled carried **15.36 against 12.78 Gbit/s** and spent **12.7 % less CPU per
+  Gbit**; a host phase where the visitor only offers 9.8 Gbit/s measures no
+  difference on that cell, which is all such a cell can say. The mixed cell's
+  interactive tail is unchanged: p99 4.07 ms against 4.96, inside that run's own
+  scatter, p50 identical. The record's two-byte length header is now
+  authenticated as associated data, which the handshake's own transport mode
+  never did. This is a wire change: **both ends upgrade together** (dialect 6.0).
+- **The pool decides a carrier per service, from what that service carried.**
+  Which carrier suits a service is a property of the *workload* as much as of the
+  path — measured on the leg the carrier crosses, a conversational flow's
+  interactive tail is 11× tighter on the datagram carrier at 1 % loss while a bulk
+  flow carries 2.8× more on the kernel one — and one deployment carries both. The
+  pool reads each service's class from what its channels moved (a megabyte crossed,
+  or a channel that ended under 64 KiB), sends a bulk service's **new** streams to
+  the kernel carrier and a conversational service's to a tunnel no bulk stream
+  occupies, and needs no configuration key to do it. A service nobody has watched
+  stays where the pool already rides, a stream that is already running is never
+  moved, and the preference always falls through to the least-loaded tunnel, so a
+  wrong guess costs throughput and never a visitor.
+- **A sealed `mhd` channel on an established lane no longer waits for an opening
+  acknowledgement.** The plain path dropped that wait when stream registration was
+  introduced; the sealed path kept it, so every new channel paid one round trip
+  before it could carry a byte, and every visitor's channel setup paid it on a
+  high-latency path. `DERIVED_REGISTERED_SELECTOR` (`0x04`) carries the same claim
+  the plain selector makes — sealed, and the lane is already registered, so no
+  answer is owed. Measured with 100 ms each way: a visitor's channel setup falls
+  from 400 ms to **200 ms** (the rest is the channel's own arrival), a channel open
+  from p50 200 213 µs to **24 µs**, and the mixed cell's interactive latency from
+  p50 601 ms / p99 up to 4 179 ms to **p50 401 ms / p99 401 ms** — the same number
+  the control arm with no tool in the path reports. A claim the server cannot honour
+  refuses that one stream, as the plain selector's already does.
+- **A busy lane keeps credit back for a small stream's request.** The opening
+  reserve was keyed on the bytes a stream has ever written, so a chat stream that
+  had carried megabytes over its life looked like bulk to it: when one bulk stream
+  with a blocked reader held the connection's credit, the next request had nowhere
+  to go. Measured on a 20 Mbit/s path under four bulk streams, a long-lived
+  interactive stream **stopped for 105 seconds**; with `SMALL_STREAM_RESERVE`
+  keeping eight payloads for any stream whose unacknowledged flight is small, every
+  measured round carried interactive traffic through the same step. The reserve is
+  taken inside the peer's credit, so no frame overruns the advertised window.
+- **A packet whose stream is small is re-sent on the path's own round trip.** The
+  retransmission timer's small-flight rule tested the *lane's* packet count, and a
+  lane carrying bulk always has a wide flight, so the interactive packet inside it
+  climbed the whole timeout ladder: on the same 20 Mbit/s step the p99 was
+  **2 391–4 946 ms**; judged on the path's round trip with no backoff it reads
+  **215–1 605 ms** in the rounds that measured, against the control arm's 502.
+- **An `mhd` stream no longer pays a Noise handshake of its own.** A lane's first
+  stream runs the KK handshake and its secret becomes the lane root; every later
+  stream on that lane seals with a key derived from `(root, direction, stream id)`.
+  The handshake phase of a channel open falls from 1 221 µs to **11 µs**, a channel
+  open under a bulk transfer from p50 1 414 µs / p99 41 ms to **211 µs / 9 ms**, and
+  the mixed clean cell's interactive p99 from 29–48 ms to **7.4–8.7 ms** — for 13 %
+  of the clean-path throughput. Forward secrecy on this carrier is now per lane
+  rather than per stream; `MOLEHILL_MHD_SEAL=0` turns the path off for one process.
+- **The carrier's AEAD is AES-256-GCM through `ring`**, at **671 ns** for a
+  1 400-byte packet against 2 805 ns for the ChaCha20-Poly1305 it replaces, which is
+  what makes sealing affordable: `bulk-n` on a clean path reads 85 % of its unsealed
+  throughput instead of 54 %.
+- **The carrier comparison states its leg.** The mhd-versus-TCP tables in
+  `docs/benchmarks.md` and its Chinese mirror now say that every row but `clean`
+  was measured with the condition on the *visitor* leg, so those rows price a
+  visitor-side impairment rather than a carrier on an impaired path, and the
+  lossy-path advantage claim is gone: the two carriers had never been compared on
+  the leg they share, and the first such run (5 % loss, 100 ms, `bulk-1`) has the
+  TCP carrier 1.6× ahead on throughput with mhd's interactive tail 20–30 % tighter.
+  `docs/configuration.md` says the same in one row.
+
+
+- **The benchmark can price the carrier itself, with nothing above it.** A new
+  `transport` scenario runs the protocol harness twice per arm — a raw TCP socket
+  on the control arm against an mhd stream on a tool arm — with the listener in
+  the server namespace and the dialer in the visitor's, so the traffic crosses the
+  shaped path rather than loopback. Four declared metrics come out of it: open,
+  first byte, the wait after the first byte, and the harness's own error rate. The
+  numbers they produce are the carrier's alone: an mhd stream opens in 3 µs
+  against a TCP connect's 48, and a round trip costs 2.5× the bare socket's.
+
+- **A lossy path costs mhd most of its bulk throughput, and that is an open defect
+  rather than a documented trade-off.** On the leg the carrier crosses, a 5 %-loss
+  100 ms path carries **0.11 Gbit/s** against the clean cell's 3.71, and a 1 %-loss
+  20 ms path carries **0.74** against the other carrier's 2.10. The cause is
+  measured: the window's growth phase ends at the connection's first loss and never
+  resumes, so on that 1 %-loss cell it sits at **1.1 MB against its own 5 MiB
+  ceiling**, refusing 1 900 writes a second with 3.4 MB queued behind it. Eight
+  mechanisms have failed to move it, and the eighth — ending the growth phase only
+  when the loss came with a standing queue — bought 66 % on the 5 %-loss cell and
+  cost 16 % interactive failures on a rotating path, so it was reverted
+  (§4.501). [Internals](docs/internals.md#multiplexing) states the
+  defect and what it means: nothing above the window decides a rate, so the window's
+  growth rule is the whole send-rate policy.
+- **This is a re-baseline release for the benchmark.** The engine changed —
+  `bench/src/bench/model.py` gained the `l4-plain` arm and `Arm.noise_data`, so
+  runs can measure the plain data plane, and the registry gained
+  `mhd_lane_dup_pct`, the busiest carrier lane's share of the bytes it re-sent.
+  A published record gathered by a different engine is not a comparable
+  baseline, so `just bench gate` runs **without `--baseline`** and the record
+  this release produces becomes the next baseline; the release notes say that
+  rather than implying a comparison the fingerprints would refuse. See
+  [docs/release.md](docs/release.md) and, for what the new metric means and when
+  it is absent, [Benchmarks](docs/benchmarks.md).
+
+- **Each carrier now has a stated path condition, measured on the leg the carrier
+  crosses.** mhd is the carrier for an impaired path and TCP is the carrier for a
+  clean one and for bulk. On an unshaped cell TCP is ahead on every axis (4.80
+  against 3.71 Gbit/s, 0.12 against 0.16 ms at p99, and less than half the CPU per
+  carried Gbit). On a path that loses packets mhd's interactive tail is **11×
+  tighter at 1 % loss and 3.8× at 5 %** — one lost segment costs the kernel TCP
+  carrier its 200 ms minimum retransmission timeout, while mhd repairs inside the
+  next round trip — and it carries **less bulk at both loss rates** (0.74 against
+  2.10 Gbit/s, 0.11 against 0.13). The fallback keeps its meaning: it fires when a
+  session cannot be *established*, which is a different question from which carrier
+  is faster. The table, its method and its costs are in
+  [Benchmarks](docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-19).
+
+- **The congestion window's ceiling follows the path** rather than sitting at a flat
+  2 MiB. A loopback path's bandwidth-delay product is a small fraction of that, and
+  the difference was a standing queue every small request waited behind: the first
+  clean stage of the staged sweep reads 12.8–23.8 ms at p99 in the good case, where
+  the flat ceiling read 135–291 ms once the bulk spine passed eight gigabits a
+  second. A shaped path keeps its old window, because its product really is
+  megabytes.
+- **A stripe group no longer widens, because nothing could use the width it
+  grew.** A group starts on the one data channel the pairing gave it and used to
+  grow one more each time a send direction parked for the dwell and then moved
+  again. A group that widens mid-transfer has to move frames between channels,
+  which reorders them, so the number the growth produced had one reader — a
+  debug line — and no path consumed it. The observation stays: a parked group
+  that then moved is still logged with how long it waited. The width is now
+  whatever the pairing decided, `MOLEHILL_STRIPE_COUNT` included.
+
 
 - **Two wire frame classes nothing sent are gone.** A v5 carrier declared an
   unreliable datagram frame and an unreliable whole-IP-packet frame. No sender in
