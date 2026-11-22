@@ -587,8 +587,53 @@ def timeline_legend() -> list:
         ),
         Patch(color=CLEAN_FACE, label="clean stage"),
         Patch(color=DEGRADED_FACE, label="degraded stage"),
+        Line2D([], [], ls=":", lw=1.1, color="0.35", label="leg boundary"),
         Line2D([], [], ls="", marker="x", color="0.55", label="no reading"),
     ]
+
+
+def stage_legs(cells: list) -> list:
+    """The leg each staged cell imposed its condition on, from the cell's name.
+
+    The name is the record (`loss1@tunnel`), so a figure never has to re-derive
+    the schedule: a stage whose name carries no leg is the default one, the
+    visitor's own connection.
+    """
+    return [
+        cell["cell"].split("@", 1)[1] if "@" in cell["cell"] else model.DEFAULT_LEG
+        for cell in cells
+    ]
+
+
+def mark_legs(axes: list, cells: list) -> None:
+    """Draw where the schedule moves from one leg to the other, and name both.
+
+    A two-leg schedule is two experiments on one axis. Where the leg changes is
+    the one thing on the figure a reader cannot infer from the numbers, and
+    comparing a reading across it is the mistake the leg dimension exists to
+    prevent — so the boundary is drawn and each run of stages is labelled with
+    the leg it imposed its condition on.
+    """
+    legs = stage_legs(cells)
+    if len(set(legs)) == 1:
+        return
+    start = 0
+    for index in range(1, len(legs) + 1):
+        if index < len(legs) and legs[index] == legs[start]:
+            continue
+        if index < len(legs):
+            for ax in axes:
+                ax.axvline(index - 0.5, color="0.35", ls=":", lw=1.1, zorder=1.5)
+        axes[0].annotate(
+            f"{legs[start]} leg",
+            ((start + index - 1) / 2.0, 1.015),
+            xycoords=("data", "axes fraction"),
+            ha="center",
+            va="bottom",
+            fontsize=FONT - 1,
+            color="0.35",
+        )
+        start = index
 
 
 def rtt_panel(ax, run: Run, scenario: str, cells: list, arm: str) -> None:
@@ -685,12 +730,19 @@ def render_timeline(run: Run, out: Path, title: str) -> None:
             bulk_panel(axes[row][1], run, scenario, cells, arm)
     axes[-1][0].set_xticks(range(len(cells)), labels=[cell["cell"] for cell in cells])
     for label in axes[-1][0].get_xticklabels():
-        label.set_rotation(30)
+        label.set_rotation(40)
         label.set_ha("right")
+        label.set_fontsize(FONT - 1)
+    # `sharex` shares the ticks, not the labels: every lower panel draws them, so
+    # an eighteen-stage schedule printed the same row of names twice, on top of
+    # itself. The left one keeps them.
+    for extra in axes[-1][1:]:
+        extra.tick_params(labelbottom=False)
+    mark_legs([row[0] for row in axes], cells)
     fig.legend(
         handles=timeline_legend(),
         loc="upper center",
-        ncol=6,
+        ncol=7,
         bbox_to_anchor=(0.5, 0.965),
         fontsize=FONT - 0.5,
     )
