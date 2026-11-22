@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Known gaps
+
+- **A carrier decision is learned after a session's first streams have opened,
+  so a cold bulk transfer finishes on the datagram carrier at 62 % of the
+  kernel carrier's rate.** The pool reads a service's class from what its
+  channels moved, and a stream that is already running is never moved onto
+  another carrier — moving one would reorder it — so the policy can only
+  redirect the streams that open after the evidence arrives. Measured on one
+  build, four rounds, only the switch differing: the automatic session carries
+  **3.584 Gbit/s on `bulk-1` against 5.743** pinned to the kernel carrier (62 %),
+  **15.299 on `bulk-n` against 18.912** (81 %), and **81.6 %** on the `two-wave`
+  scenario, where a warm stream and a settle give the pool the chance the first
+  wave does not. Both halves are the design working as written; a deployment
+  that knows its traffic is bulk should pin `MOLEHILL_DATA_CARRIER=tcp` rather
+  than wait to be taught.
+- **A wedge was sighted once under a soak and cannot be reproduced on demand,
+  so this release does not claim to have fixed it.** A wedge is a visitor
+  stream that stops moving while the path and the process both stay up, and the
+  soak's `wedge_count` axis exists to catch it. Since the sighting, five runs —
+  two product arms, a quarter of the host's cores, the build and the shape the
+  sighting came from, about eleven thousand samples an arm — read **0**. A run
+  that wedges reports it; a run that does not cannot prove the state
+  unreachable, and this is why the axis stays in the gate rather than being
+  declared closed.
+
 ### Added
 
 - **A staged run can start a named subset of its probe series**
@@ -25,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started, started and produced no sample, or every attempt failed. An absent
   number with no explanation is the shape a dead probe, a lost route and a bug in
   the analysis all produce.
+- **A scenario asks whether a carrier decision reaches the streams that open
+  after it.** `two-wave` runs a warm stream, waits out a settle, then measures a
+  fresh wave in the same session. The warm wave is what lets the pool read the
+  service's class and converge, so the measured wave is the policy's first
+  chance to place a stream where it belongs. A policy that never converges
+  shows two equal waves, which nothing else in the model can tell apart from a
+  pool that was never given the chance — so the scenario headlines throughput
+  and keeps both waves as separate cells.
 
 ### Changed
 
