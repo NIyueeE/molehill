@@ -112,7 +112,7 @@ only third-party runtime dependency is the optional `plot` extra.
 3. `just bench --profile sweep --binary target/release/molehill \
    --out benches/records/results-bench-vX.Y.Z.json`
    — run the sweep. **The profile's arm list is the requirement**: a run whose
-   arms are not `molehill,l3,frp,rathole,nps` produces a file that looks like a
+   arms are not `control,molehill,l3,frp,rathole,nps` produces a file that looks like a
    release artifact with a missing architecture or an empty peer comparison in
    it, so name them explicitly if the profile ever changes. The `l3` arm is the
    product's second architecture; it has no peer to be compared against (frp,
@@ -128,8 +128,11 @@ only third-party runtime dependency is the optional `plot` extra.
    *source* change is the only thing that makes it false.
    Budget: the sweep profile's timeline is eighteen stages — ten on the visitor
    leg, seven on the tunnel leg — which is ~35–45 minutes per arm with the
-   between-stage drains, so five arms are **three to four hours** on this host,
-   plus the ramp. `--scale 0.2` shortens the holds without changing the
+   between-stage drains, so the six arms — the tool-free control first, then the
+   product's two architectures and the three peers — are **five hours** on this
+   host, plus the ramp. The control arm is not optional: it is the floor every
+   other arm's reading is read against, and a release record without it has no
+   scale of its own. `--scale 0.2` shortens the holds without changing the
    schedule's *shape*, and the fingerprint records the scale, so a shortened run
    can never be mistaken for the published one. A record that is missing a cell
    the schedule declared is refused by `just bench gate`: coverage that shrinks

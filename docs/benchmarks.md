@@ -122,16 +122,18 @@ landed three minutes into a four-hour run on 2026-11-22 and the run was restarte
 the record names its revision, tree state, host and fingerprint before its first
 sample; the endpoint invariant is re-checked on the recorded samples; a missing
 number is a typed absence with its reason, never a zero; the analysis version is
-part of a record, so an old file cannot be re-read as a new one; the control arm
-runs every cell that a tool arm runs; and the drift, wedge and capacity axes are
-gated rather than reported.
+part of a record, so an old file cannot be re-read as a new one; the tool-free
+control arm runs every cell a tool arm runs **and the release profile includes
+it**, because a published reading with no floor of its own is a number without a
+scale; and the drift, wedge and capacity axes are gated rather than reported.
 
 ## The bench model (the measurement standard)
 
 `bench/src/bench/` is the standard and the only runner. The sweep the
 release publishes is not a second instrument: it is this model's `sweep`
 profile — the eighteen-stage `timeline` over two legs, the `capacity` ramp and the
-`half-close` cell, over the product and the reference tools — which is why the
+`half-close` cell, over the tool-free control, the product and the reference tools —
+which is why the
 schedule, the ramp and the categorical cell travel in one results file, under one
 schema, behind one gate.
 
@@ -409,7 +411,7 @@ fingerprint, a shortened run can never be mistaken for a published one.
 | `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
 | `wedge` | 1 (+0 warm-up) | ~2400 s | the soak's interactive silence, **provoked**: the product twice on one host, which is the load at which it appears. A diagnostic, not a gate |
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
-| `sweep` | 1 (+0 warm-up) | ~15 000 s | the release sweep: the eighteen-stage two-leg schedule, the load ramp and the `half-close` cell |
+| `sweep` | 1 (+0 warm-up) | ~18 500 s | the release sweep: the tool-free control, the product and the peers over the eighteen-stage two-leg schedule, the load ramp and the `half-close` cell |
 | `compare` | 3 (+1 warm-up), A/A twin | ~400 s | arms side by side on the single cells (`bulk-1`, `rr-16`, `half-close`): a comparison, never a release artifact |
 | `nobulk` | 2 (+1 warm-up) | ~300 s | the same staged timeline with the bulk spine removed: a diagnostic, not a gate |
 | `carrier` | 3 (+0 warm-up) | ~240 s | one condition held long, bulk spine off: is the L3 wedge the carrier alone? |

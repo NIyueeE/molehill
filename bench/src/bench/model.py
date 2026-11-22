@@ -2094,9 +2094,15 @@ PROFILES |= {
         # five arms.
         # The budget is what a run is *planned* against and what its record
         # prints; a run that overruns it says so rather than being cut.
-        "budget_s": 15000.0,
+        "budget_s": 18500.0,
         "aa": False,
-        "arms": ("molehill", "l3", "frp", "rathole", "nps"),
+        # The tool-free **control** arm is the floor every other arm's reading is
+        # read against, and the release artifact is the only published one — so
+        # it carries the control rather than borrowing a floor from another
+        # artifact. Without it "the product answers a half-closed visitor in
+        # 51 ms on the carrier's own leg" has no scale; with it, the same cell
+        # reads 1 054 ms on the path alone.
+        "arms": ("control", "molehill", "l3", "frp", "rathole", "nps"),
         "params": {},
     },
 }
