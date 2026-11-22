@@ -1917,6 +1917,21 @@ PROFILES |= {
         "arms": ("molehill",),
         "params": {"soak": {"scale": 1.0, "streams": 4}},
     },
+    # A comparison, not a release artifact: the single cells a reader wants side
+    # by side across arms, priced with enough rounds and a twin to be judged.
+    # The release `sweep` cannot do this — one round and no A/A is what a
+    # twenty-minute timeline per arm affords — and a rate difference inside a
+    # twin's own spread is not a comparison, it is a coin toss.
+    "compare": {
+        "what": "arms side by side on the single cells, with rounds and an A/A twin",
+        "rounds": 3,
+        "warmup_rounds": 1,
+        "scenarios": ("bulk-1", "rr-16", "half-close"),
+        "budget_s": 400.0,
+        "aa": True,
+        "arms": (),
+        "params": {"bulk-1": {"secs": 6, "omit": 2}},
+    },
     "screen": {
         "what": "a development A/B: one condition, the two builds interleaved",
         "rounds": 3,
@@ -1971,16 +1986,17 @@ PROFILES |= {
         # control — the same workload, the same topology, one architecture apart.
         # It earns its place because L3 is what this release is *for*, and a
         # release artifact that omits it cannot support the release's own claim.
-        "what": "the release sweep: the schedule, the ramp, and the single cells",
+        "what": "the release sweep: the schedule, the ramp, and the half-close cell",
         "rounds": 1,
         "warmup_rounds": 0,
         # The schedule and the ramp answer "how does it behave as the path
-        # changes"; these three are the single cells a reader compares directly
-        # across arms — one bulk stream, sixteen request/response flows, and the
-        # promise a half-close asks a tool to keep. They cost seconds per arm
-        # beside a twenty-minute timeline, and without them a release artifact
-        # could not show a peer comparison at all (`plot.render_cells` draws them).
-        "scenarios": ("timeline", "capacity", "bulk-1", "rr-16", "half-close"),
+        # changes"; `half-close` is a **categorical** cell (a tool delivers the
+        # answer a half-closed visitor is owed, or it does not), so it needs no
+        # statistics and belongs in a one-round release run. The *rate*
+        # comparisons do not: one round cannot order arms a twin arm differs
+        # from by 1.5 %, so they live in the `compare` profile with rounds and
+        # an A/A pair, and no published table quotes them.
+        "scenarios": ("timeline", "capacity", "half-close"),
         "budget_s": 3000.0,
         "aa": False,
         "arms": ("molehill", "l3", "frp", "rathole", "nps"),

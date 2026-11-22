@@ -21,10 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arm states that the cell can read all of them. In its first runs it separates
   the field at once: **two of the three reference tools returned zero bytes on
   every attempt** while this repository's carrier, one peer and the control arm
-  returned the whole tail. The `sweep` profile carries it now, beside `bulk-1`
-  and `rr-16`, and `just bench plot` draws those three as their own figure — one
-  bar per arm, each cell on its own scale, and a zero bar kept as the reading it
-  is rather than drawn as an absence.
+  returned the whole tail. The `sweep` profile carries it now — it is a
+  categorical cell, so one round decides it — and `just bench plot` draws it
+  beside any other single cell the run carried, one axes per cell and its own
+  scale, with a zero bar kept as the reading it is rather than drawn as an
+  absence. The **rate** cells (`bulk-1`, `rr-16`) are a new `compare` profile
+  instead, with three rounds and an A/A twin: a single round cannot order arms
+  that a twin of one arm differs from by 1.5 %.
 
 - **A `stall` cell was built, measured twice, and removed.** It held eight
   visitors that never read (4 KiB receive buffers, 48 MiB each offered) and timed
