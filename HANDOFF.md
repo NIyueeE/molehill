@@ -1008,6 +1008,54 @@ the measurement:**
 - `just bench plot`'s default `--out-dir` is the results file's own directory, so forgetting `--out-dir` writes charts into
   `benches/records/` beside the evidence (twice, this session). The default should be `assets/`, or the flag should be required.
 
+### I. **The transparent path does not survive a UDP block, and never comes back** (found by the first 定型 record)
+
+The six-arm release run (`~/tmp/p400-standard-sweep.json`, revision `27cd633`, fingerprint `3ccdbad726ff1a85`, 17 301 s, 167
+samples) is **red on the gate with 13 failures, all of them `l3`**. The l4 arms, the three peers and the control arm completed
+every declared cell; the transparent client died at stage 17 and never returned.
+
+| l3's record | reading |
+|---|---|
+| stages 1–16 (`clean` … `udp_throttled@tunnel`) | carried normally — `loss1@tunnel` 45.5 ms, `udp_throttled@tunnel` 1.6 ms |
+| `udp_blocked@tunnel` | **error rate 100 %**, no p99, no throughput |
+| `clean#2` (the block is over) | **error rate 100 %** — it did not recover |
+| `capacity` | **0 of 8** streams |
+| `half-close` | no measured round |
+| `run` | **2 silences, longest 455 s** |
+
+The client's own log names the shape: at 20:20:30 the claim's carrier moved `mhd → tcp` ("the carrier in use kept refusing this
+claim's traffic at the peer"); at 20:21:01 **"Lane 2 of service 2: no drain answer within 30 s; calling the drain off"**; at
+20:30:02 the block lifted and the client *noticed* — **"mhd is reachable again at 10.10.0.254:2400; using it"** — and from then on
+it logs **"claim 10.99.0.1:2401 has more flows than lanes and the lane budget has room; dialing a lane"** at 20:30:02, 20:30:23,
+20:30:26, 20:38:14 while the interactive probe never gets an answer.
+
+**What is established and what is a hypothesis.** Established: after a UDP block on the carrier's leg, a transparent claim carries
+nothing for the remaining ~20 minutes of the run, through a clean stage, a capacity ramp and a half-close cell, and the gate refuses
+the record for it. Hypothesis (to confirm, not to assume): the claim's lane state machine is stuck behind the *drain that timed
+out* — it asked the peer to drain lane 2, the peer never answered, the drain was called off, and every later lane dial either fails
+or lands somewhere the claim's flows are not routed to.
+
+**Reproduced, and it is the carrier-move path, not the block itself.** A single-arm run of the same schedule at `--scale 0.1`
+(`just bench run --profile smoke --scenarios timeline --scale 0.1 --arms l3`, record `~/tmp/p410-l3-udpblock.json`) shows the
+difference: its **warm-up round survived the block** — `udp_blocked@tunnel` 7.9 ms, `clean#2` 6.1 ms, the claim carried as if
+nothing happened — while its **second round died the same way the release run did**, with a signature the log spells out:
+
+    23:16:43  Data carrier for claim 10.99.0.1:2402: lane 2 refused its share for 3 ticks;
+              asked the peer to drain it so its replacement rides Tcp
+    23:22:29… Lane allocator: claim 10.99.0.1:2401 has more flows than lanes and the lane
+              budget has room; dialing a lane        ← once a second, 91 times, until killed
+
+So the trigger is **the carrier move**, not the block: the block makes a lane "refuse its share", the carrier rule asks the peer to
+drain that lane so its replacement rides TCP, and when that handover does not complete the claim is left with **no usable lane and no
+retry path that does not itself depend on carrying traffic** — the allocator asks for a lane once a second and never gets one, which
+is where the 455 s of silence comes from. Warm-up survived because the suspicion never fired there: the "refused its share" counter
+needs traffic to accumulate, and the block's length at that scale did not produce it.
+
+**Why this is a product goal, not a bench goal.** The bench did exactly what it was 定型 for: a deployment class nobody had
+imposed on this architecture before (a network that refuses UDP) found a permanent loss of the data plane, and the gate refused to
+publish it. The record is not the artifact to fix: the **product** is. The release path (merge, tables, tag) waits for the fix and
+for a re-run of the six-arm sweep.
+
 ## 5. Active architecture decisions
 
 > **The governing plan is `MHD-FINALIZATION-PLAN.md`** (checkout root, untracked
