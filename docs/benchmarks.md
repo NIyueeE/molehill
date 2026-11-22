@@ -346,12 +346,12 @@ fingerprint, a shortened run can never be mistaken for a published one.
 | `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
 | `wedge` | 1 (+0 warm-up) | ~2400 s | the soak's interactive silence, **provoked**: the product twice on one host, which is the load at which it appears. A diagnostic, not a gate |
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
-| `sweep` | 1 (+0 warm-up) | ~3000 s | the release sweep: the staged schedule and the load ramp |
+| `sweep` | 1 (+0 warm-up) | ~3000 s | the release sweep: the staged schedule, the load ramp and the comparison cells |
 | `nobulk` | 2 (+1 warm-up) | ~300 s | the same staged timeline with the bulk spine removed: a diagnostic, not a gate |
 | `carrier` | 3 (+0 warm-up) | ~240 s | one condition held long, bulk spine off: is the L3 wedge the carrier alone? |
 
 ## How to read the charts
-Six figures, each answering one question, each drawn only when the run carried
+Seven figures, each answering one question, each drawn only when the run carried
 that data and each carrying its method in the footer:
 
 - **the timeline master** — per arm, the interactive stream's per-stage p50
@@ -370,7 +370,12 @@ that data and each carrying its method in the footer:
 - **the drift panels** — RSS, open descriptors and threads over the run, with
   the fitted slope per minute printed: a leak is a slope, not a level;
 - **the cost bars** — CPU-seconds per carried Gbit per arm, the number the
-  CPU-cost metric is for.
+  CPU-cost metric is for;
+- **the exposure cells** — one bar per arm for each single-cell comparison the
+  run carried (`bulk-1`, `rr-16`, `half-close`), each on **its own scale**
+  because their units are unrelated. A **zero bar is a reading** — a tool that
+  returns nothing after a visitor's half-close drew that — and an `x` is a
+  missing one.
 
 A cell that carried no reading is drawn as `x` and printed as `- (reason)`,
 never as `0`: "the path carried nothing" and "nobody could measure what it

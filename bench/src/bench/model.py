@@ -1971,10 +1971,16 @@ PROFILES |= {
         # control — the same workload, the same topology, one architecture apart.
         # It earns its place because L3 is what this release is *for*, and a
         # release artifact that omits it cannot support the release's own claim.
-        "what": "the release sweep: the staged schedule and the load ramp",
+        "what": "the release sweep: the schedule, the ramp, and the single cells",
         "rounds": 1,
         "warmup_rounds": 0,
-        "scenarios": ("timeline", "capacity"),
+        # The schedule and the ramp answer "how does it behave as the path
+        # changes"; these three are the single cells a reader compares directly
+        # across arms — one bulk stream, sixteen request/response flows, and the
+        # promise a half-close asks a tool to keep. They cost seconds per arm
+        # beside a twenty-minute timeline, and without them a release artifact
+        # could not show a peer comparison at all (`plot.render_cells` draws them).
+        "scenarios": ("timeline", "capacity", "bulk-1", "rr-16", "half-close"),
         "budget_s": 3000.0,
         "aa": False,
         "arms": ("molehill", "l3", "frp", "rathole", "nps"),

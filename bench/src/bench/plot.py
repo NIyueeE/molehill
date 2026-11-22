@@ -1115,6 +1115,100 @@ def render_cost(run: Run, out: Path, title: str) -> None:
     save(fig, out)
 
 
+#: Kinds that already own a panel. A scenario of any other kind is one cell per
+#: arm and goes into the exposures panel instead.
+PANELLED_KINDS = (
+    model.Kind.STAGED,
+    model.Kind.CAPACITY,
+    model.Kind.UDP_LADDER,
+    model.Kind.RECONNECT,
+    model.Kind.TRANSPORT,
+    model.Kind.TRANSPORT_LOSS,
+    model.Kind.UDP,
+)
+
+
+def exposure_cells(run: Run) -> list:
+    """Every (scenario, metric, cell) a run carries that no other figure shows.
+
+    A release sweep now includes cells that answer "does the tool keep a
+    promise" rather than "how fast is it" — a half-closed visitor still gets its
+    answer, a fan-out of flows still fits. Without this list those readings were
+    in the file and in no chart.
+    """
+    out: list = []
+    for scenario in run.scenario_ids():
+        if run.kind(scenario) in PANELLED_KINDS:
+            continue
+        spec = model.SCENARIOS.get(scenario)
+        if spec is None or not spec.headline:
+            continue
+        out.extend(
+            (scenario, spec.headline, entry["cell"]) for entry in run.cells(scenario)
+        )
+    return out
+
+
+def render_cells(run: Run, out: Path, title: str) -> None:
+    """The exposure cells: one bar per arm, each cell on its own scale.
+
+    A **zero bar is the finding** here — a tool that delivered nothing after a
+    visitor's half-close draws nothing — so every bar carries its value, while a
+    cell with no reading at all is an `x` above the axis, which is a different
+    statement from a zero.
+
+    One axes per cell, not one axes for all of them: these cells carry different
+    units (Gbit/s, 1/s, bytes) and their ranges differ by five orders of
+    magnitude, so a shared y-axis draws the bulk bars as a line on the floor.
+    """
+    cells = exposure_cells(run)
+    if not cells or not run.arms:
+        return
+    fig, axes = plt.subplots(
+        1, len(cells), figsize=(2.5 * len(cells) + 2.4, 4.6), squeeze=False
+    )
+    for ax, (scenario, metric, cell) in zip(axes[0], cells, strict=True):
+        spec = model.METRICS[metric]
+        values = [run.median(scenario, cell, arm, metric) for arm in run.arms]
+        drawn = [value for value in values if value is not None]
+        top = max(drawn) if drawn and max(drawn) > 0 else 1.0
+        ax.set_ylim(0, top * 1.18)
+        for slot, (arm, value) in enumerate(zip(run.arms, values, strict=True)):
+            if value is None:
+                ax.plot([slot], [0.0], marker="x", ms=4, color="0.55", clip_on=False)
+                continue
+            ax.bar(slot, value, width=0.8, color=run.color(arm))
+            ax.annotate(
+                f"{value:g}",
+                (slot, value),
+                ha="center",
+                va="bottom",
+                fontsize=FONT - 1.5,
+                color="0.25",
+            )
+        ax.set_xticks(
+            range(len(run.arms)),
+            labels=run.arms,
+            rotation=30,
+            ha="right",
+            fontsize=FONT - 1,
+        )
+        ax.set_title(f"{scenario} [{cell}]" if cell else scenario, fontsize=FONT, pad=6)
+        ax.set_ylabel(f"{metric} ({spec.unit})", fontsize=FONT - 1)
+    fig.suptitle(
+        caption(
+            title,
+            "exposure cells — one bar per arm, each on its own scale; "
+            "a zero bar is a reading, x is none",
+        ),
+        y=0.97,
+        fontsize=FONT + 3,
+    )
+    footer(fig, run)
+    fig.tight_layout(rect=(0, footer_reserve(fig), 1, 0.92))
+    save(fig, out)
+
+
 def _cost_note(run: Run, cells: list) -> str:
     """Why an arm may have no bar: the control runs no tool to charge CPU to."""
     measured = {
@@ -1331,6 +1425,7 @@ FIGURES = (
     ("timeline", render_timeline),
     ("stages", render_stages),
     ("capacity", render_capacity),
+    ("cells", render_cells),
     ("udp", render_udp),
     ("drift", render_drift),
     ("cost", render_cost),
