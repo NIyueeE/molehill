@@ -1285,8 +1285,23 @@ def table_header(labels: list) -> list:
     return [row_line(["arm", *labels]), "|---" * (len(labels) + 1) + "|"]
 
 
+def split_by_leg(names: list) -> list:
+    """Cell names grouped by the leg they were measured on, in schedule order.
+
+    A table that puts a visitor-leg column beside a tunnel-leg column invites the
+    one comparison the schedule forbids — the two are different experiments — so
+    every table is emitted per leg. A name with no `@leg` was measured on the
+    default leg, the visitor's own connection.
+    """
+    groups: dict = {}
+    for name in names:
+        leg = name.split("@", 1)[1] if "@" in name else model.DEFAULT_LEG
+        groups.setdefault(leg, []).append(name)
+    return list(groups.items())
+
+
 def headline_section(run: Run) -> list:
-    """One table per scenario: the metric its claim rests on, per cell and arm."""
+    """One table per scenario and leg: the metric its claim rests on, per arm."""
     sections: list = []
     for scenario in run.scenario_ids():
         metric = run.headline(scenario)
@@ -1294,26 +1309,33 @@ def headline_section(run: Run) -> list:
         if metric not in model.METRICS or not cells:
             continue
         unit = model.METRICS[metric].unit
-        lines = [f"#### {scenario} — {metric} ({unit})", ""]
-        lines += table_header([cell["cell"] or scenario for cell in cells])
-        for arm in run.arms:
-            lines.append(
-                row_line(
-                    [
-                        arm,
-                        *[
-                            reading(run, scenario, cell["cell"], arm, metric)
-                            for cell in cells
-                        ],
-                    ]
+        names = [cell["cell"] or scenario for cell in cells]
+        for leg, leg_names in split_by_leg(names):
+            lines = [f"#### {scenario} — {metric} ({unit}) — {leg} leg", ""]
+            lines += table_header(leg_names)
+            for arm in run.arms:
+                lines.append(
+                    row_line(
+                        [
+                            arm,
+                            *[
+                                reading(run, scenario, name, arm, metric)
+                                for name in leg_names
+                            ],
+                        ]
+                    )
                 )
-            )
-        sections += [*lines, ""]
+            sections += [*lines, ""]
     return ["### Headline metric per cell", "", *sections] if sections else []
 
 
 def stage_section(run: Run) -> list:
-    """Per stage: the interactive p99, the statistic the SLO is stated in."""
+    """Per stage: the interactive p99, the statistic the SLO is stated in.
+
+    Emitted per leg, because the leg is the experiment: the same condition on the
+    visitor's connection and on the hop the tool owns are two different questions
+    and a single table put them in adjacent columns.
+    """
     rows = [
         (scenario, cell["cell"])
         for scenario in run.scenarios_of(model.Kind.STAGED)
@@ -1325,20 +1347,30 @@ def stage_section(run: Run) -> list:
     labels = [
         cell if len(scenarios) == 1 else f"{scenario} {cell}" for scenario, cell in rows
     ]
-    lines = ["### Per stage: interactive p99 (ms)", "", *table_header(labels)]
-    lines += [
-        row_line(
-            [
-                arm,
-                *[
-                    reading(run, scenario, cell, arm, "rtt_p99_ms")
-                    for scenario, cell in rows
-                ],
-            ]
-        )
-        for arm in run.arms
-    ]
-    return [*lines, ""]
+    blocks: list = []
+    for leg, leg_labels in split_by_leg(labels):
+        keep = [
+            row for row, label in zip(rows, labels, strict=True) if label in leg_labels
+        ]
+        lines = [
+            f"### Per stage: interactive p99 (ms) — {leg} leg",
+            "",
+            *table_header(leg_labels),
+        ]
+        lines += [
+            row_line(
+                [
+                    arm,
+                    *[
+                        reading(run, scenario, cell, arm, "rtt_p99_ms")
+                        for scenario, cell in keep
+                    ],
+                ]
+            )
+            for arm in run.arms
+        ]
+        blocks += [*lines, ""]
+    return blocks
 
 
 def udp_section(run: Run) -> list:

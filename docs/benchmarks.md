@@ -440,6 +440,13 @@ A cell that carried no reading is drawn as `x` and printed as `- (reason)`,
 never as `0`: "the path carried nothing" and "nobody could measure what it
 carried" are different findings.
 
+**Every figure and every printed table keeps the two legs apart.** A stage that
+imposed its condition on the visitor's connection and one that imposed it on the
+hop the tool owns are different experiments, so the master draws the boundary and
+labels each run of stages, and the tables are emitted per leg rather than with a
+visitor column beside a tunnel one. A comparison across that line is not a
+comparison the schedule supports.
+
 ### How to read a cell
 
 - **A stage's bulk cell is the load over its whole window, and the side that
