@@ -398,17 +398,17 @@ publishes; `--scale` shortens or lengthens every staged timeline's holds
 without changing the schedule's *shape*, and because the scale lands in the
 fingerprint, a shortened run can never be mistaken for a published one.
 
-| profile | rounds | budget per arm | what it is for |
+| profile | rounds | budget (whole run) | what it is for |
 |---|---|---|---|
 | `smoke` | 2 (+1 warm-up) | ~45 s | the fast loop: every headline metric, seconds not minutes |
 | `dev` | 4 (+1 warm-up) | ~150 s | the default for an optimization: every scenario, minutes |
-| `full` | 6 (+1 warm-up) | ~420 s | the release-grade sweep: everything, for as long as it takes |
+| `full` | 6 (+1 warm-up) | ~420 s | every scenario the model has, for as long as it takes: a diagnostic, not the release artifact |
 | `stage` | 2 (+1 warm-up) | ~150 s | one condition, the whole workload: a shape question, minutes |
 | `step` | 1 (+0 warm-up) | ~90 s | the robustness axis: the path changes between stages while one interactive stream runs across both boundaries |
 | `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
 | `wedge` | 1 (+0 warm-up) | ~2400 s | the soak's interactive silence, **provoked**: the product twice on one host, which is the load at which it appears. A diagnostic, not a gate |
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
-| `sweep` | 1 (+0 warm-up) | ~2400–2700 s | the release sweep: the eighteen-stage two-leg schedule, the load ramp and the `half-close` cell |
+| `sweep` | 1 (+0 warm-up) | ~15 000 s | the release sweep: the eighteen-stage two-leg schedule, the load ramp and the `half-close` cell |
 | `compare` | 3 (+1 warm-up), A/A twin | ~400 s | arms side by side on the single cells (`bulk-1`, `rr-16`, `half-close`): a comparison, never a release artifact |
 | `nobulk` | 2 (+1 warm-up) | ~300 s | the same staged timeline with the bulk spine removed: a diagnostic, not a gate |
 | `carrier` | 3 (+0 warm-up) | ~240 s | one condition held long, bulk spine off: is the L3 wedge the carrier alone? |
