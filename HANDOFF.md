@@ -1000,6 +1000,15 @@ so the fallback may well cover it). If the gate then names a missing (arm, cell)
 the workload learns to measure it, or the condition declares which architectures it can be imposed on — and the run is repeated.
 **The gate is never relaxed to fit a record**: a coverage check that can be talked out of a missing cell is not a coverage check.
 
+**Two papercuts found while publishing under the standard, both deferred to the next revision because the tree is frozen for
+the measurement:**
+
+- `just bench plot --markdown` prints the headline metric, the per-stage p99, drift and CPU — but **no per-stage throughput
+  table**, so the README's throughput table is extracted from the record with `jq`. A reader cannot reproduce that table from
+  the tool, which is the wrong shape for a published number; the revision adds the table.
+- `just bench plot`'s default `--out-dir` is the results file's own directory, so forgetting `--out-dir` writes charts into
+  `benches/records/` beside the evidence (twice, this session). The default should be `assets/`, or the flag should be required.
+
 ## 5. Active architecture decisions
 
 > **The governing plan is `MHD-FINALIZATION-PLAN.md`** (checkout root, untracked
