@@ -294,6 +294,7 @@ Two conventions the table cannot state, because they belong to the workload:
 | `bulk-1` | `bulk` | what one bulk TCP stream carries, and what it costs per byte | `throughput_gbps` |
 | `bulk-n` | `bulk` | whether N streams aggregate, or share one ceiling | `throughput_gbps` |
 | `bulk-pair` | `bulk-pair` | whether two services (or two L3 claims) each carry a full stream, which separates a per-flow ceiling from a per-host one | `throughput_gbps` |
+| `two-wave` | `two-wave` | whether a carrier decision the pool learned during a warm stream reaches the streams that open after it — a settle between the waves is what lets the pool dial and trim before the measured one | `throughput_gbps` |
 | `rr-1` | `rr` | the round-trip rate and latency of one strict request/response flow | `rtt_p99_ms` |
 | `rr-16` | `rr` | the same, 16 flows at once: aggregate rate and tail latency | `rate_per_s` |
 | `churn-16` | `rr` | a fresh connection per request: what a visitor pays to arrive, as the first request's round trip on each new connection | `rtt_p99_ms` |

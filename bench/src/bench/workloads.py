@@ -715,6 +715,50 @@ def run_bulk(ctx: Ctx, params: dict) -> list:
     return [_iperf_cell(Spot(ctx, window, tag), result, metrics)]
 
 
+def run_two_wave(ctx: Ctx, params: dict) -> list:
+    """Two bulk waves in one session: a warm one, a settle, then the measured one.
+
+    The carrier policy reads a service's class from what its channels carried, and a
+    running stream is never moved. So its effect is **only** on streams that open after
+    the class is known — and every other bulk scenario opens its streams in the first
+    second, which is why `cost` shows the pool converging onto tunnels that stay empty
+    (`HANDOFF.md` §4 E). This scenario makes the effect measurable: one warm stream
+    teaches the class, `settle_secs` gives the pool its maintenance ticks to dial and
+    trim, and the second wave's streams are the ones the policy can place.
+
+    Both waves are cells, so the report shows the warm one beside the measured one and a
+    reader can see whether the second wave is faster *because* of the decision rather
+    than because of a warm cache somewhere else.
+    """
+    port = topology.IPERF_PORT
+    cells = []
+    waves = (
+        ("warm", params["warm_streams"], params["warm_secs"]),
+        ("measured", params["streams"], params["secs"]),
+    )
+    with iperf_sink(ctx, f"two-wave-{params['streams']}", port) as sink:
+        if not sink.ready():
+            return [Cell("", False, reason="the iperf3 sink never started")]
+        if not wait_dial_port(ctx, port):
+            return [Cell("", False, reason="the tool never listened on the iperf port")]
+        for index, (name, streams, secs) in enumerate(waves):
+            if index:
+                time.sleep(float(params["settle_secs"]))
+            with measured(ctx, topology.ECHO_PORT) as window:
+                result = iperf.iperf_result(
+                    _dial(ctx, {**params, "port": port}),
+                    streams,
+                    secs,
+                    iperf_timeout(secs),
+                    ctx.work / "iperf-raw" / f"{ctx.arm.id}-{name}",
+                )
+            metrics = {"throughput_gbps": result.get("gbps_received_own_window")}
+            cells.append(
+                _iperf_cell(Spot(ctx, window, name), result, metrics, streams=streams)
+            )
+    return cells
+
+
 def run_bulk_pair(ctx: Ctx, params: dict) -> list:
     """Two single-stream bulk runs at once, one per service (or L3 claim).
 
@@ -2243,6 +2287,7 @@ def _transport_wait(log: Path, timeout: float = 20.0) -> None:
 RUNNERS = {
     model.Kind.BULK: run_bulk,
     model.Kind.BULK_PAIR: run_bulk_pair,
+    model.Kind.TWO_WAVE: run_two_wave,
     model.Kind.RR: run_rr,
     model.Kind.UDP: run_udp,
     model.Kind.UDP_LADDER: run_udp_ladder,

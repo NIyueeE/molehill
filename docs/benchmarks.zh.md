@@ -244,6 +244,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `bulk-1` | `bulk` | 一条 bulk TCP 流能承载多少,以及它每字节的代价 | `throughput_gbps` |
 | `bulk-n` | `bulk` | N 条流是聚合起来,还是共享同一个上限 | `throughput_gbps` |
 | `bulk-pair` | `bulk-pair` | 两个服务(或两条 L3 claim)是否各自承载一条完整的流,以此把每流上限与每主机上限分开 | `throughput_gbps` |
+| `two-wave` | `two-wave` | 池子在暖流里学到的载体决定,是否触达之后才开的流——两次波之间留一段静置,让池子在被测波之前完成拨号与归还 | `throughput_gbps` |
 | `rr-1` | `rr` | 一条严格请求/响应流的往返速率与延迟 | `rtt_p99_ms` |
 | `rr-16` | `rr` | 同上,但同时 16 条流:聚合速率与尾部延迟 | `rate_per_s` |
 | `churn-16` | `rr` | 每次请求新开一条连接:访客为抵达付出的代价,取每条新连接上第一个请求的往返时间 | `rtt_p99_ms` |

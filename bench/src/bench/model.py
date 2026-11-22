@@ -48,6 +48,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "the workload's measured window",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "staged",
         ),
@@ -63,6 +64,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "the workload's measured window",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -402,6 +404,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "Gbit on the visitor's link egress",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -421,6 +424,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "the workload's measured window",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -443,6 +447,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one read/write-family syscall",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -465,6 +470,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "the workload's measured window",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -483,6 +489,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "bytes the visitor offered",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -502,6 +509,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one packet on the tunnel link",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -522,6 +530,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one process set",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -540,6 +549,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one process set",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -558,6 +568,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one process set",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -579,6 +590,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one visitor",
         "needs": (
             "bulk",
+            "two-wave",
             "rr",
             "staged",
         ),
@@ -593,6 +605,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one TCP segment",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -615,6 +628,7 @@ METRIC_SPECS: tuple[dict, ...] = (
         "denominator": "one packet",
         "needs": (
             "bulk",
+            "two-wave",
             "bulk-pair",
             "rr",
             "udp",
@@ -1503,6 +1517,23 @@ def scenario_catalog() -> list:
             headline="throughput_gbps",
         ),
         Scenario(
+            id="two-wave",
+            kind="two-wave",
+            claim=(
+                "whether a carrier decision the pool learned during a warm stream "
+                "reaches the streams that open after it"
+            ),
+            params={
+                "warm_streams": 1,
+                "warm_secs": 4,
+                "settle_secs": 2,
+                "streams": 8,
+                "secs": 6,
+                "omit": 2,
+            },
+            headline="throughput_gbps",
+        ),
+        Scenario(
             id="bulk-pair",
             kind="bulk-pair",
             claim=(
@@ -1985,6 +2016,12 @@ class Kind:
 
     BULK: ClassVar[str] = "bulk"
     BULK_PAIR: ClassVar[str] = "bulk-pair"
+    # Two bulk waves in one session: a warm stream that teaches the pool a
+    # service's class, a settle, then the measured wave. It exists because the
+    # carrier policy only acts on streams opened *after* it learns the class,
+    # and every other bulk scenario opens its streams in the first second
+    # (`HANDOFF.md` §4 E).
+    TWO_WAVE: ClassVar[str] = "two-wave"
     RR: ClassVar[str] = "rr"
     UDP: ClassVar[str] = "udp"
     UDP_LADDER: ClassVar[str] = "udp-ladder"
@@ -1997,6 +2034,7 @@ class Kind:
     ALL: ClassVar[tuple] = (
         BULK,
         BULK_PAIR,
+        TWO_WAVE,
         RR,
         UDP,
         UDP_LADDER,
