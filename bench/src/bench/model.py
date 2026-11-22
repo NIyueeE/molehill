@@ -1939,7 +1939,10 @@ PROFILES: dict[str, dict] = {
         },
     },
     "full": {
-        "what": "the release-grade sweep: everything, for as long as it takes",
+        "what": (
+            "every scenario the model has, for as long as it takes: "
+            "a diagnostic, not the release artifact"
+        ),
         "rounds": 6,
         "warmup_rounds": 1,
         "scenarios": tuple(s.id for s in SCENARIOS.values()),
@@ -2085,7 +2088,13 @@ PROFILES |= {
         # from by 1.5 %, so they live in the `compare` profile with rounds and
         # an A/A pair, and no published table quotes them.
         "scenarios": ("timeline", "capacity", "half-close"),
-        "budget_s": 3000.0,
+        # The real cost of the schedule, not the holds alone: every stage pays a
+        # drain before the next one is imposed (25 to 35 s on this host), so
+        # 2 220 s of holds is 40 to 45 minutes per arm and about four hours for
+        # five arms.
+        # The budget is what a run is *planned* against and what its record
+        # prints; a run that overruns it says so rather than being cut.
+        "budget_s": 15000.0,
         "aa": False,
         "arms": ("molehill", "l3", "frp", "rathole", "nps"),
         "params": {},

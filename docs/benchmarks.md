@@ -112,7 +112,11 @@ affected tables in this page and the landing page's benchmark section updated in
 the same commit, and (4) `HANDOFF.md` told what moved and what it cost. Adding a
 scenario "to see" is not a revision: measure it as a diagnostic first, and only a
 scenario that separates arms or asks a categorical question earns a place in the
-schedule.
+schedule. And **nothing under `bench/src/bench/` may change while a release run
+is in flight** — the record names the revision it measured and the release review
+diffs that revision against the tag commit, so a plotter fix committed mid-run
+makes the artifact unusable for a release. That is not a hypothetical: two commits
+landed three minutes into a four-hour run on 2026-11-22 and the run was restarted.
 
 **What trust rests on, mechanically** — every item is a check, not an intention:
 the record names its revision, tree state, host and fingerprint before its first
