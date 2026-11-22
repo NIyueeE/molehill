@@ -1373,6 +1373,50 @@ def stage_section(run: Run) -> list:
     return blocks
 
 
+def throughput_section(run: Run) -> list:
+    """Per stage: the bulk spine, leg-split like everything else.
+
+    The figure draws this under each arm's tail, and the release table quotes it,
+    so it belongs in the printed tables too: a published throughput number whose
+    only home is a `jq` extraction is a number a reader cannot reproduce.
+    """
+    rows = [
+        (scenario, cell["cell"])
+        for scenario in run.scenarios_of(model.Kind.STAGED)
+        for cell in stage_cells(run, scenario)
+    ]
+    if not rows:
+        return []
+    scenarios = {scenario for scenario, _ in rows}
+    labels = [
+        cell if len(scenarios) == 1 else f"{scenario} {cell}" for scenario, cell in rows
+    ]
+    blocks: list = []
+    for leg, leg_labels in split_by_leg(labels):
+        keep = [
+            row for row, label in zip(rows, labels, strict=True) if label in leg_labels
+        ]
+        lines = [
+            f"### Per stage: bulk throughput (Gbit/s) — {leg} leg",
+            "",
+            *table_header(leg_labels),
+        ]
+        lines += [
+            row_line(
+                [
+                    arm,
+                    *[
+                        reading(run, scenario, cell, arm, "throughput_gbps")
+                        for scenario, cell in keep
+                    ],
+                ]
+            )
+            for arm in run.arms
+        ]
+        blocks += [*lines, ""]
+    return blocks
+
+
 def udp_section(run: Run) -> list:
     """The datagram cells: what arrived and what was lost, per arm."""
     rows = [
@@ -1497,6 +1541,7 @@ def tables(run: Run, title: str) -> str:
     ]
     lines += headline_section(run)
     lines += stage_section(run)
+    lines += throughput_section(run)
     lines += udp_section(run)
     lines += drift_section(run)
     lines += cost_section(run)
