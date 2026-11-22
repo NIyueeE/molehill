@@ -901,6 +901,34 @@ the earlier claim ("where packets are lost the product's tail is the tightest of
 samples. What would reopen it: a stage long enough, or a probe concurrent enough, to put a thousand requests in the cell. That is a
 model change and belongs in the plan, not in a release.
 
+### G. The peers' own leg — the experiment every published table skipped
+
+Every staged table on this page puts the impairment on the **visitor** leg (`condition_leg: visitor`), so each tool's own transport
+runs clean and every shaped stage ties (§3.2). `--condition-leg tunnel` moves the same condition onto the hop the tool *does* own.
+First run of it: `--profile smoke --scenarios bulk-1,rr-16 --condition loss1 --condition-leg tunnel`, four arms, **two measured
+rounds each** (record `/home/dsh/tmp/p310-tunnel-leg.json`, not committed — directional, and the run itself says its `rtt_max`
+floor needs about six rounds):
+
+| cell (1 % loss, 10 ms on the tunnel leg) | control | molehill | frp | rathole |
+|---|---|---|---|---|
+| `bulk-1` throughput, Gbit/s | 4.27 | **1.09** | 1.08 | **4.17** |
+| `rr-16` requests/s | 562 | **697** | 537 | 559 |
+| `rr-16` p99, ms | 245 | **48.7** | 73.7 | 246 |
+| `rr-16` p50, ms | 20.35 | 20.25 | 20.66 | 20.54 |
+| `rr-16` connect+setup p50, ms | 20.3 | 0.65 | 0.51 | 0.43 |
+
+**Two findings, and they point opposite ways.** On the interactive axis the product is the only arm that beats the tool-free path
+(**+24 % requests/s, p99 48.7 ms against the control's 245**) and it is **5× tighter than rathole, 1.5× tighter than frp** — which is
+what per-stream recovery over a datagram buys: a lost segment costs one stream one round trip, where yamux-over-TCP costs all sixteen
+streams an RTO, and rathole's p99 *is* the control's. On the bulk axis the same design loses **3.8× to rathole** (1.09 against 4.17)
+because the window's growth phase ends at the first loss (§4 B, "the window is the whole send-rate policy"); frp loses the same way,
+so this is not a peer-versus-us difference but a window-rule difference.
+
+**What it means for the product's claims.** "Latency on an impaired path" is now compared against peers, not only against our own
+kernel carrier, and it holds. "Throughput" must never be quoted on a clean path — the ranking inverts with the leg the loss is on.
+What would turn either into a claim: the same run at six rounds with the endpoints pre-registered (`--primary`), and the tunnel-leg
+staged schedule (which no published table is yet; `docs/benchmarks.md`, "What the model cannot answer").
+
 ## 5. Active architecture decisions
 
 > **The governing plan is `MHD-FINALIZATION-PLAN.md`** (checkout root, untracked
