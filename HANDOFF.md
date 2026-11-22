@@ -782,6 +782,32 @@ probe) rather than on loss, and measure `cost` at `clean` and at `loss1` in the 
 **Pass**: `cost` at `clean` within 1.2× of the kernel carrier's p99 **and** `loss1`/`loss5` unmoved. **Rollback**: the policy
 stays as it is, and this section keeps the number that says what it costs on a clean path.
 
+### E. The auto carrier policy decides correctly — and changes nothing on a workload whose streams are already open
+
+**Verified end to end on this build**, one `cost` run with the pool and placement instruments on, unpinned:
+
+```
+traffic class changed  service=ServiceId([0,0,0,4]) from="conversational" to="bulk"
+grows=2 shrinks=0      size=6 count=4
+tunnels=2/0/0/mhd, 1/0/1/mhd, 2/0/0/mhd, 2/0/0/mhd, 0/0/0/tcp, 0/0/0/tcp
+placements=36 fallbacks=0 (mean 33 µs, max 161)   placements=31 fallbacks=0 (mean 61, max 956)
+```
+
+So the three halves of the policy all fire: the class is **learned** (`conversational → bulk`), the mix is **owed and
+dialled** (two kernel-carrier spares, `grows=2`), and placement **never falls back** (`fallbacks=0`, 33–61 µs a placement).
+
+**And the effect on that workload is zero.** The four datagram tunnels hold all seven streams; both kernel-carrier
+spares hold **none** (`0/0/0/tcp` twice), because the bulk spine opened its streams in the stage's first second — before
+the class existed — and a running stream is never moved. The policy's benefit is therefore only available to sessions
+that open **new** streams after the class is learned, which is exactly the two-cell criterion: `bulk-1` 62 % of the
+kernel carrier, `bulk-n` **81 %** (§4.526).
+
+**And it leaves capacity it cannot give back**: `size=6 count=4` for the whole run, `shrinks=0`. `trim_step` reclaims an
+*idle tunnel of the over-represented carrier*, and every datagram tunnel is busy, so the two idle kernel spares stay.
+That is the documented trade ("a pool one over its count is bounded … better than a mix that can never be reached") —
+but here it is two over, carrying nothing, for as long as the streams last. **Not changed**: §2 freezes the policy, and
+the trade is deliberate.
+
 ### D. The first bulk cell rides the carrier it started on (62 %)
 
 **Symptom**: on the plan's two-cell criterion, auto reads **62 %** of the kernel carrier in `bulk-1` and **81 %** in `bulk-n`
