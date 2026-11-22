@@ -987,7 +987,9 @@ replaced in place, and the old numbers survive only in this file's history and i
 4. Rewrite **both** published tables — `README.md`/`README.zh.md` and `docs/benchmarks.md`/`.zh.md` — split **by leg**, from
    `just bench plot … --markdown`'s own output (the tables it prints are already per leg), with the claim discipline stated
    beside them: one round, so the tables say which side of a threshold a reading falls on and never rank arms by speed.
-5. CHANGELOG: the re-baseline entry (already written) says the next record becomes the baseline; name the file.
+5. CHANGELOG: fold `[Unreleased]` into `## [1.0.0]`, re-date it to the tag's day, and make the re-baseline entry describe
+   the method the tag actually carries — the eighteen-stage two-leg schedule, the `half-close` cell and "The standard" — not
+   only the earlier engine change (`l4-plain`, `Arm.noise_data`, `mhd_lane_dup_pct`) it names today. Name the record file.
 6. Merge this branch into `feat/v1.0.0`, then `just tag-check`. The record's revision and the tag commit must differ only in
    docs/assets/records — any change under `bench/src/bench/` after the measurement makes the artifact unusable (§0, §4.534).
 7. The tag itself is the human's (`AGENTS.md` §5).
