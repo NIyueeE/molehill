@@ -3009,6 +3009,11 @@ fn spawn_data_channel(
     // mistake the pairing and opening lines were corrected for — so all three
     // are now read at five.
     let spawned = std::time::Instant::now();
+    let is_claim = matches!(
+        args.service.service_type,
+        crate::config::ServiceType::Transparent
+    );
+    let claim_service = args.service_id;
     tokio::spawn(
         async move {
             // Only the multiplexed path consumes this: a direct channel has no
@@ -3038,7 +3043,21 @@ fn spawn_data_channel(
                 // a dead local service is this one, so the level has to be the
                 // per-connection one. A *failed request* is visible to the
                 // visitor; the operator needs the cause only when debugging.
-                debug!("{:#}", e);
+                //
+                // A **claim's lane is not a visitor connection**: when it fails,
+                // the claim has lost part of its whole data plane, and a silent
+                // failure is what let a claim sit with no lanes for twenty
+                // minutes in the first bench-standard record (`HANDOFF.md` §4 I).
+                // The reason is the one thing the operator cannot infer, so a
+                // lane's failure says so.
+                if is_claim {
+                    warn!(
+                        service = %claim_service,
+                        "a transparent claim's data channel failed: {e:#}"
+                    );
+                } else {
+                    debug!("{:#}", e);
+                }
             }
         }
         .instrument(Span::current()),
