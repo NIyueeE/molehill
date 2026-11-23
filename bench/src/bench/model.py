@@ -989,6 +989,17 @@ TIMELINES: dict[str, tuple] = {
     #   udp_throttled  a network that polices UDP to a few thousand packets a second
     #   udp_blocked    a network that refuses UDP: the product must fall back, and
     #                  a datagram-only design must fail
+    # **The recovery cell, on its own.** A UDP-refusing network on the leg the
+    # carrier lives on, bracketed by clean stages: the one question `sweep`'s own
+    # schedule asks and cannot isolate — *does a claim keep or regain its data
+    # plane after the block lifts?* It is a diagnostic, not part of the release
+    # record: the three stages cost six minutes instead of a five-hour sweep, which
+    # is what a defect on this path needs (`HANDOFF.md` §4 I).
+    "recover": (
+        ("clean", 150.0),
+        ("udp_blocked@tunnel", 150.0),
+        ("clean", 150.0),
+    ),
     "sweep": (
         ("clean", 150.0),
         ("rtt100", 120.0),
