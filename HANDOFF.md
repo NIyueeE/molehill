@@ -1108,7 +1108,20 @@ peer**: `a transparent claim's data channel failed: Failed to read data cmd: ear
 minutes before the backoff reset was fixed — a claim with no lane must not have its backoff reset by a plan that says "nothing
 short"). The claim still reads 100 % error on the stage after the block.
 
-So the ticket is now **on the server side**: what ends a freshly opened lane for a claim it just carried? The next run is that
+**The server-side hypothesis was wrong, and the log names the real one.** A clean stop is now reported (`WARN` + the death
+signal) and the same full-scale pass still reads 100 % on `udp_blocked@tunnel` and `clean#2` — with **0** "stopped serving" lines.
+What the two logs show together is sharper: the client's 75 lane failures run **13:00:22.138 → 13:03:30.417**, and the client's own
+INFO line at **13:00:22.070** is `mhd is reachable again at 10.10.0.254:2400; using it` — the first failure lands **68 ms** after the
+carrier switched *back* to mhd. Over the same window the server logs **nothing at all** (its last line is 12:40:59): no handshake, no
+refusal. So the dials are not being refused by the server — they never reach it, because they are dialled over a carrier whose pool
+died during the block and has not been re-established, and the L3 dial path does not wait for, or trigger, that re-establishment. It
+fails instantly, once per backoff step, for as long as the run lasts. The `l4` arms recover from the same block because the pool
+re-establishes itself; a claim's lane dial is not part of that.
+
+That is the next fix: **a claim's lane dial over mhd must ride the pool's establishment (or fall back to TCP for that attempt), not
+fail instantly against a dead pool.**
+
+The earlier hypothesis (superseded by the above) was that the ticket is **on the server side**: what ends a freshly opened lane for a claim it just carried? The next run is that
 question — one full-scale pass with the server's core at debug, and the refusal path instrumented the way the client's failure path
 now is.
 
