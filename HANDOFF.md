@@ -1083,6 +1083,14 @@ carrying this end's flows) so its replacement rides the carrier now preferred"**
 (one `WARN`, then debug), and **round 0 of the re-run survived the block that used to kill it** — `udp_blocked@tunnel` 1.5 ms,
 `clean#2` 1.6 ms, where the release run read 100 % error and the reproducer's round 1 died.
 
+**Both of the two things below are now closed, and the fix is demonstrated.** `_settle_legs` (bench, `958c986`) gives each leg its
+own answer after every stage and at the end of every pass — the release schedule's stage 17 used to leave its UDP-refusing firewall
+rule standing on the *tunnel* leg while stage 18 measured a "clean" stage on the visitor one, which is what made `l3` look
+permanently dead in the record as well as what left the harness hanging between passes. With the product fix and that honest
+teardown together, the reproducer's **three passes all read 0.0 % interactive error on `clean#2`** and 1.5–1.9 ms on
+`udp_blocked@tunnel` (`~/tmp/p440-l3-fixed2.json`, 3 961 s, 57 samples), where the release record read 100 % error, 0 of 8 streams
+and a 455 s silence. The six-arm sweep is the acceptance test.
+
 **Two things this round did not close.**
 1. **Round 1 of that same re-run never started**: the harness sat between passes for 15 minutes with no `round1/` workdir and no
    series samples (`~/tmp/bench-20261123-020642`), and I stopped it. A hang *between* passes is a harness question of its own, and
