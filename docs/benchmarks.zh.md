@@ -603,7 +603,7 @@ flight 为 0,也就是说载体是**闲着**,不是坏着。
 sudo -n just bench
 sudo -n just bench --profile dev --aa
 
-# the release sweep: the two-leg schedule, the load ramp and half-close, five arms
+# the release sweep: six arms (the tool-free control first), two-leg schedule, ramp, half-close
 just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
