@@ -345,6 +345,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A transparent claim that has lost every lane gets one back.** A claim whose
+  lanes all ended — which is what a network that refuses the carrier's datagrams
+  does to them — was dialled for by nobody: the lane allocator skips a claim with
+  no lane on purpose (its lanes may still be joining) and the peer only asks for a
+  channel when it has a visitor to place, which it cannot do without a lane. The
+  client now dials a replacement for a claim that has had a grace period and still
+  holds no lane, and a claim that has no lane no longer has its dial backoff reset
+  on every tick by a plan that says nothing is short. On the server side, a claim
+  whose task **stopped serving while the service stayed registered** now says so at
+  `WARN` and reports the death the way an error does, so the service's control path
+  ends and the client re-registers it instead of opening lanes into a queue nobody
+  reads (`early eof`, for ever). A claim's lane failure also carries its reason at
+  `WARN` now — it was `DEBUG`, which is why the first bench-standard record shows a
+  claim carrying nothing for twenty minutes with no line saying why.
 - **A transparent claim no longer loses its data plane for the rest of the
   session when a carrier move cannot complete.** A claim whose lane moved off a
   carrier that had started refusing its traffic asked the peer to drain the lane
