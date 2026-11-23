@@ -1051,6 +1051,31 @@ retry path that does not itself depend on carrying traffic** — the allocator a
 is where the 455 s of silence comes from. Warm-up survived because the suspicion never fired there: the "refused its share" counter
 needs traffic to accumulate, and the block's length at that scale did not produce it.
 
+**The smoking gun, from a debug-level run of the same schedule.** `RUST_LOG=debug just bench run --profile smoke --scenarios
+timeline --scale 0.1 --arms l3` (work `/home/dsh/tmp/bench-20261123-014643`) reproduces both shapes and names the moment the claim
+loses its replacement:
+
+    01:53:57  mhd is reachable again at 10.10.0.254:2400; using it
+    01:53:57  Ignoring a data channel request for 2: the claim holds the lanes it was allotted
+
+The server asked for a replacement lane at the instant the carrier came back, and the **client refused it** because its allotment
+test counted the lane that had just stopped delivering. That is the whole defect in one line: `wants_another_lane` counts
+`member_stats().filter(lane.live)` — "a member holds the slot" — and a lane whose carrier is unreachable is still `live`. So a claim
+whose lanes all ride an abandoned carrier satisfies its own allotment, refuses every replacement the peer offers, and the allocator's
+own `dial()` is the only way it could still ask for one — which is why it spins (`dial` raises `target` once per attempt, a failed
+attempt never lowers it, and the allocator has no backoff).
+
+**The fix, in three parts, all at the same seam:**
+
+1. **The allotment test must count the lanes that can still carry**: `live && !draining && carrier == the claim's current choice`.
+   A lane on an abandoned carrier does not satisfy the target, so the peer's replacement request is accepted and a lane on the
+   current carrier is dialled. This is the recovery path; without it nothing else matters.
+2. **A failed dial must not raise the want**: `dial()` raises `target` (it is recording an intent) and a dial that never lands must
+   lower it again, with in-flight attempts tracked so `live + pending < target` is the test. Today a failure inflates the target for
+   ever, which is why 91 attempts became 91 wanted lanes.
+3. **The allocator backs off and says it once**: 1 s → 2 → 4 → … capped, one `WARN` (a claim that cannot get a lane is an operator
+   fact), then `DEBUG`. Today it logs at `INFO` every tick for as long as the condition lasts.
+
 **Why this is a product goal, not a bench goal.** The bench did exactly what it was 定型 for: a deployment class nobody had
 imposed on this architecture before (a network that refuses UDP) found a permanent loss of the data plane, and the gate refused to
 publish it. The record is not the artifact to fix: the **product** is. The release path (merge, tables, tag) waits for the fix and
