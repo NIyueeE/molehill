@@ -1099,7 +1099,20 @@ logs, the 1 Hz dial loop is gone, a healthy claim now keeps its lanes through th
 does so *silently*: no carrier move fires, because a lane that carries nothing offers no evidence for the carrier rule, and no new
 lane is dialled, because a lane that is `live` and on the current carrier satisfies the allotment whether or not it delivers.
 
-The next hypothesis to test (not assumed): the ticket is a lane-level **liveness** rule — a slot that has been given traffic and has
+**Two more rounds of the same ticket (2026-11-23, later).** (1) A claim's lane failure now says why at `WARN` instead of `debug!`
+— the release run's silence was a log-level bug, not health. (2) The allocator now dials a replacement for a claim that has **no
+lane at all** after a grace period: `lanes::plan` deliberately skips a lane-less claim ("its lanes are still joining"), and the peer
+only asks for a channel when it has a visitor to place, which it cannot do without a lane — so a claim whose every lane died during
+a UDP block was stranded by design. With that rule the client *does* dial after the block, and **every dial is refused by the
+peer**: `a transparent claim's data channel failed: Failed to read data cmd: early eof`, over and over (1 079 of them in four
+minutes before the backoff reset was fixed — a claim with no lane must not have its backoff reset by a plan that says "nothing
+short"). The claim still reads 100 % error on the stage after the block.
+
+So the ticket is now **on the server side**: what ends a freshly opened lane for a claim it just carried? The next run is that
+question — one full-scale pass with the server's core at debug, and the refusal path instrumented the way the client's failure path
+now is.
+
+The earlier hypothesis for this ticket (not assumed): it is a lane-level **liveness** rule — a slot that has been given traffic and has
 delivered none for a while must stop counting as satisfying, so the claim dials a replacement — and the carrier rule's evidence bar
 (`CARRIER_MIN_PACKETS`) is what hides a total blackhole from it. The isolated reproducer for it is a single `cost` stage with
 `--condition rate100_shallow --condition-leg tunnel`, then a clean stage on the same arm.

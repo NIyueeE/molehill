@@ -3286,6 +3286,14 @@ const CARRIER_CONFIRM_TICKS: u32 = 3;
 #[cfg(mh_l3_client)]
 const LANE_DIAL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a freshly registered claim may have no lane before the allocator
+/// stops treating that as "still joining".
+///
+/// A claim's first lanes are opened by the registration path itself; the grace is
+/// what keeps the allocator from dialling beside them.
+#[cfg(mh_l3_client)]
+const LANE_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Failed lane dials after which the claim reports itself at `WARN`.
 ///
 /// Five, not three: a healthy startup asks for its lanes while the hub is still
@@ -3319,6 +3327,9 @@ struct ClaimEntry {
     /// claim whose carrier was refused dialled once a second for minutes, and
     /// every attempt made the claim want another lane (`HANDOFF.md` §4 I).
     target: usize,
+    /// When this claim was registered, so the allocator can tell a claim whose
+    /// lanes are still joining from one whose lanes are all gone.
+    registered_at: std::time::Instant,
     /// Dial attempts that have not produced a lane, and when the next one may be
     /// made. A claim that cannot get a lane must not ask on every tick: the
     /// attempt interval doubles up to [`LANE_DIAL_BACKOFF_MAX`] and one `WARN`
@@ -3366,6 +3377,7 @@ impl LanePool {
                     args,
                     share,
                     target: share,
+                    registered_at: std::time::Instant::now(),
                     dial_attempts: 0,
                     next_dial_at: std::time::Instant::now(),
                 },
@@ -3633,15 +3645,33 @@ impl LanePool {
             return;
         }
         let (loads, used) = self.snapshot();
+        // **A claim with no lane at all is short by definition**, and nothing
+        // else will dial one: `lanes::plan` deliberately skips a lane-less claim
+        // (its lanes may still be joining) and the peer only asks for a channel
+        // when it has a visitor to place, which it cannot do without a lane. A
+        // claim whose every lane died — which is what a UDP block on the
+        // carrier's leg does — was therefore stranded for the rest of the run
+        // (`HANDOFF.md` §4 I). The grace separates "still joining" from "all
+        // gone"; the per-claim backoff keeps a failed dial from spinning.
+        for load in &loads {
+            if load.lanes.is_empty() && self.mature(&load.endpoint) {
+                self.dial(&load.endpoint, false);
+            }
+        }
         // Nothing to move between, and no move without a reason.
         if loads.len() < 2 {
             return;
         }
         let Some(plan) = lanes::plan(&loads, self.budget(), used) else {
             // Nothing is short, so whatever a claim was waiting on has arrived:
-            // its next failed dial, if any, starts from a second again.
+            // its next failed dial, if any, starts from a second again. **Only a
+            // claim that has a lane**: a claim with none is short by definition
+            // (see the loop above), and resetting its backoff here made it dial
+            // once a tick — 1 079 `WARN`s in four minutes, measured 2026-11-23.
             for load in &loads {
-                self.note_satisfied(&load.endpoint);
+                if !load.lanes.is_empty() {
+                    self.note_satisfied(&load.endpoint);
+                }
             }
             return;
         };
@@ -3986,6 +4016,15 @@ impl LanePool {
         if let Some(args) = args {
             spawn_data_channel(args, None, None, std::time::Instant::now());
         }
+    }
+
+    /// Has this claim had time to open its share of lanes yet?
+    fn mature(&self, endpoint: &Endpoint) -> bool {
+        self.claims.lock().is_ok_and(|claims| {
+            claims
+                .get(endpoint)
+                .is_some_and(|entry| entry.registered_at.elapsed() >= LANE_JOIN_GRACE)
+        })
     }
 
     /// The claim has the lanes it wants: its backoff, if any, is over.
