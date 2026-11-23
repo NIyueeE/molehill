@@ -1083,7 +1083,28 @@ carrying this end's flows) so its replacement rides the carrier now preferred"**
 (one `WARN`, then debug), and **round 0 of the re-run survived the block that used to kill it** — `udp_blocked@tunnel` 1.5 ms,
 `clean#2` 1.6 ms, where the release run read 100 % error and the reproducer's round 1 died.
 
-**Both of the two things below are now closed, and the fix is demonstrated.** `_settle_legs` (bench, `958c986`) gives each leg its
+**The six-arm sweep says the fix is not enough — this paragraph replaces an earlier one that claimed it was.** The first record
+after the fix (`~/tmp/p450-standard-sweep.json`, revision `9921a7f`, 17 033 s, 167 samples) is **still red**, with 14 failures, all
+`l3`, and the failing cells moved: they now start at `rate100_shallow@tunnel` (**9.18 % interactive error**, bulk absent), and every
+stage after it — `mtu1280@tunnel`, `udp_throttled@tunnel`, `udp_blocked@tunnel`, `clean#2` — reads **100 % error, no samples**, then
+the ramp carries 0 of 8 streams and `half-close` never reaches the tool. The client logs **nothing at all** after 06:14:27 (one
+backoff `WARN`), and the run cell records two silences, the longest **1 076 s**.
+
+**What that rules out, and what it leaves.** `molehill` — the same `mhd` carrier, the same leg, the same stages — reads
+`mtu1280@tunnel` 1.94 ms / 0 % / **15.29 Gbit/s**, `udp_throttled@tunnel` 14.99, `udp_blocked@tunnel` 14.76, `clean#2` 15.15: the
+path, the MTU and the UDP policy are all survivable, so this is the **claim's** recovery and not the network. What the allotment fix
+did buy is real and still stands (the `Ignoring a data channel request … holds the lanes it was allotted` refusal is gone from the
+logs, the 1 Hz dial loop is gone, a healthy claim now keeps its lanes through the UDP block — the reproducer's three passes read
+0.0 % on `clean#2`), but a claim that loses its lanes under a **shallow queue on the carrier's leg** still never comes back, and it
+does so *silently*: no carrier move fires, because a lane that carries nothing offers no evidence for the carrier rule, and no new
+lane is dialled, because a lane that is `live` and on the current carrier satisfies the allotment whether or not it delivers.
+
+The next hypothesis to test (not assumed): the ticket is a lane-level **liveness** rule — a slot that has been given traffic and has
+delivered none for a while must stop counting as satisfying, so the claim dials a replacement — and the carrier rule's evidence bar
+(`CARRIER_MIN_PACKETS`) is what hides a total blackhole from it. The isolated reproducer for it is a single `cost` stage with
+`--condition rate100_shallow --condition-leg tunnel`, then a clean stage on the same arm.
+
+**The two things that *are* closed.** `_settle_legs` (bench, `958c986`) gives each leg its
 own answer after every stage and at the end of every pass — the release schedule's stage 17 used to leave its UDP-refusing firewall
 rule standing on the *tunnel* leg while stage 18 measured a "clean" stage on the visitor one, which is what made `l3` look
 permanently dead in the record as well as what left the harness hanging between passes. With the product fix and that honest
