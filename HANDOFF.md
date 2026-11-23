@@ -1076,6 +1076,23 @@ attempt never lowers it, and the allocator has no backoff).
 3. **The allocator backs off and says it once**: 1 s → 2 → 4 → … capped, one `WARN` (a claim that cannot get a lane is an operator
    fact), then `DEBUG`. Today it logs at `INFO` every tick for as long as the condition lasts.
 
+**Status after the first attempt at the fix (2026-11-23).** All three rules are in, with two regression tests
+(`a_lane_on_an_abandoned_carrier_does_not_satisfy_the_allotment`, `a_claim_that_cannot_get_a_lane_backs_off`). The visible change
+in the reproducer is real: the handover that used to time out now completes (**"the peer holds no flow in it; retiring it (still
+carrying this end's flows) so its replacement rides the carrier now preferred"**, 23 s after the request), the dial loop is bounded
+(one `WARN`, then debug), and **round 0 of the re-run survived the block that used to kill it** — `udp_blocked@tunnel` 1.5 ms,
+`clean#2` 1.6 ms, where the release run read 100 % error and the reproducer's round 1 died.
+
+**Two things this round did not close.**
+1. **Round 1 of that same re-run never started**: the harness sat between passes for 15 minutes with no `round1/` workdir and no
+   series samples (`~/tmp/bench-20261123-020642`), and I stopped it. A hang *between* passes is a harness question of its own, and
+   it has to be understood before the six-arm sweep is re-run — a release run that stalls after the first arm produces no record.
+2. **Whether a condition can leak across stages onto a leg the schedule has left.** `_RestoresCondition.__exit__` restores only the
+   leg the stage used, and the schedule's last stage is on the *visitor* leg while stage 17 put a firewall rule on the *tunnel* one;
+   the pass ends by restoring `ctx.leg`/`ctx.condition` (visitor, `None`). No `iptables` rule was left standing when I checked, so
+   this is not established as a defect — but the record that made `l3` look permanently dead was measured with that code, so it has
+   to be either fixed (restore *both* legs at the end of a pass) or shown harmless before the next release record is trusted.
+
 **Why this is a product goal, not a bench goal.** The bench did exactly what it was 定型 for: a deployment class nobody had
 imposed on this architecture before (a network that refuses UDP) found a permanent loss of the data plane, and the gate refused to
 publish it. The record is not the artifact to fix: the **product** is. The release path (merge, tables, tag) waits for the fix and

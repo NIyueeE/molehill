@@ -71,6 +71,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Mbit cap put every arm on the shaper's own number — the class belongs on the
   leg that owns it or it measures the harness.
 
+### Fixed
+
+- **A transparent claim no longer loses its data plane for the rest of the
+  session when a carrier move cannot complete.** A claim whose lane moved off a
+  carrier that had started refusing its traffic asked the peer to drain the lane
+  so its replacement could ride the other carrier; when that handover did not
+  answer, the client kept the lane it had abandoned — and its allotment test
+  counted that lane as serving, because a lane whose carrier is unreachable is
+  still *live* in the hub's table. The peer then offered a replacement and this
+  end refused it: `Ignoring a data channel request for 2: the claim holds the
+  lanes it was allotted`. Measured on a network that refuses UDP under the
+  carrier (`udp_blocked@tunnel`): **100 % interactive error on the next clean
+  stage, 0 of 8 streams on the capacity ramp, a failed half-close cell and a
+  455 s silence**, for the remaining twenty minutes of the run. Three rules now
+  hold: only a lane that is **live, not draining and on the claim's current
+  carrier** satisfies its allotment; a dial that *restores* a lost lane no longer
+  raises the want (only a lend, which transfers a lane, does), so a failed dial
+  cannot inflate it; and a claim that cannot get a lane backs off from one second
+  to thirty with a single `WARN` instead of a line a second at `INFO`. Regression
+  tests: `a_lane_on_an_abandoned_carrier_does_not_satisfy_the_allotment`,
+  `a_claim_that_cannot_get_a_lane_backs_off`; the acceptance test is the six-arm
+  standard sweep, whose gate named this defect in the first place.
+
 ## [1.0.0] - 2026-11-22
 
 ### Known gaps
