@@ -3342,17 +3342,6 @@ struct ClaimEntry {
     /// When this claim was registered, so the allocator can tell a claim whose
     /// lanes are still joining from one whose lanes are all gone.
     registered_at: std::time::Instant,
-    /// Has this claim ever held a lane?
-    ///
-    /// The one thing that separates a **cold start** — a fresh claim racing the
-    /// carrier's pool, whose first two dials failing is the normal shape of a
-    /// start — from a **recovery**: a claim that had lanes and lost every one.
-    /// The carrier fallback may only move the carrier in the second case, and a
-    /// clock cannot tell them apart: the recovery is measured within seconds of the
-    /// block lifting, so any grace long enough to cover a cold start misses the
-    /// stage it was meant to save (measured 2026-11-23 — a 30 s grace read 100 %
-    /// on the very stage the ungated rule had saved).
-    ever_live: std::sync::atomic::AtomicBool,
     /// Dial attempts that have not produced a lane, and when the next one may be
     /// made. A claim that cannot get a lane must not ask on every tick: the
     /// attempt interval doubles up to [`LANE_DIAL_BACKOFF_MAX`] and one `WARN`
@@ -3401,7 +3390,6 @@ impl LanePool {
                     share,
                     target: share,
                     registered_at: std::time::Instant::now(),
-                    ever_live: std::sync::atomic::AtomicBool::new(false),
                     dial_attempts: 0,
                     next_dial_at: std::time::Instant::now(),
                 },
@@ -3504,11 +3492,6 @@ impl LanePool {
                 })
                 .collect();
             used += lanes.len();
-            if !lanes.is_empty() {
-                entry
-                    .ever_live
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
             loads.push(ClaimLoad {
                 endpoint: *endpoint,
                 lanes,
@@ -4026,9 +4009,7 @@ impl LanePool {
             if grow {
                 entry.target = entry.target.saturating_add(1);
             }
-            if entry.dial_attempts == LANE_DIAL_SWITCH_AFTER
-                && entry.ever_live.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if entry.dial_attempts == LANE_DIAL_SWITCH_AFTER && entry.args.carrier.switches() > 0 {
                 // The first attempt has failed by the time the second is due: ask
                 // the carrier for the other one rather than failing again on a
                 // pool that is not there.

@@ -26,7 +26,7 @@
 //! plane.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::logging::RepeatNotice;
@@ -106,6 +106,14 @@ pub struct CarrierChoice {
     switch_allowed_at_ms: AtomicU64,
     /// The endpoint's notice: the first fallback at `INFO`, the rest at `DEBUG`.
     notice: RepeatNotice,
+    /// How many times this endpoint's carrier has moved, by either path.
+    ///
+    /// A claim reads it to tell a **cold start** — nothing has moved yet, and a
+    /// lane that fails to dial is racing a pool that is still being built — from a
+    /// **recovery**, where the endpoint has already survived a move and a lane that
+    /// fails to dial is a carrier that is not there (`HANDOFF.md` §4 I). History,
+    /// not a clock: the recovery is measured within seconds of the block lifting.
+    switches: AtomicU32,
 }
 
 /// Milliseconds since the Unix epoch, saturating at `u64::MAX`.
@@ -129,6 +137,7 @@ impl CarrierChoice {
             retry_at_ms: AtomicU64::new(0),
             switch_allowed_at_ms: AtomicU64::new(0),
             notice: RepeatNotice::new(),
+            switches: AtomicU32::new(0),
         })
     }
 
@@ -159,6 +168,15 @@ impl CarrierChoice {
         }
     }
 
+    /// How many times this endpoint's carrier has moved, by either path.
+    ///
+    /// Zero means "this endpoint has never had to move", which is what a claim
+    /// reads to keep a cold start from being mistaken for a broken carrier.
+    #[must_use]
+    pub fn switches(&self) -> u32 {
+        self.switches.load(Ordering::Relaxed)
+    }
+
     /// mhd could not be established. Answers whether the caller should fall
     /// back to TCP (and records the fallback when it should): a **forced** mhd
     /// carrier does not fall back, because the run asked for mhd and a failure
@@ -176,6 +194,7 @@ impl CarrierChoice {
     #[cfg(feature = "multiplex")]
     fn fell_back(&self, why: &str) {
         self.chosen.store(Carrier::Tcp as u8, Ordering::Relaxed);
+        self.switches.fetch_add(1, Ordering::Relaxed);
         let until = now_ms()
             .saturating_add(u64::try_from(MHD_RETRY_COOLDOWN.as_millis()).unwrap_or(u64::MAX));
         self.retry_at_ms.store(until, Ordering::Relaxed);
@@ -221,6 +240,7 @@ impl CarrierChoice {
             return false;
         }
         self.chosen.store(carrier as u8, Ordering::Relaxed);
+        self.switches.fetch_add(1, Ordering::Relaxed);
         // Moving to mhd is its own re-probe; moving to TCP has to hold mhd off
         // until the *quality* decision has been held, which is the longer of
         // the two: `MHD_RETRY_COOLDOWN` (60 s) is a reachability wait and
