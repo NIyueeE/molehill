@@ -1138,6 +1138,32 @@ That is the next fix: **a claim's lane dial over mhd must ride the pool's establ
 fail instantly against a dead pool** — and the fallback must not depend on the carrier's cooldown, which is what the ungated run was
 accidentally bypassing.
 
+**Where the ticket stands after the frame-level run of the six-minute cell (2026-11-23, `~/tmp/p580-recover.json`,
+`~/tmp/bench-20261123-181956`).** Three facts, all from one 650 s run with both ends' transparent and core modules at debug:
+
+1. **The last forwarded frame is at 18:22:34** — the second the block starts. After it: **zero** `l3 frame in` and **zero**
+   `l3 frame out` on the client for the remaining eight minutes, while the probe keeps timing out and the client keeps opening
+   channels (`early eof` every two seconds).
+2. **The recovered lanes do join**: at **18:26:44** — 74 s after the block lifts — five `l3 lane joined claim=… slot=0
+   lane=Some(…) carrier=Some(Mhd)` lines, so the client's routing table has routable lanes again. Nothing flows through them.
+3. **The server sees the channels but starts no forwarder**: `Handshaking a data channel` 18 times, `died before starting` **0**,
+   `Refused a transparent lane` **0**, and no `Transparent channel … ended` after the block — the member tasks it spawned never
+   log either end.
+
+So the failure is no longer "the claim has no lane" (it has one, joined) and no longer "the peer refuses it" (it does not). It is
+that **frames stop crossing the claim in either direction once the carrier has been blocked, and a lane that joins afterwards does not
+restart them**. That is where the next investigation goes, and the six-minute cell plus the two log lines that exist
+(`l3 lane joined`, `l3 frame in/out`) are enough to see it.
+
+**Three designs for the recovery, and the one I would take.** (a) *Keep the retry loop and fix the forwarder* — smallest change, but
+after ten iterations on this ticket each fix has moved the failure rather than ended it. (b) *Tear the claim's data plane down and
+let the registration path rebuild it*: a carrier block would end the claim's task on both ends, the client would re-register, and the
+rebuild path is the one that demonstrably works (every run's first 150 s is healthy). The cost is a visible reconnect per claim per
+block — which is what every peer in the record does anyway, and the schedule has one block. (c) *Give the claim a supervisor that
+watches "no frame forwarded for N seconds while the TUN had traffic" and re-opens the whole lane set* — the most robust, the most
+code. (b) is what I would build next: it makes the failure path identical to the path the release's first stage already proves, and it
+is the only one of the three that does not depend on the specific way the forwarder stops.
+
 The earlier hypothesis (superseded by the above) was that the ticket is **on the server side**: what ends a freshly opened lane for a claim it just carried? The next run is that
 question — one full-scale pass with the server's core at debug, and the refusal path instrumented the way the client's failure path
 now is.
