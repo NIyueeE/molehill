@@ -1665,8 +1665,7 @@ def run_staged(ctx: Ctx, params: dict) -> list:
                 proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
-        if ctx.condition is not None:
-            ctx.topo.set_condition(ctx.leg, ctx.condition)
+        _settle_legs(ctx)
     cells.append(_run_cell(drift_points, logs, series))
     return cells
 
@@ -1726,6 +1725,24 @@ def _attach_step_recovery(cells: list, logs: dict) -> None:
     recovery.evidence["step_recovery_baseline_ms"] = round(baseline, 3)
 
 
+def _settle_legs(ctx: Ctx) -> None:
+    """Put **every** leg back to the run's own path, whichever stage ran last.
+
+    A stage imposes its condition on one leg and the schedule then moves to the
+    other, so restoring only the leg the stage used leaves that stage's rule
+    standing: the release schedule ends on a *visitor*-leg stage while stage 17
+    put a UDP-refusing firewall rule on the *tunnel* one, and the guard that
+    "puts the leg back to clean however the stage ends" was looking at the wrong
+    leg. Two legs, two answers: the run's own condition on its leg, `clean` on the
+    others. A pass that ends with a rule standing is a pass whose next measurement
+    is of a network nobody asked for (`HANDOFF.md` §4 I).
+    """
+    for leg in model.LEG_NAMES:
+        wanted = ctx.condition if leg == ctx.leg else None
+        with contextlib.suppress(Exception):
+            ctx.topo.set_condition(leg, wanted or model.CONDITIONS["clean"])
+
+
 class _RestoresCondition:
     """Put the leg back to clean however the stage ends.
 
@@ -1745,15 +1762,14 @@ class _RestoresCondition:
     process.
     """
 
-    def __init__(self, topo, leg: str) -> None:
-        self.topo, self.leg = topo, leg
+    def __init__(self, ctx: Ctx, leg: str) -> None:
+        self.ctx, self.leg = ctx, leg
 
     def __enter__(self) -> None:
         return None
 
     def __exit__(self, *_: object) -> None:
-        with contextlib.suppress(Exception):
-            self.topo.set_condition(self.leg, model.CONDITIONS["clean"])
+        _settle_legs(self.ctx)
 
 
 #: Failure reasons that belong to the instrument rather than to the arm.
@@ -1789,7 +1805,7 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     # the tunnel for the next is two experiments in one run, and imposing both on
     # the run's leg would silently measure the second as a repeat of the first.
     ctx.topo.set_condition(leg, model.CONDITIONS[condition])
-    with _RestoresCondition(ctx.topo, leg):
+    with _RestoresCondition(ctx, leg):
         cell = _measure_stage(ctx, stage, params, logs)
         # What the instrument said, whether it took the whole cell down with it or
         # only `throughput_gbps`: a stage measured leniently still deserves the
