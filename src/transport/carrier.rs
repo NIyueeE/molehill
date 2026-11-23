@@ -227,6 +227,28 @@ impl CarrierChoice {
     /// worth one line, and a policy that oscillates is worth tracing rather than
     /// shouting about.
     pub fn prefer(&self, carrier: Carrier, why: &str) -> bool {
+        self.prefer_inner(carrier, why, false)
+    }
+
+    /// Move this endpoint's carrier **now**, cooldown or not, for a claim that has
+    /// no lane at all.
+    ///
+    /// The cooldown exists so *quality* decisions cannot flap: two switches inside
+    /// a minute are two answers nobody can act on. A claim with no lane is not
+    /// making a quality decision about the endpoint — it is trying to get its own
+    /// data plane back, and the carrier in use is one it has just failed to open a
+    /// lane on. Measured 2026-11-23: after a UDP block lifted, the claim's mhd lane
+    /// took the datagram retransmit schedule's own thirty seconds to handshake, so
+    /// a 150 s "recovered" stage was dead for its first third and the cell read
+    /// 100 % error (`HANDOFF.md` §4 I). Waiting out a cooldown on top of that is a
+    /// data plane that does not come back.
+    #[cfg(feature = "multiplex")]
+    pub fn prefer_for_lane(&self, carrier: Carrier, why: &str) -> bool {
+        self.prefer_inner(carrier, why, true)
+    }
+
+    /// The one switch, with the cooldown as the caller's decision.
+    fn prefer_inner(&self, carrier: Carrier, why: &str, ignore_cooldown: bool) -> bool {
         if forced_carrier().is_some() || !cfg!(feature = "mhd") {
             // A forced carrier is the run's answer (see `forced_carrier`), and a
             // build without mhd has only one carrier to be on.
@@ -236,7 +258,7 @@ impl CarrierChoice {
             return false;
         }
         let now = now_ms();
-        if now < self.switch_allowed_at_ms.load(Ordering::Relaxed) {
+        if !ignore_cooldown && now < self.switch_allowed_at_ms.load(Ordering::Relaxed) {
             return false;
         }
         self.chosen.store(carrier as u8, Ordering::Relaxed);

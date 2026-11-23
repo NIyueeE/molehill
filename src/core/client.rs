@@ -3342,6 +3342,12 @@ struct ClaimEntry {
     /// When this claim was registered, so the allocator can tell a claim whose
     /// lanes are still joining from one whose lanes are all gone.
     registered_at: std::time::Instant,
+    /// Whether this claim has already asked for the other carrier since its last
+    /// lane landed. A recovery asks **once per recovery**, not once per attempt:
+    /// by the time a block lifts the counter is far past its first value, and an
+    /// exact match on it never fires again (measured 2026-11-23: twelve attempts
+    /// deep, the rule was dead).
+    asked_other: bool,
     /// Dial attempts that have not produced a lane, and when the next one may be
     /// made. A claim that cannot get a lane must not ask on every tick: the
     /// attempt interval doubles up to [`LANE_DIAL_BACKOFF_MAX`] and one `WARN`
@@ -3390,6 +3396,7 @@ impl LanePool {
                     share,
                     target: share,
                     registered_at: std::time::Instant::now(),
+                    asked_other: false,
                     dial_attempts: 0,
                     next_dial_at: std::time::Instant::now(),
                 },
@@ -4009,7 +4016,11 @@ impl LanePool {
             if grow {
                 entry.target = entry.target.saturating_add(1);
             }
-            if entry.dial_attempts == LANE_DIAL_SWITCH_AFTER && entry.args.carrier.switches() > 0 {
+            if entry.dial_attempts >= LANE_DIAL_SWITCH_AFTER
+                && !entry.asked_other
+                && entry.args.carrier.switches() > 0
+            {
+                entry.asked_other = true;
                 // The first attempt has failed by the time the second is due: ask
                 // the carrier for the other one rather than failing again on a
                 // pool that is not there.
@@ -4021,7 +4032,7 @@ impl LanePool {
                         crate::transport::carrier::Carrier::Mhd
                     }
                 };
-                if entry.args.carrier.prefer(
+                if entry.args.carrier.prefer_for_lane(
                     other,
                     "this claim's lane could not be opened on the carrier in use",
                 ) {
@@ -4067,6 +4078,7 @@ impl LanePool {
             && let Some(entry) = claims.get_mut(endpoint)
         {
             entry.dial_attempts = 0;
+            entry.asked_other = false;
             entry.next_dial_at = std::time::Instant::now();
         }
     }

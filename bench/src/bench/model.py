@@ -997,7 +997,7 @@ TIMELINES: dict[str, tuple] = {
     # is what a defect on this path needs (`HANDOFF.md` §4 I).
     "recover": (
         ("clean", 150.0),
-        ("udp_blocked@tunnel", 150.0),
+        ("udp_blocked", 150.0, "tunnel"),
         ("clean", 150.0),
     ),
     "sweep": (
@@ -2080,6 +2080,18 @@ PROFILES |= {
         "scenarios": ("timeline",),
         "budget_s": 240.0,
         "params": {"timeline": {"scale": 1.0, "streams": 0, "timeline": "wedge"}},
+    },
+    "recover": {
+        # A diagnostic profile, not a release artifact: it exists so the claim's
+        # recovery question can be asked in six minutes instead of a five-hour
+        # sweep (see the `recover` timeline).
+        "what": "one question, isolated: does a claim return after a UDP block lifts",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline",),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "recover"}},
     },
     "sweep": {
         # The product's own two architectures first, then the reference tools.

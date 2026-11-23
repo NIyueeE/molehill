@@ -1118,8 +1118,25 @@ died during the block and has not been re-established, and the L3 dial path does
 fails instantly, once per backoff step, for as long as the run lasts. The `l4` arms recover from the same block because the pool
 re-establishes itself; a claim's lane dial is not part of that.
 
+**A six-minute reproducer now exists, and it is the tool this needs.** `just bench run --profile recover --scale 1.0 --arms l3`
+runs a three-stage timeline (`recover`: clean → `udp_blocked@tunnel` → clean) and asks the one question the sweep's schedule can
+only ask in five hours. Measured 2026-11-23: `clean` 0 %, `udp_blocked@tunnel` 100 %, **`clean#2` 100 %** — the defect, in 643 s,
+with both sides' debug logs if the environment sets `RUST_LOG`. Every future iteration on this ticket costs six minutes, not fifty.
+
+What the runs so far establish, layer by layer:
+1. **The mhd dial after a block is slow**: with the server's log on, the client's dial at 17:35:29 is handshaken by the server at
+   17:35:59 — thirty seconds, the datagram retransmit schedule — so a 150 s "recovered" stage is dead for its first third whatever
+   else happens.
+2. **The claim's lane still fails after that**: the channels that do reach the server are closed again without a forwarding command
+   (`Failed to read data cmd: early eof` on the client, nothing after `Handshaking a data channel` on the server), and the client
+   retries every thirty seconds for the rest of the run.
+3. **The carrier-switch rules I tried are timing-dependent**: an ungated `prefer` recovered a full pass (`udp_blocked@tunnel` 0.04 %,
+   `clean#2` 0 %); gating it on claim age, on "has held a lane", and on the carrier's own switch count each read 100 % again, and the
+   last two never fired at all (the switch count is zero because nothing but a *dial* failure ever calls `fell_back`).
+
 That is the next fix: **a claim's lane dial over mhd must ride the pool's establishment (or fall back to TCP for that attempt), not
-fail instantly against a dead pool.**
+fail instantly against a dead pool** — and the fallback must not depend on the carrier's cooldown, which is what the ungated run was
+accidentally bypassing.
 
 The earlier hypothesis (superseded by the above) was that the ticket is **on the server side**: what ends a freshly opened lane for a claim it just carried? The next run is that
 question — one full-scale pass with the server's core at debug, and the refusal path instrumented the way the client's failure path
