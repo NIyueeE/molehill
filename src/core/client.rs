@@ -3298,6 +3298,19 @@ const LANE_DIAL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_sec
 #[cfg(mh_l3_client)]
 const LANE_DIAL_SWITCH_AFTER: u32 = 2;
 
+/// How long a claim must have been registered before failed *dials* may move its
+/// endpoint's carrier.
+///
+/// A freshly registered claim races the pool's cold start: its first lanes are
+/// dialled before the carrier's tunnels exist, so the first two attempts failing
+/// is the normal shape of a start, not a carrier fault. Measured 2026-11-23: with
+/// no grace, five seconds into every run the fallback fired and put the endpoint
+/// on TCP for the next two minutes — a start-up regression dressed as a fix. Half
+/// a minute is longer than any cold start this bench has measured and far shorter
+/// than the twenty minutes the recovery case sits dead for.
+#[cfg(mh_l3_client)]
+const LANE_DIAL_SWITCH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a freshly registered claim may have no lane before the allocator
 /// stops treating that as "still joining".
 ///
@@ -4009,7 +4022,9 @@ impl LanePool {
             if grow {
                 entry.target = entry.target.saturating_add(1);
             }
-            if entry.dial_attempts == LANE_DIAL_SWITCH_AFTER {
+            if entry.dial_attempts == LANE_DIAL_SWITCH_AFTER
+                && entry.registered_at.elapsed() >= LANE_DIAL_SWITCH_GRACE
+            {
                 // The first attempt has failed by the time the second is due: ask
                 // the carrier for the other one rather than failing again on a
                 // pool that is not there.
