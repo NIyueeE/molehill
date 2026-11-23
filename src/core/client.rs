@@ -3286,6 +3286,18 @@ const CARRIER_CONFIRM_TICKS: u32 = 3;
 #[cfg(mh_l3_client)]
 const LANE_DIAL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Failed lane dials after which the claim asks the carrier for the other one.
+///
+/// A lane that cannot be *opened* on the carrier in use is the one carrier failure
+/// the claim can see for itself, and it is the state a UDP-blocked carrier leaves
+/// behind: the mhd pool's tunnels are gone, `mhd is reachable again` has already
+/// been printed by the reachability probe, and every dial over mhd fails in
+/// milliseconds with `early eof` while the server never sees it (`HANDOFF.md` §4 I).
+/// Two attempts — a second of backoff — and the claim asks for TCP for this
+/// endpoint; the carrier rule moves it back when its lanes say mhd is serving.
+#[cfg(mh_l3_client)]
+const LANE_DIAL_SWITCH_AFTER: u32 = 2;
+
 /// How long a freshly registered claim may have no lane before the allocator
 /// stops treating that as "still joining".
 ///
@@ -3996,6 +4008,28 @@ impl LanePool {
             entry.next_dial_at = now + wait;
             if grow {
                 entry.target = entry.target.saturating_add(1);
+            }
+            if entry.dial_attempts == LANE_DIAL_SWITCH_AFTER {
+                // The first attempt has failed by the time the second is due: ask
+                // the carrier for the other one rather than failing again on a
+                // pool that is not there.
+                let other = match entry.args.carrier.carrier() {
+                    crate::transport::carrier::Carrier::Mhd => {
+                        crate::transport::carrier::Carrier::Tcp
+                    }
+                    crate::transport::carrier::Carrier::Tcp => {
+                        crate::transport::carrier::Carrier::Mhd
+                    }
+                };
+                if entry.args.carrier.prefer(
+                    other,
+                    "this claim's lane could not be opened on the carrier in use",
+                ) {
+                    info!(
+                        "Claim {endpoint}: lane dials keep failing on the carrier in use; asking \
+                         for {other:?} for this claim"
+                    );
+                }
             }
             if entry.dial_attempts == LANE_DIAL_WARN_AFTER {
                 warn!(
