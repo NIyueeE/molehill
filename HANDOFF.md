@@ -1230,7 +1230,17 @@ them naively retires lanes during a block (harmful), while gating them on the ca
 make the carrier's fallback *claim-wide* — a claim that has been silent across all its lanes while the carrier believes its path is
 up should move the whole endpoint to TCP and rebuild once — rather than to keep tuning per-lane rules.
 
-The tree carries the configuration that has passed a full schedule (`896c0be`). Whoever takes this should start from
+**And then the rule that works, which is about the carrier and not about a lane (2026-11-24, `da6852f`).** Every earlier attempt
+looked at one lane; the signal only makes sense for the claim: **every** lane of a claim is up, **every** one is fed, **none** hears
+anything back, and the carrier believes its own path is up. Then the endpoint moves once and the claim is rebuilt on the carrier that
+just changed. Two gates make it safe, and both were measured: `carried` (a claim that has never carried anything is starting, not
+broken — without it the rule cost the first stage of every run a second of p99) and the pool's thirty-second grace. Two consecutive
+cells read `clean` 1.90 / 1.95 ms at 0 % and `clean#2` **1.54 / 1.82 ms at 0 %** — the recovery, at the latency the healthy stage has.
+
+The same rule applied **per lane** is harmful, twice over: retiring a lane for silence during a block churns a claim that was about to
+recover. That is written down because it is the obvious next idea and it is wrong.
+
+The tree carries the configuration that has passed a full schedule (`896c0be`) plus this rule (`da6852f`). Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 
