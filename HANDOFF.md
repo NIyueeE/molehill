@@ -1191,10 +1191,19 @@ TUN at all after the block. The evidence: the client's TUN is alive and reading 
 solicitations as `l3 device frame unclaimed`), while the probe — which opens **one fresh TCP connection per attempt** — produces no
 `l3 frame out` for eight minutes. A fresh claim cannot forward frames that never arrive.
 
-Next, and it is a *harness* question, not a product one: record whether the visitor can *reach* the claim (`ping`/`connect` from the
-visitor namespace to the claimed address) after every stage of the `recover` cell. If that path is closed by the time the block
-lifts, the defect this ticket has chased for two days is in the bench's own network setup, and the product's recovery has been
-blamed for it. Whoever takes this should start from
+**The rebuild works — when it is paced by the carrier, not by the clock (2026-11-24).** The first version rebuilt on a 30 s clock
+and read 100 % (`~/tmp/p620-recover-1.json`, `-2.json`); with no pacing at all it rebuilt forty-nine times in six minutes and read
+100 % once and 0 % once. The rule that works ties the rebuild to the *evidence*: **one rebuild per carrier move** (the carrier's own
+switch count), with a ten-second floor so a hopeless claim cannot spin. Two consecutive cells then recovered —
+`~/tmp/p630-recover-1.json` (`clean#2` 1.18 ms, 0 %) and `~/tmp/p630-recover-2.json` (1.58 ms, 0 %) — after every earlier run of the
+same cell read 100 %.
+
+The chain that gets a claim back after a block is therefore: lanes die → the allocator dials, backs off and reports → a claim with no
+lane asks the carrier for the other one (once per chance) → a claim still lane-less after four attempts is **rebuilt** through
+deregister + register, once per carrier move → a fresh claim on a live carrier carries.
+
+Whether that holds inside the whole schedule (and through the capacity ramp and half-close after it) is the next measurement: one
+full-scale pass, then the six-arm sweep. Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 

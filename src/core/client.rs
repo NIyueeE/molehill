@@ -3244,6 +3244,17 @@ struct LanePool {
     /// Drains this pool has asked for, with when it asked: a lane whose drain
     /// never becomes ready is called off rather than left unusable.
     draining: std::sync::Mutex<HashMap<(ServiceId, LaneId), std::time::Instant>>,
+    /// When each claim's data plane was last rebuilt and how many times its endpoint
+    /// had moved carriers at that moment, **by endpoint** — not on the claim entry,
+    /// which is thrown away by the very rebuild it would have to pace.
+    ///
+    /// On the entry the cooldown was reset by re-registration, so a claim that could
+    /// not keep a lane rebuilt on every tick: measured 2026-11-23, forty-nine
+    /// rebuilds in six minutes, and a claim that is always registering never settles
+    /// long enough to carry. The switch count is what makes a rebuild *worth it*: a
+    /// carrier move is a new chance, and a claim with no lane only gets one rebuild
+    /// per chance (`HANDOFF.md` §4 I).
+    restarted: std::sync::Mutex<HashMap<Endpoint, (std::time::Instant, u32)>>,
     /// The previous tick's per-lane cumulative counters, so a tick is a window
     /// rather than a lifetime: `(peer offered, peer refused, this end injected)`.
     carrier_sample: std::sync::Mutex<HashMap<(Endpoint, LaneId), LaneSample>>,
@@ -3309,10 +3320,14 @@ const LANE_RESTART_AFTER: u32 = 4;
 
 /// The least time between two rebuilds of the same claim.
 ///
-/// A rebuild that did not help must not be repeated faster than the evidence can
-/// change: the carrier's own switch cooldowns are the same order.
+/// Short, because the *evidence* is the carrier's own switch count: a rebuild is
+/// worth one attempt per chance, and a new chance is a carrier move, not thirty
+/// seconds of wall clock. The clock only keeps a claim that can never get a lane
+/// from rebuilding in a tight loop — measured 2026-11-23, without any pacing it did
+/// so forty-nine times in six minutes, and a claim that is always registering never
+/// settles long enough to carry (`HANDOFF.md` §4 I).
 #[cfg(mh_l3_client)]
-const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Failed lane dials after which the claim asks the carrier for the other one.
 ///
@@ -3376,10 +3391,6 @@ struct ClaimEntry {
     /// exact match on it never fires again (measured 2026-11-23: twelve attempts
     /// deep, the rule was dead).
     asked_other: bool,
-    /// When this claim's data plane was last rebuilt, so a claim that cannot keep
-    /// a lane does not rebuild on every tick — and so a rebuild that does not help
-    /// is not repeated faster than the evidence can change.
-    last_restart: std::time::Instant,
     /// Dial attempts that have not produced a lane, and when the next one may be
     /// made. A claim that cannot get a lane must not ask on every tick: the
     /// attempt interval doubles up to [`LANE_DIAL_BACKOFF_MAX`] and one `WARN`
@@ -3401,6 +3412,7 @@ impl LanePool {
             started: std::time::Instant::now(),
             switched: std::sync::atomic::AtomicBool::new(false),
             draining: std::sync::Mutex::new(HashMap::new()),
+            restarted: std::sync::Mutex::new(HashMap::new()),
             carrier_sample: std::sync::Mutex::new(HashMap::new()),
             carrier_streak: std::sync::Mutex::new(HashMap::new()),
             req_tx,
@@ -3429,7 +3441,6 @@ impl LanePool {
                     target: share,
                     registered_at: std::time::Instant::now(),
                     asked_other: false,
-                    last_restart: std::time::Instant::now(),
                     dial_attempts: 0,
                     next_dial_at: std::time::Instant::now(),
                 },
@@ -4125,15 +4136,34 @@ impl LanePool {
     /// Has this claim failed to get a lane long enough that its own replacement
     /// path should be considered broken? Answers the service to rebuild.
     fn hopeless(&self, endpoint: &Endpoint) -> Option<ServiceId> {
-        let mut claims = self.claims.lock().ok()?;
-        let entry = claims.get_mut(endpoint)?;
-        if entry.dial_attempts < LANE_RESTART_AFTER
-            || entry.last_restart.elapsed() < LANE_RESTART_COOLDOWN
-        {
-            return None;
+        let service = {
+            let claims = self.claims.lock().ok()?;
+            let entry = claims.get(endpoint)?;
+            if entry.dial_attempts < LANE_RESTART_AFTER {
+                return None;
+            }
+            entry.args.service_id
+        };
+        let switches = self
+            .claims
+            .lock()
+            .ok()
+            .and_then(|claims| {
+                claims
+                    .get(endpoint)
+                    .map(|entry| entry.args.carrier.switches())
+            })
+            .unwrap_or(0);
+        let mut restarted = self.restarted.lock().ok()?;
+        if let Some((at, seen)) = restarted.get(endpoint) {
+            // One rebuild per chance: the carrier has to have moved since the last
+            // one, and the clock keeps a hopeless claim from a tight loop.
+            if at.elapsed() < LANE_RESTART_COOLDOWN || *seen == switches {
+                return None;
+            }
         }
-        entry.last_restart = std::time::Instant::now();
-        Some(entry.args.service_id)
+        restarted.insert(*endpoint, (std::time::Instant::now(), switches));
+        Some(service)
     }
 
     /// The claim has the lanes it wants: its backoff, if any, is over.
