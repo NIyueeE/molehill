@@ -1864,15 +1864,21 @@ def _tun_state(ctx: Ctx) -> str:
     # The device's own counters: RX climbing while the visitor dials means the
     # kernel is receiving frames the tool is not taking; RX flat means nothing
     # arrives and the path is somebody else's (`HANDOFF.md` §4 I).
-    counters = "rx=?"
-    try:
-        stats = ctx.topo.ns_run(
-            topology.CLI_NS, ["ip", "-s", "-o", "link", "show", "mhbcli0"], check=False
-        )
-        words = (stats.stdout or "").split()
-        counters = " ".join(words[-6:]) if words else "rx=?"
-    except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
-        counters = "rx=err"
+    counters = {}
+    for side, ns, dev in (
+        ("cli", topology.CLI_NS, "mhbcli0"),
+        ("srv", topology.SRV_NS, "mhbsrv0"),
+    ):
+        try:
+            stats = ctx.topo.ns_run(
+                ns, ["ip", "-s", "-o", "link", "show", dev], check=False
+            )
+            words = (stats.stdout or "").split()
+            # The two counters that matter: what the kernel handed the device
+            # (userspace reads it) and what it took from it.
+            counters[side] = " ".join(words[-6:-4]) if words else "?"
+        except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
+            counters[side] = "err"
     routes = []
     for ns in (topology.CLI_NS, topology.VIS_NS):
         try:
@@ -1884,7 +1890,10 @@ def _tun_state(ctx: Ctx) -> str:
             continue
         out = got.stdout or ""
         routes.append("mhbcli0" if "mhbcli0" in out else ("other" if out else "none"))
-    return f"up={up} addr={has} routes={routes} {counters}"
+    # Both ends' devices: an L3 claim is one path through two kernels, and the one
+    # that stopped carrying is the one whose counters stopped moving.
+    both = " ".join(f"{side}={counters[side]}" for side in ("cli", "srv"))
+    return f"up={up} addr={has} routes={routes} {both}"
 
 
 def _record_boundary(ctx: Ctx, cell: Cell, boundary: dict) -> None:

@@ -1052,6 +1052,17 @@ impl Routes {
                         // apart: a full queue is this end's backpressure, an
                         // absent lane is a replacement window.
                         entry.counters.refuse(count, bytes, lane_absent);
+                        // **And said out loud, at debug.** A frame that finds no
+                        // lane and a frame that never arrives are the same silence
+                        // in every other log this end has: the transparent path's
+                        // recovery was chased for two days as a product defect while
+                        // this was the one question nobody could answer from the
+                        // record (`HANDOFF.md` §4 I).
+                        tracing::debug!(
+                            target: "molehill::transparent",
+                            "l3 frame dropped with no lane claim={endpoint} slot={slot} \
+                             lane_absent={lane_absent} packets={count}"
+                        );
                     }
                     sent
                 }

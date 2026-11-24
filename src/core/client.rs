@@ -3339,18 +3339,6 @@ const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_sec
 #[cfg(mh_l3_client)]
 const LANE_REBUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Failed lane dials after which the claim asks the carrier for the other one.
-///
-/// A lane that cannot be *opened* on the carrier in use is the one carrier failure
-/// the claim can see for itself, and it is the state a UDP-blocked carrier leaves
-/// behind: the mhd pool's tunnels are gone, `mhd is reachable again` has already
-/// been printed by the reachability probe, and every dial over mhd fails in
-/// milliseconds with `early eof` while the server never sees it (`HANDOFF.md` §4 I).
-/// Two attempts — a second of backoff — and the claim asks for TCP for this
-/// endpoint; the carrier rule moves it back when its lanes say mhd is serving.
-#[cfg(mh_l3_client)]
-const LANE_DIAL_SWITCH_AFTER: u32 = 2;
-
 /// How long a freshly registered claim may have no lane before the allocator
 /// stops treating that as "still joining".
 ///
@@ -4082,32 +4070,15 @@ impl LanePool {
             if grow {
                 entry.target = entry.target.saturating_add(1);
             }
-            if entry.dial_attempts >= LANE_DIAL_SWITCH_AFTER
-                && !entry.asked_other
-                && entry.args.carrier.switches() > 0
-            {
-                entry.asked_other = true;
-                // The first attempt has failed by the time the second is due: ask
-                // the carrier for the other one rather than failing again on a
-                // pool that is not there.
-                let other = match entry.args.carrier.carrier() {
-                    crate::transport::carrier::Carrier::Mhd => {
-                        crate::transport::carrier::Carrier::Tcp
-                    }
-                    crate::transport::carrier::Carrier::Tcp => {
-                        crate::transport::carrier::Carrier::Mhd
-                    }
-                };
-                if entry.args.carrier.prefer_for_lane(
-                    other,
-                    "this claim's lane could not be opened on the carrier in use",
-                ) {
-                    info!(
-                        "Claim {endpoint}: lane dials keep failing on the carrier in use; asking \
-                         for {other:?} for this claim"
-                    );
-                }
-            }
+            // **A claim with no lane does not move its endpoint's carrier.** The
+            // carrier choice is one per endpoint while a claim is one of five, so five
+            // claims asking for "the other carrier" in the same tick alternate it five
+            // times and land it wherever the last one left it — measured 2026-11-24 in
+            // the release sweep: `asking for Tcp` and `asking for Mhd` in the same
+            // second, 0 rebuilds, and the claim dead for the rest of the run. The repair
+            // for a claim is the **rebuild** (which re-registers and takes fresh lanes
+            // on whatever carrier the endpoint is on), and the carrier rule moves the
+            // endpoint on its own evidence (`carrier_step`) when its lanes can speak.
             if entry.dial_attempts == LANE_DIAL_WARN_AFTER {
                 warn!(
                     "Lane allocator: claim {endpoint} has dialled for a lane {} times without \
