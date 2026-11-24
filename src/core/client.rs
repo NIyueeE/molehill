@@ -3255,6 +3255,15 @@ struct LanePool {
     /// carrier move is a new chance, and a claim with no lane only gets one rebuild
     /// per chance (`HANDOFF.md` §4 I).
     restarted: std::sync::Mutex<HashMap<Endpoint, (std::time::Instant, u32)>>,
+    /// Per lane slot: what its peer last reported and what this end last handed it.
+    silence: std::sync::Mutex<HashMap<(Endpoint, usize), LaneSilence>>,
+    /// Claims that have carried traffic at least once since they were registered.
+    ///
+    /// The claim-wide fallback needs it: a claim that has **never** carried anything is
+    /// starting, not broken, and moving its endpoint then cost the first stage of every
+    /// run a second of p99 (measured 2026-11-24) — a repair that damages the healthy case
+    /// is not a repair.
+    carried: std::sync::Mutex<std::collections::HashSet<Endpoint>>,
     /// The previous tick's per-lane cumulative counters, so a tick is a window
     /// rather than a lifetime: `(peer offered, peer refused, this end injected)`.
     carrier_sample: std::sync::Mutex<HashMap<(Endpoint, LaneId), LaneSample>>,
@@ -3338,6 +3347,24 @@ const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_sec
 /// stage every run begins with.
 #[cfg(mh_l3_client)]
 const LANE_REBUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long every lane of a claim may be fed and silent before the claim's own carrier
+/// is judged broken and the endpoint moved.
+///
+/// The carrier reports each lane's counters to the other end every second, so "fed and
+/// silent" is a lane written into a void. Per lane that is hopeless (retiring them
+/// during a block churns the claim); **per claim it is a statement about the carrier**,
+/// which is the granularity the choice is made at: all of this claim's lanes are up,
+/// all of them are fed, none of them hears anything back, and the carrier believes its
+/// path is up. Then the endpoint moves once and the claim is rebuilt on the new carrier
+/// (`HANDOFF.md` §4 I).
+#[cfg(mh_l3_client)]
+const CLAIM_SILENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a lane's peer last reported and what this end last handed it, for the
+/// claim-wide silence test.
+#[cfg(mh_l3_client)]
+type LaneSilence = (u64, u64, std::time::Instant);
 
 /// Failed lane dials after which the claim asks the carrier for the other one.
 ///
@@ -3423,6 +3450,8 @@ impl LanePool {
             switched: std::sync::atomic::AtomicBool::new(false),
             draining: std::sync::Mutex::new(HashMap::new()),
             restarted: std::sync::Mutex::new(HashMap::new()),
+            silence: std::sync::Mutex::new(HashMap::new()),
+            carried: std::sync::Mutex::new(std::collections::HashSet::new()),
             carrier_sample: std::sync::Mutex::new(HashMap::new()),
             carrier_streak: std::sync::Mutex::new(HashMap::new()),
             req_tx,
@@ -3712,6 +3741,7 @@ impl LanePool {
     /// diagnostic switch (a measurement hatch, not policy), then lending.
     fn step(&self) {
         self.drain_step();
+        self.claim_fallback_step();
         self.carrier_step();
         self.diagnostic_switch();
         if !self.lend {
@@ -4050,6 +4080,110 @@ impl LanePool {
                  rides {:?}",
                 moved.lane, moved.prefer
             );
+        }
+    }
+
+    /// Move the endpoint's carrier and rebuild a claim whose **every** lane is fed and
+    /// silent while the carrier believes its own path is up.
+    ///
+    /// The decision is the carrier rule's (one choice per endpoint) but the evidence is
+    /// the claim's, which is the only granularity at which "fed and silent" is a
+    /// statement about the carrier rather than about one lane.
+    fn claim_fallback_step(&self) {
+        let Ok(guard) = self.claims.lock() else {
+            return;
+        };
+        let claims: Vec<(Endpoint, String, bool, crate::transport::carrier::Carrier)> = guard
+            .iter()
+            .map(|(endpoint, entry)| {
+                let carrier = entry.args.carrier.as_ref();
+                let chosen = carrier.carrier();
+                let usable = chosen != crate::transport::carrier::Carrier::Mhd || carrier.try_mhd();
+                (*endpoint, entry.tun.clone(), usable, chosen)
+            })
+            .collect();
+        drop(guard);
+        for (endpoint, tun, usable, chosen) in claims {
+            if !usable || crate::transport::carrier::forced_carrier().is_some() {
+                continue;
+            }
+            let Ok(hub) = TunHub::get_or_spawn(&tun, Direction::Source) else {
+                continue;
+            };
+            let Ok(mut silence) = self.silence.lock() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            let members: Vec<_> = hub
+                .member_stats()
+                .into_iter()
+                .filter(|member| member.endpoint == endpoint && member.live)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            // Only a claim that has carried something can be *silent*: one that has never
+            // carried is starting.
+            let carried = members.iter().any(|member| {
+                member.counters.injected_packets > 0 || member.counters.enqueued_packets > 0
+            });
+            let known = {
+                let Ok(mut set) = self.carried.lock() else {
+                    return;
+                };
+                if carried {
+                    set.insert(endpoint);
+                }
+                set.contains(&endpoint)
+            };
+            if !known {
+                continue;
+            }
+            let mut all_silent = true;
+            for member in &members {
+                let offered = member.remote.map_or(0, |remote| u64::from(remote.offered));
+                let fed = member.counters.enqueued_packets;
+                let key = (endpoint, member.slot);
+                if let Some((seen_offered, seen_fed, since)) = silence.get(&key).copied() {
+                    if offered != seen_offered || fed < seen_fed {
+                        silence.insert(key, (offered, fed, now));
+                        all_silent = false;
+                    } else if fed == seen_fed || since.elapsed() < CLAIM_SILENT_BUDGET {
+                        all_silent = false;
+                    }
+                } else {
+                    silence.insert(key, (offered, fed, now));
+                    all_silent = false;
+                }
+            }
+            drop(silence);
+            if !all_silent {
+                continue;
+            }
+            // Every lane is fed and silent: move the endpoint, then rebuild the claim so
+            // its replacement set is dialled on the carrier that just changed.
+            let other = match chosen {
+                crate::transport::carrier::Carrier::Mhd => crate::transport::carrier::Carrier::Tcp,
+                crate::transport::carrier::Carrier::Tcp => crate::transport::carrier::Carrier::Mhd,
+            };
+            let Ok(guard) = self.claims.lock() else {
+                return;
+            };
+            let Some(args) = guard.get(&endpoint).map(|entry| Arc::clone(&entry.args)) else {
+                continue;
+            };
+            drop(guard);
+            let switched = args.carrier.prefer(
+                other,
+                "every lane of this claim is fed and none of them hears back",
+            );
+            if let Some(service) = self.hopeless(&endpoint) {
+                warn!(
+                    "Claim {endpoint}: every lane is fed and silent; moving the endpoint to \
+                     {other:?} ({switched}) and rebuilding the claim's data plane"
+                );
+                self.restart(service);
+            }
         }
     }
 
