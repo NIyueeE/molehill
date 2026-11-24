@@ -5663,8 +5663,15 @@ impl ClientSession {
         let Some(endpoint) = active.lane else {
             return;
         };
+        let tun = active.args.service.transparent_tun.clone();
         if let Some(pool) = self.lane_pool.as_ref() {
             pool.unregister(&endpoint);
+        }
+        // **And the claim's flows go with it.** A rebuilt claim is a new claim at the same
+        // address; the flows the old one placed point into slots nothing carries any more,
+        // and the next visitor's packet would be dropped there (`HANDOFF.md` §4 I).
+        if let Ok(hub) = TunHub::get_or_spawn(&tun, Direction::Source) {
+            hub.forget_claim(&endpoint);
         }
     }
 

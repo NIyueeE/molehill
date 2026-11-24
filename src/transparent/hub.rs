@@ -223,6 +223,20 @@ impl TunHub {
         self.routes.stats()
     }
 
+    /// Forget a claim: its slots, and the flows the table had placed in them.
+    ///
+    /// A rebuilt claim is a **new** claim at the same address. The flows the previous
+    /// one had placed point into slots whose members are gone, so a new visitor's first
+    /// packet is placed where nothing carries it and dropped — measured 2026-11-24: an
+    /// arm whose timeline had been through a block and a rebuild carried the whole
+    /// schedule at 4 Gbit/s and then timed out at the *first* level of the capacity ramp
+    /// until the table forgot those flows by itself (`HANDOFF.md` §4 I).
+    pub fn forget_claim(&self, endpoint: &Endpoint) {
+        if let Ok(mut table) = self.routes.table.lock() {
+            table.remove(endpoint);
+        }
+    }
+
     /// Every member slot of every claim this hub carries, live or empty:
     /// which slot carried how much, and which ones a replacement window cost.
     pub fn member_stats(&self) -> Vec<MemberStat> {
