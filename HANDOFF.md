@@ -1214,8 +1214,23 @@ So the claim's recovery path is: lanes die → the allocator dials with backoff 
 one (once per chance) → still lane-less after four attempts, the claim is **rebuilt** once per carrier move, with the session
 pausing long enough for the peer to finish letting the old claim go.
 
-Whether that holds inside the whole schedule (and through the capacity ramp and half-close after it) is the next measurement: one
-full-scale pass, then the six-arm sweep. Whoever takes this should start from
+**Where it stands after six more configurations (2026-11-24, end of the day).** The recovery is a **race with roughly even odds**, and
+every attempt to make it deterministic has moved which side wins rather than which side exists:
+
+| configuration | isolated cell | full schedule |
+|---|---|---|
+| rebuild + claim-level carrier switch + ordering pause | 3/3 recovered | **passed once** (`~/tmp/p770-l3-full.json`, every stage 0 %), then the release sweep failed with `asking for Tcp` and `asking for Mhd` in the same second and **0 rebuilds** |
+| rebuild only (no claim-level switch) | **3/3 recovered** | failed (`~/tmp/p830-l3-full.json`, `clean#2` 100 %) — the claims keep their joined-but-dead lanes, so `lanes.is_empty()` is false and the rebuild never fires |
+| + silence rule (retire a fed lane whose peer is silent) | failed | not reached |
+| + the same rule gated on the carrier believing its path is up | failed | not reached |
+
+What that leaves is a product decision, not another trigger: **a claim whose lanes are up and carry nothing must be repaired, and the
+product cannot see "carrying nothing" without a signal it does not have** — the peer's lane reports are the only candidate, and using
+them naively retires lanes during a block (harmful), while gating them on the carrier's own belief still churns. The next move is to
+make the carrier's fallback *claim-wide* — a claim that has been silent across all its lanes while the carrier believes its path is
+up should move the whole endpoint to TCP and rebuild once — rather than to keep tuning per-lane rules.
+
+The tree carries the configuration that has passed a full schedule (`896c0be`). Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 
