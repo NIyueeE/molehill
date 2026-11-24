@@ -1836,6 +1836,69 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         return again
 
 
+def _tun_state(ctx: Ctx) -> str:
+    """The client's transparent device as the kernel sees it, for the bench log.
+
+    A claim that stops carrying has two possible owners: the tool, or the path the
+    visitor's packets take to reach it. `no answer` from the boundary probe and zero
+    forwarded frames cannot tell them apart, and the device's own state can: an
+    address or a link that disappeared is the path, and both present is the tool
+    (`HANDOFF.md` §4 I).
+    """
+    try:
+        link = ctx.topo.ns_run(
+            topology.CLI_NS, ["ip", "-o", "link", "show", "mhbcli0"], check=False
+        )
+        addr = ctx.topo.ns_run(
+            topology.CLI_NS, ["ip", "-o", "-4", "addr", "show", "mhbcli0"], check=False
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
+        return "unavailable"
+    up = "UP" in (link.stdout or "")
+    has = "inet " in (addr.stdout or "")
+    # Where a packet for the claimed address would go, from both namespaces that
+    # have to agree for a visitor to reach it: the client's kernel forwards into the
+    # device, the visitor's sends toward the client. A device that is up and
+    # addressed with no route into it is a path broken by something recreating the
+    # device — which is a different owner from a tool that will not forward.
+    # The device's own counters: RX climbing while the visitor dials means the
+    # kernel is receiving frames the tool is not taking; RX flat means nothing
+    # arrives and the path is somebody else's (`HANDOFF.md` §4 I).
+    counters = "rx=?"
+    try:
+        stats = ctx.topo.ns_run(
+            topology.CLI_NS, ["ip", "-s", "-o", "link", "show", "mhbcli0"], check=False
+        )
+        words = (stats.stdout or "").split()
+        counters = " ".join(words[-6:]) if words else "rx=?"
+    except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
+        counters = "rx=err"
+    routes = []
+    for ns in (topology.CLI_NS, topology.VIS_NS):
+        try:
+            got = ctx.topo.ns_run(
+                ns, ["ip", "-o", "-4", "route", "get", "10.99.0.1"], check=False
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
+            routes.append("?")
+            continue
+        out = got.stdout or ""
+        routes.append("mhbcli0" if "mhbcli0" in out else ("other" if out else "none"))
+    return f"up={up} addr={has} routes={routes} {counters}"
+
+
+def _record_boundary(ctx: Ctx, cell: Cell, boundary: dict) -> None:
+    """What a visitor could do at this stage's boundary, and what the device it
+    reaches looked like doing it.
+
+    The two together separate the tool from the path: a boundary that cannot answer
+    while the client's TUN is up and addressed is the tool's fault, and one that
+    cannot answer while the device is gone is nobody's product (`HANDOFF.md` §4 I).
+    """
+    cell.evidence["echo_probe"] = boundary
+    cell.evidence["client_tun"] = _tun_state(ctx)
+
+
 def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     """The body of one stage, with its condition already imposed."""
     label, condition, secs, leg = stage
@@ -1950,7 +2013,7 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     built.evidence["series_logs"] = [str(logs[mode]) for mode in series if mode in logs]
     # The boundary's own answer, on every stage: a visitor's whole life through the
     # tool, asked before this stage's traffic started.
-    built.evidence["echo_probe"] = boundary
+    _record_boundary(ctx, built, boundary)
     built.evidence |= {
         "condition": condition,
         "hold_s": secs,
