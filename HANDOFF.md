@@ -1202,6 +1202,18 @@ The chain that gets a claim back after a block is therefore: lanes die → the a
 lane asks the carrier for the other one (once per chance) → a claim still lane-less after four attempts is **rebuilt** through
 deregister + register, once per carrier move → a fresh claim on a live carrier carries.
 
+**The missing piece was ordering, and three consecutive cells now recover (2026-11-24).** The rebuild
+(deregister + register) was a coin flip: two cells recovered, two read 100 % on the same build. The difference is *when* the
+registration lands — a deregistration is asynchronous on the server, and a registration that arrives while the old claim's task is
+still ending opens lanes that join on both ends and carry nothing (the state that had no explanation for two days). With a **pause
+between the two** — 300 ms, the same order as the server's own replacement backoff — three cells in a row read `clean#2` 1.30, 1.46
+and 1.23 ms at **0 % error**, and the first stage of each read 0 % as well (a thirty-second pool grace keeps a cold start from being
+rebuilt).
+
+So the claim's recovery path is: lanes die → the allocator dials with backoff → a claim with no lane asks the carrier for the other
+one (once per chance) → still lane-less after four attempts, the claim is **rebuilt** once per carrier move, with the session
+pausing long enough for the peer to finish letting the old claim go.
+
 Whether that holds inside the whole schedule (and through the capacity ramp and half-close after it) is the next measurement: one
 full-scale pass, then the six-arm sweep. Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds

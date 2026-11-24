@@ -3329,6 +3329,16 @@ const LANE_RESTART_AFTER: u32 = 4;
 #[cfg(mh_l3_client)]
 const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The pool's own age before any claim may be rebuilt.
+///
+/// A session's first half minute is the coldest state there is: the carrier's pool is
+/// being built, the claims' first lanes are dialling, and a dial that fails in that
+/// window is the normal shape of a start. Rebuilding there cost the *first* stage
+/// three quarters of its samples (measured 2026-11-24) — a repair that damages the one
+/// stage every run begins with.
+#[cfg(mh_l3_client)]
+const LANE_REBUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Failed lane dials after which the claim asks the carrier for the other one.
 ///
 /// A lane that cannot be *opened* on the carrier in use is the one carrier failure
@@ -4139,7 +4149,9 @@ impl LanePool {
         let service = {
             let claims = self.claims.lock().ok()?;
             let entry = claims.get(endpoint)?;
-            if entry.dial_attempts < LANE_RESTART_AFTER {
+            if entry.dial_attempts < LANE_RESTART_AFTER
+                || self.started.elapsed() < LANE_REBUILD_GRACE
+            {
                 return None;
             }
             entry.args.service_id
@@ -4575,6 +4587,18 @@ impl ClientSession {
                         // for the registration that follows.
                         if let Some(entry) = self.services.remove(&id) {
                             self.deregister(id, &mut wr).await?;
+                            // **Let the peer finish tearing the claim down.** A
+                            // deregistration is asynchronous on the server: its
+                            // claim's task ends when its channel set does, and a
+                            // registration that lands inside that window opens lanes
+                            // that join and carry nothing — measured 2026-11-24 as
+                            // the alternating outcome of the same cell, the same
+                            // build (`HANDOFF.md` §4 I). The pause is the same order
+                            // as the server's own replacement backoff.
+                            tokio::time::sleep(crate::common::constants::PROLOGUE_BUDGET.min(
+                                std::time::Duration::from_millis(300),
+                            ))
+                            .await;
                             self.services.insert(
                                 id,
                                 ServiceEntry {
