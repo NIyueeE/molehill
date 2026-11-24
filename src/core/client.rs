@@ -476,6 +476,18 @@ enum SessionRequest {
     /// Drop a service: the server releases its public endpoint while the
     /// session keeps serving its siblings.
     Deregister(ServiceId),
+    /// Rebuild one service's data plane: deregister it and register it again.
+    ///
+    /// The claim's own replacement path cannot always recover it — a carrier that
+    /// was blocked for a while leaves lanes that join and carry nothing, which
+    /// eleven fixes on the lane path each moved rather than ended (`HANDOFF.md`
+    /// §4 I). A **rebuild** puts the claim through the path that is healthy in
+    /// every run's first seconds: deregister (which forgets the claim, its lanes
+    /// and its hub members on both ends) and register again (which opens the
+    /// member set the client just asked for). One visible reconnect per claim per
+    /// block, which is what every peer in the record already does.
+    #[cfg(mh_l3_client)]
+    Restart(ServiceId),
     /// Ask the peer to stop using one of a claim's lanes, or to take it back.
     ///
     /// The allocator decides (it is the only thing that reads the evidence) but
@@ -3286,6 +3298,22 @@ const CARRIER_CONFIRM_TICKS: u32 = 3;
 #[cfg(mh_l3_client)]
 const LANE_DIAL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Failed lane dials after which a claim with no lane stops trying to patch
+/// itself and asks for its whole data plane to be rebuilt.
+///
+/// Four attempts span fifteen seconds of the backoff: long enough that a claim
+/// joining a cold carrier is not rebuilt for nothing, short enough that a blocked
+/// carrier's twenty dead minutes become one reconnect.
+#[cfg(mh_l3_client)]
+const LANE_RESTART_AFTER: u32 = 4;
+
+/// The least time between two rebuilds of the same claim.
+///
+/// A rebuild that did not help must not be repeated faster than the evidence can
+/// change: the carrier's own switch cooldowns are the same order.
+#[cfg(mh_l3_client)]
+const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Failed lane dials after which the claim asks the carrier for the other one.
 ///
 /// A lane that cannot be *opened* on the carrier in use is the one carrier failure
@@ -3348,6 +3376,10 @@ struct ClaimEntry {
     /// exact match on it never fires again (measured 2026-11-23: twelve attempts
     /// deep, the rule was dead).
     asked_other: bool,
+    /// When this claim's data plane was last rebuilt, so a claim that cannot keep
+    /// a lane does not rebuild on every tick — and so a rebuild that does not help
+    /// is not repeated faster than the evidence can change.
+    last_restart: std::time::Instant,
     /// Dial attempts that have not produced a lane, and when the next one may be
     /// made. A claim that cannot get a lane must not ask on every tick: the
     /// attempt interval doubles up to [`LANE_DIAL_BACKOFF_MAX`] and one `WARN`
@@ -3397,6 +3429,7 @@ impl LanePool {
                     target: share,
                     registered_at: std::time::Instant::now(),
                     asked_other: false,
+                    last_restart: std::time::Instant::now(),
                     dial_attempts: 0,
                     next_dial_at: std::time::Instant::now(),
                 },
@@ -3675,6 +3708,18 @@ impl LanePool {
         for load in &loads {
             if load.lanes.is_empty() && self.mature(&load.endpoint) {
                 self.dial(&load.endpoint, false);
+                // **And when dialling has stopped working, rebuild.** A claim that
+                // has been short of every lane for four failed attempts is not a
+                // claim whose next dial will land — it is one whose replacement
+                // path has stopped working, and the honest repair is to put it
+                // through the path that works (`SessionRequest::Restart`).
+                if let Some(service) = self.hopeless(&load.endpoint) {
+                    warn!(
+                        "Claim {}: no lane after several attempts; rebuilding its data plane",
+                        load.endpoint
+                    );
+                    self.restart(service);
+                }
             }
         }
         // Nothing to move between, and no move without a reason.
@@ -4063,6 +4108,11 @@ impl LanePool {
         }
     }
 
+    /// Ask the session to rebuild this claim's data plane.
+    fn restart(&self, service: ServiceId) {
+        let _ = self.req_tx.send(SessionRequest::Restart(service));
+    }
+
     /// Has this claim had time to open its share of lanes yet?
     fn mature(&self, endpoint: &Endpoint) -> bool {
         self.claims.lock().is_ok_and(|claims| {
@@ -4070,6 +4120,20 @@ impl LanePool {
                 .get(endpoint)
                 .is_some_and(|entry| entry.registered_at.elapsed() >= LANE_JOIN_GRACE)
         })
+    }
+
+    /// Has this claim failed to get a lane long enough that its own replacement
+    /// path should be considered broken? Answers the service to rebuild.
+    fn hopeless(&self, endpoint: &Endpoint) -> Option<ServiceId> {
+        let mut claims = self.claims.lock().ok()?;
+        let entry = claims.get_mut(endpoint)?;
+        if entry.dial_attempts < LANE_RESTART_AFTER
+            || entry.last_restart.elapsed() < LANE_RESTART_COOLDOWN
+        {
+            return None;
+        }
+        entry.last_restart = std::time::Instant::now();
+        Some(entry.args.service_id)
     }
 
     /// The claim has the lanes it wants: its backoff, if any, is over.
@@ -4475,6 +4539,24 @@ impl ClientSession {
                         self.deregister(id, &mut wr).await?;
                     }
                     #[cfg(mh_l3_client)]
+                    Some(SessionRequest::Restart(id)) => {
+                        // The slot is the service's own; `deregister` removes the
+                        // entry from the session, so it is taken first and put back
+                        // for the registration that follows.
+                        if let Some(entry) = self.services.remove(&id) {
+                            self.deregister(id, &mut wr).await?;
+                            self.services.insert(
+                                id,
+                                ServiceEntry {
+                                    slot: entry.slot,
+                                    state: ServiceState::Registering,
+                                },
+                            );
+                            self.register(id, &nonce, &mut rd, &mut wr).await?;
+                            self.drain_dropped(&nonce, &mut rd, &mut wr).await?;
+                        }
+                    }
+                    #[cfg(mh_l3_client)]
                     Some(SessionRequest::DrainLane { service, lane, cancel }) => {
                         let cmd = if cancel {
                             SessionCmd::CancelDrain(service, lane)
@@ -4757,6 +4839,11 @@ impl ClientSession {
                 // still wants one.
                 #[cfg(mh_l3_client)]
                 SessionRequest::DrainLane { .. } => {}
+                // A rebuild that arrives while the session is (re)connecting is
+                // already happening: the service is re-registered by the sweep
+                // that follows this call, from the slot this end still holds.
+                #[cfg(mh_l3_client)]
+                SessionRequest::Restart(_) => {}
             }
         }
     }

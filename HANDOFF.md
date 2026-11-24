@@ -1178,7 +1178,23 @@ rebuilds after losing its whole lane set**, and it wants a decision rather than 
   observability this end does not have yet (the hub counts what it places, not what the TUN offered and nobody took).
 
 I would build (b). It is a real change to the claim's lifecycle, not a patch, and it is the only one of the three that does not
-depend on knowing *how* the forwarder stops — which eleven attempts have failed to establish. Whoever takes this should start from
+depend on knowing *how* the forwarder stops — which eleven attempts have failed to establish.
+
+**(b) is built, and it does not fix it — which is itself the most useful result of the day.** `SessionRequest::Restart` puts a
+claim through deregister + register when it has been lane-less for four attempts (once per thirty seconds, at `WARN`);
+`~/tmp/p600-recover.json` shows it firing **49 times** in six minutes. The stage after the block still reads **100 % error, zero
+samples**. So a claim rebuilt from scratch — fresh lanes, fresh hub members, both ends' state discarded — does not carry traffic
+either. **The claim is not what is broken.**
+
+That leaves one candidate, and it is upstream of the product: the visitor's packets to the claimed address do not reach the client's
+TUN at all after the block. The evidence: the client's TUN is alive and reading (it logs its own namespace's IPv6 router
+solicitations as `l3 device frame unclaimed`), while the probe — which opens **one fresh TCP connection per attempt** — produces no
+`l3 frame out` for eight minutes. A fresh claim cannot forward frames that never arrive.
+
+Next, and it is a *harness* question, not a product one: record whether the visitor can *reach* the claim (`ping`/`connect` from the
+visitor namespace to the claimed address) after every stage of the `recover` cell. If that path is closed by the time the block
+lifts, the defect this ticket has chased for two days is in the bench's own network setup, and the product's recovery has been
+blamed for it. Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 
