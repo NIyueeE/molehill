@@ -3354,6 +3354,16 @@ const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_sec
 #[cfg(mh_l3_client)]
 const LANE_REBUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The pause between a rebuilt claim's deregistration and its registration.
+///
+/// A deregistration is asynchronous on the server: its claim's task ends when its
+/// channel set does, and a registration inside that window opens lanes that join on
+/// both ends and carry nothing (`HANDOFF.md` §4 I). The same order as the server's own
+/// replacement backoff, and a constant of its own rather than the prologue budget,
+/// which only exists in an `mhd` build.
+#[cfg(mh_l3_client)]
+const LANE_RESTART_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// How long every lane of a claim may be fed and silent before the claim's own carrier
 /// is judged broken and the endpoint moved.
 ///
@@ -3409,18 +3419,6 @@ const CLAIM_RATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3)
 #[cfg(mh_l3_client)]
 type LaneSilence = (u64, u64, std::time::Instant);
 
-/// Failed lane dials after which the claim asks the carrier for the other one.
-///
-/// A lane that cannot be *opened* on the carrier in use is the one carrier failure
-/// the claim can see for itself, and it is the state a UDP-blocked carrier leaves
-/// behind: the mhd pool's tunnels are gone, `mhd is reachable again` has already
-/// been printed by the reachability probe, and every dial over mhd fails in
-/// milliseconds with `early eof` while the server never sees it (`HANDOFF.md` §4 I).
-/// Two attempts — a second of backoff — and the claim asks for TCP for this
-/// endpoint; the carrier rule moves it back when its lanes say mhd is serving.
-#[cfg(mh_l3_client)]
-const LANE_DIAL_SWITCH_AFTER: u32 = 2;
-
 /// How long a freshly registered claim may have no lane before the allocator
 /// stops treating that as "still joining".
 ///
@@ -3465,12 +3463,6 @@ struct ClaimEntry {
     /// When this claim was registered, so the allocator can tell a claim whose
     /// lanes are still joining from one whose lanes are all gone.
     registered_at: std::time::Instant,
-    /// Whether this claim has already asked for the other carrier since its last
-    /// lane landed. A recovery asks **once per recovery**, not once per attempt:
-    /// by the time a block lifts the counter is far past its first value, and an
-    /// exact match on it never fires again (measured 2026-11-23: twelve attempts
-    /// deep, the rule was dead).
-    asked_other: bool,
     /// Dial attempts that have not produced a lane, and when the next one may be
     /// made. A claim that cannot get a lane must not ask on every tick: the
     /// attempt interval doubles up to [`LANE_DIAL_BACKOFF_MAX`] and one `WARN`
@@ -3524,7 +3516,6 @@ impl LanePool {
                     share,
                     target: share,
                     registered_at: std::time::Instant::now(),
-                    asked_other: false,
                     dial_attempts: 0,
                     next_dial_at: std::time::Instant::now(),
                 },
@@ -4128,6 +4119,33 @@ impl LanePool {
         }
     }
 
+    /// Move the endpoint's carrier and rebuild this claim, on the recovery switch.
+    ///
+    /// **The cooldown does not apply here.** It exists so *quality* decisions cannot
+    /// flap; a claim whose every lane is fed and silent is not making a quality
+    /// decision — it is trying to get its data plane back.
+    fn move_and_rebuild(
+        &self,
+        endpoint: Endpoint,
+        args: &Arc<RunDataChannelArgs>,
+        other: crate::transport::carrier::Carrier,
+    ) {
+        #[cfg(feature = "multiplex")]
+        let switched = args.carrier.prefer_for_lane(
+            other,
+            "every lane of this claim is fed and none of them hears back",
+        );
+        #[cfg(not(feature = "multiplex"))]
+        let switched = false;
+        if let Some(service) = self.hopeless(&endpoint) {
+            warn!(
+                "Claim {endpoint}: every lane is fed and silent; moving the endpoint to \
+                 {other:?} ({switched}) and rebuilding the claim's data plane"
+            );
+            self.restart(service);
+        }
+    }
+
     /// Rebuild a claim whose lanes will not take the device's frames, and say so.
     fn rebuild_for_backpressure(&self, endpoint: Endpoint) -> bool {
         let Some(service) = self.hopeless(&endpoint) else {
@@ -4237,7 +4255,7 @@ impl LanePool {
             .map(|(endpoint, entry)| {
                 let carrier = entry.args.carrier.as_ref();
                 let chosen = carrier.carrier();
-                let usable = chosen != crate::transport::carrier::Carrier::Mhd || carrier.try_mhd();
+                let usable = carrier.usable();
                 (*endpoint, entry.tun.clone(), usable, chosen)
             })
             .collect();
@@ -4323,17 +4341,7 @@ impl LanePool {
                 continue;
             };
             drop(guard);
-            let switched = args.carrier.prefer(
-                other,
-                "every lane of this claim is fed and none of them hears back",
-            );
-            if let Some(service) = self.hopeless(&endpoint) {
-                warn!(
-                    "Claim {endpoint}: every lane is fed and silent; moving the endpoint to \
-                     {other:?} ({switched}) and rebuilding the claim's data plane"
-                );
-                self.restart(service);
-            }
+            self.move_and_rebuild(endpoint, &args, other);
         }
     }
 
@@ -4366,32 +4374,11 @@ impl LanePool {
             if grow {
                 entry.target = entry.target.saturating_add(1);
             }
-            if entry.dial_attempts >= LANE_DIAL_SWITCH_AFTER
-                && !entry.asked_other
-                && entry.args.carrier.switches() > 0
-            {
-                entry.asked_other = true;
-                // The first attempt has failed by the time the second is due: ask
-                // the carrier for the other one rather than failing again on a
-                // pool that is not there.
-                let other = match entry.args.carrier.carrier() {
-                    crate::transport::carrier::Carrier::Mhd => {
-                        crate::transport::carrier::Carrier::Tcp
-                    }
-                    crate::transport::carrier::Carrier::Tcp => {
-                        crate::transport::carrier::Carrier::Mhd
-                    }
-                };
-                if entry.args.carrier.prefer_for_lane(
-                    other,
-                    "this claim's lane could not be opened on the carrier in use",
-                ) {
-                    info!(
-                        "Claim {endpoint}: lane dials keep failing on the carrier in use; asking \
-                         for {other:?} for this claim"
-                    );
-                }
-            }
+            // **No carrier switch here.** The choice is one per endpoint while a claim
+            // is one of five, so five claims asking for "the other carrier" in the same
+            // tick alternate it five times and land it wherever the last one left it
+            // (`HANDOFF.md` §4 I). The carrier moves in `claim_fallback_step`, on the
+            // claim's own evidence and once per chance; the repair here is the rebuild.
             if entry.dial_attempts == LANE_DIAL_WARN_AFTER {
                 warn!(
                     "Lane allocator: claim {endpoint} has dialled for a lane {} times without \
@@ -4468,7 +4455,6 @@ impl LanePool {
             && let Some(entry) = claims.get_mut(endpoint)
         {
             entry.dial_attempts = 0;
-            entry.asked_other = false;
             entry.next_dial_at = std::time::Instant::now();
         }
     }
@@ -4879,10 +4865,7 @@ impl ClientSession {
                             // the alternating outcome of the same cell, the same
                             // build (`HANDOFF.md` §4 I). The pause is the same order
                             // as the server's own replacement backoff.
-                            tokio::time::sleep(crate::common::constants::PROLOGUE_BUDGET.min(
-                                std::time::Duration::from_millis(300),
-                            ))
-                            .await;
+                            tokio::time::sleep(LANE_RESTART_PAUSE).await;
                             self.services.insert(
                                 id,
                                 ServiceEntry {

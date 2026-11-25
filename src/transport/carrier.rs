@@ -147,6 +147,22 @@ impl CarrierChoice {
     /// endpoint has fallen back and its cooldown has not elapsed. An elapsed
     /// cooldown offers mhd again — that is the re-probe — while
     /// [`Self::carrier`] keeps reporting TCP until a session actually comes up.
+    /// May a channel that dials now use the carrier this endpoint chose?
+    ///
+    /// One name for the question, so a caller outside the `multiplex` feature set can
+    /// ask it too (`HANDOFF.md` §4 I).
+    #[must_use]
+    pub fn usable(&self) -> bool {
+        #[cfg(feature = "multiplex")]
+        {
+            self.try_mhd()
+        }
+        #[cfg(not(feature = "multiplex"))]
+        {
+            true
+        }
+    }
+
     #[cfg(feature = "multiplex")]
     #[must_use]
     pub fn try_mhd(&self) -> bool {
