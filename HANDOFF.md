@@ -1243,7 +1243,19 @@ recover. That is written down because it is the obvious next idea and it is wron
 **The release sweep of that configuration: nine failures, all in one cell (2026-11-24, `~/tmp/p870-standard-sweep.json`, 16 611 s).**
 The timeline is **green in every one of the eighteen stages** (`udp_blocked@tunnel` 1.52 ms, `clean#2` 1.5 ms, `mtu1280` 1.62, `udp_throttled` 1.66), `half-close` delivers 65 536 bytes, and the wedge axis is silent. What is left is `l3`'s **capacity ramp**: `L1` times out at the harness's 26 s bound, `L2..L8` are never attempted, and the five other arms sustain 8 of 8 streams.
 
-**And the ramp is fine on its own**: `~/tmp/p880-cap.json` reads L1 5.82, L3 9.99, L8 10.34 Gbit/s with 1..8 streams sustained. It is the **order** that breaks it — capacity after a 54-minute timeline that included a block and a rebuild — and forgetting the rebuilt claim's flows (`TunHub::forget_claim`, in this commit) did **not** fix it (`~/tmp/p890-tc.json`: a scaled timeline plus capacity still fails L1). So the next question is what the timeline leaves behind that throttles the ramp's first level; the two candidates worth checking first are the iperf3 sink the timeline left bound and the claim's lanes after its rebuilds. Whoever takes this should start from
+**And the ramp is fine on its own**: `~/tmp/p880-cap.json` reads L1 5.82, L3 9.99, L8 10.34 Gbit/s with 1..8 streams sustained. It is the **order** that breaks it — capacity after a 54-minute timeline that included a block and a rebuild — and forgetting the rebuilt claim's flows (`TunHub::forget_claim`, in this commit) did **not** fix it (`~/tmp/p890-tc.json`: a scaled timeline plus capacity still fails L1). So the next question is what the timeline leaves behind that throttles the ramp's first level. Four short runs have narrowed it (2026-11-25):
+
+| before `capacity` | L1 | verdict |
+|---|---|---|
+| nothing | 5.82 Gbit/s | passes (`~/tmp/p880-cap.json`) |
+| `cost` on a clean path | 6.44 | passes (`~/tmp/p900-cc.json`) |
+| `cost` on a 60 s `udp_blocked` tunnel leg | — | never ready: a block from the first second is not the schedule's shape |
+| the `recover` timeline (clean → block → clean) | 6.25 | **passes** (`~/tmp/p910-rc.json`) |
+| `cost` on a 60 s `rate100_shallow` tunnel leg | 5.60 | passes (`~/tmp/p920-rs.json`) |
+| `cost` on a 60 s `mtu1280` tunnel leg | 1.73 | passes (`~/tmp/p921-mtu.json`) |
+| the **whole 18-stage timeline** at scale 0.25 | timeout | **fails** (`~/tmp/p890-tc.json`) |
+
+So it is not the block, not a shallow queue, not an MTU stage and not a rebuild on its own — it takes the whole schedule to produce it, which is why the next step is to bisect the schedule at scale 0.1 (a twelve-minute timeline plus the ramp) and then drop stages from a diagnostic timeline until the ramp survives. Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 
