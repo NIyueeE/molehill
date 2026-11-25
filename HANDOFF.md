@@ -1266,7 +1266,20 @@ for a minute, the claim's bulk streams do not recover their rate — the ramp's 
 reads 1.5 ms and every timeline stage is green. The next question is whose state that is: mhd's per-lane congestion/credit state
 (the l4 arms recover from the same stage, so their pool's control differs) or the claim's lanes' own windows. The two fixes to try,
 in order: reset a lane's congestion state when its path has been clean for a few seconds, and (if that is not it) re-establish the
-claim's lanes when the carrier's path condition changes. Whoever takes this should start from
+claim's lanes when the carrier's path condition changes.
+
+**Two attempts at that, and what they established (2026-11-25).** (1) A rebuild on *backpressure* — a claim whose lanes refuse the
+device's frames for want of queue space for five seconds — never fired: `~/tmp/p960-thr.json` shows the same timeout with **no**
+overflow, because a slow lane means the device is not offering much either (TCP's own window has already shrunk), so the queue never
+fills. (2) The ramp now **waits for the workload's own port** before its first level (`wait_dial_port`, sixty-second budget, recorded
+like any instrument parameter), which turned the cell's evidence from "no peer ever connected" into "**413 peers accepted and the
+client still could not finish in 26 s**" (`~/tmp/p970-thr.json`).
+
+That is the finding to hand over: after a path that policed the carrier's datagrams for a minute, a claim's lanes carry at a rate far
+below the one they had before it, nothing the claim can see calls itself broken (no silence, no backpressure, no failed dial), and the
+next bulk user — the ramp's first level — is the one that pays. The fix that follows from it is a **rate-recovery** rule: a claim whose
+lanes deliver far below their own recent peak while flows are placed should re-establish them, the way the silence rule
+re-establishes a claim that carries nothing. That rule does not exist yet, and the sweep's `l3` ramp cell stays red until it does. Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 
