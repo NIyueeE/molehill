@@ -862,6 +862,19 @@ must act on:
 
 Stated so a reader does not ask a chart for something it never measured:
 
+- **`l3`'s capacity ramp, once it follows a schedule that policed UDP.** The ramp
+  is healthy on its own (`L1` 5.82 to `L8` 10.34 Gbit/s, one to eight streams
+  sustained) and after any *single* stage of the release schedule, but it times
+  out at its first level when it follows the whole schedule — or one minute of
+  `udp_throttled` on the carrier's leg — while every stage of that same run's
+  timeline is green and its interactive series reads ~1.5 ms. That is a **bulk
+  recovery** limit rather than a liveness one: after a policed path the claim's
+  throughput streams do not get their rate back, and the ramp's first level is the
+  first bulk that asks. Until the state that stays throttled is named (HANDOFF.md,
+  §4 I), `l3`'s ramp cells are **not quotable**: `just bench gate` reports their
+  coverage as missing, which is the honest reading of a cell the model cannot
+  produce.
+
 - **A churn comparison, until its instrument is fixed.** `churn-16` opens a
   fresh connection per request and the reading is not yet trustworthy: in three
   runs on 2026-10-10 the L4 arms produced every degenerate cell (four rounds
