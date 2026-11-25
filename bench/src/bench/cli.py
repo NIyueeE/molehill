@@ -37,7 +37,7 @@ import time
 import tomllib
 from pathlib import Path
 
-from bench import analysis, hostinfo, model, paths, runner, topology, workloads
+from bench import analysis, hostinfo, model, paths, plot, runner, topology, workloads
 from bench import instruments as inst
 from bench.targets import adapter_for, peer_version
 from bench.targets.peers import PEERS
@@ -561,6 +561,35 @@ def _check_arms(c: Checker) -> None:
             spec = f"id={kind},txqueuelen={model.DEEP_TXQUEUELEN}"
             parsed = model.parse_arm_spec(spec)
             c.equal(f"arm spec {kind} txqueuelen", parsed.txqueuelen, 10000)
+    # **The tables the release notes are pasted from.** A scenario with one cell
+    # writes it with an empty name, and the table has to label the column with the
+    # scenario while looking the reading up under the name the record stored — the
+    # two were one value, and the half-close table printed `-` for every arm while
+    # the record carried 65 536 bytes (`HANDOFF.md` §4 I). The check renders a
+    # synthetic record, so it costs nothing and cannot drift from the file format.
+    synthetic = plot.Run(
+        results={"samples": []},
+        meta={
+            "arms": [{"id": "a"}],
+            "scenarios": [{"id": "half-close", "headline": "half_close_bytes"}],
+        },
+        summary={
+            "cells": [
+                {
+                    "scenario": "half-close",
+                    "cell": "",
+                    "arms": {"a": {"metrics": {"half_close_bytes": {"median": 65536}}}},
+                }
+            ]
+        },
+    )
+    table = "\n".join(plot.headline_section(synthetic))
+    c.check(
+        "a single-cell scenario's table reads its own value",
+        "| a | 65536 |" in table,
+        table,
+    )
+
     # A carrier is *not* an arm key (the product chooses one at runtime, so the
     # contrast is the `udp_blocked` condition); the *shape* is derived from the
     # service type (a forwarding service multiplexes, a claim never does), so an

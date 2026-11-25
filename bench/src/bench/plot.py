@@ -1309,18 +1309,27 @@ def headline_section(run: Run) -> list:
         if metric not in model.METRICS or not cells:
             continue
         unit = model.METRICS[metric].unit
-        names = [cell["cell"] or scenario for cell in cells]
-        for leg, leg_names in split_by_leg(names):
+        # **Two names for one cell.** A scenario with a single cell writes it with an
+        # empty name, and the table has to *label* that column with the scenario while
+        # looking the reading up under the name the record actually stored: substituting
+        # one for the other read the half-close table as `-` for every arm while the
+        # record carried 65 536 bytes (`HANDOFF.md` §4 I).
+        keys = [cell["cell"] for cell in cells]
+        labels = [key or scenario for key in keys]
+        for leg, leg_names in split_by_leg(labels):
+            columns = [
+                index for index, label in enumerate(labels) if label in leg_names
+            ]
             lines = [f"#### {scenario} — {metric} ({unit}) — {leg} leg", ""]
-            lines += table_header(leg_names)
+            lines += table_header([labels[index] for index in columns])
             for arm in run.arms:
                 lines.append(
                     row_line(
                         [
                             arm,
                             *[
-                                reading(run, scenario, name, arm, metric)
-                                for name in leg_names
+                                reading(run, scenario, keys[index], arm, metric)
+                                for index in columns
                             ],
                         ]
                     )
@@ -1572,7 +1581,10 @@ def parse_args(argv) -> argparse.Namespace:
         "--out-dir",
         type=Path,
         default=None,
-        help="where the PNGs go (default: the results file's own directory)",
+        help=(
+            "where the PNGs go (default: ./bench-charts/<run stem>/, so a record's "
+            "own directory — which is a data directory — is never written to)"
+        ),
     )
     parser.add_argument(
         "--markdown", action="store_true", help="print the tables to stdout"
@@ -1588,9 +1600,14 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     run = load_run(args.results)
     apply_style()
-    out_dir = args.out_dir or args.results.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"bench-{run.meta.get('fingerprint') or 'unfingerprinted'}"
+    # **Never beside the record.** A record's own directory is where the committed
+    # release artefacts live (`benches/records/`), and a default that wrote PNGs there
+    # put stray `bench-*.png` files next to them twice during the v1.0.0 run
+    # (`HANDOFF.md` §4 I). The default is a directory of its own under the working
+    # directory, named after the run, so a render never lands in a data directory.
+    out_dir = args.out_dir or Path.cwd() / "bench-charts" / stem
+    out_dir.mkdir(parents=True, exist_ok=True)
     for name, render in FIGURES:
         render(run, out_dir / f"{stem}-{name}.png", args.title)
     if args.markdown:

@@ -808,7 +808,10 @@ meta.
   refused rather than compared.
 - **`just bench plot` renders exactly the figures this page describes** from
   any results file: the timeline master, the small multiples, the capacity
-  curve, the UDP ladder, the drift panels and the cost bars.
+  curve, the exposure cells, the drift panels and the cost bars. Its PNGs go to
+  `./bench-charts/<run>/` unless `--out-dir` says otherwise, so a render never
+  writes beside the record it read — that directory holds the committed release
+  artefacts.
 - **A CPU number can be split into the carrier's own phases.** When the campaign
   ran with `MOLEHILL_MHD_STATS=1`, `just bench phases <work directory or results
   file>` reads the daemons' cumulative logs and prints seconds per carried Gbit

@@ -126,6 +126,7 @@ l3-accept-ipv6 *ARGS:
 #   just bench list | report FILE | gate FILE | compare A B | doctor
 #   just bench peers fetch                  # the reference-tool binaries
 #   just bench interop | udp-stress | l3 | l3-census | mux | phases | observe
+#   just bench plot ~/tmp/bench-*.json   # PNGs land in ./bench-charts/<run>/
 #   just bench plot ~/tmp/bench-*.json --out-dir ~/tmp/charts
 bench *ARGS:
     #!/usr/bin/env bash
