@@ -2122,6 +2122,16 @@ def _thinned(points: list, every: int = 5) -> list:
     return points[::every]
 
 
+#: How long the ramp waits for the arm's workload port before it starts.
+#:
+#: Long enough for a claim that has to rebuild its data plane (its deregistration, the
+#: peer's teardown, the registration and the first lane: a few seconds), and short
+#: enough that a tool which is not coming back is reported as such rather than waited
+#: out. The seconds a scenario *does* spend here are recorded in the run's evidence like
+#: any other instrument parameter.
+CAPACITY_READY_BUDGET = 60.0
+
+
 def run_capacity(ctx: Ctx, params: dict) -> list:
     """Ramp the bulk load until the interactive stream breaks the SLO.
 
@@ -2131,6 +2141,18 @@ def run_capacity(ctx: Ctx, params: dict) -> list:
     latency is.
     """
     ctx.topo.set_condition(ctx.leg, model.CONDITIONS[params["condition"]])
+    # **The ramp asks for capacity, not for recovery.** A scenario that starts while
+    # the previous one's damage is still settling measures the transition — measured
+    # 2026-11-25: after a stage that policed the carrier's datagrams for a minute, the
+    # first level timed out with the backend never having accepted a connection, while
+    # the same ramp on its own sustained every level (`HANDOFF.md` §4 I). The gate is
+    # the workload's own port, with a budget long enough for a claim to rebuild.
+    ready_by = time.monotonic() + CAPACITY_READY_BUDGET
+    while (
+        not wait_dial_port(ctx, topology.IPERF_PORT, 2.0)
+        and time.monotonic() < ready_by
+    ):
+        time.sleep(1.0)
     settle = params["settle_s"]
     cells: list = []
     sustainable = 0

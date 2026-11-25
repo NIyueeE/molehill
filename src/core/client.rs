@@ -3257,6 +3257,9 @@ struct LanePool {
     restarted: std::sync::Mutex<HashMap<Endpoint, (std::time::Instant, u32)>>,
     /// Per lane slot: what its peer last reported and what this end last handed it.
     silence: std::sync::Mutex<HashMap<(Endpoint, usize), LaneSilence>>,
+    /// Per claim: how many frames its lanes have refused for want of queue space, and
+    /// since when that has been happening.
+    backpressure: std::sync::Mutex<HashMap<Endpoint, (u64, std::time::Instant)>>,
     /// Claims that have carried traffic at least once since they were registered.
     ///
     /// The claim-wide fallback needs it: a claim that has **never** carried anything is
@@ -3361,6 +3364,18 @@ const LANE_REBUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 #[cfg(mh_l3_client)]
 const CLAIM_SILENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a claim's lanes may refuse the device's frames for want of queue space
+/// before they are judged too slow and the claim rebuilt.
+///
+/// This is the **bulk** counterpart of the silence rule: a lane that is fed, answers,
+/// and still cannot keep up shows up as backpressure at the hub (`overflow_packets`),
+/// and a path that policed the carrier for a minute leaves exactly that — the ramp
+/// after such a stage times out at its first level while the interactive series reads
+/// 1.5 ms (`HANDOFF.md` §4 I). Five seconds of refused frames is a lane that is not
+/// going to recover its rate on its own.
+#[cfg(mh_l3_client)]
+const CLAIM_SLOW_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a lane's peer last reported and what this end last handed it, for the
 /// claim-wide silence test.
 #[cfg(mh_l3_client)]
@@ -3451,6 +3466,7 @@ impl LanePool {
             draining: std::sync::Mutex::new(HashMap::new()),
             restarted: std::sync::Mutex::new(HashMap::new()),
             silence: std::sync::Mutex::new(HashMap::new()),
+            backpressure: std::sync::Mutex::new(HashMap::new()),
             carried: std::sync::Mutex::new(std::collections::HashSet::new()),
             carrier_sample: std::sync::Mutex::new(HashMap::new()),
             carrier_streak: std::sync::Mutex::new(HashMap::new()),
@@ -4083,6 +4099,47 @@ impl LanePool {
         }
     }
 
+    /// Rebuild a claim whose lanes will not take the device's frames, and say so.
+    fn rebuild_for_backpressure(&self, endpoint: Endpoint) -> bool {
+        let Some(service) = self.hopeless(&endpoint) else {
+            return false;
+        };
+        warn!(
+            "Claim {endpoint}: its lanes have refused the device's frames for \
+             {CLAIM_SLOW_BUDGET:?}; rebuilding its data plane"
+        );
+        self.restart(service);
+        true
+    }
+
+    /// Have this claim's lanes spent long enough refusing the device's frames for want
+    /// of queue space to be called too slow?
+    fn lanes_slow(
+        &self,
+        endpoint: Endpoint,
+        members: &[crate::transparent::hub::MemberStat],
+    ) -> bool {
+        let overflow: u64 = members
+            .iter()
+            .map(|member| member.counters.overflow_packets)
+            .sum();
+        let Ok(mut backpressure) = self.backpressure.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        match backpressure.get(&endpoint).copied() {
+            Some((seen, since)) if overflow > seen => {
+                backpressure.insert(endpoint, (overflow, since));
+                since.elapsed() >= CLAIM_SLOW_BUDGET
+            }
+            Some(_) => false,
+            None => {
+                backpressure.insert(endpoint, (overflow, now));
+                false
+            }
+        }
+    }
+
     /// Move the endpoint's carrier and rebuild a claim whose **every** lane is fed and
     /// silent while the carrier believes its own path is up.
     ///
@@ -4157,6 +4214,13 @@ impl LanePool {
                 }
             }
             drop(silence);
+            if !all_silent {
+                continue;
+            }
+            // **Or it is fed, answering, and too slow.**
+            if self.lanes_slow(endpoint, &members) && self.rebuild_for_backpressure(endpoint) {
+                continue;
+            }
             if !all_silent {
                 continue;
             }
