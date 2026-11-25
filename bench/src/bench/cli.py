@@ -37,7 +37,7 @@ import time
 import tomllib
 from pathlib import Path
 
-from bench import analysis, hostinfo, model, paths, plot, runner, topology, workloads
+from bench import analysis, hostinfo, model, paths, runner, topology, workloads
 from bench import instruments as inst
 from bench.targets import adapter_for, peer_version
 from bench.targets.peers import PEERS
@@ -567,6 +567,10 @@ def _check_arms(c: Checker) -> None:
     # two were one value, and the half-close table printed `-` for every arm while
     # the record carried 65 536 bytes (`HANDOFF.md` §4 I). The check renders a
     # synthetic record, so it costs nothing and cannot drift from the file format.
+    # Imported here: `plot` needs matplotlib, which only the plotting extra installs,
+    # and a `bench run` must not need the plotter's dependencies.
+    from bench import plot  # noqa: PLC0415 - matplotlib is the plotting extra's
+
     synthetic = plot.Run(
         results={"samples": []},
         meta={
