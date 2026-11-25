@@ -343,6 +343,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole cost, and a measured pairing p99 of fourteen milliseconds is invisible to
   a hundred-millisecond threshold.
 
+### Changed
+
+- **The release record is the 2026-11-25 sweep, and the gate passes on it without a
+  baseline**: 171 arm/scenario/cell triples, the staged schedule and the load ramp for
+  all six arms, `l3` sustaining 8 of 8 streams where the previous record had nine
+  coverage failures in that cell. `benches/records/results-bench-v1.0.0.json` and the
+  chart set in `assets/` are that run; the published tables in `README.md` and
+  `docs/benchmarks.md` are generated from it.
+
 ### Fixed
 
 - **A transparent claim that has lost every lane gets one back.** A claim whose
