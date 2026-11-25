@@ -1279,7 +1279,17 @@ That is the finding to hand over: after a path that policed the carrier's datagr
 below the one they had before it, nothing the claim can see calls itself broken (no silence, no backpressure, no failed dial), and the
 next bulk user — the ramp's first level — is the one that pays. The fix that follows from it is a **rate-recovery** rule: a claim whose
 lanes deliver far below their own recent peak while flows are placed should re-establish them, the way the silence rule
-re-establishes a claim that carries nothing. That rule does not exist yet, and the sweep's `l3` ramp cell stays red until it does. Whoever takes this should start from
+re-establishes a claim that carries nothing. **The rule exists now, and it is dormant in every shape tested (2026-11-25, `~/tmp/p990-pol.json`).** A claim whose delivery sits
+under a fifth of its own recent peak for ten seconds, with flows placed, is rebuilt (`CLAIM_RATE_BUDGET`, the peak decaying one part in
+sixty-four a tick so a legitimately quiet claim is not rebuilt for ever). The `police` diagnostic — clean 60 s, a policed carrier 60 s,
+clean 60 s, then the ramp — shows what the rule has to catch: the first clean stage carries **9.90 Gbit/s**, the policed one and the
+clean one after it carry **nothing**, and the ramp's first level still times out. The rule never fired: after the policed stage the
+bulk streams have ended, so the claim's `flows` are zero and the rule's own demand gate keeps it quiet — the demand it should be
+reacting to arrives only when the *ramp* starts, and by then the harness's 26 s bound has already run out.
+
+So the last piece is a judgement about **whose demand counts**: a claim that has just been carrying bulk and has just stopped is the
+one to re-establish, not only the claim that is being asked *right now*. The next session starts there, with `just bench run --profile
+police` (ten minutes) as the test and the eight remaining rounds' worth of work already written down. Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 

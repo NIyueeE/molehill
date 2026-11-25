@@ -3260,6 +3260,9 @@ struct LanePool {
     /// Per claim: how many frames its lanes have refused for want of queue space, and
     /// since when that has been happening.
     backpressure: std::sync::Mutex<HashMap<Endpoint, (u64, std::time::Instant)>>,
+    /// Per claim: its peak delivery rate, the last rate, and since when it has been far
+    /// below that peak.
+    rate: std::sync::Mutex<HashMap<Endpoint, Rate>>,
     /// Claims that have carried traffic at least once since they were registered.
     ///
     /// The claim-wide fallback needs it: a claim that has **never** carried anything is
@@ -3376,6 +3379,26 @@ const CLAIM_SILENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(mh_l3_client)]
 const CLAIM_SLOW_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A claim's delivery: its peak, its last cumulative total, and since when it has been
+/// far below that peak.
+#[cfg(mh_l3_client)]
+type Rate = (u64, u64, Option<std::time::Instant>);
+
+/// How far below its own recent peak a claim's delivery may sit before its lanes are
+/// judged unable to recover.
+#[cfg(mh_l3_client)]
+const CLAIM_RATE_FLOOR_PCT: u64 = 20;
+
+/// How long it may sit there.
+///
+/// The third and last shape of "the lanes are not working": a claim that carries, that
+/// nobody refuses, and that delivers a fraction of what it delivered a minute ago — the
+/// state a path that policed the carrier's datagrams leaves behind (`HANDOFF.md` §4 I).
+/// Ten seconds is longer than one TCP retransmit round and shorter than the twenty
+/// minutes the original defect cost.
+#[cfg(mh_l3_client)]
+const CLAIM_RATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What a lane's peer last reported and what this end last handed it, for the
 /// claim-wide silence test.
 #[cfg(mh_l3_client)]
@@ -3467,6 +3490,7 @@ impl LanePool {
             restarted: std::sync::Mutex::new(HashMap::new()),
             silence: std::sync::Mutex::new(HashMap::new()),
             backpressure: std::sync::Mutex::new(HashMap::new()),
+            rate: std::sync::Mutex::new(HashMap::new()),
             carried: std::sync::Mutex::new(std::collections::HashSet::new()),
             carrier_sample: std::sync::Mutex::new(HashMap::new()),
             carrier_streak: std::sync::Mutex::new(HashMap::new()),
@@ -4112,6 +4136,59 @@ impl LanePool {
         true
     }
 
+    /// Is this claim delivering a fraction of its own recent peak while it still has
+    /// flows that want the lanes?
+    fn rate_collapsed(
+        &self,
+        endpoint: Endpoint,
+        members: &[crate::transparent::hub::MemberStat],
+    ) -> bool {
+        // Demand, not merely traffic: a claim with no flow placed is idle, and an idle
+        // claim is not a slow one.
+        if members.iter().map(|member| member.flows).sum::<usize>() == 0 {
+            return false;
+        }
+        let total: u64 = members
+            .iter()
+            .map(|member| member.counters.enqueued_packets + member.counters.injected_packets)
+            .sum();
+        let Ok(mut rate) = self.rate.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let Some((peak, last, low)) = rate.get(&endpoint).copied() else {
+            rate.insert(endpoint, (total, total, None));
+            return false;
+        };
+        let current = total.saturating_sub(last);
+        // A peak that is never forgotten would rebuild a claim that legitimately slows
+        // down for the rest of the session: it decays, one part in sixty-four a tick.
+        let peak = peak.saturating_sub(peak / 64).max(current);
+        if peak == 0 || current * 100 >= peak * CLAIM_RATE_FLOOR_PCT {
+            rate.insert(endpoint, (peak, total, None));
+            return false;
+        }
+        let since = low.unwrap_or(now);
+        rate.insert(endpoint, (peak, total, Some(since)));
+        since.elapsed() >= CLAIM_RATE_BUDGET
+    }
+
+    /// Rebuild a claim whose lanes deliver a fraction of what they used to, and say so.
+    fn rebuild_for_slow_rate(&self, endpoint: Endpoint) -> bool {
+        let Some(service) = self.hopeless(&endpoint) else {
+            return false;
+        };
+        warn!(
+            "Claim {endpoint}: its lanes deliver far below their own recent peak; \
+             rebuilding its data plane"
+        );
+        if let Ok(mut rate) = self.rate.lock() {
+            rate.remove(&endpoint);
+        }
+        self.restart(service);
+        true
+    }
+
     /// Have this claim's lanes spent long enough refusing the device's frames for want
     /// of queue space to be called too slow?
     fn lanes_slow(
@@ -4217,8 +4294,12 @@ impl LanePool {
             if !all_silent {
                 continue;
             }
-            // **Or it is fed, answering, and too slow.**
+            // **Or it is fed, answering, and too slow.** Backpressure first (the queue
+            // says so directly), then the rate itself.
             if self.lanes_slow(endpoint, &members) && self.rebuild_for_backpressure(endpoint) {
+                continue;
+            }
+            if self.rate_collapsed(endpoint, &members) && self.rebuild_for_slow_rate(endpoint) {
                 continue;
             }
             if !all_silent {

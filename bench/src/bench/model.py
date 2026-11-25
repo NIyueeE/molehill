@@ -1012,6 +1012,14 @@ TIMELINES: dict[str, tuple] = {
         ("udp_blocked", 20.0, "tunnel"),
         ("clean", 20.0),
     ),
+    # Clean, then a minute of a policed carrier, then clean again — the shape that
+    # leaves a claim's lanes delivering a fraction of their peak, for the diagnostic
+    # profile of the same name (`HANDOFF.md` §4 I).
+    "police": (
+        ("clean", 60.0),
+        ("udp_throttled", 60.0, "tunnel"),
+        ("clean", 60.0),
+    ),
     "vislegs": (
         ("clean", 20.0),
         ("loss5", 20.0),
@@ -2121,6 +2129,15 @@ PROFILES |= {
         "budget_s": 900.0,
         "aa": False,
         "params": {"timeline": {"timeline": "tunlegs"}},
+    },
+    "police": {
+        "what": "diagnostic: a policed carrier between clean stages, then the ramp",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline", "capacity"),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "police"}},
     },
     "vislegs": {
         "what": "diagnostic: the visitor-leg half of the schedule, then the ramp",
