@@ -3391,13 +3391,18 @@ const CLAIM_RATE_FLOOR_PCT: u64 = 20;
 
 /// How long it may sit there.
 ///
+/// Three seconds, not ten: the ramp's first level is bounded at twenty-six, and a repair
+/// that lands after the measurement has ended is a repair the user never sees. Long
+/// enough that a single slow round trip is not a verdict, short enough to fit inside the
+/// first level of the cell this rule exists for (`HANDOFF.md` §4 I).
+///
 /// The third and last shape of "the lanes are not working": a claim that carries, that
 /// nobody refuses, and that delivers a fraction of what it delivered a minute ago — the
 /// state a path that policed the carrier's datagrams leaves behind (`HANDOFF.md` §4 I).
 /// Ten seconds is longer than one TCP retransmit round and shorter than the twenty
 /// minutes the original defect cost.
 #[cfg(mh_l3_client)]
-const CLAIM_RATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const CLAIM_RATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// What a lane's peer last reported and what this end last handed it, for the
 /// claim-wide silence test.
