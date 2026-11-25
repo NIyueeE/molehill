@@ -1255,7 +1255,18 @@ The timeline is **green in every one of the eighteen stages** (`udp_blocked@tunn
 | `cost` on a 60 s `mtu1280` tunnel leg | 1.73 | passes (`~/tmp/p921-mtu.json`) |
 | the **whole 18-stage timeline** at scale 0.25 | timeout | **fails** (`~/tmp/p890-tc.json`) |
 
-So it is not the block, not a shallow queue, not an MTU stage and not a rebuild on its own — it takes the whole schedule to produce it, which is why the next step is to bisect the schedule at scale 0.1 (a twelve-minute timeline plus the ramp) and then drop stages from a diagnostic timeline until the ramp survives. Whoever takes this should start from
+**The bisect lands on the UDP policer (2026-11-25).** The full timeline reproduces the ramp's failure at scale 0.1
+(`~/tmp/p930.t1.json`, 1 378 s), and the two diagnostic halves of the schedule show it is neither leg on its own: the
+tunnel-leg half fails (`~/tmp/p940-tun.json`) **and** the visitor-leg half fails (`~/tmp/p941-vis.json`). One stage on its own
+does: **`udp_throttled` then the ramp** fails (`~/tmp/p950-thr.json`), while a clean cost stage (`p900`), `rate100_shallow`
+(`p920`), `mtu1280` (`p921`) and the `recover` timeline's block (`p910`) all leave the ramp healthy.
+
+That makes the remaining defect a **bulk-throughput** one, not a liveness one: after a path that policed the carrier's datagrams
+for a minute, the claim's bulk streams do not recover their rate — the ramp's first level times out — while the interactive series
+reads 1.5 ms and every timeline stage is green. The next question is whose state that is: mhd's per-lane congestion/credit state
+(the l4 arms recover from the same stage, so their pool's control differs) or the claim's lanes' own windows. The two fixes to try,
+in order: reset a lane's congestion state when its path has been clean for a few seconds, and (if that is not it) re-establish the
+claim's lanes when the carrier's path condition changes. Whoever takes this should start from
 `~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
 later, and the probe's timeouts are all in one timeline.
 

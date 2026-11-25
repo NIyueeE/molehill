@@ -1000,6 +1000,26 @@ TIMELINES: dict[str, tuple] = {
         ("udp_blocked", 150.0, "tunnel"),
         ("clean", 150.0),
     ),
+    # Two halves of the release schedule, for bisecting what a *preceding* scenario
+    # leaves behind: the tunnel-leg stages only, then the visitor-leg ones. A diagnosis
+    # of `l3`'s capacity ramp, which passes alone and fails after the whole timeline
+    # (`HANDOFF.md` §4 I).
+    "tunlegs": (
+        ("clean", 20.0),
+        ("rate100_shallow", 20.0, "tunnel"),
+        ("mtu1280", 20.0, "tunnel"),
+        ("udp_throttled", 20.0, "tunnel"),
+        ("udp_blocked", 20.0, "tunnel"),
+        ("clean", 20.0),
+    ),
+    "vislegs": (
+        ("clean", 20.0),
+        ("loss5", 20.0),
+        ("rate100_shallow", 20.0),
+        ("loss1_rate100", 20.0),
+        ("jitter", 20.0),
+        ("clean", 20.0),
+    ),
     "sweep": (
         ("clean", 150.0),
         ("rtt100", 120.0),
@@ -2092,6 +2112,24 @@ PROFILES |= {
         "budget_s": 900.0,
         "aa": False,
         "params": {"timeline": {"timeline": "recover"}},
+    },
+    "tunlegs": {
+        "what": "diagnostic: the tunnel-leg half of the schedule, then the ramp",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline", "capacity"),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "tunlegs"}},
+    },
+    "vislegs": {
+        "what": "diagnostic: the visitor-leg half of the schedule, then the ramp",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline", "capacity"),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "vislegs"}},
     },
     "sweep": {
         # The product's own two architectures first, then the reference tools.
