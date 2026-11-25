@@ -223,6 +223,20 @@ impl TunHub {
         self.routes.stats()
     }
 
+    /// Forget a claim: its slots, and the flows the table had placed in them.
+    ///
+    /// A rebuilt claim is a **new** claim at the same address. The flows the previous
+    /// one had placed point into slots whose members are gone, so a new visitor's first
+    /// packet is placed where nothing carries it and dropped — measured 2026-11-24: an
+    /// arm whose timeline had been through a block and a rebuild carried the whole
+    /// schedule at 4 Gbit/s and then timed out at the *first* level of the capacity ramp
+    /// until the table forgot those flows by itself (`HANDOFF.md` §4 I).
+    pub fn forget_claim(&self, endpoint: &Endpoint) {
+        if let Ok(mut table) = self.routes.table.lock() {
+            table.remove(endpoint);
+        }
+    }
+
     /// Every member slot of every claim this hub carries, live or empty:
     /// which slot carried how much, and which ones a replacement window cost.
     pub fn member_stats(&self) -> Vec<MemberStat> {
@@ -672,6 +686,32 @@ pub struct MemberStat {
     pub flows: usize,
 }
 
+impl MemberStat {
+    /// Does this slot's lane satisfy the claim's lane allotment *right now*?
+    ///
+    /// Three things have to hold, and the middle one is the defect this method
+    /// exists for: **a lane whose carrier the claim has abandoned cannot deliver
+    /// the claim's traffic**, so counting it as though it were serving leaves the
+    /// claim convinced it holds the lanes it was allotted while nothing it has can
+    /// carry a byte. The peer then asks for a replacement, this end refuses it,
+    /// and the only dial left is the allocator's own — measured 2026-11-23 on a
+    /// claim whose carrier moved off a policed UDP path: `Ignoring a data channel
+    /// request for 2: the claim holds the lanes it was allotted`, seconds after
+    /// `mhd is reachable again`, and the claim carried nothing for the rest of the
+    /// run (`HANDOFF.md` §4 I).
+    ///
+    /// `carrier` is `None` when the slot's dialing end could not say: counting it
+    /// is the conservative answer, because refusing a replacement on a guess is
+    /// the failure this method removes.
+    #[must_use]
+    pub fn satisfies_allotment(&self, endpoint: Endpoint, chosen: Carrier) -> bool {
+        self.endpoint == endpoint
+            && self.live
+            && !self.draining
+            && self.carrier.is_none_or(|carrier| carrier == chosen)
+    }
+}
+
 /// The routing state of one hub, without the device.
 ///
 /// Split from [`TunHub`] on purpose: the member sets and the placement rule are
@@ -1026,6 +1066,17 @@ impl Routes {
                         // apart: a full queue is this end's backpressure, an
                         // absent lane is a replacement window.
                         entry.counters.refuse(count, bytes, lane_absent);
+                        // **And said out loud, at debug.** A frame that finds no
+                        // lane and a frame that never arrives are the same silence
+                        // in every other log this end has: the transparent path's
+                        // recovery was chased for two days as a product defect while
+                        // this was the one question nobody could answer from the
+                        // record (`HANDOFF.md` §4 I).
+                        tracing::debug!(
+                            target: "molehill::transparent",
+                            "l3 frame dropped with no lane claim={endpoint} slot={slot} \
+                             lane_absent={lane_absent} packets={count}"
+                        );
                     }
                     sent
                 }
@@ -1962,6 +2013,55 @@ mod tests {
     use super::*;
     use crate::transparent::ip::PacketInfo;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// One member slot's stat, with only the fields the allotment rule reads
+    /// given values: the rule is about liveness, draining and carrier, and a
+    /// test that spells out every counter would hide which three matter.
+    fn slot(live: bool, draining: bool, carrier: Option<Carrier>) -> MemberStat {
+        MemberStat {
+            endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)), 2401),
+            slot: 0,
+            live,
+            draining,
+            peer_draining: false,
+            lane: None,
+            carrier,
+            forwarded: 0,
+            counters: LaneCounters::default(),
+            remote: None,
+            retired: Vec::new(),
+            no_channel: 0,
+            active_flows: 0,
+            flows: 0,
+        }
+    }
+
+    /// **The defect of 2026-11-23, as a rule.** A claim's allotment is satisfied
+    /// by lanes that can still carry its traffic. A lane whose carrier the claim
+    /// has left is live in the hub's table and useless to the claim: counting it
+    /// made the client refuse the peer's replacement and carry nothing for the
+    /// rest of the run (`HANDOFF.md` §4 I).
+    #[test]
+    fn a_lane_on_an_abandoned_carrier_does_not_satisfy_the_allotment() {
+        let endpoint = Endpoint::new(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)), 2401);
+        let on_mhd = slot(true, false, Some(Carrier::Mhd));
+        let on_tcp = slot(true, false, Some(Carrier::Tcp));
+        let draining = slot(true, true, Some(Carrier::Mhd));
+        let gone = slot(false, false, Some(Carrier::Mhd));
+        let unknown = slot(true, false, None);
+
+        assert!(on_mhd.satisfies_allotment(endpoint, Carrier::Mhd));
+        assert!(!on_mhd.satisfies_allotment(endpoint, Carrier::Tcp));
+        assert!(on_tcp.satisfies_allotment(endpoint, Carrier::Tcp));
+        assert!(!draining.satisfies_allotment(endpoint, Carrier::Mhd));
+        assert!(!gone.satisfies_allotment(endpoint, Carrier::Mhd));
+        // A slot whose dialing end could not say which carrier it rides is
+        // counted: refusing a replacement on a guess is the failure being fixed.
+        assert!(unknown.satisfies_allotment(endpoint, Carrier::Tcp));
+        // Another claim's lane is never this claim's allotment.
+        let other = Endpoint::new(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)), 2402);
+        assert!(!on_mhd.satisfies_allotment(other, Carrier::Mhd));
+    }
 
     /// One IPv4/TCP packet with `payload` bytes after its headers, and a total
     /// length that agrees with the bytes it carries — which is what makes it

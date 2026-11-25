@@ -587,8 +587,53 @@ def timeline_legend() -> list:
         ),
         Patch(color=CLEAN_FACE, label="clean stage"),
         Patch(color=DEGRADED_FACE, label="degraded stage"),
+        Line2D([], [], ls=":", lw=1.1, color="0.35", label="leg boundary"),
         Line2D([], [], ls="", marker="x", color="0.55", label="no reading"),
     ]
+
+
+def stage_legs(cells: list) -> list:
+    """The leg each staged cell imposed its condition on, from the cell's name.
+
+    The name is the record (`loss1@tunnel`), so a figure never has to re-derive
+    the schedule: a stage whose name carries no leg is the default one, the
+    visitor's own connection.
+    """
+    return [
+        cell["cell"].split("@", 1)[1] if "@" in cell["cell"] else model.DEFAULT_LEG
+        for cell in cells
+    ]
+
+
+def mark_legs(axes: list, cells: list) -> None:
+    """Draw where the schedule moves from one leg to the other, and name both.
+
+    A two-leg schedule is two experiments on one axis. Where the leg changes is
+    the one thing on the figure a reader cannot infer from the numbers, and
+    comparing a reading across it is the mistake the leg dimension exists to
+    prevent — so the boundary is drawn and each run of stages is labelled with
+    the leg it imposed its condition on.
+    """
+    legs = stage_legs(cells)
+    if len(set(legs)) == 1:
+        return
+    start = 0
+    for index in range(1, len(legs) + 1):
+        if index < len(legs) and legs[index] == legs[start]:
+            continue
+        if index < len(legs):
+            for ax in axes:
+                ax.axvline(index - 0.5, color="0.35", ls=":", lw=1.1, zorder=1.5)
+        axes[0].annotate(
+            f"{legs[start]} leg",
+            ((start + index - 1) / 2.0, 1.015),
+            xycoords=("data", "axes fraction"),
+            ha="center",
+            va="bottom",
+            fontsize=FONT - 1,
+            color="0.35",
+        )
+        start = index
 
 
 def rtt_panel(ax, run: Run, scenario: str, cells: list, arm: str) -> None:
@@ -685,12 +730,19 @@ def render_timeline(run: Run, out: Path, title: str) -> None:
             bulk_panel(axes[row][1], run, scenario, cells, arm)
     axes[-1][0].set_xticks(range(len(cells)), labels=[cell["cell"] for cell in cells])
     for label in axes[-1][0].get_xticklabels():
-        label.set_rotation(30)
+        label.set_rotation(40)
         label.set_ha("right")
+        label.set_fontsize(FONT - 1)
+    # `sharex` shares the ticks, not the labels: every lower panel draws them, so
+    # an eighteen-stage schedule printed the same row of names twice, on top of
+    # itself. The left one keeps them.
+    for extra in axes[-1][1:]:
+        extra.tick_params(labelbottom=False)
+    mark_legs([row[0] for row in axes], cells)
     fig.legend(
         handles=timeline_legend(),
         loc="upper center",
-        ncol=6,
+        ncol=7,
         bbox_to_anchor=(0.5, 0.965),
         fontsize=FONT - 0.5,
     )
@@ -1115,6 +1167,100 @@ def render_cost(run: Run, out: Path, title: str) -> None:
     save(fig, out)
 
 
+#: Kinds that already own a panel. A scenario of any other kind is one cell per
+#: arm and goes into the exposures panel instead.
+PANELLED_KINDS = (
+    model.Kind.STAGED,
+    model.Kind.CAPACITY,
+    model.Kind.UDP_LADDER,
+    model.Kind.RECONNECT,
+    model.Kind.TRANSPORT,
+    model.Kind.TRANSPORT_LOSS,
+    model.Kind.UDP,
+)
+
+
+def exposure_cells(run: Run) -> list:
+    """Every (scenario, metric, cell) a run carries that no other figure shows.
+
+    A release sweep now includes cells that answer "does the tool keep a
+    promise" rather than "how fast is it" — a half-closed visitor still gets its
+    answer, a fan-out of flows still fits. Without this list those readings were
+    in the file and in no chart.
+    """
+    out: list = []
+    for scenario in run.scenario_ids():
+        if run.kind(scenario) in PANELLED_KINDS:
+            continue
+        spec = model.SCENARIOS.get(scenario)
+        if spec is None or not spec.headline:
+            continue
+        out.extend(
+            (scenario, spec.headline, entry["cell"]) for entry in run.cells(scenario)
+        )
+    return out
+
+
+def render_cells(run: Run, out: Path, title: str) -> None:
+    """The exposure cells: one bar per arm, each cell on its own scale.
+
+    A **zero bar is the finding** here — a tool that delivered nothing after a
+    visitor's half-close draws nothing — so every bar carries its value, while a
+    cell with no reading at all is an `x` above the axis, which is a different
+    statement from a zero.
+
+    One axes per cell, not one axes for all of them: these cells carry different
+    units (Gbit/s, 1/s, bytes) and their ranges differ by five orders of
+    magnitude, so a shared y-axis draws the bulk bars as a line on the floor.
+    """
+    cells = exposure_cells(run)
+    if not cells or not run.arms:
+        return
+    fig, axes = plt.subplots(
+        1, len(cells), figsize=(2.5 * len(cells) + 2.4, 4.6), squeeze=False
+    )
+    for ax, (scenario, metric, cell) in zip(axes[0], cells, strict=True):
+        spec = model.METRICS[metric]
+        values = [run.median(scenario, cell, arm, metric) for arm in run.arms]
+        drawn = [value for value in values if value is not None]
+        top = max(drawn) if drawn and max(drawn) > 0 else 1.0
+        ax.set_ylim(0, top * 1.18)
+        for slot, (arm, value) in enumerate(zip(run.arms, values, strict=True)):
+            if value is None:
+                ax.plot([slot], [0.0], marker="x", ms=4, color="0.55", clip_on=False)
+                continue
+            ax.bar(slot, value, width=0.8, color=run.color(arm))
+            ax.annotate(
+                f"{value:g}",
+                (slot, value),
+                ha="center",
+                va="bottom",
+                fontsize=FONT - 1.5,
+                color="0.25",
+            )
+        ax.set_xticks(
+            range(len(run.arms)),
+            labels=run.arms,
+            rotation=30,
+            ha="right",
+            fontsize=FONT - 1,
+        )
+        ax.set_title(f"{scenario} [{cell}]" if cell else scenario, fontsize=FONT, pad=6)
+        ax.set_ylabel(f"{metric} ({spec.unit})", fontsize=FONT - 1)
+    fig.suptitle(
+        caption(
+            title,
+            "exposure cells — one bar per arm, each on its own scale; "
+            "a zero bar is a reading, x is none",
+        ),
+        y=0.97,
+        fontsize=FONT + 3,
+    )
+    footer(fig, run)
+    fig.tight_layout(rect=(0, footer_reserve(fig), 1, 0.92))
+    save(fig, out)
+
+
 def _cost_note(run: Run, cells: list) -> str:
     """Why an arm may have no bar: the control runs no tool to charge CPU to."""
     measured = {
@@ -1139,8 +1285,23 @@ def table_header(labels: list) -> list:
     return [row_line(["arm", *labels]), "|---" * (len(labels) + 1) + "|"]
 
 
+def split_by_leg(names: list) -> list:
+    """Cell names grouped by the leg they were measured on, in schedule order.
+
+    A table that puts a visitor-leg column beside a tunnel-leg column invites the
+    one comparison the schedule forbids — the two are different experiments — so
+    every table is emitted per leg. A name with no `@leg` was measured on the
+    default leg, the visitor's own connection.
+    """
+    groups: dict = {}
+    for name in names:
+        leg = name.split("@", 1)[1] if "@" in name else model.DEFAULT_LEG
+        groups.setdefault(leg, []).append(name)
+    return list(groups.items())
+
+
 def headline_section(run: Run) -> list:
-    """One table per scenario: the metric its claim rests on, per cell and arm."""
+    """One table per scenario and leg: the metric its claim rests on, per arm."""
     sections: list = []
     for scenario in run.scenario_ids():
         metric = run.headline(scenario)
@@ -1148,26 +1309,33 @@ def headline_section(run: Run) -> list:
         if metric not in model.METRICS or not cells:
             continue
         unit = model.METRICS[metric].unit
-        lines = [f"#### {scenario} — {metric} ({unit})", ""]
-        lines += table_header([cell["cell"] or scenario for cell in cells])
-        for arm in run.arms:
-            lines.append(
-                row_line(
-                    [
-                        arm,
-                        *[
-                            reading(run, scenario, cell["cell"], arm, metric)
-                            for cell in cells
-                        ],
-                    ]
+        names = [cell["cell"] or scenario for cell in cells]
+        for leg, leg_names in split_by_leg(names):
+            lines = [f"#### {scenario} — {metric} ({unit}) — {leg} leg", ""]
+            lines += table_header(leg_names)
+            for arm in run.arms:
+                lines.append(
+                    row_line(
+                        [
+                            arm,
+                            *[
+                                reading(run, scenario, name, arm, metric)
+                                for name in leg_names
+                            ],
+                        ]
+                    )
                 )
-            )
-        sections += [*lines, ""]
+            sections += [*lines, ""]
     return ["### Headline metric per cell", "", *sections] if sections else []
 
 
 def stage_section(run: Run) -> list:
-    """Per stage: the interactive p99, the statistic the SLO is stated in."""
+    """Per stage: the interactive p99, the statistic the SLO is stated in.
+
+    Emitted per leg, because the leg is the experiment: the same condition on the
+    visitor's connection and on the hop the tool owns are two different questions
+    and a single table put them in adjacent columns.
+    """
     rows = [
         (scenario, cell["cell"])
         for scenario in run.scenarios_of(model.Kind.STAGED)
@@ -1179,20 +1347,74 @@ def stage_section(run: Run) -> list:
     labels = [
         cell if len(scenarios) == 1 else f"{scenario} {cell}" for scenario, cell in rows
     ]
-    lines = ["### Per stage: interactive p99 (ms)", "", *table_header(labels)]
-    lines += [
-        row_line(
-            [
-                arm,
-                *[
-                    reading(run, scenario, cell, arm, "rtt_p99_ms")
-                    for scenario, cell in rows
-                ],
-            ]
-        )
-        for arm in run.arms
+    blocks: list = []
+    for leg, leg_labels in split_by_leg(labels):
+        keep = [
+            row for row, label in zip(rows, labels, strict=True) if label in leg_labels
+        ]
+        lines = [
+            f"### Per stage: interactive p99 (ms) — {leg} leg",
+            "",
+            *table_header(leg_labels),
+        ]
+        lines += [
+            row_line(
+                [
+                    arm,
+                    *[
+                        reading(run, scenario, cell, arm, "rtt_p99_ms")
+                        for scenario, cell in keep
+                    ],
+                ]
+            )
+            for arm in run.arms
+        ]
+        blocks += [*lines, ""]
+    return blocks
+
+
+def throughput_section(run: Run) -> list:
+    """Per stage: the bulk spine, leg-split like everything else.
+
+    The figure draws this under each arm's tail, and the release table quotes it,
+    so it belongs in the printed tables too: a published throughput number whose
+    only home is a `jq` extraction is a number a reader cannot reproduce.
+    """
+    rows = [
+        (scenario, cell["cell"])
+        for scenario in run.scenarios_of(model.Kind.STAGED)
+        for cell in stage_cells(run, scenario)
     ]
-    return [*lines, ""]
+    if not rows:
+        return []
+    scenarios = {scenario for scenario, _ in rows}
+    labels = [
+        cell if len(scenarios) == 1 else f"{scenario} {cell}" for scenario, cell in rows
+    ]
+    blocks: list = []
+    for leg, leg_labels in split_by_leg(labels):
+        keep = [
+            row for row, label in zip(rows, labels, strict=True) if label in leg_labels
+        ]
+        lines = [
+            f"### Per stage: bulk throughput (Gbit/s) — {leg} leg",
+            "",
+            *table_header(leg_labels),
+        ]
+        lines += [
+            row_line(
+                [
+                    arm,
+                    *[
+                        reading(run, scenario, cell, arm, "throughput_gbps")
+                        for scenario, cell in keep
+                    ],
+                ]
+            )
+            for arm in run.arms
+        ]
+        blocks += [*lines, ""]
+    return blocks
 
 
 def udp_section(run: Run) -> list:
@@ -1319,6 +1541,7 @@ def tables(run: Run, title: str) -> str:
     ]
     lines += headline_section(run)
     lines += stage_section(run)
+    lines += throughput_section(run)
     lines += udp_section(run)
     lines += drift_section(run)
     lines += cost_section(run)
@@ -1331,6 +1554,7 @@ FIGURES = (
     ("timeline", render_timeline),
     ("stages", render_stages),
     ("capacity", render_capacity),
+    ("cells", render_cells),
     ("udp", render_udp),
     ("drift", render_drift),
     ("cost", render_cost),

@@ -104,45 +104,33 @@ The same run as small multiples — one panel per stage, a lollipop per tool:
 
 ![Interactive RTT per stage, per tool](assets/bench-v1.0.0-stages.png)
 
-**Interactive stream RTT p99, per stage** (ms). Every stage after `clean` is
-shaped — the harness installed the queue or the delay that dominates it — so no
-winner is marked in those columns. Sample counts and the full reading rules:
-[Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
+**Interactive stream RTT p99, per stage, on each leg** (ms). Every stage after
+`clean` is shaped — the harness installed the queue or the delay that dominates
+it — so no winner is marked in those columns. Sample counts and the full reading
+rules: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
-| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
-|---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 7.689 | 401.470 | 1073.018 | 2450.189 | 197.008 | 434.016 | 106.208 | 1.942 |
-| molehill (L3) | 2.150 | 401.667 | 1061.883 | 2478.847 | 197.609 | 431.594 | 106.362 | 1.450 |
-| frp | 2.234 | 402.024 | 1080.589 | 2088.327 | 194.918 | 425.647 | 105.852 | 7.362 |
-| rathole | 2.154 | 401.305 | 1061.774 | 2042.192 | 197.831 | 426.570 | 107.056 | 2.170 |
-| nps | 101.266 | 500.894 | 1075.239 | 2094.287 | 196.248 | 425.525 | 165.809 | 72.158 |
+| tool | clean | rtt100 | loss1 | loss1_deep | loss5 | rate20 | rate100 | rate100_shallow | loss1_rate100 | jitter | clean (repeat) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| molehill (L4) | 4.434 | 401.552 | 1072.768 | 1053.098 | 2212.327 | 433.168 | 195.660 | 2894.120 | 1180.588 | 106.501 | 2.239 |
+| molehill (L3) | 2.035 | 402.104 | 1059.330 | 1065.152 | 2049.744 | 429.041 | 195.373 | 82.394 | 1189.158 | 105.886 | 10.520 |
+| frp | 1.989 | 401.548 | 1069.314 | 1070.820 | 2053.390 | 426.833 | 196.842 | 3442.223 | 1201.561 | 108.424 | 15.530 |
+| rathole | 2.394 | 401.780 | 1068.491 | 1065.593 | 2461.230 | 437.597 | 196.757 | 3679.847 | 1192.447 | 106.141 | 1.909 |
+| nps | 70.661 | 602.125 | 1060.053 | 1086.395 | 2077.155 | 429.029 | 195.927 | 3917.243 | 1215.476 | 148.906 | 201.264 |
 
-**Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
-not its best second).
+The **tunnel leg** is the second half of the schedule — the hop the tool owns,
+where its own carrier lives — and it is the half that separates the architectures:
+at 1 % loss under the carrier `molehill (L3)` answers in **61 ms** where the
+tool-free control needs **1 066 ms**, and when the network refuses UDP outright it
+answers in **8.6 ms** because its claim recovers its lanes. Full tunnel-leg table:
+[Benchmarks](./docs/benchmarks.md#where-the-product-stands-against-the-peers-2026-11-25-this-model).
 
-| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
-|---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 9.203 | 3.396 | 12.422 | 1.073 | 0.094 | 0.019 | 11.666 | 15.568 |
-| molehill (L3) | 10.132 | 3.180 | 8.078 | 1.039 | 0.093 | 0.019 | 9.570 | 10.170 |
-| frp | 6.061 | 3.373 | 6.172 | 1.152 | 0.094 | 0.019 | 6.181 | 6.052 |
-| rathole | 28.568 | 3.393 | 14.696 | 1.204 | 0.094 | 0.019 | 14.203 | 28.446 |
-| nps | 0.134 | 0.136 | 0.134 | 0.136 | 0.094 | 0.019 | 0.134 | 0.134 |
+Bulk throughput is in the charts below and in
+[Benchmarks](./docs/benchmarks.md#where-the-product-stands-against-the-peers-2026-11-25-this-model).
+The capacity ramp sustains **8 of 8 streams** for the control, `molehill` (both
+architectures) and rathole, 7 for nps and 4 for frp; the half-close cell delivers
+the answer a half-closed visitor is owed for the same four and none for the other
+two.
 
-**How to read it.** On every shaped stage the four forwarding tools are within a
-few per cent of each other: a shaped path is the queue, not the tool. The `loss5`
-column's spread (2042–2479 ms) is three samples wide, because a serial probe
-completes about 220 requests in that stage's 120 s. On the clean cell the
-product's L4 arm reads 7.689 ms in the first stage and 1.942 ms in the last,
-while frp reads the reverse (2.234 then 7.362) — that cell is bimodal for every
-arm that forwards in user space, so one round cannot rank it. Bulk is where the
-arms separate: rathole carries the most on every unshaped stage, the product is
-second on the two lossy ones (12.4 against frp's 6.2 at 1 % loss) and third on
-the clean one, and its own clean figure moves 9.203 → 15.568 between two stages
-of the same condition — the stage order disagrees with itself, as
-[warm and cold](./docs/benchmarks.md#warm-and-cold) documents for the tail. What
-the carrier policy itself costs — a session's first streams land where the pool
-already rides — is measured in
-[Benchmarks](./docs/benchmarks.md#where-mhd-wins-and-where-it-loses-2026-11-19).
 
 **How to read the arms.** `molehill (L3)` is this project's second architecture,
 not a fifth tool: its comparison is `molehill (L4)` and the tool-free control

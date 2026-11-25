@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-11-22
+## [1.0.0] - 2026-11-23
 
 ### Known gaps
 
@@ -214,6 +214,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A cell asks the one question a rate cannot: does a half-closed visitor still
+  get its answer?** `half-close` sends a request, shuts its own send direction
+  and still expects the rest of the response — the shape a
+  `curl --data-binary @-` pipeline, a shell heredoc into a service, or any client
+  that cannot know how much it is owed produces — so a tool that forwards the
+  half-close as a close returns a truncated response with no error anywhere. The
+  metric is the bytes that still arrive after the half-close; the backend owes
+  them only *after* it has seen the visitor's end (a four-byte self-identification
+  keeps every other scenario's echo path untouched), and the tool-free control
+  arm states that the cell can read all of them. In its first runs it separates
+  the field at once: **two of the three reference tools returned zero bytes on
+  every attempt** while this repository's carrier, one peer and the control arm
+  returned the whole tail. The `sweep` profile carries it now — it is a
+  categorical cell, so one round decides it — and `just bench plot` draws it
+  beside any other single cell the run carried, one axes per cell and its own
+  scale, with a zero bar kept as the reading it is rather than drawn as an
+  absence. The **rate** cells (`bulk-1`, `rr-16`) are a new `compare` profile
+  instead, with three rounds and an A/A twin: a single round cannot order arms
+  that a twin of one arm differs from by 1.5 %.
+
+- **A `stall` cell was built, measured twice, and removed.** It held eight
+  visitors that never read (4 KiB receive buffers, 48 MiB each offered) and timed
+  a ninth — the operator's question "does one broken visitor cost the next one".
+  On a clean path the ninth was served in **0.66–1.28 ms** against the control
+  arm's **0.85**, and on a 1 %-loss path every arm read that path's own round trip
+  (**40.90–41.51 ms** against 40.92). A cell whose readings *are* the control
+  arm's number cannot order anything, so it is not a published metric. The
+  finding — no tool in this set serialises a service's visitors — and the reason
+  are in [Benchmarks](docs/benchmarks.md#what-the-model-cannot-answer).
+
 - **A staged run can start a named subset of its probe series**
   (`just bench run --series interactive`). The three series are three separate
   measurements of one network — the staged `rtt_p99_ms` comes from the
@@ -314,6 +344,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a hundred-millisecond threshold.
 
 ### Fixed
+
+- **A transparent claim that has lost every lane gets one back.** A claim whose
+  lanes all ended — which is what a network that refuses the carrier's datagrams
+  does to them — was dialled for by nobody: the lane allocator skips a claim with
+  no lane on purpose (its lanes may still be joining) and the peer only asks for a
+  channel when it has a visitor to place, which it cannot do without a lane. The
+  client now dials a replacement for a claim that has had a grace period and still
+  holds no lane, and a claim that has no lane no longer has its dial backoff reset
+  on every tick by a plan that says nothing is short. On the server side, a claim
+  whose task **stopped serving while the service stayed registered** now says so at
+  `WARN` and reports the death the way an error does, so the service's control path
+  ends and the client re-registers it instead of opening lanes into a queue nobody
+  reads (`early eof`, for ever). A claim's lane failure also carries its reason at
+  `WARN` now — it was `DEBUG`, which is why the first bench-standard record shows a
+  claim carrying nothing for twenty minutes with no line saying why.
+- **A transparent claim no longer loses its data plane for the rest of the
+  session when a carrier move cannot complete.** A claim whose lane moved off a
+  carrier that had started refusing its traffic asked the peer to drain the lane
+  so its replacement could ride the other carrier; when that handover did not
+  answer, the client kept the lane it had abandoned — and its allotment test
+  counted that lane as serving, because a lane whose carrier is unreachable is
+  still *live* in the hub's table. The peer then offered a replacement and this
+  end refused it: `Ignoring a data channel request for 2: the claim holds the
+  lanes it was allotted`. Measured on a network that refuses UDP under the
+  carrier (`udp_blocked@tunnel`): **100 % interactive error on the next clean
+  stage, 0 of 8 streams on the capacity ramp, a failed half-close cell and a
+  455 s silence**, for the remaining twenty minutes of the run. Three rules now
+  hold: only a lane that is **live, not draining and on the claim's current
+  carrier** satisfies its allotment; a dial that *restores* a lost lane no longer
+  raises the want (only a lend, which transfers a lane, does), so a failed dial
+  cannot inflate it; and a claim that cannot get a lane backs off from one second
+  to thirty with a single `WARN` instead of a line a second at `INFO`. Regression
+  tests: `a_lane_on_an_abandoned_carrier_does_not_satisfy_the_allotment`,
+  `a_claim_that_cannot_get_a_lane_backs_off`; the acceptance test is the six-arm
+  standard sweep, whose gate named this defect in the first place.
 
 - **A lane's first packet now reaches the peer.** The datagram batch was sized from
   its *first* span and accepted a tail that was shorter, so the kernel split the
@@ -594,6 +659,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symptom beyond the sender reporting that the peer's credit was blocking it.
 
 ### Changed
+
+- **The bench is the product's only feedback channel now, and it says so.** A
+  release record may claim a **per-cell fact** — the SLO held, a wedge or none,
+  the capacity ramp, a categorical cell, which side of a declared threshold a
+  reading falls on — and it may **not** claim that one arm is faster than
+  another: one round carries no noise estimate of its own, and a twin of the same
+  arm has been measured 1.5 % away from itself on a bulk cell. A difference claim
+  belongs to `compare` (three rounds, a warm-up and an A/A twin, ~400 s), and the
+  release record is the coverage and stability artifact. Both rules, the trust
+  checklist behind them and the revision rule are
+  [Benchmarks, "The standard"](docs/benchmarks.md#the-standard-what-this-bench-is-for-and-what-it-may-claim).
+- **The release schedule covers the deployment classes on the leg where each one
+  actually happens.** Eighteen stages: ten on the **visitor's** connection (a
+  healthy path bracketing the walk, distance, light loss and the same loss with a
+  queue that does not tail-drop, heavy loss, a 20 and a 100 Mbit uplink, the same
+  100 Mbit with an 11 ms queue, a mobile path losing and rate-capped at once, and
+  jitter) and seven on the **tunnel's** — the hop the tool owns and the only place
+  a carrier's own transport can be measured (distance, light and heavy loss,
+  bufferbloat, a 1 280-byte MTU, UDP policed, UDP refused). Two of the visitor
+  rows are **pairs that vary one parameter** (a queue depth at one loss rate, then
+  at one rate) and four conditions are walked on **both legs**, which is the
+  controlled comparison the page now states: a reading from one leg is never
+  compared with a reading from the other. The schedule is one release run of about
+  three hours for five arms; `just bench gate` refuses a record missing a declared
+  cell, because a coverage that shrinks silently is the one failure a reader
+  cannot see. Measured before it was written down: a 1 280-byte MTU on the
+  *visitor* leg moved no arm's reading (control 41.39, rathole 8.96, molehill 3.82
+  Gbit/s against the clean cell's 40.45 / 9.83 / 4.00), and 1 % loss with a 100
+  Mbit cap put every arm on the shaper's own number — the class belongs on the
+  leg that owns it or it measures the harness.
 
 - **A session that carries only bulk services moves its pool to the kernel
   carrier.** The pool has read each service's class and used it to place

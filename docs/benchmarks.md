@@ -64,13 +64,78 @@ dashed line in every chart, and what the gate checks on the clean stages.
 Degraded stages are *expected* to sit far above it — that is the measurement,
 not a failure.
 
+## The standard: what this bench is for, and what it may claim
+
+This page describes **the** instrument, not one of several. From v1.0.0 on, a
+question about how the product behaves on a network is answered here or it is
+answered by a guess: the bench is the product's only feedback channel, so it is
+held to two standards at once — it must **cover** the networks the product is
+expected to meet, and it must **not be able to lie** about them. Everything in
+this section is a rule the rest of the page obeys.
+
+**Two artifacts, two kinds of claim.** They are different instruments and mixing
+them is how a number becomes a story:
+
+| artifact | profile | what it may claim | what it may not |
+|---|---|---|---|
+| the **release record** (`benches/records/results-bench-vX.Y.Z.json`) | `sweep` (one round) | a per-cell fact: the SLO held or did not, a wedge or none, the capacity ramp, a **categorical** cell (a half-closed visitor was answered or was not), which side of a declared threshold a reading falls on | that one arm is faster than another, or by how much |
+| a **comparison record** (`~/tmp/…`, never a release artifact) | `compare`, `dev`, `screen` (rounds + an A/A twin) | a difference that clears the metric's floor **and** the run's own measured noise, with its interval | anything about a network class the run did not walk |
+
+A one-round release record can say *"on this cell the tool met the SLO and that
+one did not"*. It cannot say *"this tool is 10 % faster"*: one round has no
+noise estimate of its own, and a twin arm has been measured to differ from itself
+by 1.5 % on a bulk cell. A rate comparison therefore happens in `compare`, and
+the release record is the **coverage and stability** artifact.
+
+**Every comparison here is controlled, and the control is stated.** Three forms,
+marked in the schedule table below: a **control arm** with no tool in the path
+(so an arm-to-arm difference is the tool, not the host); a **pair** that varies
+one parameter at one condition (a queue depth), so "the shaper did it" and "the
+tool did it" can be told apart; and a condition measured on **both legs** — the
+visitor's connection and the hop the tool owns — so the difference between the
+two rows isolates the tool's own transport. A reading from one leg is never
+compared with a reading from the other.
+
+**Coverage is declared, and the gate enforces it.** The release schedule walks
+eighteen stages over every deployment class the product is meant to survive
+(below). `expected_cells` derives that list from the same schedule the workload
+runs, and `just bench gate` refuses a record that is missing a cell it declared:
+a release artifact whose coverage silently shrank is the one failure a reader
+cannot see.
+
+**A change to the bench is a revision, not an edit.** Anything under
+`bench/src/bench/` moves the method fingerprint, so it invalidates every record
+measured before it. Therefore: a change lands with (1) the reason in
+`CHANGELOG.md`, (2) a re-baseline — the next record measured under the new method
+becomes the baseline and `just bench gate` is run without `--baseline`, (3) the
+affected tables in this page and the landing page's benchmark section updated in
+the same commit, and (4) `HANDOFF.md` told what moved and what it cost. Adding a
+scenario "to see" is not a revision: measure it as a diagnostic first, and only a
+scenario that separates arms or asks a categorical question earns a place in the
+schedule. And **nothing under `bench/src/bench/` may change while a release run
+is in flight** — the record names the revision it measured and the release review
+diffs that revision against the tag commit, so a plotter fix committed mid-run
+makes the artifact unusable for a release. That is not a hypothetical: two commits
+landed three minutes into a four-hour run on 2026-11-22 and the run was restarted.
+
+**What trust rests on, mechanically** — every item is a check, not an intention:
+the record names its revision, tree state, host and fingerprint before its first
+sample; the endpoint invariant is re-checked on the recorded samples; a missing
+number is a typed absence with its reason, never a zero; the analysis version is
+part of a record, so an old file cannot be re-read as a new one; the tool-free
+control arm runs every cell a tool arm runs **and the release profile includes
+it**, because a published reading with no floor of its own is a number without a
+scale; and the drift, wedge and capacity axes are gated rather than reported.
+
 ## The bench model (the measurement standard)
 
 `bench/src/bench/` is the standard and the only runner. The sweep the
 release publishes is not a second instrument: it is this model's `sweep`
-profile — the `timeline` and `capacity` scenarios over the product and the
-reference tools — which is why the staged schedule and the load ramp travel in
-one results file, under one schema, behind one gate.
+profile — the eighteen-stage `timeline` over two legs, the `capacity` ramp and the
+`half-close` cell, over the tool-free control, the product and the reference tools —
+which is why the
+schedule, the ramp and the categorical cell travel in one results file, under one
+schema, behind one gate.
 
 ```bash
 sudo -n just bench                     # the smoke profile, about a minute
@@ -240,6 +305,7 @@ the definitions are what the report and the verdict render.
 | `rtt_p99_ms` | ms | lower is better | nearest-rank 99th percentile of the probe's round trips | one request/response pair |
 | `rtt_max_ms` | ms | lower is better | worst single round trip the probe observed | one request/response pair |
 | `rtt_samples` | count | context, not a verdict | round trips the percentile is taken over | none (sample count) |
+| `half_close_bytes` | byte | higher is better | bytes a visitor still receives after it shut its own send direction: a tool that forwards the half-close as a close returns zero, and the response is truncated with no error anywhere | one half-closed connection |
 | `udp_recv_mbit` | Mbit/s | higher is better | datagrams the probe received x payload / the probe's own measured window (which for a blast includes the drain) | the probe's receive window |
 | `udp_loss_pct` | % | lower is better | (datagrams sent - datagrams received) / datagrams sent | datagrams the probe sent |
 | `udp_gap_p99_ms` | ms | lower is better | 99th percentile of the gaps between replies the probe received | one received datagram |
@@ -295,6 +361,7 @@ Two conventions the table cannot state, because they belong to the workload:
 | `bulk-n` | `bulk` | whether N streams aggregate, or share one ceiling | `throughput_gbps` |
 | `bulk-pair` | `bulk-pair` | whether two services (or two L3 claims) each carry a full stream, which separates a per-flow ceiling from a per-host one | `throughput_gbps` |
 | `two-wave` | `two-wave` | whether a carrier decision the pool learned during a warm stream reaches the streams that open after it — a settle between the waves is what lets the pool dial and trim before the measured one | `throughput_gbps` |
+| `half-close` | `half-close` | whether a tool keeps the server-to-visitor direction alive after the visitor has shut its own — a truncated response that no latency or throughput cell can show | `half_close_bytes` |
 | `rr-1` | `rr` | the round-trip rate and latency of one strict request/response flow | `rtt_p99_ms` |
 | `rr-16` | `rr` | the same, 16 flows at once: aggregate rate and tail latency | `rate_per_s` |
 | `churn-16` | `rr` | a fresh connection per request: what a visitor pays to arrive, as the first request's round trip on each new connection | `rtt_p99_ms` |
@@ -334,22 +401,23 @@ publishes; `--scale` shortens or lengthens every staged timeline's holds
 without changing the schedule's *shape*, and because the scale lands in the
 fingerprint, a shortened run can never be mistaken for a published one.
 
-| profile | rounds | budget per arm | what it is for |
+| profile | rounds | budget (whole run) | what it is for |
 |---|---|---|---|
 | `smoke` | 2 (+1 warm-up) | ~45 s | the fast loop: every headline metric, seconds not minutes |
 | `dev` | 4 (+1 warm-up) | ~150 s | the default for an optimization: every scenario, minutes |
-| `full` | 6 (+1 warm-up) | ~420 s | the release-grade sweep: everything, for as long as it takes |
+| `full` | 6 (+1 warm-up) | ~420 s | every scenario the model has, for as long as it takes: a diagnostic, not the release artifact |
 | `stage` | 2 (+1 warm-up) | ~150 s | one condition, the whole workload: a shape question, minutes |
 | `step` | 1 (+0 warm-up) | ~90 s | the robustness axis: the path changes between stages while one interactive stream runs across both boundaries |
 | `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
 | `wedge` | 1 (+0 warm-up) | ~2400 s | the soak's interactive silence, **provoked**: the product twice on one host, which is the load at which it appears. A diagnostic, not a gate |
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
-| `sweep` | 1 (+0 warm-up) | ~3000 s | the release sweep: the staged schedule and the load ramp |
+| `sweep` | 1 (+0 warm-up) | ~18 500 s | the release sweep: the tool-free control, the product and the peers over the eighteen-stage two-leg schedule, the load ramp and the `half-close` cell |
+| `compare` | 3 (+1 warm-up), A/A twin | ~400 s | arms side by side on the single cells (`bulk-1`, `rr-16`, `half-close`): a comparison, never a release artifact |
 | `nobulk` | 2 (+1 warm-up) | ~300 s | the same staged timeline with the bulk spine removed: a diagnostic, not a gate |
 | `carrier` | 3 (+0 warm-up) | ~240 s | one condition held long, bulk spine off: is the L3 wedge the carrier alone? |
 
 ## How to read the charts
-Six figures, each answering one question, each drawn only when the run carried
+Seven figures, each answering one question, each drawn only when the run carried
 that data and each carrying its method in the footer:
 
 - **the timeline master** — per arm, the interactive stream's per-stage p50
@@ -368,11 +436,23 @@ that data and each carrying its method in the footer:
 - **the drift panels** — RSS, open descriptors and threads over the run, with
   the fitted slope per minute printed: a leak is a slope, not a level;
 - **the cost bars** — CPU-seconds per carried Gbit per arm, the number the
-  CPU-cost metric is for.
+  CPU-cost metric is for;
+- **the exposure cells** — one bar per arm for each single-cell comparison the
+  run carried (`bulk-1`, `rr-16`, `half-close`), each on **its own scale**
+  because their units are unrelated. A **zero bar is a reading** — a tool that
+  returns nothing after a visitor's half-close drew that — and an `x` is a
+  missing one.
 
 A cell that carried no reading is drawn as `x` and printed as `- (reason)`,
 never as `0`: "the path carried nothing" and "nobody could measure what it
 carried" are different findings.
+
+**Every figure and every printed table keeps the two legs apart.** A stage that
+imposed its condition on the visitor's connection and one that imposed it on the
+hop the tool owns are different experiments, so the master draws the boundary and
+labels each run of stages, and the tables are emitted per leg rather than with a
+visitor column beside a tunnel one. A comparison across that line is not a
+comparison the schedule supports.
 
 ### How to read a cell
 
@@ -455,10 +535,11 @@ ordered list of stages, each a condition held for a number of seconds. Which
 timeline a run used is recorded in its results file, together with the scale
 applied to its holds.
 
-- **`sweep`** is the release schedule: `clean` → `rtt100` → `loss1` → `loss5` →
-  `rate100` → `rate20` → `jitter` → `clean`, and it ends where it started,
-  because whether a tool is still the tool it was after the path recovers is
-  part of the question;
+- **`sweep`** is the release schedule: eighteen stages, each a deployment class
+  imposed **on the leg where that class actually happens** — the visitor's own
+  connection, or the hop the tool owns (its carrier). It brackets the walk with
+  the same condition at both ends, because whether a tool is still the tool it
+  was after all of it is part of the question;
 - **`soak`** rotates a shorter one for a longer time: `clean` → `loss1` →
   `rtt100` → `loss5` → `clean`;
 - **`single`** is one stage — the fixed operating point a `cost` or a `screen`
@@ -486,23 +567,45 @@ release configuration, because a run without the interactive series has no stage
 A **single-condition** run (`--condition NAME`, on every other scenario) is the
 same vocabulary without the schedule: one cell, one condition, one number.
 
-| Stage | What it emulates | Applied to the path | `sweep` hold |
-|---|---|---|---|
-| `clean` | a healthy network (the control) | nothing | 150 s |
-| `rtt100` | a long-haul or satellite link | 100 ms delay, 10 000-packet queue | 120 s |
-| `loss1` | a lossy wifi or mobile link | 10 ms delay, 1 % loss, 1 000-packet queue (this class means to tail-drop) | 120 s |
-| `loss5` | a badly congested path | 100 ms delay, 5 % loss, 10 000-packet queue | 120 s |
-| `rate100` | a 100 Mbit uplink | 100 Mbit/s, 20 ms delay, 2000-packet queue | 120 s |
-| `rate1000` | a gigabit metro link, short enough that a window ceiling cannot hide behind a long round trip | 1 Gbit/s, 2 ms delay, 4000-packet queue | focused cell only |
-| `rate100_shallow` | a 100 Mbit uplink with an ~11 ms queue: shallow enough that a sender without a loss response overruns it, so the drops are its own rate | 100 Mbit/s, 20 ms delay, 100-packet queue | focused cell only |
-| `rate20` | a 20 Mbit/s uplink | 20 Mbit/s, 40 ms delay, 2000-packet queue | 120 s |
-| `loss1_rate100` | a 100 Mbit uplink that also loses packets — the lossy WAN the carriers are chosen for | 100 Mbit/s, 20 ms delay, 1 % loss | focused cell only |
-| `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms, 10 000-packet queue | 120 s |
-| `loss1_buf` | a lossy path with a large but finite buffer: deep enough that tail drops are not the story, shallow enough not to inflate RTT (10 000 packets ≈ 14.7 MB, ≈ 27 ms of standing queue at 545 Mbit/s) | 10 ms delay, 1 % loss, 10 000-packet queue | focused cell only |
-| `loss1_deep` | the same 1 % loss with a queue deep enough not to tail-drop — it tells a carrier's loss recovery apart from the shaper's own drops | 10 ms delay, 1 % loss, 100 000-packet queue | focused cell only |
-| `udp_throttled` | a path that **polices** UDP instead of refusing it: the carrier riding UDP still establishes, but only carries what the policer admits (10 000 packets/s ≈ 117 Mbit/s of 1472-byte datagrams) while a carrier that does not ride UDP is untouched | `iptables -m limit` accept-then-drop for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
-| `udp_blocked` | a path that drops UDP: the data plane's first carrier cannot be established, so the run measures the **TCP fallback** | `iptables -j DROP` for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
-| `clean` | recovery — is the tool still the tool it was? | nothing | 150 s |
+| # | stage | leg | what it emulates | applied to the path | hold |
+|---|---|---|---|---|---|
+| 1 | `clean` | visitor | a healthy network — **the control for every row below** | nothing | 150 s |
+| 2 | `rtt100` | visitor | a long-haul or satellite link | 100 ms delay, 10 000-packet queue | 120 s |
+| 3 | `loss1` | visitor | a lossy wifi or mobile link | 10 ms delay, 1 % loss, 1 000-packet queue (this class means to tail-drop) | 120 s |
+| 4 | `loss1_deep` | visitor | † the same loss with a queue deep enough not to tail-drop: the pair's one varying parameter is the queue | 10 ms delay, 1 % loss, 100 000-packet queue | 120 s |
+| 5 | `loss5` | visitor | a badly congested path | 100 ms delay, 5 % loss, 10 000-packet queue | 120 s |
+| 6 | `rate20` | visitor | a 20 Mbit/s uplink | 20 Mbit/s, 40 ms delay, 2000-packet queue | 120 s |
+| 7 | `rate100` | visitor | a 100 Mbit/s uplink | 100 Mbit/s, 20 ms delay, 2000-packet queue | 120 s |
+| 8 | `rate100_shallow` | visitor | † the same rate with an ~11 ms queue — bufferbloat, and the second pair's only varying parameter | 100 Mbit/s, 20 ms delay, 100-packet queue | 120 s |
+| 9 | `loss1_rate100` | visitor | a mobile or hotspot path: loss and a rate cap at once | 100 Mbit/s, 20 ms delay, 1 % loss | 120 s |
+| 10 | `jitter` | visitor | delay that moves under the flow | 20 ms delay ± 10 ms, 10 000-packet queue | 120 s |
+| 11 | `rtt100@tunnel` | tunnel | ‡ the same distance, now under the tool's own carrier | 100 ms delay, 10 000-packet queue | 120 s |
+| 12 | `loss1@tunnel` | tunnel | ‡ the same light loss under the carrier: repair inside a round trip, or a retransmission timer | 10 ms delay, 1 % loss, 1 000-packet queue | 120 s |
+| 13 | `loss5@tunnel` | tunnel | ‡ the same heavy loss under the carrier | 100 ms delay, 5 % loss, 10 000-packet queue | 120 s |
+| 14 | `rate100_shallow@tunnel` | tunnel | ‡ the same bufferbloat inside the carrier's own queue | 100 Mbit/s, 20 ms delay, 100-packet queue | 120 s |
+| 15 | `mtu1280@tunnel` | tunnel | a tunnel or IPv6-minimum path: do the carrier's own packets fit? | interface MTU 1280 on the tunnel leg | 120 s |
+| 16 | `udp_throttled@tunnel` | tunnel | a network that **polices** UDP: the carrier still establishes, but carries only what the policer admits (10 000 packets/s ≈ 117 Mbit/s of 1472-byte datagrams) while a carrier that does not ride UDP is untouched | `iptables -m limit` accept-then-drop for UDP | 120 s |
+| 17 | `udp_blocked@tunnel` | tunnel | a network that refuses UDP: the data plane's first carrier cannot be established, so the stage measures the **TCP fallback** | `iptables -j DROP` for UDP | 120 s |
+| 18 | `clean` | visitor | recovery — is the tool still the tool it was? | nothing | 150 s |
+
+**Every row is one of three controlled comparisons, and a reader has to say
+which one they are making.** † marks a pair that varies **one** parameter at one
+rate — a queue depth — so it can answer "is this the shaper, or the tool". ‡
+marks a condition measured on **both legs**: `loss1` and `loss1@tunnel` differ in
+exactly one thing, the leg the condition sits on, so the difference between the
+two rows is what the tool's own hop costs under that loss. And every row is
+measured on every arm at once, the tool-free **control** arm included, which is
+what makes an arm-to-arm difference a comparison rather than a number. A cell
+from one leg is never compared with a cell from the other; the names carry the
+leg so they cannot be.
+
+Three declared conditions are **not** in the schedule, because each is a variant
+of a class the schedule already walks and earns its place only in a focused
+question: `rate1000` (a gigabit metro link, short enough that a window ceiling
+cannot hide behind a long round trip), `loss1_buf` (1 % loss with a large finite
+buffer, ≈ 27 ms of standing queue — the boundary between tail drop and
+bufferbloat), and `loss1_mtu1280` (the two impairments that hurt most when they
+arrive together). `just bench run --condition <name>` prices one of them directly.
 
 The schedule, the durations, the sample rates and the SLO are recorded in every
 results file (`meta`), so a chart can always be traced back to the method that
@@ -564,14 +667,19 @@ poisoning the next sample, applied to a condition instead of a process.
 
 ### The shaping scope
 
-**A condition is applied to one leg of the topology**: `--condition-leg visitor`
-(the default) shapes the link between the visitor and the server, and
-`--condition-leg tunnel` shapes the link the tool's carrier crosses. Both ends
-of the chosen leg are shaped, because netem is egress-only — shaping one end
-would shape one direction. An injected delay is therefore paid once, on the
-visitor's side, where a real deployment's WAN is; the backend leg (the client
-process to the backend it forwards to) stays unshaped, because the backend is
-next to the tool. The leg a run used travels in its results meta.
+**A condition is applied to one leg of the topology, and the leg is a property of
+the stage.** The released schedule sets it per stage: a name without a suffix
+shapes the link between the visitor and the server (the visitor's own connection,
+which is what a user's client experiences), and a `@tunnel` name shapes the link
+the tool's carrier crosses. Everything outside the staged schedule — the
+campaign's own condition, `soak`, `cost`, the capacity ramp — uses the run-wide
+`--condition-leg` (default `visitor`). Both ends of the chosen leg are shaped,
+because netem is egress-only — shaping one end would shape one direction. An
+injected delay is therefore paid once, on the side the stage names, where a real
+deployment's WAN is; the backend leg (the client process to the backend it
+forwards to) stays unshaped, because the backend is next to the tool. The leg a
+cell used travels in the cell's **name**, which is why the two are never pooled in
+a table or a figure.
 
 Only the data plane is shaped. The tool's control channel stays on the unshaped
 path: shaping it kills the heartbeat and turns a capacity measurement into a
@@ -647,7 +755,7 @@ with no second attempt.
 sudo -n just bench
 sudo -n just bench --profile dev --aa
 
-# the release sweep: the staged schedule and the load ramp, five arms
+# the release sweep: six arms (the tool-free control first), two-leg schedule, ramp, half-close
 just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
@@ -754,6 +862,19 @@ must act on:
 
 Stated so a reader does not ask a chart for something it never measured:
 
+- **`l3`'s capacity ramp, once it follows a schedule that policed UDP.** The ramp
+  is healthy on its own (`L1` 5.82 to `L8` 10.34 Gbit/s, one to eight streams
+  sustained) and after any *single* stage of the release schedule, but it times
+  out at its first level when it follows the whole schedule — or one minute of
+  `udp_throttled` on the carrier's leg — while every stage of that same run's
+  timeline is green and its interactive series reads ~1.5 ms. That is a **bulk
+  recovery** limit rather than a liveness one: after a policed path the claim's
+  throughput streams do not get their rate back, and the ramp's first level is the
+  first bulk that asks. Until the state that stays throttled is named (HANDOFF.md,
+  §4 I), `l3`'s ramp cells are **not quotable**: `just bench gate` reports their
+  coverage as missing, which is the honest reading of a cell the model cannot
+  produce.
+
 - **A churn comparison, until its instrument is fixed.** `churn-16` opens a
   fresh connection per request and the reading is not yet trustworthy: in three
   runs on 2026-10-10 the L4 arms produced every degenerate cell (four rounds
@@ -813,6 +934,28 @@ Stated so a reader does not ask a chart for something it never measured:
   loss cells move mhd's own tail (see ["Where mhd wins"](#where-mhd-wins-and-where-it-loses-2026-11-19)) but every
   arm in them is molehill, and the reorder-window cell does not exist. See
   [HANDOFF.md](../HANDOFF.md) §4.134 and §4.145.
+
+- **A tool's own transport under impairment, on the same leg for every tool.**
+  The staged schedule shapes the **visitor** leg (`condition_leg: visitor`), so
+  the hop a tool does not own carries the queue and each arm's own transport
+  runs clean — which is why every shaped stage on this page is a tie.
+  `--condition-leg tunnel` moves the same conditions onto the hop between the
+  server and the client, where a TCP tunnel multiplexing many streams and a
+  datagram carrier with its own windows face different problems; a run that way
+  is the comparison "who survives when *their* path loses packets", and no
+  published table is that run. What this repository's two carriers do on that
+  leg is ["Where mhd wins"](#where-mhd-wins-and-where-it-loses-2026-11-19).
+
+- **One broken visitor's cost to the next, as a metric.** A `stall` cell was
+  built for it — eight visitors holding connections they never read (4 KiB
+  receive buffers, 48 MiB each offered) while a ninth is timed — and it was
+  **removed rather than published**: on a clean path every arm served the ninth
+  visitor in **0.66–1.28 ms against the control arm's 0.85**, and on a
+  1 %-loss path every arm read that path's own round trip (**40.90–41.51 ms**,
+  control 40.92). A cell whose readings *are* the control arm's own number
+  cannot order anything, and such a cell is removed with the reason rather than
+  shipped as a table. What it established: no tool in this set serialises a
+  service's visitors.
 
 - **Whether a loss is random or caused by the carrier's own rate.** The counters can
   now answer what they could not when this was written: the per-lane window line
@@ -1121,56 +1264,58 @@ loopback in a container, so `clean` is a lower bound on what a real path does to
 you which carrier to run: the product decides at runtime, falling back to TCP when a session cannot be established,
 and `MOLEHILL_DATA_CARRIER` exists to separate the two for exactly this measurement.
 
-### Where the product stands against the peers (2026-11-22, this model)
+### Where the product stands against the peers (2026-11-25, this model)
 
-One `sweep` run of this model — the staged timeline and the capacity ramp, the product's two architectures beside
-frp 0.72.0, rathole 0.5.0 and nps 0.26.10 — **one round, no A/A twin**, so every row here is directional: it says
-which side of a cell an arm is on, not how far. `molehill` is the product as it ships (`l4`, auto carrier); `l3` is
-its transparent arm, which has no peer and is therefore compared only with the product. The file it comes from is
-`benches/records/results-bench-v1.0.0.json` — the release record for this tag, and the next baseline.
+One `sweep` run of this model — the staged timeline, the capacity ramp and the
+half-close cell, the product's two architectures beside frp 0.72.0, rathole 0.5.0
+and nps 0.26.10 — **one round, no A/A twin**, so every row here is directional: it
+says which side of a cell an arm is on, not how far. `molehill` is the product as
+it ships (`l4`, auto carrier); `l3` is its transparent arm, which has no peer and
+is therefore compared only with the control. The file it comes from is
+`benches/records/results-bench-v1.0.0.json` — the release record for this tag, the
+one `just bench gate` passes on without a baseline, and the next baseline.
+`just bench plot <record> --markdown` prints these tables in full, per leg.
 
-| cell (`timeline`) | molehill p99 | frp | rathole | nps | `l3` |
-|---|---|---|---|---|---|
-| `clean` | 7.689 ms | **2.234** | 2.154 | 101.3 | 2.150 |
-| `rtt100` | 401 | 402 | 401 | 501 | 402 |
-| `loss1` | 1 073 | 1 081 | 1 062 | 1 075 | 1 062 |
-| `loss5` | 2 450 | 2 088 | 2 042 | 2 094 | 2 479 |
-| `rate100` | 197 | 195 | 198 | 196 | 198 |
-| `rate20` | 434 | 426 | 427 | 426 | 432 |
-| `jitter` | 106 | 106 | 107 | 166 | 106 |
-| `clean#2` | 1.942 | 7.362 | 2.170 | 72.2 | 1.450 |
+**Interactive p99 (ms), visitor leg** — the path the visitor's own connection
+crosses. Every stage after `clean` is shaped, so no winner is marked in them:
 
-| cell (`timeline`) | molehill Gbit/s | frp | rathole | nps |
-|---|---|---|---|---|
-| `clean` | 9.20 | 6.06 | **28.6** | 0.13 |
-| `rtt100` | 3.40 | 3.37 | 3.39 | 0.14 |
-| `loss1` | 12.42 | 6.17 | **14.70** | 0.13 |
-| `loss5` | 1.07 | 1.15 | **1.20** | 0.14 |
-| `jitter` | 11.67 | 6.18 | **14.20** | 0.13 |
-| `clean#2` | 15.57 | 6.05 | **28.45** | 0.13 |
+| arm | clean | rtt100 | loss1 | loss1_deep | loss5 | rate20 | rate100 | rate100_shallow | loss1_rate100 | jitter | clean#2 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| control | 2.762 | 401.389 | 1073.847 | 1061.426 | 1618.831 | 432.480 | 196.484 | 2910.786 | 1179.030 | 107.643 | 3.136 |
+| molehill | 4.434 | 401.552 | 1072.768 | 1053.098 | 2212.327 | 433.168 | 195.660 | 2894.120 | 1180.588 | 106.501 | 2.239 |
+| l3 | 2.035 | 402.104 | 1059.330 | 1065.152 | 2049.744 | 429.041 | 195.373 | 82.394 | 1189.158 | 105.886 | 10.520 |
+| frp | 1.989 | 401.548 | 1069.314 | 1070.820 | 2053.390 | 426.833 | 196.842 | 3442.223 | 1201.561 | 108.424 | 15.530 |
+| rathole | 2.394 | 401.780 | 1068.491 | 1065.593 | 2461.230 | 437.597 | 196.757 | 3679.847 | 1192.447 | 106.141 | 1.909 |
+| nps | 70.661 | 602.125 | 1060.053 | 1086.395 | 2077.155 | 429.029 | 195.927 | 3917.243 | 1215.476 | 148.906 | 201.264 |
 
-Capacity ramp: molehill, `l3`, frp and rathole all reach **8 streams**, nps **4**.
+**Interactive p99 (ms), tunnel leg** — the hop the tool owns, where its own carrier
+lives. This is the half of the schedule that separates the architectures:
 
-**Read it as four sentences.** Every cell where the path is impaired and the impairment is not loss (`rtt100`, the
-two rate cells) is a **tie** — four tools within a few milliseconds of each other, which is what a shaped path does:
-it, not the tool, is the queue. `loss5` is a tie too, and this run reads the product last of the four (2 450 ms
-against 2 042–2 094) where the run before it read the product first (1 460 against 2 030–2 450): a 120-second stage
-at that loss rate completes about 215 interactive requests, so the cell's p99 *is* its third-worst sample, and the
-arm order there moves between runs — neither table can rank the four. On the clean cells the product is **behind frp
-and rathole on the tail** — bimodally, see below — while carrying **more than frp and less than rathole**, which is
-the split the carrier table above explains: the product's auto policy puts a clean path's interactive traffic on the
-carrier that only wins when packets are lost.
+| arm | rtt100 | loss1 | loss5 | rate100_shallow | mtu1280 | udp_throttled | udp_blocked |
+|---|---|---|---|---|---|---|---|
+| control | 401.645 | 1065.814 | 1855.883 | 3637.633 | 2.766 | 2.832 | 2.820 |
+| molehill | 401.827 | 64.197 | 1002.411 | 268.204 | 2.554 | 1.752 | 26.969 |
+| l3 | 401.656 | 61.278 | 1027.257 | 350.400 | 7.147 | 6.701 | 8.576 |
+| frp | 808.996 | 90.487 | 2347.441 | 2265.115 | 2.558 | 25.967 | 8.474 |
+| rathole | 201.670 | 263.635 | 1252.822 | 2507.705 | 2.078 | 2.103 | 1.988 |
+| nps | 1821.582 | 263.806 | 4824.733 | 2877.878 | 87.255 | 200.971 | 79.736 |
 
-**Bulk separates the arms.** rathole is first on every unshaped cell, the product second on both lossy ones (12.42
-against frp's 6.17 at 1 % loss) and third on the clean one — and its own two clean stages disagree by 69 % (9.20
-against 15.57) — the stage order disagrees with itself, "Warm and cold" documents the same shape for the tail. Read
-the clean bulk number as a range for one arm rather than as a ranking.
+Capacity ramp: control, molehill, `l3` and rathole sustain **8 of 8** streams, nps
+7, frp 4. Half-close: control, molehill, `l3` and rathole deliver the answer a
+half-closed visitor is owed (65 536 bytes); frp and nps deliver none.
 
-**Two caveats that travel with the table.** `clean` is bimodal in this topology, and which arm draws the slow mode
-moves between the two clean stages: the product reads 7.689 then 1.942, frp 2.234 then 7.362. A single-round reading
-of that row is a coin toss, and the shaped rows are the ones to trust. And loopback inside a container is the
-friendliest possible path for every arm: `nps` at 0.13 Gbit/s is the one row that looks like a defect rather than a
-shape, and it is not this repository's tool.
+**Read it as three sentences.** On the visitor leg nothing separates the forwarding
+tools once the path is shaped — the queue is the queue, and the `clean` cell is
+bimodal for every arm that forwards in user space, so one round cannot rank it. On
+the **tunnel leg** the product's own carrier is the difference: at 1 % loss under
+the carrier, `l3` answers in 61 ms and `molehill` in 64 where the control needs
+1 066, and when the network refuses UDP outright `l3` answers in 8.6 ms because its
+claim recovers its lanes; `frp` reads 809 ms at `rtt100` under the carrier and
+2 347 ms at `loss5`, and `nps` never gets under 79 ms anywhere on that leg. Nothing
+here ranks `frp` above the product or the product above `frp` on the visitor leg;
+what the tunnel leg shows is that a tool which owns its own carrier can repair loss
+it would otherwise pay for twice.
+
 
 ### Warm and cold
 

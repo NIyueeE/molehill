@@ -69,6 +69,21 @@ def cmd_list(args) -> int:
             f"carrier={arm.data_carrier or '-':<5} "
             f"pool_cap={arm.pool_cap or 'default':<8} txqueuelen={arm.txqueuelen}"
         )
+    print("\ntimelines (a staged schedule is the run's coverage contract):")
+    for name in model.TIMELINES:
+        stages = model.timeline_for(name)
+        print(
+            f"  {name:<8} {len(stages)} stages, "
+            f"{sum(hold for _, hold, _ in stages):.0f}s of holds, "
+            f"legs: {', '.join(sorted({leg for _, _, leg in stages}))}"
+        )
+        print(
+            "      "
+            + " -> ".join(
+                condition if leg == model.DEFAULT_LEG else f"{condition}@{leg}"
+                for condition, _, leg in stages
+            )
+        )
     print("\nprofiles (a profile is a time budget with a method attached):")
     for name, profile in model.PROFILES.items():
         print(

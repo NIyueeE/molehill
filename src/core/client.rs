@@ -476,6 +476,18 @@ enum SessionRequest {
     /// Drop a service: the server releases its public endpoint while the
     /// session keeps serving its siblings.
     Deregister(ServiceId),
+    /// Rebuild one service's data plane: deregister it and register it again.
+    ///
+    /// The claim's own replacement path cannot always recover it — a carrier that
+    /// was blocked for a while leaves lanes that join and carry nothing, which
+    /// eleven fixes on the lane path each moved rather than ended (`HANDOFF.md`
+    /// §4 I). A **rebuild** puts the claim through the path that is healthy in
+    /// every run's first seconds: deregister (which forgets the claim, its lanes
+    /// and its hub members on both ends) and register again (which opens the
+    /// member set the client just asked for). One visible reconnect per claim per
+    /// block, which is what every peer in the record already does.
+    #[cfg(mh_l3_client)]
+    Restart(ServiceId),
     /// Ask the peer to stop using one of a claim's lanes, or to take it back.
     ///
     /// The allocator decides (it is the only thing that reads the evidence) but
@@ -3009,6 +3021,11 @@ fn spawn_data_channel(
     // mistake the pairing and opening lines were corrected for — so all three
     // are now read at five.
     let spawned = std::time::Instant::now();
+    let is_claim = matches!(
+        args.service.service_type,
+        crate::config::ServiceType::Transparent
+    );
+    let claim_service = args.service_id;
     tokio::spawn(
         async move {
             // Only the multiplexed path consumes this: a direct channel has no
@@ -3038,7 +3055,21 @@ fn spawn_data_channel(
                 // a dead local service is this one, so the level has to be the
                 // per-connection one. A *failed request* is visible to the
                 // visitor; the operator needs the cause only when debugging.
-                debug!("{:#}", e);
+                //
+                // A **claim's lane is not a visitor connection**: when it fails,
+                // the claim has lost part of its whole data plane, and a silent
+                // failure is what let a claim sit with no lanes for twenty
+                // minutes in the first bench-standard record (`HANDOFF.md` §4 I).
+                // The reason is the one thing the operator cannot infer, so a
+                // lane's failure says so.
+                if is_claim {
+                    warn!(
+                        service = %claim_service,
+                        "a transparent claim's data channel failed: {e:#}"
+                    );
+                } else {
+                    debug!("{:#}", e);
+                }
             }
         }
         .instrument(Span::current()),
@@ -3213,6 +3244,32 @@ struct LanePool {
     /// Drains this pool has asked for, with when it asked: a lane whose drain
     /// never becomes ready is called off rather than left unusable.
     draining: std::sync::Mutex<HashMap<(ServiceId, LaneId), std::time::Instant>>,
+    /// When each claim's data plane was last rebuilt and how many times its endpoint
+    /// had moved carriers at that moment, **by endpoint** — not on the claim entry,
+    /// which is thrown away by the very rebuild it would have to pace.
+    ///
+    /// On the entry the cooldown was reset by re-registration, so a claim that could
+    /// not keep a lane rebuilt on every tick: measured 2026-11-23, forty-nine
+    /// rebuilds in six minutes, and a claim that is always registering never settles
+    /// long enough to carry. The switch count is what makes a rebuild *worth it*: a
+    /// carrier move is a new chance, and a claim with no lane only gets one rebuild
+    /// per chance (`HANDOFF.md` §4 I).
+    restarted: std::sync::Mutex<HashMap<Endpoint, (std::time::Instant, u32)>>,
+    /// Per lane slot: what its peer last reported and what this end last handed it.
+    silence: std::sync::Mutex<HashMap<(Endpoint, usize), LaneSilence>>,
+    /// Per claim: how many frames its lanes have refused for want of queue space, and
+    /// since when that has been happening.
+    backpressure: std::sync::Mutex<HashMap<Endpoint, (u64, std::time::Instant)>>,
+    /// Per claim: its peak delivery rate, the last rate, and since when it has been far
+    /// below that peak.
+    rate: std::sync::Mutex<HashMap<Endpoint, Rate>>,
+    /// Claims that have carried traffic at least once since they were registered.
+    ///
+    /// The claim-wide fallback needs it: a claim that has **never** carried anything is
+    /// starting, not broken, and moving its endpoint then cost the first stage of every
+    /// run a second of p99 (measured 2026-11-24) — a repair that damages the healthy case
+    /// is not a repair.
+    carried: std::sync::Mutex<std::collections::HashSet<Endpoint>>,
     /// The previous tick's per-lane cumulative counters, so a tick is a window
     /// rather than a lifetime: `(peer offered, peer refused, this end injected)`.
     carrier_sample: std::sync::Mutex<HashMap<(Endpoint, LaneId), LaneSample>>,
@@ -3235,6 +3292,18 @@ struct LanePool {
 #[cfg(mh_l3_client)]
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The wait before a claim's next lane dial, after `attempts` without one.
+///
+/// One second, doubling, capped by [`LANE_DIAL_BACKOFF_MAX`]: a claim that lost
+/// its lane to a network condition recovers within a second of the condition
+/// ending, and a claim that cannot get one at all costs a line a second at most
+/// (and, after [`LANE_DIAL_WARN_AFTER`], not even that).
+#[cfg(mh_l3_client)]
+fn lane_dial_backoff(attempts: u32) -> std::time::Duration {
+    let shift = attempts.saturating_sub(1).min(5);
+    std::time::Duration::from_secs(1 << shift).min(LANE_DIAL_BACKOFF_MAX)
+}
+
 /// How many consecutive ticks a claim must be judged to be losing traffic on
 /// the carrier it rides before a lane is handed over.
 ///
@@ -3245,6 +3314,129 @@ const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// [`crate::transport::carrier::SWITCH_COOLDOWN`].
 #[cfg(mh_l3_client)]
 const CARRIER_CONFIRM_TICKS: u32 = 3;
+
+/// The longest a claim with no lane waits between dial attempts.
+///
+/// A claim that cannot get a lane used to ask on every tick — one `INFO` line a
+/// second for as long as the condition lasted, and (with the old `dial`, which
+/// raised the want on every attempt) an ever-growing want. The wait doubles from
+/// a second to this, and the attempt after [`LANE_DIAL_WARN_AFTER`] says so once.
+#[cfg(mh_l3_client)]
+const LANE_DIAL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Failed lane dials after which a claim with no lane stops trying to patch
+/// itself and asks for its whole data plane to be rebuilt.
+///
+/// Four attempts span fifteen seconds of the backoff: long enough that a claim
+/// joining a cold carrier is not rebuilt for nothing, short enough that a blocked
+/// carrier's twenty dead minutes become one reconnect.
+#[cfg(mh_l3_client)]
+const LANE_RESTART_AFTER: u32 = 4;
+
+/// The least time between two rebuilds of the same claim.
+///
+/// Short, because the *evidence* is the carrier's own switch count: a rebuild is
+/// worth one attempt per chance, and a new chance is a carrier move, not thirty
+/// seconds of wall clock. The clock only keeps a claim that can never get a lane
+/// from rebuilding in a tight loop — measured 2026-11-23, without any pacing it did
+/// so forty-nine times in six minutes, and a claim that is always registering never
+/// settles long enough to carry (`HANDOFF.md` §4 I).
+#[cfg(mh_l3_client)]
+const LANE_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pool's own age before any claim may be rebuilt.
+///
+/// A session's first half minute is the coldest state there is: the carrier's pool is
+/// being built, the claims' first lanes are dialling, and a dial that fails in that
+/// window is the normal shape of a start. Rebuilding there cost the *first* stage
+/// three quarters of its samples (measured 2026-11-24) — a repair that damages the one
+/// stage every run begins with.
+#[cfg(mh_l3_client)]
+const LANE_REBUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long every lane of a claim may be fed and silent before the claim's own carrier
+/// is judged broken and the endpoint moved.
+///
+/// The carrier reports each lane's counters to the other end every second, so "fed and
+/// silent" is a lane written into a void. Per lane that is hopeless (retiring them
+/// during a block churns the claim); **per claim it is a statement about the carrier**,
+/// which is the granularity the choice is made at: all of this claim's lanes are up,
+/// all of them are fed, none of them hears anything back, and the carrier believes its
+/// path is up. Then the endpoint moves once and the claim is rebuilt on the new carrier
+/// (`HANDOFF.md` §4 I).
+#[cfg(mh_l3_client)]
+const CLAIM_SILENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a claim's lanes may refuse the device's frames for want of queue space
+/// before they are judged too slow and the claim rebuilt.
+///
+/// This is the **bulk** counterpart of the silence rule: a lane that is fed, answers,
+/// and still cannot keep up shows up as backpressure at the hub (`overflow_packets`),
+/// and a path that policed the carrier for a minute leaves exactly that — the ramp
+/// after such a stage times out at its first level while the interactive series reads
+/// 1.5 ms (`HANDOFF.md` §4 I). Five seconds of refused frames is a lane that is not
+/// going to recover its rate on its own.
+#[cfg(mh_l3_client)]
+const CLAIM_SLOW_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A claim's delivery: its peak, its last cumulative total, and since when it has been
+/// far below that peak.
+#[cfg(mh_l3_client)]
+type Rate = (u64, u64, Option<std::time::Instant>);
+
+/// How far below its own recent peak a claim's delivery may sit before its lanes are
+/// judged unable to recover.
+#[cfg(mh_l3_client)]
+const CLAIM_RATE_FLOOR_PCT: u64 = 20;
+
+/// How long it may sit there.
+///
+/// Three seconds, not ten: the ramp's first level is bounded at twenty-six, and a repair
+/// that lands after the measurement has ended is a repair the user never sees. Long
+/// enough that a single slow round trip is not a verdict, short enough to fit inside the
+/// first level of the cell this rule exists for (`HANDOFF.md` §4 I).
+///
+/// The third and last shape of "the lanes are not working": a claim that carries, that
+/// nobody refuses, and that delivers a fraction of what it delivered a minute ago — the
+/// state a path that policed the carrier's datagrams leaves behind (`HANDOFF.md` §4 I).
+/// Ten seconds is longer than one TCP retransmit round and shorter than the twenty
+/// minutes the original defect cost.
+#[cfg(mh_l3_client)]
+const CLAIM_RATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a lane's peer last reported and what this end last handed it, for the
+/// claim-wide silence test.
+#[cfg(mh_l3_client)]
+type LaneSilence = (u64, u64, std::time::Instant);
+
+/// Failed lane dials after which the claim asks the carrier for the other one.
+///
+/// A lane that cannot be *opened* on the carrier in use is the one carrier failure
+/// the claim can see for itself, and it is the state a UDP-blocked carrier leaves
+/// behind: the mhd pool's tunnels are gone, `mhd is reachable again` has already
+/// been printed by the reachability probe, and every dial over mhd fails in
+/// milliseconds with `early eof` while the server never sees it (`HANDOFF.md` §4 I).
+/// Two attempts — a second of backoff — and the claim asks for TCP for this
+/// endpoint; the carrier rule moves it back when its lanes say mhd is serving.
+#[cfg(mh_l3_client)]
+const LANE_DIAL_SWITCH_AFTER: u32 = 2;
+
+/// How long a freshly registered claim may have no lane before the allocator
+/// stops treating that as "still joining".
+///
+/// A claim's first lanes are opened by the registration path itself; the grace is
+/// what keeps the allocator from dialling beside them.
+#[cfg(mh_l3_client)]
+const LANE_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Failed lane dials after which the claim reports itself at `WARN`.
+///
+/// Five, not three: a healthy startup asks for its lanes while the hub is still
+/// being built, and three attempts inside the first second warned on every start
+/// (measured 2026-11-23). Five attempts span the first fifteen seconds of the
+/// backoff, which a healthy claim never reaches and a stuck one always does.
+#[cfg(mh_l3_client)]
+const LANE_DIAL_WARN_AFTER: u32 = 5;
 
 /// One claim, as the allocator knows it.
 #[cfg(mh_l3_client)]
@@ -3263,7 +3455,29 @@ struct ClaimEntry {
     /// apart: a lane that *failed* leaves the claim short of its target, so the
     /// replacement is dialed; a lane retired on purpose lowered the target
     /// first, so that request is refused.
+    ///
+    /// **It is a want, not a tally of attempts.** An earlier version raised it
+    /// by one on every `dial()`, so a dial that never landed asked for one more
+    /// lane instead of satisfying the one already wanted: measured 2026-11-23, a
+    /// claim whose carrier was refused dialled once a second for minutes, and
+    /// every attempt made the claim want another lane (`HANDOFF.md` §4 I).
     target: usize,
+    /// When this claim was registered, so the allocator can tell a claim whose
+    /// lanes are still joining from one whose lanes are all gone.
+    registered_at: std::time::Instant,
+    /// Whether this claim has already asked for the other carrier since its last
+    /// lane landed. A recovery asks **once per recovery**, not once per attempt:
+    /// by the time a block lifts the counter is far past its first value, and an
+    /// exact match on it never fires again (measured 2026-11-23: twelve attempts
+    /// deep, the rule was dead).
+    asked_other: bool,
+    /// Dial attempts that have not produced a lane, and when the next one may be
+    /// made. A claim that cannot get a lane must not ask on every tick: the
+    /// attempt interval doubles up to [`LANE_DIAL_BACKOFF_MAX`] and one `WARN`
+    /// says so, because a claim with no lane is an operator fact and not a
+    /// per-second one.
+    dial_attempts: u32,
+    next_dial_at: std::time::Instant,
 }
 
 #[cfg(mh_l3_client)]
@@ -3278,6 +3492,11 @@ impl LanePool {
             started: std::time::Instant::now(),
             switched: std::sync::atomic::AtomicBool::new(false),
             draining: std::sync::Mutex::new(HashMap::new()),
+            restarted: std::sync::Mutex::new(HashMap::new()),
+            silence: std::sync::Mutex::new(HashMap::new()),
+            backpressure: std::sync::Mutex::new(HashMap::new()),
+            rate: std::sync::Mutex::new(HashMap::new()),
+            carried: std::sync::Mutex::new(std::collections::HashSet::new()),
             carrier_sample: std::sync::Mutex::new(HashMap::new()),
             carrier_streak: std::sync::Mutex::new(HashMap::new()),
             req_tx,
@@ -3304,6 +3523,10 @@ impl LanePool {
                     args,
                     share,
                     target: share,
+                    registered_at: std::time::Instant::now(),
+                    asked_other: false,
+                    dial_attempts: 0,
+                    next_dial_at: std::time::Instant::now(),
                 },
             );
         }
@@ -3323,18 +3546,27 @@ impl LanePool {
     /// on purpose lowered the target first, so this answers no — otherwise the
     /// allocator would undo its own move on every request.
     fn wants_another_lane(&self, endpoint: &Endpoint) -> bool {
-        let Some((tun, target)) = self.claims.lock().ok().and_then(|claims| {
-            claims
-                .get(endpoint)
-                .map(|entry| (entry.tun.clone(), entry.target))
+        let Some((tun, target, chosen)) = self.claims.lock().ok().and_then(|claims| {
+            claims.get(endpoint).map(|entry| {
+                (
+                    entry.tun.clone(),
+                    entry.target,
+                    entry.args.carrier.carrier(),
+                )
+            })
         }) else {
             return true;
         };
         match TunHub::get_or_spawn(&tun, Direction::Source) {
             Ok(hub) => {
+                // **Only a lane that can still carry counts** (`satisfies_allotment`):
+                // a lane on the carrier this claim has left is live and useless, and
+                // counting it is what made this end refuse the peer's replacement —
+                // the claim then carried nothing until the session ended
+                // (`HANDOFF.md` §4 I).
                 hub.member_stats()
                     .iter()
-                    .filter(|lane| lane.endpoint == *endpoint && lane.live)
+                    .filter(|lane| lane.satisfies_allotment(*endpoint, chosen))
                     .count()
                     < target
             }
@@ -3554,17 +3786,53 @@ impl LanePool {
     /// diagnostic switch (a measurement hatch, not policy), then lending.
     fn step(&self) {
         self.drain_step();
+        self.claim_fallback_step();
         self.carrier_step();
         self.diagnostic_switch();
         if !self.lend {
             return;
         }
         let (loads, used) = self.snapshot();
+        // **A claim with no lane at all is short by definition**, and nothing
+        // else will dial one: `lanes::plan` deliberately skips a lane-less claim
+        // (its lanes may still be joining) and the peer only asks for a channel
+        // when it has a visitor to place, which it cannot do without a lane. A
+        // claim whose every lane died — which is what a UDP block on the
+        // carrier's leg does — was therefore stranded for the rest of the run
+        // (`HANDOFF.md` §4 I). The grace separates "still joining" from "all
+        // gone"; the per-claim backoff keeps a failed dial from spinning.
+        for load in &loads {
+            if load.lanes.is_empty() && self.mature(&load.endpoint) {
+                self.dial(&load.endpoint, false);
+                // **And when dialling has stopped working, rebuild.** A claim that
+                // has been short of every lane for four failed attempts is not a
+                // claim whose next dial will land — it is one whose replacement
+                // path has stopped working, and the honest repair is to put it
+                // through the path that works (`SessionRequest::Restart`).
+                if let Some(service) = self.hopeless(&load.endpoint) {
+                    warn!(
+                        "Claim {}: no lane after several attempts; rebuilding its data plane",
+                        load.endpoint
+                    );
+                    self.restart(service);
+                }
+            }
+        }
         // Nothing to move between, and no move without a reason.
         if loads.len() < 2 {
             return;
         }
         let Some(plan) = lanes::plan(&loads, self.budget(), used) else {
+            // Nothing is short, so whatever a claim was waiting on has arrived:
+            // its next failed dial, if any, starts from a second again. **Only a
+            // claim that has a lane**: a claim with none is short by definition
+            // (see the loop above), and resetting its backoff here made it dial
+            // once a tick — 1 079 `WARN`s in four minutes, measured 2026-11-23.
+            for load in &loads {
+                if !load.lanes.is_empty() {
+                    self.note_satisfied(&load.endpoint);
+                }
+            }
             return;
         };
         match plan {
@@ -3572,12 +3840,10 @@ impl LanePool {
                 // Room under the budget means a claim is holding fewer lanes than
                 // the configuration gave it — a lane died and its replacement has
                 // not arrived — so this hands the room to the claim that needs it
-                // rather than waiting for the dead one.
-                info!(
-                    "Lane allocator: claim {to} has more flows than lanes and the lane budget has \
-                     room; dialing a lane"
-                );
-                self.dial(&to);
+                // rather than waiting for the dead one. It is a **restore**: the
+                // want is already there, and a dial that fails must not raise it
+                // (`dial`, `grow = false`).
+                self.dial(&to, false);
             }
             lanes::Plan::Lend {
                 from,
@@ -3604,8 +3870,9 @@ impl LanePool {
                 }
                 info!("Lane allocator: lent lane {from_slot} of claim {from} to claim {to}");
                 // Only now, with the donor's lane on its way out: a swap, never
-                // a growth.
-                self.dial(&to);
+                // a growth — but the *receiver's* want does rise with the channel
+                // it is about to hold.
+                self.dial(&to, true);
             }
         }
     }
@@ -3861,16 +4128,348 @@ impl LanePool {
         }
     }
 
-    /// Dial one more lane for a claim, and count it as wanted.
-    fn dial(&self, endpoint: &Endpoint) {
-        let args = self.claims.lock().ok().and_then(|mut claims| {
-            claims.get_mut(endpoint).map(|entry| {
-                entry.target += 1;
-                Arc::clone(&entry.args)
+    /// Rebuild a claim whose lanes will not take the device's frames, and say so.
+    fn rebuild_for_backpressure(&self, endpoint: Endpoint) -> bool {
+        let Some(service) = self.hopeless(&endpoint) else {
+            return false;
+        };
+        warn!(
+            "Claim {endpoint}: its lanes have refused the device's frames for \
+             {CLAIM_SLOW_BUDGET:?}; rebuilding its data plane"
+        );
+        self.restart(service);
+        true
+    }
+
+    /// Is this claim delivering a fraction of its own recent peak while it still has
+    /// flows that want the lanes?
+    fn rate_collapsed(
+        &self,
+        endpoint: Endpoint,
+        members: &[crate::transparent::hub::MemberStat],
+    ) -> bool {
+        // Demand, not merely traffic: a claim with no flow placed is idle, and an idle
+        // claim is not a slow one.
+        if members.iter().map(|member| member.flows).sum::<usize>() == 0 {
+            return false;
+        }
+        let total: u64 = members
+            .iter()
+            .map(|member| member.counters.enqueued_packets + member.counters.injected_packets)
+            .sum();
+        let Ok(mut rate) = self.rate.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let Some((peak, last, low)) = rate.get(&endpoint).copied() else {
+            rate.insert(endpoint, (total, total, None));
+            return false;
+        };
+        let current = total.saturating_sub(last);
+        // A peak that is never forgotten would rebuild a claim that legitimately slows
+        // down for the rest of the session: it decays, one part in sixty-four a tick.
+        let peak = peak.saturating_sub(peak / 64).max(current);
+        if peak == 0 || current * 100 >= peak * CLAIM_RATE_FLOOR_PCT {
+            rate.insert(endpoint, (peak, total, None));
+            return false;
+        }
+        let since = low.unwrap_or(now);
+        rate.insert(endpoint, (peak, total, Some(since)));
+        since.elapsed() >= CLAIM_RATE_BUDGET
+    }
+
+    /// Rebuild a claim whose lanes deliver a fraction of what they used to, and say so.
+    fn rebuild_for_slow_rate(&self, endpoint: Endpoint) -> bool {
+        let Some(service) = self.hopeless(&endpoint) else {
+            return false;
+        };
+        warn!(
+            "Claim {endpoint}: its lanes deliver far below their own recent peak; \
+             rebuilding its data plane"
+        );
+        if let Ok(mut rate) = self.rate.lock() {
+            rate.remove(&endpoint);
+        }
+        self.restart(service);
+        true
+    }
+
+    /// Have this claim's lanes spent long enough refusing the device's frames for want
+    /// of queue space to be called too slow?
+    fn lanes_slow(
+        &self,
+        endpoint: Endpoint,
+        members: &[crate::transparent::hub::MemberStat],
+    ) -> bool {
+        let overflow: u64 = members
+            .iter()
+            .map(|member| member.counters.overflow_packets)
+            .sum();
+        let Ok(mut backpressure) = self.backpressure.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        match backpressure.get(&endpoint).copied() {
+            Some((seen, since)) if overflow > seen => {
+                backpressure.insert(endpoint, (overflow, since));
+                since.elapsed() >= CLAIM_SLOW_BUDGET
+            }
+            Some(_) => false,
+            None => {
+                backpressure.insert(endpoint, (overflow, now));
+                false
+            }
+        }
+    }
+
+    /// Move the endpoint's carrier and rebuild a claim whose **every** lane is fed and
+    /// silent while the carrier believes its own path is up.
+    ///
+    /// The decision is the carrier rule's (one choice per endpoint) but the evidence is
+    /// the claim's, which is the only granularity at which "fed and silent" is a
+    /// statement about the carrier rather than about one lane.
+    fn claim_fallback_step(&self) {
+        let Ok(guard) = self.claims.lock() else {
+            return;
+        };
+        let claims: Vec<(Endpoint, String, bool, crate::transport::carrier::Carrier)> = guard
+            .iter()
+            .map(|(endpoint, entry)| {
+                let carrier = entry.args.carrier.as_ref();
+                let chosen = carrier.carrier();
+                let usable = chosen != crate::transport::carrier::Carrier::Mhd || carrier.try_mhd();
+                (*endpoint, entry.tun.clone(), usable, chosen)
             })
+            .collect();
+        drop(guard);
+        for (endpoint, tun, usable, chosen) in claims {
+            if !usable || crate::transport::carrier::forced_carrier().is_some() {
+                continue;
+            }
+            let Ok(hub) = TunHub::get_or_spawn(&tun, Direction::Source) else {
+                continue;
+            };
+            let Ok(mut silence) = self.silence.lock() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            let members: Vec<_> = hub
+                .member_stats()
+                .into_iter()
+                .filter(|member| member.endpoint == endpoint && member.live)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            // Only a claim that has carried something can be *silent*: one that has never
+            // carried is starting.
+            let carried = members.iter().any(|member| {
+                member.counters.injected_packets > 0 || member.counters.enqueued_packets > 0
+            });
+            let known = {
+                let Ok(mut set) = self.carried.lock() else {
+                    return;
+                };
+                if carried {
+                    set.insert(endpoint);
+                }
+                set.contains(&endpoint)
+            };
+            if !known {
+                continue;
+            }
+            let mut all_silent = true;
+            for member in &members {
+                let offered = member.remote.map_or(0, |remote| u64::from(remote.offered));
+                let fed = member.counters.enqueued_packets;
+                let key = (endpoint, member.slot);
+                if let Some((seen_offered, seen_fed, since)) = silence.get(&key).copied() {
+                    if offered != seen_offered || fed < seen_fed {
+                        silence.insert(key, (offered, fed, now));
+                        all_silent = false;
+                    } else if fed == seen_fed || since.elapsed() < CLAIM_SILENT_BUDGET {
+                        all_silent = false;
+                    }
+                } else {
+                    silence.insert(key, (offered, fed, now));
+                    all_silent = false;
+                }
+            }
+            drop(silence);
+            if !all_silent {
+                continue;
+            }
+            // **Or it is fed, answering, and too slow.** Backpressure first (the queue
+            // says so directly), then the rate itself.
+            if self.lanes_slow(endpoint, &members) && self.rebuild_for_backpressure(endpoint) {
+                continue;
+            }
+            if self.rate_collapsed(endpoint, &members) && self.rebuild_for_slow_rate(endpoint) {
+                continue;
+            }
+            if !all_silent {
+                continue;
+            }
+            // Every lane is fed and silent: move the endpoint, then rebuild the claim so
+            // its replacement set is dialled on the carrier that just changed.
+            let other = match chosen {
+                crate::transport::carrier::Carrier::Mhd => crate::transport::carrier::Carrier::Tcp,
+                crate::transport::carrier::Carrier::Tcp => crate::transport::carrier::Carrier::Mhd,
+            };
+            let Ok(guard) = self.claims.lock() else {
+                return;
+            };
+            let Some(args) = guard.get(&endpoint).map(|entry| Arc::clone(&entry.args)) else {
+                continue;
+            };
+            drop(guard);
+            let switched = args.carrier.prefer(
+                other,
+                "every lane of this claim is fed and none of them hears back",
+            );
+            if let Some(service) = self.hopeless(&endpoint) {
+                warn!(
+                    "Claim {endpoint}: every lane is fed and silent; moving the endpoint to \
+                     {other:?} ({switched}) and rebuilding the claim's data plane"
+                );
+                self.restart(service);
+            }
+        }
+    }
+
+    /// Dial one more lane for a claim, at most once per backoff step.
+    ///
+    /// `grow` separates the two reasons a dial happens, and they are not the same
+    /// bookkeeping:
+    ///
+    /// * **restore** (`grow == false`) — a lane failed and the claim is short of
+    ///   the want it already has. Raising the want here is what turned one lost
+    ///   lane into an unbounded one (`HANDOFF.md` §4 I);
+    /// * **transfer** (`grow == true`) — a lend moved a lane's want from the donor
+    ///   to this claim, so the receiver's want rises with the channel it is about
+    ///   to hold.
+    ///
+    /// A dial that fails leaves the want alone and doubles the wait to the next
+    /// one; the attempt after [`LANE_DIAL_WARN_AFTER`] reports itself at `WARN`
+    /// once, because a claim that cannot get a lane is a fact an operator needs
+    /// and a per-second line is not.
+    fn dial(&self, endpoint: &Endpoint, grow: bool) {
+        let args = self.claims.lock().ok().and_then(|mut claims| {
+            let entry = claims.get_mut(endpoint)?;
+            let now = std::time::Instant::now();
+            if now < entry.next_dial_at {
+                return None;
+            }
+            entry.dial_attempts = entry.dial_attempts.saturating_add(1);
+            let wait = lane_dial_backoff(entry.dial_attempts);
+            entry.next_dial_at = now + wait;
+            if grow {
+                entry.target = entry.target.saturating_add(1);
+            }
+            if entry.dial_attempts >= LANE_DIAL_SWITCH_AFTER
+                && !entry.asked_other
+                && entry.args.carrier.switches() > 0
+            {
+                entry.asked_other = true;
+                // The first attempt has failed by the time the second is due: ask
+                // the carrier for the other one rather than failing again on a
+                // pool that is not there.
+                let other = match entry.args.carrier.carrier() {
+                    crate::transport::carrier::Carrier::Mhd => {
+                        crate::transport::carrier::Carrier::Tcp
+                    }
+                    crate::transport::carrier::Carrier::Tcp => {
+                        crate::transport::carrier::Carrier::Mhd
+                    }
+                };
+                if entry.args.carrier.prefer_for_lane(
+                    other,
+                    "this claim's lane could not be opened on the carrier in use",
+                ) {
+                    info!(
+                        "Claim {endpoint}: lane dials keep failing on the carrier in use; asking \
+                         for {other:?} for this claim"
+                    );
+                }
+            }
+            if entry.dial_attempts == LANE_DIAL_WARN_AFTER {
+                warn!(
+                    "Lane allocator: claim {endpoint} has dialled for a lane {} times without \
+                     getting one; retrying at most every {} s",
+                    entry.dial_attempts,
+                    wait.as_secs().max(1)
+                );
+            } else {
+                debug!(
+                    "Lane allocator: claim {endpoint} dials a lane (attempt {}, next in {} s)",
+                    entry.dial_attempts,
+                    wait.as_secs().max(1)
+                );
+            }
+            Some(Arc::clone(&entry.args))
         });
         if let Some(args) = args {
             spawn_data_channel(args, None, None, std::time::Instant::now());
+        }
+    }
+
+    /// Ask the session to rebuild this claim's data plane.
+    fn restart(&self, service: ServiceId) {
+        let _ = self.req_tx.send(SessionRequest::Restart(service));
+    }
+
+    /// Has this claim had time to open its share of lanes yet?
+    fn mature(&self, endpoint: &Endpoint) -> bool {
+        self.claims.lock().is_ok_and(|claims| {
+            claims
+                .get(endpoint)
+                .is_some_and(|entry| entry.registered_at.elapsed() >= LANE_JOIN_GRACE)
+        })
+    }
+
+    /// Has this claim failed to get a lane long enough that its own replacement
+    /// path should be considered broken? Answers the service to rebuild.
+    fn hopeless(&self, endpoint: &Endpoint) -> Option<ServiceId> {
+        let service = {
+            let claims = self.claims.lock().ok()?;
+            let entry = claims.get(endpoint)?;
+            if entry.dial_attempts < LANE_RESTART_AFTER
+                || self.started.elapsed() < LANE_REBUILD_GRACE
+            {
+                return None;
+            }
+            entry.args.service_id
+        };
+        let switches = self
+            .claims
+            .lock()
+            .ok()
+            .and_then(|claims| {
+                claims
+                    .get(endpoint)
+                    .map(|entry| entry.args.carrier.switches())
+            })
+            .unwrap_or(0);
+        let mut restarted = self.restarted.lock().ok()?;
+        if let Some((at, seen)) = restarted.get(endpoint) {
+            // One rebuild per chance: the carrier has to have moved since the last
+            // one, and the clock keeps a hopeless claim from a tight loop.
+            if at.elapsed() < LANE_RESTART_COOLDOWN || *seen == switches {
+                return None;
+            }
+        }
+        restarted.insert(*endpoint, (std::time::Instant::now(), switches));
+        Some(service)
+    }
+
+    /// The claim has the lanes it wants: its backoff, if any, is over.
+    fn note_satisfied(&self, endpoint: &Endpoint) {
+        if let Ok(mut claims) = self.claims.lock()
+            && let Some(entry) = claims.get_mut(endpoint)
+        {
+            entry.dial_attempts = 0;
+            entry.asked_other = false;
+            entry.next_dial_at = std::time::Instant::now();
         }
     }
 }
@@ -4266,6 +4865,36 @@ impl ClientSession {
                         self.deregister(id, &mut wr).await?;
                     }
                     #[cfg(mh_l3_client)]
+                    Some(SessionRequest::Restart(id)) => {
+                        // The slot is the service's own; `deregister` removes the
+                        // entry from the session, so it is taken first and put back
+                        // for the registration that follows.
+                        if let Some(entry) = self.services.remove(&id) {
+                            self.deregister(id, &mut wr).await?;
+                            // **Let the peer finish tearing the claim down.** A
+                            // deregistration is asynchronous on the server: its
+                            // claim's task ends when its channel set does, and a
+                            // registration that lands inside that window opens lanes
+                            // that join and carry nothing — measured 2026-11-24 as
+                            // the alternating outcome of the same cell, the same
+                            // build (`HANDOFF.md` §4 I). The pause is the same order
+                            // as the server's own replacement backoff.
+                            tokio::time::sleep(crate::common::constants::PROLOGUE_BUDGET.min(
+                                std::time::Duration::from_millis(300),
+                            ))
+                            .await;
+                            self.services.insert(
+                                id,
+                                ServiceEntry {
+                                    slot: entry.slot,
+                                    state: ServiceState::Registering,
+                                },
+                            );
+                            self.register(id, &nonce, &mut rd, &mut wr).await?;
+                            self.drain_dropped(&nonce, &mut rd, &mut wr).await?;
+                        }
+                    }
+                    #[cfg(mh_l3_client)]
                     Some(SessionRequest::DrainLane { service, lane, cancel }) => {
                         let cmd = if cancel {
                             SessionCmd::CancelDrain(service, lane)
@@ -4548,6 +5177,11 @@ impl ClientSession {
                 // still wants one.
                 #[cfg(mh_l3_client)]
                 SessionRequest::DrainLane { .. } => {}
+                // A rebuild that arrives while the session is (re)connecting is
+                // already happening: the service is re-registered by the sweep
+                // that follows this call, from the slot this end still holds.
+                #[cfg(mh_l3_client)]
+                SessionRequest::Restart(_) => {}
             }
         }
     }
@@ -5179,8 +5813,15 @@ impl ClientSession {
         let Some(endpoint) = active.lane else {
             return;
         };
+        let tun = active.args.service.transparent_tun.clone();
         if let Some(pool) = self.lane_pool.as_ref() {
             pool.unregister(&endpoint);
+        }
+        // **And the claim's flows go with it.** A rebuilt claim is a new claim at the same
+        // address; the flows the old one placed point into slots nothing carries any more,
+        // and the next visitor's packet would be dropped there (`HANDOFF.md` §4 I).
+        if let Ok(hub) = TunHub::get_or_spawn(&tun, Direction::Source) {
+            hub.forget_claim(&endpoint);
         }
     }
 
@@ -5207,6 +5848,17 @@ mod tests {
         reason = "tests unwrap and expect on values they just constructed"
     )]
     use super::*;
+
+    /// The wait a claim pays between lane dials: a second, doubling, capped —
+    /// so a claim that lost its lane to a network condition is back within a
+    /// second of it ending, and one that cannot get a lane costs a line a minute.
+    #[cfg(mh_l3_client)]
+    #[test]
+    fn a_claim_that_cannot_get_a_lane_backs_off() {
+        let secs: Vec<u64> = (0..8).map(|n| lane_dial_backoff(n).as_secs()).collect();
+        assert_eq!(secs, vec![1, 1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(lane_dial_backoff(99).as_secs(), 30);
+    }
 
     /// A tunnel's byte counts accumulate per tunnel, and the snapshot is cumulative
     /// so a policy can difference two of them into a window.

@@ -323,6 +323,21 @@ METRIC_SPECS: tuple[dict, ...] = (
         "precision": 0,
     },
     {
+        "id": "half_close_bytes",
+        "unit": "byte",
+        "direction": "higher",
+        "definition": (
+            "bytes a visitor still receives after it shut its own send "
+            "direction: a tool that forwards the half-close as a close returns "
+            "zero, and the response is truncated with no error anywhere"
+        ),
+        "denominator": "one half-closed connection",
+        "needs": ("half-close",),
+        "materiality": ("rel", 5.0),
+        "precision": 0,
+        "headline": True,
+    },
+    {
         "id": "udp_recv_mbit",
         "unit": "Mbit/s",
         "direction": "higher",
@@ -932,17 +947,105 @@ STAGED_SERIES: tuple = ("interactive", "udp", "churn")
 #: The stage schedules. A timeline is a *list* rather than a dict because the
 #: recovery axis is a repeat: the clean stage at both ends is the run's own
 #: replicate, and its position is part of what it means.
+#: The leg a stage imposes its condition on unless the stage says otherwise: the
+#: visitor's own connection, which is what the user's client experiences. A stage
+#: that names `tunnel` shapes the hop the **tool** owns instead, and that is a
+#: different experiment — it is the only way to measure a carrier's own transport,
+#: and several conditions do nothing at all on the visitor leg while being the
+#: whole question on the tunnel one (a 1 280-byte MTU left every arm's visitor-leg
+#: reading unchanged, because what it constrains is the size of the packets the
+#: *tool* re-sends, not the visitor's TCP; measured 2026-11-22: control 41.39,
+#: rathole 8.96, molehill 3.82 Gbit/s against the clean cell's 40.45 / 9.83 / 4.00).
+DEFAULT_LEG = "visitor"
+
 TIMELINES: dict[str, tuple] = {
-    # The sweep: how a tool behaves as the path degrades, and whether it is
-    # still the tool it was when the path recovers.
+    # **The release schedule.** Every deployment class the product is expected to
+    # survive, on the leg where that class actually happens, bracketed by the same
+    # condition at both ends — the run's own control for "did the tool come back
+    # after all of it", which is the only repeated measure a one-pass release run
+    # has. `docs/benchmarks.md`, "The release schedule", is the table a reader
+    # holds this against; changing either is one change.
+    #
+    # Visitor leg — the path the visitor's own connection crosses:
+    #   clean          the healthy path, and the control for every other row
+    #   rtt100         distance: a long-haul round trip
+    #   loss1          light loss
+    #   loss1_deep     the *same* loss with a queue deep enough not to tail-drop:
+    #                  a controlled pair whose one varying parameter is the queue,
+    #                  so "the tail is repair" and "the tail is the shaper" can be
+    #                  told apart
+    #   loss5          heavy loss
+    #   rate20         a slow uplink (20 Mbit/s)
+    #   rate100        a 100 Mbit/s uplink
+    #   rate100_shallow the same rate with an ~11 ms queue: the second controlled
+    #                  pair, same rate and one varying parameter — bufferbloat
+    #   loss1_rate100  a mobile/hotspot path: loss and a rate cap together
+    #   jitter         delay that moves under the flow
+    # Tunnel leg — the hop the tool owns, where its own carrier lives:
+    #   rtt100         the bandwidth-delay product its windows must open across
+    #   loss1/loss5    loss *under the carrier*: repair inside an RTT, or a timer
+    #   rate100_shallow bufferbloat inside the carrier's own queue
+    #   mtu1280        a tunnel or IPv6-minimum path: do its own packets fit?
+    #   udp_throttled  a network that polices UDP to a few thousand packets a second
+    #   udp_blocked    a network that refuses UDP: the product must fall back, and
+    #                  a datagram-only design must fail
+    # **The recovery cell, on its own.** A UDP-refusing network on the leg the
+    # carrier lives on, bracketed by clean stages: the one question `sweep`'s own
+    # schedule asks and cannot isolate — *does a claim keep or regain its data
+    # plane after the block lifts?* It is a diagnostic, not part of the release
+    # record: the three stages cost six minutes instead of a five-hour sweep, which
+    # is what a defect on this path needs (`HANDOFF.md` §4 I).
+    "recover": (
+        ("clean", 150.0),
+        ("udp_blocked", 150.0, "tunnel"),
+        ("clean", 150.0),
+    ),
+    # Two halves of the release schedule, for bisecting what a *preceding* scenario
+    # leaves behind: the tunnel-leg stages only, then the visitor-leg ones. A diagnosis
+    # of `l3`'s capacity ramp, which passes alone and fails after the whole timeline
+    # (`HANDOFF.md` §4 I).
+    "tunlegs": (
+        ("clean", 20.0),
+        ("rate100_shallow", 20.0, "tunnel"),
+        ("mtu1280", 20.0, "tunnel"),
+        ("udp_throttled", 20.0, "tunnel"),
+        ("udp_blocked", 20.0, "tunnel"),
+        ("clean", 20.0),
+    ),
+    # Clean, then a minute of a policed carrier, then clean again — the shape that
+    # leaves a claim's lanes delivering a fraction of their peak, for the diagnostic
+    # profile of the same name (`HANDOFF.md` §4 I).
+    "police": (
+        ("clean", 60.0),
+        ("udp_throttled", 60.0, "tunnel"),
+        ("clean", 60.0),
+    ),
+    "vislegs": (
+        ("clean", 20.0),
+        ("loss5", 20.0),
+        ("rate100_shallow", 20.0),
+        ("loss1_rate100", 20.0),
+        ("jitter", 20.0),
+        ("clean", 20.0),
+    ),
     "sweep": (
         ("clean", 150.0),
         ("rtt100", 120.0),
         ("loss1", 120.0),
+        ("loss1_deep", 120.0),
         ("loss5", 120.0),
-        ("rate100", 120.0),
         ("rate20", 120.0),
+        ("rate100", 120.0),
+        ("rate100_shallow", 120.0),
+        ("loss1_rate100", 120.0),
         ("jitter", 120.0),
+        ("rtt100", 120.0, "tunnel"),
+        ("loss1", 120.0, "tunnel"),
+        ("loss5", 120.0, "tunnel"),
+        ("rate100_shallow", 120.0, "tunnel"),
+        ("mtu1280", 120.0, "tunnel"),
+        ("udp_throttled", 120.0, "tunnel"),
+        ("udp_blocked", 120.0, "tunnel"),
         ("clean", 150.0),
     ),
     # The drift axis: fewer conditions, longer holds.
@@ -1006,10 +1109,58 @@ def staged_condition(name: str, params: dict) -> str:
 
 
 def timeline_for(name: str, scale: float = 1.0) -> tuple:
-    """A timeline with every stage's hold scaled, never the order or the set."""
+    """A timeline with every stage's hold scaled, never the order or the set.
+
+    A stage is `(condition, seconds)` or `(condition, seconds, leg)`, and this is
+    the one place the shape is normalised: `stages_of` builds the run's cells and
+    `expected_cells` builds the list the gate checks from the same triples, so a
+    stage cannot be measured on one leg and claimed on another.
+    """
     if name not in TIMELINES:
         raise SystemExit(f"unknown timeline {name!r}; known: {', '.join(TIMELINES)}")
-    return tuple((cond, round(secs * scale, 2)) for cond, secs in TIMELINES[name])
+    out = []
+    for stage in TIMELINES[name]:
+        condition, secs, *rest = stage
+        leg = rest[0] if rest else DEFAULT_LEG
+        if leg not in LEG_NAMES:
+            raise SystemExit(
+                f"timeline {name!r} puts {condition!r} on an unknown leg {leg!r}; "
+                f"known: {', '.join(LEG_NAMES)}"
+            )
+        if condition != "campaign" and condition not in CONDITIONS:
+            raise SystemExit(
+                f"timeline {name!r} names an unknown condition {condition!r}"
+            )
+        out.append((condition, round(secs * scale, 2), leg))
+    return tuple(out)
+
+
+#: The legs a stage may name. Kept here rather than imported from `topology` so
+#: the *model* refuses a schedule it cannot measure, before a run starts.
+LEG_NAMES: tuple = ("visitor", "tunnel")
+
+
+def stages_of(params: dict) -> tuple:
+    """The staged run's stages: `(label, condition, hold seconds, leg)`.
+
+    One home for the label rule. A condition appears once per leg, so the same
+    condition on the two legs is two cells — `loss1` and `loss1@tunnel` — and a
+    repeat of one of them is numbered (`clean`, `clean#2`) exactly as before.
+    The workload builds its cell names from this and `expected_cells` builds the
+    list the gate checks, so the two cannot disagree.
+    """
+    holds = timeline_for(params["timeline"], params.get("scale", 1.0))
+    floor = params.get("min_hold_s", 0.0)
+    seen: dict = {}
+    stages = []
+    for condition, secs, leg in holds:
+        resolved = staged_condition(condition, params)
+        key = resolved if leg == DEFAULT_LEG else f"{resolved}@{leg}"
+        seen[key] = seen.get(key, 0) + 1
+        occurrence = seen[key]
+        label = key if occurrence == 1 else f"{key}#{occurrence}"
+        stages.append((label, resolved, max(secs, floor), leg))
+    return tuple(stages)
 
 
 # --------------------------------------------------------------------------
@@ -1478,16 +1629,7 @@ def expected_cells(scenario_id: str, params: dict) -> list:
     """
     scenario = SCENARIOS[scenario_id]
     if scenario.kind == Kind.STAGED:
-        holds = timeline_for(params["timeline"], params.get("scale", 1.0))
-        seen: dict = {}
-        cells = []
-        for condition, _ in holds:
-            resolved = staged_condition(condition, params)
-            seen[resolved] = seen.get(resolved, 0) + 1
-            cells.append(
-                resolved if seen[resolved] == 1 else f"{resolved}#{seen[resolved]}"
-            )
-        return [*cells, "run"]
+        return [stage[0] for stage in stages_of(params)] + ["run"]
     if scenario.kind == Kind.CAPACITY:
         return [f"L{n}" for n in range(1, params["streams_max"] + 1)] + ["ramp"]
     if scenario.kind == Kind.TRANSPORT:
@@ -1532,6 +1674,17 @@ def scenario_catalog() -> list:
                 "omit": 2,
             },
             headline="throughput_gbps",
+        ),
+        Scenario(
+            id="half-close",
+            kind="half-close",
+            claim=(
+                "whether a tool keeps the server-to-visitor direction alive after "
+                "the visitor has shut its own: a truncated response no latency or "
+                "throughput cell can show"
+            ),
+            params={"reps": 3, "send_bytes": 4096, "tail_bytes": 65536},
+            headline="half_close_bytes",
         ),
         Scenario(
             id="bulk-pair",
@@ -1805,6 +1958,7 @@ PROFILES: dict[str, dict] = {
             "bulk-1",
             "bulk-n",
             "bulk-pair",
+            "half-close",
             "rr-1",
             "rr-16",
             "churn-16",
@@ -1824,7 +1978,10 @@ PROFILES: dict[str, dict] = {
         },
     },
     "full": {
-        "what": "the release-grade sweep: everything, for as long as it takes",
+        "what": (
+            "every scenario the model has, for as long as it takes: "
+            "a diagnostic, not the release artifact"
+        ),
         "rounds": 6,
         "warmup_rounds": 1,
         "scenarios": tuple(s.id for s in SCENARIOS.values()),
@@ -1890,6 +2047,21 @@ PROFILES |= {
         "arms": ("molehill",),
         "params": {"soak": {"scale": 1.0, "streams": 4}},
     },
+    # A comparison, not a release artifact: the single cells a reader wants side
+    # by side across arms, priced with enough rounds and a twin to be judged.
+    # The release `sweep` cannot do this — one round and no A/A is what a
+    # twenty-minute timeline per arm affords — and a rate difference inside a
+    # twin's own spread is not a comparison, it is a coin toss.
+    "compare": {
+        "what": "arms side by side on the single cells, with rounds and an A/A twin",
+        "rounds": 3,
+        "warmup_rounds": 1,
+        "scenarios": ("bulk-1", "rr-16", "half-close"),
+        "budget_s": 400.0,
+        "aa": True,
+        "arms": (),
+        "params": {"bulk-1": {"secs": 6, "omit": 2}},
+    },
     "screen": {
         "what": "a development A/B: one condition, the two builds interleaved",
         "rounds": 3,
@@ -1937,6 +2109,45 @@ PROFILES |= {
         "budget_s": 240.0,
         "params": {"timeline": {"scale": 1.0, "streams": 0, "timeline": "wedge"}},
     },
+    "recover": {
+        # A diagnostic profile, not a release artifact: it exists so the claim's
+        # recovery question can be asked in six minutes instead of a five-hour
+        # sweep (see the `recover` timeline).
+        "what": "one question, isolated: does a claim return after a UDP block lifts",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline",),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "recover"}},
+    },
+    "tunlegs": {
+        "what": "diagnostic: the tunnel-leg half of the schedule, then the ramp",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline", "capacity"),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "tunlegs"}},
+    },
+    "police": {
+        "what": "diagnostic: a policed carrier between clean stages, then the ramp",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline", "capacity"),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "police"}},
+    },
+    "vislegs": {
+        "what": "diagnostic: the visitor-leg half of the schedule, then the ramp",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline", "capacity"),
+        "budget_s": 900.0,
+        "aa": False,
+        "params": {"timeline": {"timeline": "vislegs"}},
+    },
     "sweep": {
         # The product's own two architectures first, then the reference tools.
         # `l3` has no peer: frp, rathole and nps are forwarding proxies with no
@@ -1944,13 +2155,32 @@ PROFILES |= {
         # control — the same workload, the same topology, one architecture apart.
         # It earns its place because L3 is what this release is *for*, and a
         # release artifact that omits it cannot support the release's own claim.
-        "what": "the release sweep: the staged schedule and the load ramp",
+        "what": "the release sweep: the schedule, the ramp, and the half-close cell",
         "rounds": 1,
         "warmup_rounds": 0,
-        "scenarios": ("timeline", "capacity"),
-        "budget_s": 3000.0,
+        # The schedule and the ramp answer "how does it behave as the path
+        # changes"; `half-close` is a **categorical** cell (a tool delivers the
+        # answer a half-closed visitor is owed, or it does not), so it needs no
+        # statistics and belongs in a one-round release run. The *rate*
+        # comparisons do not: one round cannot order arms a twin arm differs
+        # from by 1.5 %, so they live in the `compare` profile with rounds and
+        # an A/A pair, and no published table quotes them.
+        "scenarios": ("timeline", "capacity", "half-close"),
+        # The real cost of the schedule, not the holds alone: every stage pays a
+        # drain before the next one is imposed (25 to 35 s on this host), so
+        # 2 220 s of holds is 40 to 45 minutes per arm and about four hours for
+        # five arms.
+        # The budget is what a run is *planned* against and what its record
+        # prints; a run that overruns it says so rather than being cut.
+        "budget_s": 18500.0,
         "aa": False,
-        "arms": ("molehill", "l3", "frp", "rathole", "nps"),
+        # The tool-free **control** arm is the floor every other arm's reading is
+        # read against, and the release artifact is the only published one — so
+        # it carries the control rather than borrowing a floor from another
+        # artifact. Without it "the product answers a half-closed visitor in
+        # 51 ms on the carrier's own leg" has no scale; with it, the same cell
+        # reads 1 054 ms on the path alone.
+        "arms": ("control", "molehill", "l3", "frp", "rathole", "nps"),
         "params": {},
     },
 }
@@ -2022,6 +2252,10 @@ class Kind:
     # and every other bulk scenario opens its streams in the first second
     # (`HANDOFF.md` §4 E).
     TWO_WAVE: ClassVar[str] = "two-wave"
+    #: A visitor that shuts its own send direction and still expects the rest of
+    #: the answer: the classic half-close a proxy can turn into a truncated
+    #: response without an error anywhere.
+    HALF_CLOSE: ClassVar[str] = "half-close"
     RR: ClassVar[str] = "rr"
     UDP: ClassVar[str] = "udp"
     UDP_LADDER: ClassVar[str] = "udp-ladder"
@@ -2035,6 +2269,7 @@ class Kind:
         BULK,
         BULK_PAIR,
         TWO_WAVE,
+        HALF_CLOSE,
         RR,
         UDP,
         UDP_LADDER,

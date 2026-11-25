@@ -60,7 +60,7 @@ UDP_PROBE = HERE / "probes" / "udp.py"
 #: travels through the same queue, so the writer cannot finish ahead of the
 #: bytes that preceded it.
 ECHO_SRC = """
-import queue, socket, sys, threading
+import queue, socket, sys, threading, time
 from contextlib import suppress
 
 port = int(sys.argv[1])
@@ -78,6 +78,70 @@ QUEUE_DEPTH = 64
 ANNOUNCE_OVER = 64 << 10
 
 EOF = object()
+
+#: A probe names itself in its first four bytes, so one backend can serve the
+#: echo and this without a second port or a second service in every arm's
+#: config: `HC01` is a visitor that will half-close its own direction. The peek
+#: is non-destructive, so a plain visitor's bytes are untouched and the echo path
+#: is the one every other scenario already measured.
+HALF_CLOSE = b"HC01"
+#: How much the backend still owes a visitor after that visitor said it is done
+#: sending. A tool that treats a half-close as a close delivers zero.
+TAIL_BYTES = 65536
+
+
+def peek_mode(conn):
+    # The probe's magic if one is coming, else None, without consuming bytes.
+    # A plain visitor may legitimately say nothing for a while (nothing in this
+    # model does, but a backend must not depend on that), so the wait is bounded
+    # and a timeout means "the echo".
+    end = time.time() + 1.0
+    head = b""
+    while len(head) < 4:
+        left = end - time.time()
+        if left <= 0:
+            return None
+        conn.settimeout(left)
+        try:
+            more = conn.recv(4 - len(head), socket.MSG_PEEK)
+        except (OSError, socket.timeout):
+            return None
+        if not more:
+            return None
+        head += more
+    conn.settimeout(None)
+    return head
+
+
+def take(conn, count):
+    # Consume exactly `count` bytes; the peek above promised they are there.
+    got = 0
+    while got < count:
+        more = conn.recv(count - got)
+        if not more:
+            return False
+        got += len(more)
+    return True
+
+
+def serve_half_close(conn):
+    # Read until the visitor half-closes, *then* answer. That is the whole
+    # cell: the answer is only owed after the visitor has said it will send
+    # nothing more, so a tool that forwards a half-close as a close loses it and
+    # one that half-closes the pair delivers it.
+    while True:
+        data = conn.recv(65536)
+        if not data:
+            break
+    pattern = bytes(range(256)) * (TAIL_BYTES // 256)
+    try:
+        conn.sendall(pattern)
+    except OSError:
+        sys.stdout.write(f"HALFCLOSE WROTE 0\\n")
+        sys.stdout.flush()
+        return
+    sys.stdout.write(f"HALFCLOSE WROTE {len(pattern)}\\n")
+    sys.stdout.flush()
 
 
 def udp_echo():
@@ -98,6 +162,12 @@ threading.Thread(target=udp_echo, daemon=True).start()
 def serve(conn, addr):
     sys.stdout.write(f"PEER {addr[0]}:{addr[1]}\\n")
     sys.stdout.flush()
+    mode = peek_mode(conn)
+    if mode == HALF_CLOSE and take(conn, 4):
+        serve_half_close(conn)
+        with suppress(OSError):
+            conn.close()
+        return
     q = queue.Queue(maxsize=QUEUE_DEPTH)
     done = threading.Event()
     taken = [0]
@@ -171,6 +241,60 @@ print(f"ECHO READY {port}", flush=True)
 while True:
     conn, addr = srv.accept()
     threading.Thread(target=serve, args=(conn, addr), daemon=True).start()
+"""
+
+
+#: The visitor-side probe the half-close cell drives. It runs inside the visitor
+#: namespace, so its traffic crosses the same shaped path every other cell's
+#: does, and it prints one JSON line: the runner owns the verdict, the probe owns
+#: only what the sockets did.
+PROBE_SRC = """
+import json, socket, sys, time
+
+mode, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+
+def dial(timeout):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((host, port))
+    return sock
+
+
+def close_quietly(sock):
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def half_close(reps, send_bytes, tail_bytes):
+    out = []
+    for _ in range(reps):
+        started = time.time()
+        row = {"got": 0, "ms": 0.0, "err": ""}
+        try:
+            sock = dial(10.0)
+            sock.sendall(b"HC01")
+            sock.sendall(b"x" * send_bytes)
+            sock.shutdown(socket.SHUT_WR)
+            got = 0
+            while got < tail_bytes:
+                more = sock.recv(65536)
+                if not more:
+                    break
+                got += len(more)
+            close_quietly(sock)
+            row["got"] = got
+        except OSError as exc:
+            row["err"] = str(exc)
+        row["ms"] = round((time.time() - started) * 1000.0, 2)
+        out.append(row)
+    return out
+
+
+rows = half_close(int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]))
+print(json.dumps({"mode": mode, "reps": rows}))
 """
 
 
@@ -757,6 +881,80 @@ def run_two_wave(ctx: Ctx, params: dict) -> list:
                 _iperf_cell(Spot(ctx, window, name), result, metrics, streams=streams)
             )
     return cells
+
+
+def _run_probe(ctx: Ctx, args: list, timeout: float) -> dict:
+    """Run the visitor-side probe inside the visitor namespace, read its line."""
+    argv = ctx.topo.ns_argv(
+        topology.VIS_NS, [sys.executable, "-c", PROBE_SRC, *[str(a) for a in args]]
+    )
+    done = subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, check=False
+    )
+    lines = (done.stdout or "").strip().splitlines()
+    if not lines:
+        detail = (done.stderr or "").strip().splitlines()
+        tail = detail[-1] if detail else f"exit {done.returncode} with no output"
+        raise RuntimeError(tail[:200])
+    try:
+        return json.loads(lines[-1])
+    except ValueError as exc:
+        raise RuntimeError(
+            f"the probe's last line was not JSON: {lines[-1][:120]}"
+        ) from exc
+
+
+def run_half_close(ctx: Ctx, params: dict) -> list:
+    """Does the answer a visitor is owed *after* it half-closed still arrive?
+
+    A visitor may send its request, shut its own direction and still expect the
+    rest of the answer: `curl --data-binary @-` against a streaming endpoint, a
+    shell pipeline into the service, any client that cannot know how much it is
+    owed. That is a shape no latency or throughput cell can fail — the transfer
+    is never slow, it is *cut* — and a proxy that forwards a half-close as a
+    close returns a truncated response with no error anywhere.
+
+    The backend owes the visitor `tail_bytes` only after its read direction ends
+    (`HALF_CLOSE` in `ECHO_SRC`), so the metric is exactly the bytes a tool let
+    through a half-closed pair. The control arm has no tool in the path and
+    therefore states what the cell can read.
+    """
+    port = topology.ECHO_PORT
+    if not wait_dial_port(ctx, port):
+        return [Cell("", False, reason="the tool never listened on the echo port")]
+    reps = int(params["reps"])
+    send_bytes = int(params["send_bytes"])
+    tail_bytes = int(params["tail_bytes"])
+    with measured(ctx, port) as window:
+        try:
+            out = _run_probe(
+                ctx,
+                ["half-close", ctx.arm.dial_host, port, reps, send_bytes, tail_bytes],
+                timeout=20.0 + 15.0 * reps,
+            )
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            return [Cell("", False, reason=f"the probe could not run: {exc}")]
+    rows = out.get("reps") or []
+    if not rows:
+        return [Cell("", False, reason="the probe produced no rep")]
+    got = [int(row.get("got", 0)) for row in rows]
+    return [
+        Cell(
+            "",
+            ok=True,
+            metrics={"half_close_bytes": int(statistics.median(got))},
+            evidence=_evidence(
+                ctx,
+                window,
+                {
+                    "reps": rows,
+                    "send_bytes": send_bytes,
+                    "tail_bytes": tail_bytes,
+                    "delivered_reps": sum(1 for value in got if value > 0),
+                },
+            ),
+        )
+    ]
 
 
 def run_bulk_pair(ctx: Ctx, params: dict) -> list:
@@ -1420,21 +1618,14 @@ def _gap_p99(points: list):
 
 
 def _stages_of(params: dict) -> list:
-    """The timeline with its holds scaled, floored, and numbered per condition."""
-    holds = model.timeline_for(params["timeline"], params.get("scale", 1.0))
-    floor = params.get("min_hold_s", 0.0)
-    seen: dict = {}
-    stages = []
-    for condition, secs in holds:
-        # The `campaign` sentinel resolves to the run's own condition, so a
-        # single-point cost run can price the path it names (§12 P1) and its cell
-        # keeps the name `expected_cells` computed from the same params.
-        resolved = model.staged_condition(condition, params)
-        seen[resolved] = seen.get(resolved, 0) + 1
-        occurrence = seen[resolved]
-        label = resolved if occurrence == 1 else f"{resolved}#{occurrence}"
-        stages.append((label, resolved, max(secs, floor)))
-    return stages
+    """The run's stages, with the label rule owned by the model.
+
+    The naming has one home (`model.stages_of`) because the gate checks the cell
+    list `expected_cells` builds from the same function: a stage measured under
+    one name and claimed under another is the class of error that check exists
+    for, not one it should have to catch.
+    """
+    return list(model.stages_of(params))
 
 
 def run_staged(ctx: Ctx, params: dict) -> list:
@@ -1474,8 +1665,7 @@ def run_staged(ctx: Ctx, params: dict) -> list:
                 proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
-        if ctx.condition is not None:
-            ctx.topo.set_condition(ctx.leg, ctx.condition)
+        _settle_legs(ctx)
     cells.append(_run_cell(drift_points, logs, series))
     return cells
 
@@ -1535,6 +1725,24 @@ def _attach_step_recovery(cells: list, logs: dict) -> None:
     recovery.evidence["step_recovery_baseline_ms"] = round(baseline, 3)
 
 
+def _settle_legs(ctx: Ctx) -> None:
+    """Put **every** leg back to the run's own path, whichever stage ran last.
+
+    A stage imposes its condition on one leg and the schedule then moves to the
+    other, so restoring only the leg the stage used leaves that stage's rule
+    standing: the release schedule ends on a *visitor*-leg stage while stage 17
+    put a UDP-refusing firewall rule on the *tunnel* one, and the guard that
+    "puts the leg back to clean however the stage ends" was looking at the wrong
+    leg. Two legs, two answers: the run's own condition on its leg, `clean` on the
+    others. A pass that ends with a rule standing is a pass whose next measurement
+    is of a network nobody asked for (`HANDOFF.md` §4 I).
+    """
+    for leg in model.LEG_NAMES:
+        wanted = ctx.condition if leg == ctx.leg else None
+        with contextlib.suppress(Exception):
+            ctx.topo.set_condition(leg, wanted or model.CONDITIONS["clean"])
+
+
 class _RestoresCondition:
     """Put the leg back to clean however the stage ends.
 
@@ -1554,15 +1762,14 @@ class _RestoresCondition:
     process.
     """
 
-    def __init__(self, topo, leg: str) -> None:
-        self.topo, self.leg = topo, leg
+    def __init__(self, ctx: Ctx, leg: str) -> None:
+        self.ctx, self.leg = ctx, leg
 
     def __enter__(self) -> None:
         return None
 
     def __exit__(self, *_: object) -> None:
-        with contextlib.suppress(Exception):
-            self.topo.set_condition(self.leg, model.CONDITIONS["clean"])
+        _settle_legs(self.ctx)
 
 
 #: Failure reasons that belong to the instrument rather than to the arm.
@@ -1593,9 +1800,12 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     does not leave a hole in the coverage the gate checks. The second attempt is
     what the sample carries; the first one's reason travels in its evidence.
     """
-    condition = stage[1]
-    ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
-    with _RestoresCondition(ctx.topo, ctx.leg):
+    _label, condition, _secs, leg = stage
+    # The stage's own leg: a schedule that shapes the visitor for one stage and
+    # the tunnel for the next is two experiments in one run, and imposing both on
+    # the run's leg would silently measure the second as a repeat of the first.
+    ctx.topo.set_condition(leg, model.CONDITIONS[condition])
+    with _RestoresCondition(ctx, leg):
         cell = _measure_stage(ctx, stage, params, logs)
         # What the instrument said, whether it took the whole cell down with it or
         # only `throughput_gbps`: a stage measured leniently still deserves the
@@ -1613,7 +1823,7 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         cell.evidence["reachable_after_failure"] = wait_dial_port(
             ctx, topology.IPERF_PORT, 5.0
         )
-        ctx.topo.drain(ctx.leg)
+        ctx.topo.drain(leg)
         again = _measure_stage(ctx, stage, params, logs)
         again.evidence["retried_after"] = (first or "")[:200]
         # The first attempt's own evidence is the one that describes the failure;
@@ -1626,10 +1836,82 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
         return again
 
 
+def _tun_state(ctx: Ctx) -> str:
+    """The client's transparent device as the kernel sees it, for the bench log.
+
+    A claim that stops carrying has two possible owners: the tool, or the path the
+    visitor's packets take to reach it. `no answer` from the boundary probe and zero
+    forwarded frames cannot tell them apart, and the device's own state can: an
+    address or a link that disappeared is the path, and both present is the tool
+    (`HANDOFF.md` §4 I).
+    """
+    try:
+        link = ctx.topo.ns_run(
+            topology.CLI_NS, ["ip", "-o", "link", "show", "mhbcli0"], check=False
+        )
+        addr = ctx.topo.ns_run(
+            topology.CLI_NS, ["ip", "-o", "-4", "addr", "show", "mhbcli0"], check=False
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
+        return "unavailable"
+    up = "UP" in (link.stdout or "")
+    has = "inet " in (addr.stdout or "")
+    # Where a packet for the claimed address would go, from both namespaces that
+    # have to agree for a visitor to reach it: the client's kernel forwards into the
+    # device, the visitor's sends toward the client. A device that is up and
+    # addressed with no route into it is a path broken by something recreating the
+    # device — which is a different owner from a tool that will not forward.
+    # The device's own counters: RX climbing while the visitor dials means the
+    # kernel is receiving frames the tool is not taking; RX flat means nothing
+    # arrives and the path is somebody else's (`HANDOFF.md` §4 I).
+    counters = {}
+    for side, ns, dev in (
+        ("cli", topology.CLI_NS, "mhbcli0"),
+        ("srv", topology.SRV_NS, "mhbsrv0"),
+    ):
+        try:
+            stats = ctx.topo.ns_run(
+                ns, ["ip", "-s", "-o", "link", "show", dev], check=False
+            )
+            words = (stats.stdout or "").split()
+            # The two counters that matter: what the kernel handed the device
+            # (userspace reads it) and what it took from it.
+            counters[side] = " ".join(words[-6:-4]) if words else "?"
+        except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
+            counters[side] = "err"
+    routes = []
+    for ns in (topology.CLI_NS, topology.VIS_NS):
+        try:
+            got = ctx.topo.ns_run(
+                ns, ["ip", "-o", "-4", "route", "get", "10.99.0.1"], check=False
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic never fails a stage
+            routes.append("?")
+            continue
+        out = got.stdout or ""
+        routes.append("mhbcli0" if "mhbcli0" in out else ("other" if out else "none"))
+    # Both ends' devices: an L3 claim is one path through two kernels, and the one
+    # that stopped carrying is the one whose counters stopped moving.
+    both = " ".join(f"{side}={counters[side]}" for side in ("cli", "srv"))
+    return f"up={up} addr={has} routes={routes} {both}"
+
+
+def _record_boundary(ctx: Ctx, cell: Cell, boundary: dict) -> None:
+    """What a visitor could do at this stage's boundary, and what the device it
+    reaches looked like doing it.
+
+    The two together separate the tool from the path: a boundary that cannot answer
+    while the client's TUN is up and addressed is the tool's fault, and one that
+    cannot answer while the device is gone is nobody's product (`HANDOFF.md` §4 I).
+    """
+    cell.evidence["echo_probe"] = boundary
+    cell.evidence["client_tun"] = _tun_state(ctx)
+
+
 def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     """The body of one stage, with its condition already imposed."""
-    label, condition, secs = stage
-    drain = ctx.topo.drain(ctx.leg)
+    label, condition, secs, leg = stage
+    drain = ctx.topo.drain(leg)
     # Asked before the condition and before this stage's own traffic: was the tool
     # serving anyone at this boundary at all?
     boundary = echo_round_trip(ctx)
@@ -1740,7 +2022,7 @@ def _measure_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     built.evidence["series_logs"] = [str(logs[mode]) for mode in series if mode in logs]
     # The boundary's own answer, on every stage: a visitor's whole life through the
     # tool, asked before this stage's traffic started.
-    built.evidence["echo_probe"] = boundary
+    _record_boundary(ctx, built, boundary)
     built.evidence |= {
         "condition": condition,
         "hold_s": secs,
@@ -1840,6 +2122,16 @@ def _thinned(points: list, every: int = 5) -> list:
     return points[::every]
 
 
+#: How long the ramp waits for the arm's workload port before it starts.
+#:
+#: Long enough for a claim that has to rebuild its data plane (its deregistration, the
+#: peer's teardown, the registration and the first lane: a few seconds), and short
+#: enough that a tool which is not coming back is reported as such rather than waited
+#: out. The seconds a scenario *does* spend here are recorded in the run's evidence like
+#: any other instrument parameter.
+CAPACITY_READY_BUDGET = 60.0
+
+
 def run_capacity(ctx: Ctx, params: dict) -> list:
     """Ramp the bulk load until the interactive stream breaks the SLO.
 
@@ -1849,6 +2141,18 @@ def run_capacity(ctx: Ctx, params: dict) -> list:
     latency is.
     """
     ctx.topo.set_condition(ctx.leg, model.CONDITIONS[params["condition"]])
+    # **The ramp asks for capacity, not for recovery.** A scenario that starts while
+    # the previous one's damage is still settling measures the transition — measured
+    # 2026-11-25: after a stage that policed the carrier's datagrams for a minute, the
+    # first level timed out with the backend never having accepted a connection, while
+    # the same ramp on its own sustained every level (`HANDOFF.md` §4 I). The gate is
+    # the workload's own port, with a budget long enough for a claim to rebuild.
+    ready_by = time.monotonic() + CAPACITY_READY_BUDGET
+    while (
+        not wait_dial_port(ctx, topology.IPERF_PORT, 2.0)
+        and time.monotonic() < ready_by
+    ):
+        time.sleep(1.0)
     settle = params["settle_s"]
     cells: list = []
     sustainable = 0
@@ -2288,6 +2592,7 @@ RUNNERS = {
     model.Kind.BULK: run_bulk,
     model.Kind.BULK_PAIR: run_bulk_pair,
     model.Kind.TWO_WAVE: run_two_wave,
+    model.Kind.HALF_CLOSE: run_half_close,
     model.Kind.RR: run_rr,
     model.Kind.UDP: run_udp,
     model.Kind.UDP_LADDER: run_udp_ladder,

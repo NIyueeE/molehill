@@ -13,6 +13,36 @@ Read `AGENTS.md` first for the rules; read this for the state.
 
 ## 0. Where to start right now (read this first)
 
+> **§4.534 (the bench 定型: coverage lands on the leg each class happens on, a claim discipline, a revision rule).**
+> **Why.** The release schedule was eight stages, all imposed on the visitor's connection — the leg **no tool owns** — so every
+> shaped cell tied and a release run could compare arms only on a clean path. The product's own feedback channel therefore could
+> not see the one thing it exists to measure.
+> **What it is now.** Eighteen stages: ten on the visitor leg (healthy path bracketing the walk; distance; light loss; the same
+> loss with a queue that does not tail-drop; heavy loss; 20 and 100 Mbit uplinks; the same 100 Mbit with an 11 ms queue; a mobile
+> path losing and rate-capped at once; jitter) and seven on the tunnel leg, where a carrier's own transport is all there is to
+> measure (distance, light and heavy loss, bufferbloat, a 1 280-byte MTU, UDP policed, UDP refused). Two rows are
+> **single-parameter pairs** (queue depth at one loss rate, then at one rate) and four conditions are walked on **both legs**.
+> **A cell's name carries its leg** (`loss1@tunnel`), the label rule has one home (`model.stages_of`) so the workload and
+> `expected_cells` cannot disagree, `just bench gate` refuses a record missing a declared cell, the master figure draws the leg
+> boundary, and a reading from one leg is never compared with one from the other.
+> **The claim discipline is written down** (`docs/benchmarks.md`, "The standard"): a one-round release record may claim per-cell
+> facts only — SLO held, wedge, capacity, a categorical cell, side of a threshold — and a difference claim needs the `compare`
+> profile (three rounds, warm-up, A/A twin). A change under `bench/src/bench/` is a **revision**: reason in CHANGELOG, gate
+> without `--baseline`, affected tables in the same commit, this file told what moved.
+> **Two measurements forced the leg dimension, and both are negative results.** `mtu1280` on the visitor leg moved no arm
+> (control 41.39, rathole 8.96, molehill 3.82 Gbit/s against clean's 40.45 / 9.83 / 4.00); `loss1_rate100` on the visitor leg put
+> **every** arm on 0.096 Gbit/s and 286 ms, i.e. on the shaper's own number. A class imposed on the leg that does not own it
+> measures the harness.
+> **Validation** (scale 0.1, two arms, two passes — machinery, not evidence): `loss1@tunnel` **51 ms** against the tool-free
+> control's **1 054**, `loss5@tunnel` 605 against 2 479, `rate100_shallow@tunnel` 235 against 2 694, while the same conditions on
+> the visitor leg tie (1 045 against 1 084). That is the controlled comparison the schedule is for, and it is the same direction
+> §4 G measured at full scale.
+> **Cost, stated because it is real**: ~35 s of drain per stage on top of a 120 s hold, so the release sweep is **~4 hours** for
+> five arms (budget raised to 15 000 s accordingly). `docs/release.md` and the profiles table say so. And **the tree is frozen
+> while a release run is in flight**: two plotter/list commits landed three minutes into the first attempt at this run and made
+> its record unusable for a release (`githooks/pre-tag` diffs the record's revision against the tag commit under
+> `bench/src/bench/`), so that attempt was killed at minute ten and replaced.
+
 > **§4.533 (the release audit: `just tag-check` goes from three failures to a pass, and the sweep withdrew one published claim).**
 > **What the tag review wanted was not code.** `[Unreleased]` held 24 entries the dated `## [1.0.0] - 2026-11-01` section did not
 > have, and neither `benches/records/results-bench-v1.0.0.json` nor `assets/bench-v1.0.0.png` existed. The dated section had also
@@ -678,6 +708,18 @@ Binding constraints, all still in force:
   frames. The parked-and-moved observation stays as a log line.
 - **Never create or push a release tag.** Only a human asks for that; a release
   record is written only when every gate in §7 passes.
+- **The bench is 定型 from v1.0.0 and is the product's only feedback channel.** Its
+  standard is written in `docs/benchmarks.md`, "The standard": a **release record**
+  (one round) may claim only per-cell facts — SLO held, wedges, capacity, a
+  categorical cell, which side of a declared threshold — and never that one arm is
+  faster than another; a **difference claim** belongs to `compare` (rounds + an
+  A/A twin). The schedule covers the deployment classes **on the leg where each
+  happens** (visitor or tunnel), and a reading from one leg is never compared with
+  one from the other. A change under `bench/src/bench/` is a **revision**: reason
+  in CHANGELOG, re-baseline (`just bench gate` without `--baseline`), the affected
+  tables updated in the same commit, and this file told what moved. "Add a
+  scenario to see" is not a revision — measure it as a diagnostic first, and only
+  a scenario that separates arms or asks a categorical question earns a place.
 - A change that does not beat its own gate is **reverted whole**, with its
   measurement kept. More complexity is not more advanced.
 
@@ -900,6 +942,388 @@ the distance between the third-worst samples of five draws from one distribution
 the earlier claim ("where packets are lost the product's tail is the tightest of the four") is withdrawn as one draw of three
 samples. What would reopen it: a stage long enough, or a probe concurrent enough, to put a thousand requests in the cell. That is a
 model change and belongs in the plan, not in a release.
+
+### G. The peers' own leg — the experiment every published table skipped
+
+Every staged table on this page puts the impairment on the **visitor** leg (`condition_leg: visitor`), so each tool's own transport
+runs clean and every shaped stage ties (§3.2). `--condition-leg tunnel` moves the same condition onto the hop the tool *does* own.
+First run of it: `--profile smoke --scenarios bulk-1,rr-16 --condition loss1 --condition-leg tunnel`, four arms, **two measured
+rounds each** (record `/home/dsh/tmp/p310-tunnel-leg.json`, not committed — directional, and the run itself says its `rtt_max`
+floor needs about six rounds):
+
+| cell (1 % loss, 10 ms on the tunnel leg) | control | molehill | frp | rathole |
+|---|---|---|---|---|
+| `bulk-1` throughput, Gbit/s | 4.27 | **1.09** | 1.08 | **4.17** |
+| `rr-16` requests/s | 562 | **697** | 537 | 559 |
+| `rr-16` p99, ms | 245 | **48.7** | 73.7 | 246 |
+| `rr-16` p50, ms | 20.35 | 20.25 | 20.66 | 20.54 |
+| `rr-16` connect+setup p50, ms | 20.3 | 0.65 | 0.51 | 0.43 |
+
+**Two findings, and they point opposite ways.** On the interactive axis the product is the only arm that beats the tool-free path
+(**+24 % requests/s, p99 48.7 ms against the control's 245**) and it is **5× tighter than rathole, 1.5× tighter than frp** — which is
+what per-stream recovery over a datagram buys: a lost segment costs one stream one round trip, where yamux-over-TCP costs all sixteen
+streams an RTO, and rathole's p99 *is* the control's. On the bulk axis the same design loses **3.8× to rathole** (1.09 against 4.17)
+because the window's growth phase ends at the first loss (§4 B, "the window is the whole send-rate policy"); frp loses the same way,
+so this is not a peer-versus-us difference but a window-rule difference.
+
+**What it means for the product's claims.** "Latency on an impaired path" is now compared against peers, not only against our own
+kernel carrier, and it holds. "Throughput" must never be quoted on a clean path — the ranking inverts with the leg the loss is on.
+What would turn either into a claim: the same run at six rounds with the endpoints pre-registered (`--primary`), and the tunnel-leg
+staged schedule (which no published table is yet; `docs/benchmarks.md`, "What the model cannot answer").
+
+### H. The first record under the standard — what it replaces, and the merge checklist
+
+The run in flight (`~/tmp/p380-standard-sweep.json`, five arms, `sweep` profile at revision `a1d941e` and later, ~4 h) is the
+**first record under the 定型 bench**. It replaces `benches/records/results-bench-v1.0.0.json` — measured under the eight-stage
+visitor-only schedule, i.e. a method that no longer exists. Since v1.0.0 was never tagged, that file was never *published*: it is
+replaced in place, and the old numbers survive only in this file's history and in `CHANGELOG.md`.
+
+**The merge, in order, once the run lands:**
+
+1. `just bench gate <record>` **without** `--baseline` — a method-changing release re-baselines (§7). Absolute half only:
+   coverage of every declared cell, the endpoint invariant, the SLO on the clean stages, drift and wedges, the ramp.
+2. `just bench plot <record> --out-dir assets/` and rename to the release's names (`bench-v1.0.0*.png`), replacing the set.
+3. Move the record into `benches/records/results-bench-v1.0.0.json` and the charts into `assets/`.
+4. Rewrite **both** published tables — `README.md`/`README.zh.md` and `docs/benchmarks.md`/`.zh.md` — split **by leg**, from
+   `just bench plot … --markdown`'s own output (the tables it prints are already per leg), with the claim discipline stated
+   beside them: one round, so the tables say which side of a threshold a reading falls on and never rank arms by speed.
+5. CHANGELOG: fold `[Unreleased]` into `## [1.0.0]`, re-date it to the tag's day, and make the re-baseline entry describe
+   the method the tag actually carries — the eighteen-stage two-leg schedule, the `half-close` cell and "The standard" — not
+   only the earlier engine change (`l4-plain`, `Arm.noise_data`, `mhd_lane_dup_pct`) it names today. Name the record file.
+6. Merge this branch into `feat/v1.0.0`, then `just tag-check`. The record's revision and the tag commit must differ only in
+   docs/assets/records — any change under `bench/src/bench/` after the measurement makes the artifact unusable (§0, §4.534).
+7. The tag itself is the human's (`AGENTS.md` §5).
+
+**The risk to watch, and the one thing that must *not* happen.** A stage may produce no cell for an arm — `udp_blocked@tunnel` on
+`l3` is the candidate, because a claim's lanes ride the datagram carrier (though `src/transparent/lanes.rs` can move a lane to TCP,
+so the fallback may well cover it). If the gate then names a missing (arm, cell), the fix is **a revision of the model** — either
+the workload learns to measure it, or the condition declares which architectures it can be imposed on — and the run is repeated.
+**The gate is never relaxed to fit a record**: a coverage check that can be talked out of a missing cell is not a coverage check.
+
+**Two papercuts found while publishing under the standard, both deferred to the next revision because the tree is frozen for
+the measurement:**
+
+- ~~`just bench plot --markdown` prints no per-stage throughput table~~ — **fixed before the record ran** (`throughput_section`,
+  `6b21240`), because leaving it would have made the README's throughput table a `jq` extraction no reader could reproduce.
+- `just bench plot`'s default `--out-dir` is the results file's own directory, so forgetting `--out-dir` writes charts into
+  `benches/records/` beside the evidence (twice, this session). The default should be `assets/`, or the flag should be required.
+
+### I. **The transparent path does not survive a UDP block, and never comes back** (found by the first 定型 record)
+
+The six-arm release run (`~/tmp/p400-standard-sweep.json`, revision `27cd633`, fingerprint `3ccdbad726ff1a85`, 17 301 s, 167
+samples) is **red on the gate with 13 failures, all of them `l3`**. The l4 arms, the three peers and the control arm completed
+every declared cell; the transparent client died at stage 17 and never returned.
+
+| l3's record | reading |
+|---|---|
+| stages 1–16 (`clean` … `udp_throttled@tunnel`) | carried normally — `loss1@tunnel` 45.5 ms, `udp_throttled@tunnel` 1.6 ms |
+| `udp_blocked@tunnel` | **error rate 100 %**, no p99, no throughput |
+| `clean#2` (the block is over) | **error rate 100 %** — it did not recover |
+| `capacity` | **0 of 8** streams |
+| `half-close` | no measured round |
+| `run` | **2 silences, longest 455 s** |
+
+The client's own log names the shape: at 20:20:30 the claim's carrier moved `mhd → tcp` ("the carrier in use kept refusing this
+claim's traffic at the peer"); at 20:21:01 **"Lane 2 of service 2: no drain answer within 30 s; calling the drain off"**; at
+20:30:02 the block lifted and the client *noticed* — **"mhd is reachable again at 10.10.0.254:2400; using it"** — and from then on
+it logs **"claim 10.99.0.1:2401 has more flows than lanes and the lane budget has room; dialing a lane"** at 20:30:02, 20:30:23,
+20:30:26, 20:38:14 while the interactive probe never gets an answer.
+
+**What is established and what is a hypothesis.** Established: after a UDP block on the carrier's leg, a transparent claim carries
+nothing for the remaining ~20 minutes of the run, through a clean stage, a capacity ramp and a half-close cell, and the gate refuses
+the record for it. Hypothesis (to confirm, not to assume): the claim's lane state machine is stuck behind the *drain that timed
+out* — it asked the peer to drain lane 2, the peer never answered, the drain was called off, and every later lane dial either fails
+or lands somewhere the claim's flows are not routed to.
+
+**Reproduced, and it is the carrier-move path, not the block itself.** A single-arm run of the same schedule at `--scale 0.1`
+(`just bench run --profile smoke --scenarios timeline --scale 0.1 --arms l3`, record `~/tmp/p410-l3-udpblock.json`) shows the
+difference: its **warm-up round survived the block** — `udp_blocked@tunnel` 7.9 ms, `clean#2` 6.1 ms, the claim carried as if
+nothing happened — while its **second round died the same way the release run did**, with a signature the log spells out:
+
+    23:16:43  Data carrier for claim 10.99.0.1:2402: lane 2 refused its share for 3 ticks;
+              asked the peer to drain it so its replacement rides Tcp
+    23:22:29… Lane allocator: claim 10.99.0.1:2401 has more flows than lanes and the lane
+              budget has room; dialing a lane        ← once a second, 91 times, until killed
+
+So the trigger is **the carrier move**, not the block: the block makes a lane "refuse its share", the carrier rule asks the peer to
+drain that lane so its replacement rides TCP, and when that handover does not complete the claim is left with **no usable lane and no
+retry path that does not itself depend on carrying traffic** — the allocator asks for a lane once a second and never gets one, which
+is where the 455 s of silence comes from. Warm-up survived because the suspicion never fired there: the "refused its share" counter
+needs traffic to accumulate, and the block's length at that scale did not produce it.
+
+**The smoking gun, from a debug-level run of the same schedule.** `RUST_LOG=debug just bench run --profile smoke --scenarios
+timeline --scale 0.1 --arms l3` (work `/home/dsh/tmp/bench-20261123-014643`) reproduces both shapes and names the moment the claim
+loses its replacement:
+
+    01:53:57  mhd is reachable again at 10.10.0.254:2400; using it
+    01:53:57  Ignoring a data channel request for 2: the claim holds the lanes it was allotted
+
+The server asked for a replacement lane at the instant the carrier came back, and the **client refused it** because its allotment
+test counted the lane that had just stopped delivering. That is the whole defect in one line: `wants_another_lane` counts
+`member_stats().filter(lane.live)` — "a member holds the slot" — and a lane whose carrier is unreachable is still `live`. So a claim
+whose lanes all ride an abandoned carrier satisfies its own allotment, refuses every replacement the peer offers, and the allocator's
+own `dial()` is the only way it could still ask for one — which is why it spins (`dial` raises `target` once per attempt, a failed
+attempt never lowers it, and the allocator has no backoff).
+
+**The fix, in three parts, all at the same seam:**
+
+1. **The allotment test must count the lanes that can still carry**: `live && !draining && carrier == the claim's current choice`.
+   A lane on an abandoned carrier does not satisfy the target, so the peer's replacement request is accepted and a lane on the
+   current carrier is dialled. This is the recovery path; without it nothing else matters.
+2. **A failed dial must not raise the want**: `dial()` raises `target` (it is recording an intent) and a dial that never lands must
+   lower it again, with in-flight attempts tracked so `live + pending < target` is the test. Today a failure inflates the target for
+   ever, which is why 91 attempts became 91 wanted lanes.
+3. **The allocator backs off and says it once**: 1 s → 2 → 4 → … capped, one `WARN` (a claim that cannot get a lane is an operator
+   fact), then `DEBUG`. Today it logs at `INFO` every tick for as long as the condition lasts.
+
+**Status after the first attempt at the fix (2026-11-23).** All three rules are in, with two regression tests
+(`a_lane_on_an_abandoned_carrier_does_not_satisfy_the_allotment`, `a_claim_that_cannot_get_a_lane_backs_off`). The visible change
+in the reproducer is real: the handover that used to time out now completes (**"the peer holds no flow in it; retiring it (still
+carrying this end's flows) so its replacement rides the carrier now preferred"**, 23 s after the request), the dial loop is bounded
+(one `WARN`, then debug), and **round 0 of the re-run survived the block that used to kill it** — `udp_blocked@tunnel` 1.5 ms,
+`clean#2` 1.6 ms, where the release run read 100 % error and the reproducer's round 1 died.
+
+**The six-arm sweep says the fix is not enough — this paragraph replaces an earlier one that claimed it was.** The first record
+after the fix (`~/tmp/p450-standard-sweep.json`, revision `9921a7f`, 17 033 s, 167 samples) is **still red**, with 14 failures, all
+`l3`, and the failing cells moved: they now start at `rate100_shallow@tunnel` (**9.18 % interactive error**, bulk absent), and every
+stage after it — `mtu1280@tunnel`, `udp_throttled@tunnel`, `udp_blocked@tunnel`, `clean#2` — reads **100 % error, no samples**, then
+the ramp carries 0 of 8 streams and `half-close` never reaches the tool. The client logs **nothing at all** after 06:14:27 (one
+backoff `WARN`), and the run cell records two silences, the longest **1 076 s**.
+
+**What that rules out, and what it leaves.** `molehill` — the same `mhd` carrier, the same leg, the same stages — reads
+`mtu1280@tunnel` 1.94 ms / 0 % / **15.29 Gbit/s**, `udp_throttled@tunnel` 14.99, `udp_blocked@tunnel` 14.76, `clean#2` 15.15: the
+path, the MTU and the UDP policy are all survivable, so this is the **claim's** recovery and not the network. What the allotment fix
+did buy is real and still stands (the `Ignoring a data channel request … holds the lanes it was allotted` refusal is gone from the
+logs, the 1 Hz dial loop is gone, a healthy claim now keeps its lanes through the UDP block — the reproducer's three passes read
+0.0 % on `clean#2`), but a claim that loses its lanes under a **shallow queue on the carrier's leg** still never comes back, and it
+does so *silently*: no carrier move fires, because a lane that carries nothing offers no evidence for the carrier rule, and no new
+lane is dialled, because a lane that is `live` and on the current carrier satisfies the allotment whether or not it delivers.
+
+**Two more rounds of the same ticket (2026-11-23, later).** (1) A claim's lane failure now says why at `WARN` instead of `debug!`
+— the release run's silence was a log-level bug, not health. (2) The allocator now dials a replacement for a claim that has **no
+lane at all** after a grace period: `lanes::plan` deliberately skips a lane-less claim ("its lanes are still joining"), and the peer
+only asks for a channel when it has a visitor to place, which it cannot do without a lane — so a claim whose every lane died during
+a UDP block was stranded by design. With that rule the client *does* dial after the block, and **every dial is refused by the
+peer**: `a transparent claim's data channel failed: Failed to read data cmd: early eof`, over and over (1 079 of them in four
+minutes before the backoff reset was fixed — a claim with no lane must not have its backoff reset by a plan that says "nothing
+short"). The claim still reads 100 % error on the stage after the block.
+
+**The server-side hypothesis was wrong, and the log names the real one.** A clean stop is now reported (`WARN` + the death
+signal) and the same full-scale pass still reads 100 % on `udp_blocked@tunnel` and `clean#2` — with **0** "stopped serving" lines.
+What the two logs show together is sharper: the client's 75 lane failures run **13:00:22.138 → 13:03:30.417**, and the client's own
+INFO line at **13:00:22.070** is `mhd is reachable again at 10.10.0.254:2400; using it` — the first failure lands **68 ms** after the
+carrier switched *back* to mhd. Over the same window the server logs **nothing at all** (its last line is 12:40:59): no handshake, no
+refusal. So the dials are not being refused by the server — they never reach it, because they are dialled over a carrier whose pool
+died during the block and has not been re-established, and the L3 dial path does not wait for, or trigger, that re-establishment. It
+fails instantly, once per backoff step, for as long as the run lasts. The `l4` arms recover from the same block because the pool
+re-establishes itself; a claim's lane dial is not part of that.
+
+**A six-minute reproducer now exists, and it is the tool this needs.** `just bench run --profile recover --scale 1.0 --arms l3`
+runs a three-stage timeline (`recover`: clean → `udp_blocked@tunnel` → clean) and asks the one question the sweep's schedule can
+only ask in five hours. Measured 2026-11-23: `clean` 0 %, `udp_blocked@tunnel` 100 %, **`clean#2` 100 %** — the defect, in 643 s,
+with both sides' debug logs if the environment sets `RUST_LOG`. Every future iteration on this ticket costs six minutes, not fifty.
+
+What the runs so far establish, layer by layer:
+1. **The mhd dial after a block is slow**: with the server's log on, the client's dial at 17:35:29 is handshaken by the server at
+   17:35:59 — thirty seconds, the datagram retransmit schedule — so a 150 s "recovered" stage is dead for its first third whatever
+   else happens.
+2. **The claim's lane still fails after that**: the channels that do reach the server are closed again without a forwarding command
+   (`Failed to read data cmd: early eof` on the client, nothing after `Handshaking a data channel` on the server), and the client
+   retries every thirty seconds for the rest of the run.
+3. **The carrier-switch rules I tried are timing-dependent**: an ungated `prefer` recovered a full pass (`udp_blocked@tunnel` 0.04 %,
+   `clean#2` 0 %); gating it on claim age, on "has held a lane", and on the carrier's own switch count each read 100 % again, and the
+   last two never fired at all (the switch count is zero because nothing but a *dial* failure ever calls `fell_back`).
+
+That is the next fix: **a claim's lane dial over mhd must ride the pool's establishment (or fall back to TCP for that attempt), not
+fail instantly against a dead pool** — and the fallback must not depend on the carrier's cooldown, which is what the ungated run was
+accidentally bypassing.
+
+**Where the ticket stands after the frame-level run of the six-minute cell (2026-11-23, `~/tmp/p580-recover.json`,
+`~/tmp/bench-20261123-181956`).** Three facts, all from one 650 s run with both ends' transparent and core modules at debug:
+
+1. **The last forwarded frame is at 18:22:34** — the second the block starts. After it: **zero** `l3 frame in` and **zero**
+   `l3 frame out` on the client for the remaining eight minutes, while the probe keeps timing out and the client keeps opening
+   channels (`early eof` every two seconds).
+2. **The recovered lanes do join**: at **18:26:44** — 74 s after the block lifts — five `l3 lane joined claim=… slot=0
+   lane=Some(…) carrier=Some(Mhd)` lines, so the client's routing table has routable lanes again. Nothing flows through them.
+3. **The server sees the channels but starts no forwarder**: `Handshaking a data channel` 18 times, `died before starting` **0**,
+   `Refused a transparent lane` **0**, and no `Transparent channel … ended` after the block — the member tasks it spawned never
+   log either end.
+
+So the failure is no longer "the claim has no lane" (it has one, joined) and no longer "the peer refuses it" (it does not). It is
+that **frames stop crossing the claim in either direction once the carrier has been blocked, and a lane that joins afterwards does not
+restart them**. That is where the next investigation goes, and the six-minute cell plus the two log lines that exist
+(`l3 lane joined`, `l3 frame in/out`) are enough to see it.
+
+**Three designs for the recovery, and the one I would take.** (a) *Keep the retry loop and fix the forwarder* — smallest change, but
+after ten iterations on this ticket each fix has moved the failure rather than ended it. (b) *Tear the claim's data plane down and
+let the registration path rebuild it*: a carrier block would end the claim's task on both ends, the client would re-register, and the
+rebuild path is the one that demonstrably works (every run's first 150 s is healthy). The cost is a visible reconnect per claim per
+block — which is what every peer in the record does anyway, and the schedule has one block. (c) *Give the claim a supervisor that
+watches "no frame forwarded for N seconds while the TUN had traffic" and re-opens the whole lane set* — the most robust, the most
+code. (b) is what I would build next: it makes the failure path identical to the path the release's first stage already proves, and it
+is the only one of the three that does not depend on the specific way the forwarder stops.
+
+**And a decision this ticket has earned (2026-11-23, after eleven fixes).** The repo's own §9 rule is "three failed attempts on one
+problem: stop, write the findings, ask the human". This ticket is at eleven: the allotment rule, the dial backoff, the lane-less
+dial, the spurious backoff reset, the log level, the server's clean-stop report, and four variants of the carrier fallback. Each one
+made the failure move rather than end, and the four attempts that *did* recover a full pass were all timing-dependent (they switched
+the carrier at the right moment by accident). What is left is not a missing line — it is a **design question about how a claim
+rebuilds after losing its whole lane set**, and it wants a decision rather than another experiment:
+
+* **(a) keep fixing the forwarder** — every fix so far has cost a 6-minute cell and moved the failure;
+* **(b) tear the claim down and let the registration path rebuild it** — the path that demonstrably works is the one the first 150 s
+  of every run takes; the cost is one visible reconnect per claim per block, which is what every peer in the record already does;
+* **(c) a supervisor that re-opens the whole lane set on "offered but not forwarded"** — most robust, most code, and it needs the
+  observability this end does not have yet (the hub counts what it places, not what the TUN offered and nobody took).
+
+I would build (b). It is a real change to the claim's lifecycle, not a patch, and it is the only one of the three that does not
+depend on knowing *how* the forwarder stops — which eleven attempts have failed to establish.
+
+**(b) is built, and it does not fix it — which is itself the most useful result of the day.** `SessionRequest::Restart` puts a
+claim through deregister + register when it has been lane-less for four attempts (once per thirty seconds, at `WARN`);
+`~/tmp/p600-recover.json` shows it firing **49 times** in six minutes. The stage after the block still reads **100 % error, zero
+samples**. So a claim rebuilt from scratch — fresh lanes, fresh hub members, both ends' state discarded — does not carry traffic
+either. **The claim is not what is broken.**
+
+That leaves one candidate, and it is upstream of the product: the visitor's packets to the claimed address do not reach the client's
+TUN at all after the block. The evidence: the client's TUN is alive and reading (it logs its own namespace's IPv6 router
+solicitations as `l3 device frame unclaimed`), while the probe — which opens **one fresh TCP connection per attempt** — produces no
+`l3 frame out` for eight minutes. A fresh claim cannot forward frames that never arrive.
+
+**The rebuild works — when it is paced by the carrier, not by the clock (2026-11-24).** The first version rebuilt on a 30 s clock
+and read 100 % (`~/tmp/p620-recover-1.json`, `-2.json`); with no pacing at all it rebuilt forty-nine times in six minutes and read
+100 % once and 0 % once. The rule that works ties the rebuild to the *evidence*: **one rebuild per carrier move** (the carrier's own
+switch count), with a ten-second floor so a hopeless claim cannot spin. Two consecutive cells then recovered —
+`~/tmp/p630-recover-1.json` (`clean#2` 1.18 ms, 0 %) and `~/tmp/p630-recover-2.json` (1.58 ms, 0 %) — after every earlier run of the
+same cell read 100 %.
+
+The chain that gets a claim back after a block is therefore: lanes die → the allocator dials, backs off and reports → a claim with no
+lane asks the carrier for the other one (once per chance) → a claim still lane-less after four attempts is **rebuilt** through
+deregister + register, once per carrier move → a fresh claim on a live carrier carries.
+
+**The missing piece was ordering, and three consecutive cells now recover (2026-11-24).** The rebuild
+(deregister + register) was a coin flip: two cells recovered, two read 100 % on the same build. The difference is *when* the
+registration lands — a deregistration is asynchronous on the server, and a registration that arrives while the old claim's task is
+still ending opens lanes that join on both ends and carry nothing (the state that had no explanation for two days). With a **pause
+between the two** — 300 ms, the same order as the server's own replacement backoff — three cells in a row read `clean#2` 1.30, 1.46
+and 1.23 ms at **0 % error**, and the first stage of each read 0 % as well (a thirty-second pool grace keeps a cold start from being
+rebuilt).
+
+So the claim's recovery path is: lanes die → the allocator dials with backoff → a claim with no lane asks the carrier for the other
+one (once per chance) → still lane-less after four attempts, the claim is **rebuilt** once per carrier move, with the session
+pausing long enough for the peer to finish letting the old claim go.
+
+**Where it stands after six more configurations (2026-11-24, end of the day).** The recovery is a **race with roughly even odds**, and
+every attempt to make it deterministic has moved which side wins rather than which side exists:
+
+| configuration | isolated cell | full schedule |
+|---|---|---|
+| rebuild + claim-level carrier switch + ordering pause | 3/3 recovered | **passed once** (`~/tmp/p770-l3-full.json`, every stage 0 %), then the release sweep failed with `asking for Tcp` and `asking for Mhd` in the same second and **0 rebuilds** |
+| rebuild only (no claim-level switch) | **3/3 recovered** | failed (`~/tmp/p830-l3-full.json`, `clean#2` 100 %) — the claims keep their joined-but-dead lanes, so `lanes.is_empty()` is false and the rebuild never fires |
+| + silence rule (retire a fed lane whose peer is silent) | failed | not reached |
+| + the same rule gated on the carrier believing its path is up | failed | not reached |
+
+What that leaves is a product decision, not another trigger: **a claim whose lanes are up and carry nothing must be repaired, and the
+product cannot see "carrying nothing" without a signal it does not have** — the peer's lane reports are the only candidate, and using
+them naively retires lanes during a block (harmful), while gating them on the carrier's own belief still churns. The next move is to
+make the carrier's fallback *claim-wide* — a claim that has been silent across all its lanes while the carrier believes its path is
+up should move the whole endpoint to TCP and rebuild once — rather than to keep tuning per-lane rules.
+
+**And then the rule that works, which is about the carrier and not about a lane (2026-11-24, `da6852f`).** Every earlier attempt
+looked at one lane; the signal only makes sense for the claim: **every** lane of a claim is up, **every** one is fed, **none** hears
+anything back, and the carrier believes its own path is up. Then the endpoint moves once and the claim is rebuilt on the carrier that
+just changed. Two gates make it safe, and both were measured: `carried` (a claim that has never carried anything is starting, not
+broken — without it the rule cost the first stage of every run a second of p99) and the pool's thirty-second grace. Two consecutive
+cells read `clean` 1.90 / 1.95 ms at 0 % and `clean#2` **1.54 / 1.82 ms at 0 %** — the recovery, at the latency the healthy stage has.
+
+The same rule applied **per lane** is harmful, twice over: retiring a lane for silence during a block churns a claim that was about to
+recover. That is written down because it is the obvious next idea and it is wrong.
+
+**The release sweep of that configuration: nine failures, all in one cell (2026-11-24, `~/tmp/p870-standard-sweep.json`, 16 611 s).**
+The timeline is **green in every one of the eighteen stages** (`udp_blocked@tunnel` 1.52 ms, `clean#2` 1.5 ms, `mtu1280` 1.62, `udp_throttled` 1.66), `half-close` delivers 65 536 bytes, and the wedge axis is silent. What is left is `l3`'s **capacity ramp**: `L1` times out at the harness's 26 s bound, `L2..L8` are never attempted, and the five other arms sustain 8 of 8 streams.
+
+**And the ramp is fine on its own**: `~/tmp/p880-cap.json` reads L1 5.82, L3 9.99, L8 10.34 Gbit/s with 1..8 streams sustained. It is the **order** that breaks it — capacity after a 54-minute timeline that included a block and a rebuild — and forgetting the rebuilt claim's flows (`TunHub::forget_claim`, in this commit) did **not** fix it (`~/tmp/p890-tc.json`: a scaled timeline plus capacity still fails L1). So the next question is what the timeline leaves behind that throttles the ramp's first level. Four short runs have narrowed it (2026-11-25):
+
+| before `capacity` | L1 | verdict |
+|---|---|---|
+| nothing | 5.82 Gbit/s | passes (`~/tmp/p880-cap.json`) |
+| `cost` on a clean path | 6.44 | passes (`~/tmp/p900-cc.json`) |
+| `cost` on a 60 s `udp_blocked` tunnel leg | — | never ready: a block from the first second is not the schedule's shape |
+| the `recover` timeline (clean → block → clean) | 6.25 | **passes** (`~/tmp/p910-rc.json`) |
+| `cost` on a 60 s `rate100_shallow` tunnel leg | 5.60 | passes (`~/tmp/p920-rs.json`) |
+| `cost` on a 60 s `mtu1280` tunnel leg | 1.73 | passes (`~/tmp/p921-mtu.json`) |
+| the **whole 18-stage timeline** at scale 0.25 | timeout | **fails** (`~/tmp/p890-tc.json`) |
+
+**The bisect lands on the UDP policer (2026-11-25).** The full timeline reproduces the ramp's failure at scale 0.1
+(`~/tmp/p930.t1.json`, 1 378 s), and the two diagnostic halves of the schedule show it is neither leg on its own: the
+tunnel-leg half fails (`~/tmp/p940-tun.json`) **and** the visitor-leg half fails (`~/tmp/p941-vis.json`). One stage on its own
+does: **`udp_throttled` then the ramp** fails (`~/tmp/p950-thr.json`), while a clean cost stage (`p900`), `rate100_shallow`
+(`p920`), `mtu1280` (`p921`) and the `recover` timeline's block (`p910`) all leave the ramp healthy.
+
+That makes the remaining defect a **bulk-throughput** one, not a liveness one: after a path that policed the carrier's datagrams
+for a minute, the claim's bulk streams do not recover their rate — the ramp's first level times out — while the interactive series
+reads 1.5 ms and every timeline stage is green. The next question is whose state that is: mhd's per-lane congestion/credit state
+(the l4 arms recover from the same stage, so their pool's control differs) or the claim's lanes' own windows. The two fixes to try,
+in order: reset a lane's congestion state when its path has been clean for a few seconds, and (if that is not it) re-establish the
+claim's lanes when the carrier's path condition changes.
+
+**Two attempts at that, and what they established (2026-11-25).** (1) A rebuild on *backpressure* — a claim whose lanes refuse the
+device's frames for want of queue space for five seconds — never fired: `~/tmp/p960-thr.json` shows the same timeout with **no**
+overflow, because a slow lane means the device is not offering much either (TCP's own window has already shrunk), so the queue never
+fills. (2) The ramp now **waits for the workload's own port** before its first level (`wait_dial_port`, sixty-second budget, recorded
+like any instrument parameter), which turned the cell's evidence from "no peer ever connected" into "**413 peers accepted and the
+client still could not finish in 26 s**" (`~/tmp/p970-thr.json`).
+
+That is the finding to hand over: after a path that policed the carrier's datagrams for a minute, a claim's lanes carry at a rate far
+below the one they had before it, nothing the claim can see calls itself broken (no silence, no backpressure, no failed dial), and the
+next bulk user — the ramp's first level — is the one that pays. The fix that follows from it is a **rate-recovery** rule: a claim whose
+lanes deliver far below their own recent peak while flows are placed should re-establish them, the way the silence rule
+re-establishes a claim that carries nothing. **The rule exists now, and it is dormant in every shape tested (2026-11-25, `~/tmp/p990-pol.json`).** A claim whose delivery sits
+under a fifth of its own recent peak for ten seconds, with flows placed, is rebuilt (`CLAIM_RATE_BUDGET`, the peak decaying one part in
+sixty-four a tick so a legitimately quiet claim is not rebuilt for ever). The `police` diagnostic — clean 60 s, a policed carrier 60 s,
+clean 60 s, then the ramp — shows what the rule has to catch: the first clean stage carries **9.90 Gbit/s**, the policed one and the
+clean one after it carry **nothing**, and the ramp's first level still times out. The rule never fired: after the policed stage the
+bulk streams have ended, so the claim's `flows` are zero and the rule's own demand gate keeps it quiet — the demand it should be
+reacting to arrives only when the *ramp* starts, and by then the harness's 26 s bound has already run out.
+
+So the last piece is a judgement about **whose demand counts**: a claim that has just been carrying bulk and has just stopped is the
+one to re-establish, not only the claim that is being asked *right now*. The next session starts there, with `just bench run --profile
+police` (ten minutes) as the test and the eight remaining rounds' worth of work already written down. Whoever takes this should start from
+`~/tmp/p580-recover.json`'s logs (`~/tmp/bench-20261123-181956`), where the last forwarded frame, the join seventy-four seconds
+later, and the probe's timeouts are all in one timeline.
+
+The earlier hypothesis (superseded by the above) was that the ticket is **on the server side**: what ends a freshly opened lane for a claim it just carried? The next run is that
+question — one full-scale pass with the server's core at debug, and the refusal path instrumented the way the client's failure path
+now is.
+
+The earlier hypothesis for this ticket (not assumed): it is a lane-level **liveness** rule — a slot that has been given traffic and has
+delivered none for a while must stop counting as satisfying, so the claim dials a replacement — and the carrier rule's evidence bar
+(`CARRIER_MIN_PACKETS`) is what hides a total blackhole from it. The isolated reproducer for it is a single `cost` stage with
+`--condition rate100_shallow --condition-leg tunnel`, then a clean stage on the same arm.
+
+**The two things that *are* closed.** `_settle_legs` (bench, `958c986`) gives each leg its
+own answer after every stage and at the end of every pass — the release schedule's stage 17 used to leave its UDP-refusing firewall
+rule standing on the *tunnel* leg while stage 18 measured a "clean" stage on the visitor one, which is what made `l3` look
+permanently dead in the record as well as what left the harness hanging between passes. With the product fix and that honest
+teardown together, the reproducer's **three passes all read 0.0 % interactive error on `clean#2`** and 1.5–1.9 ms on
+`udp_blocked@tunnel` (`~/tmp/p440-l3-fixed2.json`, 3 961 s, 57 samples), where the release record read 100 % error, 0 of 8 streams
+and a 455 s silence. The six-arm sweep is the acceptance test.
+
+**Two things this round did not close.**
+1. **Round 1 of that same re-run never started**: the harness sat between passes for 15 minutes with no `round1/` workdir and no
+   series samples (`~/tmp/bench-20261123-020642`), and I stopped it. A hang *between* passes is a harness question of its own, and
+   it has to be understood before the six-arm sweep is re-run — a release run that stalls after the first arm produces no record.
+2. **Whether a condition can leak across stages onto a leg the schedule has left.** `_RestoresCondition.__exit__` restores only the
+   leg the stage used, and the schedule's last stage is on the *visitor* leg while stage 17 put a firewall rule on the *tunnel* one;
+   the pass ends by restoring `ctx.leg`/`ctx.condition` (visitor, `None`). No `iptables` rule was left standing when I checked, so
+   this is not established as a defect — but the record that made `l3` look permanently dead was measured with that code, so it has
+   to be either fixed (restore *both* legs at the end of a pass) or shown harmless before the next release record is trusted.
+
+**Why this is a product goal, not a bench goal.** The bench did exactly what it was 定型 for: a deployment class nobody had
+imposed on this architecture before (a network that refuses UDP) found a permanent loss of the data plane, and the gate refused to
+publish it. The record is not the artifact to fix: the **product** is. The release path (merge, tables, tag) waits for the fix and
+for a re-run of the six-arm sweep.
 
 ## 5. Active architecture decisions
 

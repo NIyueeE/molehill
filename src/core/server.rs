@@ -3540,7 +3540,7 @@ fn spawn_transparent_service(
         let wire = service.wire_format;
         tokio::spawn(
             async move {
-                if let Err(e) = run_transparent_service(
+                let result = run_transparent_service(
                     data_ch_rx,
                     data_ch_req_tx,
                     tun,
@@ -3550,10 +3550,33 @@ fn spawn_transparent_service(
                     control_task,
                     transparent,
                 )
-                .await
-                {
-                    error!("{:#}", e);
-                    report_pool_death(&pool_died_tx);
+                .await;
+                match result {
+                    Ok(()) => {
+                        // A claim's task that returns leaves the service
+                        // **registered with no data path**: its packets arrive on
+                        // the operator's TUN and nothing moves them. That is how
+                        // a re-registration replaces the channel queue, and
+                        // nothing else notices — the client's next lane opens, the
+                        // dispatcher hands it to a queue nobody reads, and the
+                        // client reads `early eof` for ever while both services
+                        // look healthy from the control session (`HANDOFF.md` §4
+                        // I: a claim carried nothing for twenty minutes in the
+                        // first bench-standard record).
+                        //
+                        // So a clean stop is reported like a failure: the
+                        // service's control path ends and the client re-registers
+                        // it, which builds a fresh claim with a live queue.
+                        warn!(
+                            "the transparent claim at {endpoint} stopped serving while the service \
+                             is still registered; telling the session to re-register it"
+                        );
+                        report_pool_death(&pool_died_tx);
+                    }
+                    Err(e) => {
+                        error!("{:#}", e);
+                        report_pool_death(&pool_died_tx);
+                    }
                 }
             }
             .instrument(Span::current()),
