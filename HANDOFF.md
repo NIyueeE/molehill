@@ -1320,6 +1320,33 @@ and a 455 s silence. The six-arm sweep is the acceptance test.
    this is not established as a defect — but the record that made `l3` look permanently dead was measured with that code, so it has
    to be either fixed (restore *both* legs at the end of a pass) or shown harmless before the next release record is trusted.
 
+### §4 I.1 The release run after the fix, and the four papercuts it exposed (2026-11-26)
+
+The `l3` recovery thread ends with a green gate and a release record (`2026-11-25`, nine failures → none, `l3`
+sustaining 8 of 8 streams). Fixing the papercuts that record exposed turned up four things, all closed:
+
+1. **`bench plot`'s table read the wrong key.** A scenario with one cell writes it with an empty name; the table labelled
+   the column with the scenario's name and looked the reading up under *that*, so the half-close table printed `-` for
+   every arm while the record carried 65 536 bytes. The `selfcheck` now renders a synthetic record and asserts the value
+   appears (989 → 990 checks), and the table is regenerated.
+2. **`bench plot` wrote its PNGs beside the record** (`benches/records/`, a data directory) — twice during the release.
+   The default is now `./bench-charts/<run>/`; `--out-dir` still wins.
+3. **`nix` was compiled into builds that never call it**: it is `optional` now, pulled by `mhd` and `transparent` only.
+4. **A per-claim carrier switch had come back into `dial`** — reintroduced by the `git checkout` that reverted an
+   experiment. It is the code that five claims sharing one endpoint turn into five switches per tick, the state the
+   2026-11-24 sweep failed in. Removed; the carrier moves only in `claim_fallback_step`, once per chance, through the
+   switch that bypasses the quality cooldown, and `dial`'s repair is the rebuild.
+
+Two smaller ones found on the way: the selfcheck's own plot check made every `bench run` need matplotlib (it imports the
+plotter locally now), and `--no-default-features --features server,client,mhd` (no `noise`) does not compile — **that one
+predates this work**, reproduced on a clean `fc82206` worktree, and is not fixed.
+
+**One run was thrown away, and why.** The first repeat sweep produced **nothing** for `l3` and `frp`: every one of their
+samples is `TimeoutExpired` on the *probe* (`ip netns exec … python3 … timed out after 8.0 seconds`), their client logs
+hold 25 lines and one carrier switch, and no rebuild fired. The other four arms were complete. That is the host, not the
+product, and it is the failure shape to recognise: an arm whose *instrument* times out looks exactly like an arm that
+carried nothing, and the gate reports it as coverage.
+
 **Why this is a product goal, not a bench goal.** The bench did exactly what it was 定型 for: a deployment class nobody had
 imposed on this architecture before (a network that refuses UDP) found a permanent loss of the data plane, and the gate refused to
 publish it. The record is not the artifact to fix: the **product** is. The release path (merge, tables, tag) waits for the fix and
