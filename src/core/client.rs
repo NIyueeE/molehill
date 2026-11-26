@@ -3260,6 +3260,10 @@ struct LanePool {
     /// Per claim: how many frames its lanes have refused for want of queue space, and
     /// since when that has been happening.
     backpressure: std::sync::Mutex<HashMap<Endpoint, (u64, std::time::Instant)>>,
+    /// When each claim was last rebuilt **for stalling** (backpressure or a rate
+    /// collapse), on its own clock so the two triggers cannot spend the lane-less
+    /// rebuild's permission.
+    restarted_stalled: std::sync::Mutex<HashMap<Endpoint, std::time::Instant>>,
     /// Per claim: its peak delivery rate, the last rate, and since when it has been far
     /// below that peak.
     rate: std::sync::Mutex<HashMap<Endpoint, Rate>>,
@@ -3389,6 +3393,12 @@ const CLAIM_SILENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(mh_l3_client)]
 const CLAIM_SLOW_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The least time between two *stalled* rebuilds of the same claim — the pacing for a
+/// claim that has lanes and is not getting their rate, which `hopeless` (the lane-less
+/// gate) cannot pace.
+#[cfg(mh_l3_client)]
+const LANE_STALL_RESTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A claim's delivery: its peak, its last cumulative total, and since when it has been
 /// far below that peak.
 #[cfg(mh_l3_client)]
@@ -3488,6 +3498,7 @@ impl LanePool {
             silence: std::sync::Mutex::new(HashMap::new()),
             backpressure: std::sync::Mutex::new(HashMap::new()),
             rate: std::sync::Mutex::new(HashMap::new()),
+            restarted_stalled: std::sync::Mutex::new(HashMap::new()),
             carried: std::sync::Mutex::new(std::collections::HashSet::new()),
             carrier_sample: std::sync::Mutex::new(HashMap::new()),
             carrier_streak: std::sync::Mutex::new(HashMap::new()),
@@ -4148,7 +4159,7 @@ impl LanePool {
 
     /// Rebuild a claim whose lanes will not take the device's frames, and say so.
     fn rebuild_for_backpressure(&self, endpoint: Endpoint) -> bool {
-        let Some(service) = self.hopeless(&endpoint) else {
+        let Some(service) = self.stalled_rebuild(&endpoint) else {
             return false;
         };
         warn!(
@@ -4198,7 +4209,7 @@ impl LanePool {
 
     /// Rebuild a claim whose lanes deliver a fraction of what they used to, and say so.
     fn rebuild_for_slow_rate(&self, endpoint: Endpoint) -> bool {
-        let Some(service) = self.hopeless(&endpoint) else {
+        let Some(service) = self.stalled_rebuild(&endpoint) else {
             return false;
         };
         warn!(
@@ -4210,6 +4221,33 @@ impl LanePool {
         }
         self.restart(service);
         true
+    }
+
+    /// The rebuild pacing for a claim that **has** lanes and is not getting their rate.
+    ///
+    /// `hopeless` is the *lane-less* claim's gate and it never opens for a claim with
+    /// lanes (`dial_attempts` is zero there), so sharing it made both the backpressure
+    /// and the rate rule dead code — measured 2026-11-26: the release sweep's `l3`
+    /// capacity level timed out with the backend having accepted six connections and
+    /// **zero** rebuilds, because the rule that exists for exactly that state could not
+    /// get past a gate that asks "how many dials have failed?".
+    fn stalled_rebuild(&self, endpoint: &Endpoint) -> Option<ServiceId> {
+        let service = {
+            let claims = self.claims.lock().ok()?;
+            claims.get(endpoint).map(|entry| entry.args.service_id)?
+        };
+        if self.started.elapsed() < LANE_REBUILD_GRACE {
+            return None;
+        }
+        let mut restarted = self.restarted_stalled.lock().ok()?;
+        if restarted
+            .get(endpoint)
+            .is_some_and(|at| at.elapsed() < LANE_STALL_RESTART_COOLDOWN)
+        {
+            return None;
+        }
+        restarted.insert(*endpoint, std::time::Instant::now());
+        Some(service)
     }
 
     /// Have this claim's lanes spent long enough refusing the device's frames for want
