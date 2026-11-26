@@ -1341,6 +1341,20 @@ Two smaller ones found on the way: the selfcheck's own plot check made every `be
 plotter locally now), and `--no-default-features --features server,client,mhd` (no `noise`) does not compile — **that one
 predates this work**, reproduced on a clean `fc82206` worktree, and is not fixed.
 
+**The repeat sweep, and what it says about the cell that keeps failing (2026-11-26).** On a quiet host the six-arm sweep ran again:
+166 triples, and **the same nine failures, all `l3/capacity`** — `L1` timed out with the backend having accepted **six** connections,
+`l2..L8` never attempted, and the client's log shows one carrier switch, no silence and no backpressure. So the cell is not flaky in
+one direction: of three sweeps of the same schedule, one was green (`~/tmp/p1100-standard-sweep.json`) and two red
+(`~/tmp/p870-standard-sweep.json`, `~/tmp/p1400-standard-sweep.json`), and the red ones fail at the *first* bulk level after a
+schedule that policed the carrier's datagrams.
+
+Chasing that exposed a real bug and then a wall. The bug: both "stalled" rules (backpressure, rate collapse) were paced by
+`hopeless`, the **lane-less** claim's gate, which requires four failed dials — a claim that *has* lanes has none, so both rules were
+dead code and the sweep's log showed **zero** rebuilds for the state they exist for. They now pace themselves
+(`LANE_STALL_RESTART_COOLDOWN`), and the `police` cell shows them firing (`slow-rate=2 rebuilds=2`). The wall: with the rebuild
+firing, the bulk **still** does not come back inside the stage (`~/tmp/p1500-pol.json`: `L1` failed, both clean stages carry nothing),
+so the throttle is **below the claim** — a fresh registration and a fresh lane set do not restore the rate.
+
 **One run was thrown away, and why.** The first repeat sweep produced **nothing** for `l3` and `frp`: every one of their
 samples is `TimeoutExpired` on the *probe* (`ip netns exec … python3 … timed out after 8.0 seconds`), their client logs
 hold 25 lines and one carrier switch, and no rebuild fired. The other four arms were complete. That is the host, not the
